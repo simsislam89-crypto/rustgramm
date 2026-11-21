@@ -5,7 +5,9 @@
 use serde::{Deserialize, Serialize};
 
 pub mod ayu;
+pub mod extera;
 pub use ayu::*;
+pub use extera::ExteraSettings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +117,8 @@ pub struct Settings {
     pub user_hosts: Vec<String>,
     /// Остальные настройки AyuGram (внешний вид, фильтры, меню, поле ввода).
     pub ayu: AyuSettings,
+    /// Настройки exteraGram (основа Android-версии).
+    pub extera: ExteraSettings,
     /// Фильтры сообщений.
     pub filters: Vec<Filter>,
 }
