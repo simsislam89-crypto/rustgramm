@@ -125,6 +125,10 @@ pub struct Settings {
     pub window_opacity: u8,
     /// Недавно выбранные эмодзи (строка символов, новые впереди).
     pub recent_emoji: String,
+    /// Скорость анимаций, проценты (0 — без анимаций, 100 — как в Telegram, до 200).
+    pub anim_speed: u8,
+    /// Масштаб интерфейса, проценты (80..=150).
+    pub ui_scale: u8,
 }
 
 impl Default for Settings {
@@ -138,6 +142,8 @@ impl Default for Settings {
             filters: Vec::new(),
             window_opacity: 86,
             recent_emoji: String::new(),
+            anim_speed: 100,
+            ui_scale: 100,
         }
     }
 }

@@ -18,6 +18,8 @@ const REACTIONS: [&str; 6] = ["👍", "❤", "🔥", "😂", "😮", "😢"];
 pub(crate) enum Act {
     /// Скачать вложение и открыть.
     Open(i32),
+    /// Прервать идущую загрузку вложения.
+    CancelFetch(i32),
     /// Открыть картинку в просмотрщике.
     Viewer(i32),
     Reply(i32, String),
@@ -55,6 +57,10 @@ struct Env<'a> {
     avatars: &'a HashMap<i64, egui::TextureHandle>,
     /// Сообщения, у которых слева рисуется аватарка отправителя (последнее в серии).
     avatar_msgs: &'a std::collections::HashSet<i32>,
+    /// Идущие загрузки вложений: сообщение → (скачано, всего).
+    fetching: &'a HashMap<i32, (u64, u64)>,
+    /// Вложения, уже лежащие в кэше.
+    cached: &'a std::collections::HashSet<i32>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -370,7 +376,7 @@ impl App {
                 if resp.clicked() {
                     self.emoji_pinned = !self.emoji_pinned;
                     self.emoji_open = self.emoji_pinned;
-                } else if resp.hovered() && s.show_emoji_popup {
+                } else if resp.hovered() && s.show_emoji_popup && ui.ctx().content_rect().width() < super::NARROW_WIDTH {
                     self.emoji_open = true;
                 }
             }
@@ -402,75 +408,53 @@ impl App {
         let _ = attach;
     }
 
-    pub(crate) fn emoji_window(&mut self, ctx: &egui::Context) {
-        let appear = tween(ctx, "emoji-panel", f32::from(u8::from(self.emoji_open)), 0.18);
-        if appear < 0.01 {
-            return;
-        }
+    /// Содержимое панели эмодзи/стикеров/GIF (одно и для правой панели, и для всплывающего окна).
+    pub(crate) fn emoji_panel_body(&mut self, ui: &mut egui::Ui) {
         let mut picked = None;
         let mut jump = self.emoji_jump.take();
         let mut tab = self.emoji_tab;
         let mut sacts: Vec<super::panels::StickerAct> = Vec::new();
-        let screen = ctx.content_rect();
-        let size = Vec2::new(344.0_f32.min(screen.width() - 16.0), 340.0_f32.min(screen.height() - 120.0));
-        // Панель поднимается над кнопкой с пружинистой посадкой, как лист на iPhone.
-        let rise = (1.0 - spring(appear)) * 22.0;
-        let pos = egui::pos2(
-            (self.emoji_btn.right() - size.x + 20.0).clamp(8.0, screen.width() - size.x - 8.0),
-            self.emoji_btn.top() - size.y - 12.0 + rise,
-        );
-        #[allow(deprecated)]
-        let area = egui::Area::new(egui::Id::new("emoji-panel"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(pos);
-        let inner = area.show(ctx, |ui| {
-            ui.set_opacity(appear.clamp(0.0, 1.0));
-            egui::Frame::new()
-                .fill(t2(WINDOW_BG))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
-                .corner_radius(egui::CornerRadius::same(14))
-                .inner_margin(egui::Margin::symmetric(6, 6))
-                .show(ui, |ui| {
-                    ui.set_min_size(size);
-                    ui.set_max_size(size);
-                    // Вкладки «Эмодзи» и «Стикеры».
-                    ui.horizontal(|ui| {
-                        for (n, name) in ["Эмодзи", "Стикеры", "GIF"].iter().enumerate() {
-                            let g = ui.painter().layout_no_wrap((*name).to_owned(), FontId::proportional(14.0), WHITE);
-                            let (r, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 24.0, 30.0), Sense::click());
-                            let k = tween(ui.ctx(), ("emtab", n), f32::from(u8::from(tab == n)), 0.16);
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(14.0), lerp_color(DIALOG_TEXT, WHITE, k));
-                            ui.painter().rect_filled(
-                                Rect::from_center_size(egui::pos2(r.center().x, r.bottom() - 1.0), Vec2::new((r.width() - 16.0) * k, 2.5)),
-                                egui::CornerRadius::same(1),
-                                WHITE,
-                            );
-                            if resp.clicked() {
-                                tab = n;
-                            }
-                        }
-                    });
-                    if tab == 0 {
-                        let h = (ui.available_height() - 42.0).max(60.0);
-                        ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| {
-                            if self.emoji_add_open {
-                                self.featured_view(ui, &mut sacts);
-                            } else if let Some(i) = self.emoji_pack {
-                                self.pack_view(ui, i, &mut sacts);
-                            } else if let Some(emoji) = self.emoji.as_ref() {
-                                picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
-                            }
-                        });
-                        self.emoji_bar(ui, &mut jump, &mut sacts);
-                    } else if tab == 1 {
-                        self.sticker_tab(ui, self.emoji.as_ref(), &mut sacts);
-                    } else {
-                        self.gif_tab(ui, &mut sacts);
-                    }
-                });
+        // Вкладки как в AyuGram: на всю ширину, подчёркивание у выбранной.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let w = ui.available_width() / 3.0;
+            for (n, name) in ["Эмодзи", "Стикеры", "GIF"].iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+                let k = tween(ui.ctx(), ("emtab", n), f32::from(u8::from(tab == n)), 0.16);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(14.0), lerp_color(DIALOG_TEXT, WHITE, k));
+                ui.painter().rect_filled(
+                    Rect::from_center_size(egui::pos2(r.center().x, r.bottom() - 1.0), Vec2::new(44.0 * k, 2.5)),
+                    egui::CornerRadius::same(1),
+                    WHITE,
+                );
+                if resp.clicked() {
+                    tab = n;
+                }
+            }
         });
+        if tab == 0 {
+            let h = (ui.available_height() - 42.0).max(60.0);
+            ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| {
+                if self.emoji_add_open {
+                    self.featured_view(ui, &mut sacts);
+                } else if let Some(i) = self.emoji_pack {
+                    self.pack_view(ui, i, &mut sacts);
+                } else if let Some(emoji) = self.emoji.as_ref() {
+                    picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
+                }
+            });
+            self.emoji_bar(ui, &mut jump, &mut sacts);
+        } else if tab == 1 {
+            self.sticker_tab(ui, self.emoji.as_ref(), &mut sacts);
+        } else {
+            self.gif_tab(ui, &mut sacts);
+        }
         self.emoji_tab = tab;
         self.emoji_jump = jump;
+        self.emoji_apply(sacts, picked);
+    }
+
+    fn emoji_apply(&mut self, sacts: Vec<super::panels::StickerAct>, picked: Option<char>) {
         for a in sacts {
             use super::panels::StickerAct as A;
             match a {
@@ -550,6 +534,38 @@ impl App {
             std::mem::swap(&mut recent, &mut self.settings.recent_emoji);
             self.send(Cmd::Settings(Box::new(self.settings.clone())));
         }
+    }
+
+    /// Всплывающее окно над полем ввода (только узкое окно; в широком панель стоит справа).
+    pub(crate) fn emoji_window(&mut self, ctx: &egui::Context) {
+        let appear = tween(ctx, "emoji-panel", f32::from(u8::from(self.emoji_open)), 0.18);
+        if appear < 0.01 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let size = Vec2::new(344.0_f32.min(screen.width() - 16.0), 340.0_f32.min(screen.height() - 120.0));
+        let rise = (1.0 - spring(appear)) * 22.0;
+        let pos = egui::pos2(
+            (self.emoji_btn.right() - size.x + 20.0).clamp(8.0, screen.width() - size.x - 8.0),
+            self.emoji_btn.top() - size.y - 12.0 + rise,
+        );
+        #[allow(deprecated)]
+        let area = egui::Area::new(egui::Id::new("emoji-panel"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos);
+        let inner = area.show(ctx, |ui| {
+            ui.set_opacity(appear.clamp(0.0, 1.0));
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
+                .corner_radius(egui::CornerRadius::same(14))
+                .inner_margin(egui::Margin::symmetric(6, 6))
+                .show(ui, |ui| {
+                    ui.set_min_size(size);
+                    ui.set_max_size(size);
+                    self.emoji_panel_body(ui);
+                });
+        });
         // Закрытие: Esc или курсор ушёл с панели и кнопки (если панель не закреплена кликом).
         let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
             inner.response.rect.expand(8.0).contains(p) || self.emoji_btn.expand(4.0).contains(p)
@@ -606,6 +622,8 @@ impl App {
                 read_out,
                 avatars: &self.avatars,
                 avatar_msgs: &avatar_msgs,
+                fetching: &self.fetching,
+                cached: &self.cached_media,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
                 tex: &self.textures,
@@ -711,6 +729,7 @@ impl App {
             Act::CopyId(id) => ctx.copy_text(id.to_string()),
             Act::Save(id) => self.send(Cmd::Download(id)),
             Act::Open(id) => self.send(Cmd::OpenFile(id)),
+            Act::CancelFetch(id) => self.send(Cmd::CancelFetch(id)),
             Act::Viewer(id) => {
                 self.viewer = Some(id);
                 self.viewer_zoom = 1.0;
@@ -1049,7 +1068,12 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                     if album.len() > 1 {
                         super::media_ui::album(ui, album, w, env.tex, &mut cards);
                     } else if let Some(info) = &m.media {
-                        super::media_ui::card(ui, m, info, w, env.tex.get(&m.id), text_c, date_c, &mut cards);
+                        let load = match env.fetching.get(&m.id) {
+                            Some(&(d, t)) => super::media_ui::Load::Active(d, t),
+                            None if env.cached.contains(&m.id) => super::media_ui::Load::Cached,
+                            None => super::media_ui::Load::Remote,
+                        };
+                        super::media_ui::card(ui, m, info, w, env.tex.get(&m.id), text_c, date_c, &mut cards, load);
                     }
                     if !m.text.is_empty() && !m.entities.is_empty() {
                         let runs = super::rich::build_runs(&m.text, &m.entities);
@@ -1083,15 +1107,8 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                         if let Some(v) = m.views {
                             extra.push(("history_views", v.to_string()));
                         }
-                        let note = m.deleted.then(|| {
-                            if s.deleted_mark.is_empty() { "удалено".to_owned() } else { format!("{} удалено", s.deleted_mark) }
-                        });
-                        let note_w = note.as_ref().map_or(0.0, |n| 20.0 + n.chars().count() as f32 * 6.4);
-                        if let Some(n) = &note {
-                            let (r, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
-                            icons::tg(ui.painter(), "menu/delete", r.center(), DANGER);
-                            ui.label(RichText::new(n).size(12.0).color(DANGER));
-                        }
+                        // Как в AyuGram: маленькое приглушённое ведро слева от времени, без надписи.
+                        let note_w = if m.deleted { 17.0 } else { 0.0 };
                         let extra_w: f32 = note_w + extra
                             .iter()
                             .map(|(n, t)| {
@@ -1108,6 +1125,11 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                             if !t.is_empty() {
                                 ui.label(RichText::new(t).size(12.0).color(date_c));
                             }
+                        }
+                        if m.deleted {
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(13.0, 14.0), Sense::hover());
+                            icons::tg_sized(ui.painter(), "menu/delete", r.center(), Vec2::splat(18.0), date_c);
+                            resp.on_hover_text("удалено");
                         }
                         ui.label(RichText::new(meta).size(12.0).color(date_c));
                         if m.outgoing {

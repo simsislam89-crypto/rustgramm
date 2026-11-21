@@ -46,6 +46,22 @@ fn atlas(ctx: &Context) -> Option<Atlas> {
     Some(a)
 }
 
+/// Сохраняет значок как белый PNG с прозрачностью (для страницы плеера). `true`, если записано.
+pub fn export_png(name: &str, path: &std::path::Path) -> bool {
+    static GRAY: OnceLock<Option<image::GrayImage>> = OnceLock::new();
+    let Some(r) = index().get(name) else { return false };
+    let Some(atlas) = GRAY.get_or_init(|| image::load_from_memory(ATLAS_PNG).ok().map(|i| i.to_luma8())) else {
+        return false;
+    };
+    let (x, y, w, h) = (r[0] as u32, r[1] as u32, r[2] as u32, r[3] as u32);
+    let crop = image::imageops::crop_imm(atlas, x, y, w, h).to_image();
+    let mut out = image::RgbaImage::new(w, h);
+    for (px, l) in out.pixels_mut().zip(crop.pixels()) {
+        *px = image::Rgba([255, 255, 255, l.0[0]]);
+    }
+    out.save_with_format(path, image::ImageFormat::Png).is_ok()
+}
+
 /// Логический размер значка Telegram (px), `None`, если такого нет в наборе.
 pub fn native_size(name: &str) -> Option<Vec2> {
     index().get(name).map(|r| Vec2::new(r[2], r[3]) / 2.0)

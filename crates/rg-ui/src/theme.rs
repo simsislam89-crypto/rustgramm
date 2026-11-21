@@ -75,6 +75,13 @@ pub const NARROW_WIDTH: f32 = 720.0;
 // ---- прозрачность окна
 /// Непрозрачность фонов, 0..=255 (86% ≈ 219).
 static ALPHA: AtomicU8 = AtomicU8::new(219);
+/// Скорость анимаций, проценты (0 — мгновенно).
+static ANIM: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(100);
+
+/// Задать скорость анимаций в процентах (0 — выключены, 200 — вдвое быстрее).
+pub fn set_anim_speed(pct: u8) {
+    ANIM.store(u16::from(pct.min(200)), Ordering::Relaxed);
+}
 /// Процент непрозрачности по умолчанию.
 pub const DEFAULT_OPACITY_PCT: u8 = 86;
 
@@ -119,6 +126,8 @@ fn with_alpha(c: Color32, a: u8) -> Color32 {
 /// Плавный переход к `target` за `dur` секунд (мгновенно при «уменьшении движения»).
 pub fn tween(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, dur: f32) -> f32 {
     let id = egui::Id::NULL.with(id);
+    let speed = f32::from(ANIM.load(Ordering::Relaxed)) / 100.0;
+    let dur = if speed <= 0.0 { 0.0 } else { dur / speed };
     ctx.animate_value_with_time(id, target, dur)
 }
 

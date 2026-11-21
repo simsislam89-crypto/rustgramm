@@ -34,6 +34,10 @@ pub enum Cmd {
     /// Загрузить фото профиля чата с индексом.
     Avatar(usize),
     Download(i32),
+    /// Прервать загрузку вложения сообщения.
+    CancelFetch(i32),
+    /// Какие из этих сообщений уже скачаны в кэш (ответ — `Ev::Cached`).
+    CachedMedia(Vec<i32>),
     /// Скачать вложение и открыть программой по умолчанию (безопасные типы) или показать в папке.
     OpenFile(i32),
     RequestCode(String),
@@ -80,6 +84,10 @@ pub enum Cmd {
     PeerInfo(usize),
     /// Загрузить сохранённые GIF.
     Gifs,
+    /// Обзор аккаунта для «Настроек» Telegram.
+    Account,
+    /// Сохранить имя, фамилию и «О себе».
+    UpdateProfile(String, String, String),
     /// Создать канал (название, описание, true — канал, false — супергруппа).
     CreateChannel(String, String, bool),
     /// Создать группу с участниками.
@@ -133,10 +141,17 @@ pub enum Ev {
     /// Событие из потока обновлений Telegram.
     Live(rg_core::engine::Live),
     Gifs(Vec<StickerRow>),
+    Account(Box<rg_core::engine::AccountOverview>),
     /// Сведения о чате (идентификатор чата Bot API).
     PeerInfo(i64, rg_core::engine::PeerInfo),
     /// Ролик скачан: открыть во встроенном плеере.
     PlayVideo(PathBuf),
+    /// Ход загрузки вложения: сообщение, скачано, всего (байт).
+    Progress(i32, u64, u64),
+    /// Загрузка вложения закончилась (успешно, отменена или с ошибкой).
+    FetchEnd(i32),
+    /// Сообщения, вложения которых уже лежат в кэше.
+    Cached(Vec<i32>),
     Status(String),
     Error(String),
 }
@@ -312,6 +327,8 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let mut current: Option<usize> = None;
     let mut sticker_sets: Vec<StickerSetRow> = Vec::new();
     let mut sticker_docs: std::collections::HashMap<i64, StickerRow> = std::collections::HashMap::new();
+    let fetches: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
+        std::sync::Arc::default();
 
     let authorized = connected.client.is_authorized().await.unwrap_or(false);
     let mut qr_mode = false;
@@ -350,6 +367,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 continue;
             }
         };
+        let play = matches!(cmd, Cmd::OpenFile(_));
         match cmd {
             Cmd::Keys(..) => {}
             Cmd::Proxy(url) => {
@@ -755,37 +773,83 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                 });
             }
-            Cmd::OpenFile(msg_id) => {
+            Cmd::OpenFile(msg_id) | Cmd::Download(msg_id) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
                 let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                {
+                    let mut f = fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if f.contains_key(&msg_id) {
+                        continue;
+                    }
+                    f.insert(msg_id, cancel.clone());
+                }
+                let fetches = fetches.clone();
                 tokio::spawn(async move {
-                    out.send(Ev::Status("Загрузка файла…".into()));
-                    match eng.download_file(peer, msg_id).await {
-                        Ok(Some(p)) => {
+                    let o2 = out.clone();
+                    let res = eng
+                        .fetch_media(peer, msg_id, !play, &cancel, move |done, total| {
+                            o2.send(Ev::Progress(msg_id, done, total));
+                        })
+                        .await;
+                    fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&msg_id);
+                    out.send(Ev::FetchEnd(msg_id));
+                    match res {
+                        Ok(rg_core::engine::Fetched::Ready(p)) => {
                             let ext = p.extension().and_then(|e| e.to_str()).map(str::to_lowercase).unwrap_or_default();
-                            if cfg!(windows) && matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv" | "m4v" | "gif" | "ogv") {
+                            if play {
+                                out.send(Ev::Cached(vec![msg_id]));
+                            }
+                            if play && cfg!(windows) && matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv" | "m4v" | "gif" | "ogv") {
                                 out.send(Ev::PlayVideo(p));
-                                out.send(Ev::Status(String::new()));
-                            } else {
+                            } else if play {
                                 rg_core::media::open_downloaded(&p);
+                                out.send(Ev::Status(format!("Открыто: {}", p.display())));
+                            } else {
                                 out.send(Ev::Status(format!("Сохранено: {}", p.display())));
                             }
                         }
-                        Ok(None) => out.err("Вложение недоступно"),
+                        Ok(rg_core::engine::Fetched::Cancelled) => {}
+                        Ok(rg_core::engine::Fetched::Missing) => out.err("Вложение недоступно"),
                         Err(e) => out.err(format!("Загрузка: {e}")),
                     }
                 });
             }
-            Cmd::Download(msg_id) => {
+            Cmd::CancelFetch(msg_id) => {
+                if let Some(c) = fetches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&msg_id) {
+                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Cmd::CachedMedia(ids) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
                 let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                let found: Vec<i32> = ids.into_iter().filter(|id| eng.cached_media(peer, *id).is_some()).collect();
+                if !found.is_empty() {
+                    out.send(Ev::Cached(found));
+                }
+            }
+            Cmd::Account => {
+                let (eng, out) = (engine.clone(), out.clone());
                 tokio::spawn(async move {
-                    match eng.download_file(peer, msg_id).await {
-                        Ok(Some(p)) => out.send(Ev::Status(format!("Сохранено: {}", p.display()))),
-                        Ok(None) => out.err("Вложение недоступно"),
-                        Err(e) => out.err(format!("Загрузка: {e}")),
+                    match eng.account_overview().await {
+                        Ok(a) => out.send(Ev::Account(Box::new(a))),
+                        Err(e) => out.err(format!("Настройки аккаунта: {e}")),
+                    }
+                });
+            }
+            Cmd::UpdateProfile(first, last, about) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.update_profile(&first, &last, &about).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Профиль сохранён".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Профиль не сохранён: {e}")),
                     }
                 });
             }

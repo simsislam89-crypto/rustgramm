@@ -183,8 +183,7 @@ impl App {
             }
             Some("settings") => {
                 self.drawer_open = false;
-                self.settings_open = true;
-                self.settings_tab = page::MENU;
+                self.open_tg_settings();
             }
             Some("saved") => {
                 self.drawer_open = false;

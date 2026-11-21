@@ -7,7 +7,32 @@ use rg_core::engine::MessageRow;
 use rg_core::media::{MediaInfo, MediaKind, human_size};
 
 use super::chat::Act;
+use super::icons;
 use super::theme::*;
+
+/// Состояние загрузки вложения для карточки.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Load {
+    /// Не скачано.
+    Remote,
+    /// Идёт загрузка: скачано и всего (байт).
+    Active(u64, u64),
+    /// Лежит в кэше, открывается сразу.
+    Cached,
+}
+
+/// Дуга хода загрузки по часовой стрелке от верха.
+fn progress_ring(p: &egui::Painter, c: Pos2, r: f32, frac: f32) {
+    let n = 48;
+    let end = frac.clamp(0.0, 1.0) * std::f32::consts::TAU;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + end * i as f32 / n as f32;
+            c + Vec2::new(a.cos(), a.sin()) * r
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, Stroke::new(2.5, Color32::WHITE)));
+}
 
 /// «м:сс» для длительности.
 pub fn mmss(secs: u32) -> String {
@@ -42,6 +67,7 @@ pub fn card(
     text_c: Color32,
     date_c: Color32,
     cards: &mut Vec<(Rect, Act)>,
+    load: Load,
 ) {
     match &info.kind {
         MediaKind::Photo => {
@@ -80,13 +106,36 @@ pub fn card(
                 }
             }
             let p = ui.painter();
-            p.circle_filled(rect.center(), 24.0, Color32::from_black_alpha(150));
-            play_triangle(p, rect.center() + Vec2::new(2.0, 0.0), 22.0, Color32::WHITE);
+            let c = rect.center();
+            p.circle_filled(c, 26.0, Color32::from_black_alpha(150));
+            // Как в Telegram: стрелка загрузки → кольцо с крестиком (идёт загрузка) → play (скачано).
+            let mut chip_text = String::new();
+            match load {
+                Load::Active(done, total) => {
+                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                    progress_ring(p, c, 24.0, frac.max(0.04));
+                    icons::tg(p, "history_file_cancel", c, Color32::WHITE);
+                    chip_text = format!("{} / {}", human_size(done), human_size(total));
+                    ui.ctx().request_repaint();
+                }
+                Load::Remote => {
+                    icons::tg(p, "history_file_download", c, Color32::WHITE);
+                    chip_text = human_size(info.size);
+                }
+                Load::Cached => icons::tg(p, "media_video_play", c, Color32::WHITE),
+            }
             // Чип со временем или «GIF» в левом верхнем углу.
-            let label = match info.kind {
-                MediaKind::Gif => "GIF".to_owned(),
-                _ if info.duration > 0 => mmss(info.duration),
-                _ => String::new(),
+            let label = if !chip_text.is_empty() {
+                match info.duration {
+                    0 => chip_text,
+                    d => format!("{} · {}", mmss(d), chip_text),
+                }
+            } else {
+                match info.kind {
+                    MediaKind::Gif => "GIF".to_owned(),
+                    _ if info.duration > 0 => mmss(info.duration),
+                    _ => String::new(),
+                }
             };
             if !label.is_empty() {
                 let g = p.layout_no_wrap(label, FontId::proportional(12.0), Color32::WHITE);
@@ -94,7 +143,8 @@ pub fn card(
                 p.rect_filled(chip, CornerRadius::same(9), Color32::from_black_alpha(140));
                 p.galley(chip.min + Vec2::new(6.0, 2.0), g, Color32::WHITE);
             }
-            cards.push((rect, Act::Open(m.id)));
+            let act = if matches!(load, Load::Active(..)) { Act::CancelFetch(m.id) } else { Act::Open(m.id) };
+            cards.push((rect, act));
         }
         MediaKind::Voice | MediaKind::Audio => {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 44.0), Sense::hover());

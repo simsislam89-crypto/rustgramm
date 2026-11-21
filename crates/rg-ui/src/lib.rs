@@ -10,6 +10,7 @@ mod media_ui;
 mod panels;
 mod rich;
 mod settings_ui;
+mod tg_settings;
 pub mod theme;
 mod win;
 #[cfg(windows)]
@@ -114,6 +115,12 @@ struct App {
     emoji_sets: Vec<StickerSetRow>,
     /// Открытый ролик: путь и окно плеера (создаётся при первом показе).
     player_path: Option<std::path::PathBuf>,
+    /// Идущие загрузки вложений: сообщение → (скачано, всего).
+    fetching: HashMap<i32, (u64, u64)>,
+    /// Окно «Настройки» Telegram.
+    tgs: tg_settings::State,
+    /// Сообщения, вложения которых уже в кэше (открываются мгновенно).
+    cached_media: HashSet<i32>,
     /// Сохранённые GIF и окно создания группы/канала.
     gif_list: Vec<StickerRow>,
     gifs_requested: bool,
@@ -249,6 +256,9 @@ impl App {
             stickers_requested: false,
             emoji_sets: Vec::new(),
             player_path: None,
+            fetching: HashMap::new(),
+            tgs: tg_settings::State::default(),
+            cached_media: HashSet::new(),
             gif_list: Vec::new(),
             gifs_requested: false,
             create_kind: 0,
@@ -284,12 +294,41 @@ impl App {
 
     /// Предпросмотры только для свежих вложений и по одному разу.
     /// Событие из потока обновлений: сообщения доходят сразу, без перезахода в чат.
+    /// Обновляет строку чата в списке по новому сообщению. Возвращает `true`, если нужен полный
+    /// перезапрос списка (чат не найден или должен сменить место).
+    fn apply_live_to_list(&mut self, key: i64, row: &(i64, bool, String), is_open: bool) -> bool {
+        let Some(pos) = self.dialogs.iter().position(|d| d.id == key) else {
+            return true;
+        };
+        let (date, outgoing, text) = row;
+        let old = self.dialogs[pos].clone();
+        let newer = *date > old.date;
+        let d = &mut self.dialogs[pos];
+        if newer || *date == old.date {
+            d.last.clone_from(text);
+        }
+        if newer {
+            d.date = *date;
+            if !outgoing && !is_open {
+                d.unread += 1;
+            }
+        }
+        if !newer || old.pinned {
+            return false;
+        }
+        // Уже самый верхний среди незакреплённых той же папки (архив или основной список)?
+        self.dialogs
+            .iter()
+            .any(|o| o.id != key && !o.pinned && o.archived == old.archived && o.date >= old.date)
+    }
+
     fn on_live(&mut self, ctx: &egui::Context, l: rg_core::engine::Live) {
         use rg_core::engine::Live;
         let open_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
         match l {
             Live::Message(key, row) => {
                 let row = *row;
+                let row_snapshot = (row.date, row.outgoing, row.text.chars().take(80).collect::<String>());
                 if open_id == Some(key) {
                     let idx = self.selected.unwrap_or(0);
                     let now_t = ctx.input(|i| i.time);
@@ -315,7 +354,11 @@ impl App {
                         self.send(Cmd::MarkRead);
                     }
                 }
-                self.refresh_at.get_or_insert(std::time::Instant::now());
+                // Строка списка обновляется на месте; полный перезапрос (300 чатов + архив)
+                // нужен, только если чат должен подняться вверх или его нет в списке.
+                if self.apply_live_to_list(key, &row_snapshot, open_id == Some(key)) {
+                    self.refresh_at.get_or_insert(std::time::Instant::now());
+                }
             }
             Live::Deleted(ch, ids) => {
                 let keep = self.settings.ayu.save_deleted_messages;
@@ -354,9 +397,16 @@ impl App {
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape))
             || self.player.as_ref().is_some_and(video::VideoView::wants_close);
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
-        let avail = egui::Rect::from_min_max(screen.min + Vec2::new(60.0, 64.0), screen.max - Vec2::new(60.0, 56.0));
-        let w = avail.width().min(avail.height() * 16.0 / 9.0).max(160.0);
-        let vr = egui::Rect::from_center_size(avail.center(), Vec2::new(w, w * 9.0 / 16.0));
+        // Окно плеера по пропорциям самого видео; полный экран — вся область окна.
+        let full = self.player.as_ref().is_some_and(video::VideoView::is_full);
+        let aspect = self.player.as_ref().and_then(video::VideoView::aspect).unwrap_or(16.0 / 9.0);
+        let vr = if full {
+            screen
+        } else {
+            let avail = egui::Rect::from_min_max(screen.min + Vec2::new(60.0, 64.0), screen.max - Vec2::new(60.0, 56.0));
+            let w = avail.width().min(avail.height() * aspect).max(160.0);
+            egui::Rect::from_center_size(avail.center(), Vec2::new(w, w / aspect))
+        };
         if self.player.is_none() {
             let dir = worker::home().join("player");
             match video::VideoView::new(frame, &path, &dir, false) {
@@ -392,14 +442,7 @@ impl App {
                     FontId::proportional(14.0),
                     WHITE,
                 );
-                ui.painter().text(
-                    rect.center_bottom() - Vec2::new(0.0, 28.0),
-                    egui::Align2::CENTER_CENTER,
-                    "Пробел — пауза · ← → — перемотка · F — на весь экран · M — звук · Esc — закрыть",
-                    FontId::proportional(12.0),
-                    SUBTEXT,
-                );
-                let x = egui::Rect::from_center_size(rect.right_top() + Vec2::new(-36.0, 32.0), Vec2::splat(36.0));
+                let x = egui::Rect::from_center_size(rect.right_top() + Vec2::new(-36.0, 72.0), Vec2::splat(36.0));
                 let xr = ui.interact(x, ui.make_persistent_id("player-close"), Sense::click());
                 icons::tg(ui.painter(), "info/info_close", x.center(), if xr.hovered() { WHITE } else { SUBTEXT });
                 let over_x = xr.hovered();
@@ -451,6 +494,19 @@ impl App {
                 let _ = self.cmd.send(Cmd::Preview(idx, id));
             }
         }
+        // Какие ролики уже скачаны: на них рисуется play, остальные — стрелка загрузки.
+        let videos: Vec<i32> = rows
+            .iter()
+            .filter(|r| {
+                r.media.as_ref().is_some_and(|x| {
+                    matches!(x.kind, rg_core::media::MediaKind::Video | rg_core::media::MediaKind::Gif | rg_core::media::MediaKind::Round)
+                }) && !self.cached_media.contains(&r.id)
+            })
+            .map(|r| r.id)
+            .collect();
+        if !videos.is_empty() {
+            let _ = self.cmd.send(Cmd::CachedMedia(videos));
+        }
     }
 
     /// Открыть чат из списка.
@@ -467,6 +523,7 @@ impl App {
     }
 
     fn reset_chat_state(&mut self) {
+        self.cached_media.clear();
         self.known.clear();
         self.arrived.clear();
         self.chat_opened = std::time::Instant::now();
@@ -519,6 +576,17 @@ impl App {
                 }
                 Ev::Live(l) => self.on_live(ctx, l),
                 Ev::PlayVideo(p) => self.player_path = Some(p),
+                Ev::Progress(id, done, total) => {
+                    self.fetching.insert(id, (done, total));
+                }
+                Ev::FetchEnd(id) => {
+                    self.fetching.remove(&id);
+                }
+                Ev::Cached(ids) => self.cached_media.extend(ids),
+                Ev::Account(a) => {
+                    self.tgs.account = Some(*a);
+                    self.tgs.filled = false;
+                }
                 Ev::Gifs(g) => self.gif_list = g,
                 Ev::PeerInfo(id, info) => {
                     self.peer_infos.insert(id, info);
@@ -1134,6 +1202,11 @@ impl eframe::App for App {
         self.flush_refresh(ui.ctx());
         let ctx = ui.ctx().clone();
         theme::set_opacity(self.settings.window_opacity);
+        theme::set_anim_speed(self.settings.anim_speed);
+        let zoom = f32::from(self.settings.ui_scale.clamp(80, 150)) / 100.0;
+        if (ctx.zoom_factor() - zoom).abs() > 0.001 {
+            ctx.set_zoom_factor(zoom);
+        }
         ui.painter()
             .rect_filled(ctx.content_rect(), egui::CornerRadius::ZERO, t(BACKDROP));
         if !self.emoji_tried {
@@ -1180,8 +1253,23 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
         }
-        let info_k = theme::tween(&ctx, "info-panel", f32::from(u8::from(self.info_open && self.selected.is_some() && !narrow)), 0.2);
-        if info_k > 0.01 && self.selected.is_some() {
+        // Панель эмодзи/стикеров/GIF в широком окне стоит справа, как в AyuGram, и занимает место панели сведений.
+        let emoji_k = theme::tween(&ctx, "emoji-side", f32::from(u8::from(self.emoji_open && self.selected.is_some() && !narrow)), 0.2);
+        if emoji_k > 0.01 && self.selected.is_some() {
+            egui::Panel::right("emoji-side")
+                .exact_size(320.0 * ease_out(emoji_k))
+                .frame(egui::Frame::new().fill(tint_panel()).inner_margin(egui::Margin::symmetric(4, 0)))
+                .show(ui, |ui| {
+                    ui.set_min_width(300.0);
+                    self.emoji_panel_body(ui);
+                });
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.emoji_open = false;
+                self.emoji_pinned = false;
+            }
+        }
+        let info_k = theme::tween(&ctx, "info-panel", f32::from(u8::from(self.info_open && !self.emoji_open && self.selected.is_some() && !narrow)), 0.2);
+        if info_k > 0.01 && self.selected.is_some() && emoji_k < 0.01 {
             egui::Panel::right("info")
                 .exact_size(320.0 * ease_out(info_k))
                 .frame(egui::Frame::new().fill(tint_panel()))
@@ -1239,13 +1327,16 @@ impl eframe::App for App {
                     }),
             )
             .show(ui, |ui| self.messages_ui(ui));
-        self.emoji_window(&ctx);
+        if narrow {
+            self.emoji_window(&ctx);
+        }
         self.chat_windows(&ctx);
         self.viewer_window(&ctx);
         self.contacts_window(&ctx);
         self.drawer(&ctx);
         self.create_window(&ctx);
         self.settings_window(&ctx);
+        self.tg_settings_window(&ctx);
         #[cfg(windows)]
         self.player_overlay(&ctx, frame);
         #[cfg(not(windows))]
