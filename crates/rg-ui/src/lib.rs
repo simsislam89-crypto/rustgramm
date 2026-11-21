@@ -46,6 +46,8 @@ struct App {
     proxy_open: bool,
     qr_cache: Option<(String, QrImage)>,
     now: i64,
+    /// Когда показана текущая ошибка (unix); через 6 секунд она скрывается.
+    error_at: i64,
     /// Ответ на сообщение (идентификатор и начало текста).
     reply: Option<(i32, String)>,
     /// Идентификатор редактируемого сообщения.
@@ -131,6 +133,7 @@ impl App {
             proxy_open: false,
             qr_cache: None,
             now: 0,
+            error_at: 0,
             reply: None,
             editing: None,
             search_open: false,
@@ -246,7 +249,10 @@ impl App {
                 Ev::Image(..) => {}
                 Ev::Settings(s) => self.settings = *s,
                 Ev::Status(s) => self.status = s,
-                Ev::Error(e) => self.error = e,
+                Ev::Error(e) => {
+                    self.error = e;
+                    self.error_at = self.now;
+                }
             }
         }
     }
@@ -601,6 +607,13 @@ impl eframe::App for App {
         self.now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(self.now, |d| d.as_secs() as i64);
+        if !self.error.is_empty() && self.stage == Stage::Ready {
+            if self.now - self.error_at > 6 {
+                self.error.clear();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
         if self.stage != Stage::Ready {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(WINDOW_BG))
