@@ -42,6 +42,18 @@ pub const CATEGORIES: [(&str, char); 8] = [
     ("Символы", '\u{2764}'),
 ];
 
+/// Значки нижней полосы (набор Telegram), в порядке `CATEGORIES`.
+pub const CATEGORY_ICONS: [&str; 8] = [
+    "emoji/emoji_recent",
+    "emoji/emoji_smile",
+    "emoji/emoji_nature",
+    "emoji/emoji_food",
+    "emoji/emoji_travel",
+    "emoji/emoji_activities",
+    "emoji/emoji_objects",
+    "emoji/emoji_love",
+];
+
 /// Раздел эмодзи (индекс в `CATEGORIES`, кроме «Недавние»).
 pub fn category(c: char) -> usize {
     match c as u32 {
@@ -71,7 +83,17 @@ fn intra(c: char) -> u8 {
 impl Emoji {
     /// Распаковывает атлас в текстуру; `None`, если встроенная картинка повреждена.
     pub fn load(ctx: &egui::Context) -> Option<Self> {
-        let img = image::load_from_memory(ATLAS_PNG).ok()?.to_rgba8();
+        // Локальный атлас Apple-эмодзи (из кэша AyuGram у владельца) в раскладке встроенного.
+        // Он не входит ни в программу, ни в репозиторий: права на Apple-эмодзи не наши.
+        let local = std::fs::read(crate::worker::home().join("emoji-apple.png"))
+            .ok()
+            .and_then(|b| image::load_from_memory(&b).ok())
+            .map(|i| i.to_rgba8());
+        let builtin = image::load_from_memory(ATLAS_PNG).ok()?.to_rgba8();
+        let img = match local {
+            Some(l) if l.dimensions() == builtin.dimensions() => l,
+            _ => builtin,
+        };
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
         let tex = ctx.load_texture("emoji-atlas", color, egui::TextureOptions::LINEAR);
@@ -146,15 +168,23 @@ impl Emoji {
             ui.label(RichText::new(text).size(size).color(color));
             return;
         }
+        // Одно-три эмодзи без текста показываются крупно, как в Telegram.
+        let segs = self.segments(text);
+        let only_emoji = !segs.is_empty() && segs.iter().all(|s| matches!(s, Seg::Emoji(_)));
+        let jumbo = match segs.len() {
+            1 if only_emoji => Some(44.0),
+            2..=3 if only_emoji => Some(34.0),
+            _ => None,
+        };
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for seg in self.segments(text) {
+            ui.spacing_mut().item_spacing.x = if jumbo.is_some() { 2.0 } else { 0.0 };
+            for seg in segs {
                 match seg {
                     Seg::Text(s) => {
                         ui.label(RichText::new(s).size(size).color(color));
                     }
                     Seg::Emoji(c) => {
-                        if let Some(img) = self.image(c, size * 1.25) {
+                        if let Some(img) = self.image(c, jumbo.unwrap_or(size * 1.35)) {
                             ui.add(img);
                         }
                     }
@@ -208,12 +238,12 @@ impl Emoji {
     /// `jump` — раздел, к которому нужно прокрутить (сбрасывается).
     pub fn picker(&self, ui: &mut egui::Ui, recents: &str, jump: &mut Option<usize>) -> Option<char> {
         let mut chosen = None;
-        let cell = 36.0;
+        let cell = 40.0;
         let cols = ((ui.available_width() / cell).floor() as usize).max(1);
         let recent: Vec<char> = recents.chars().filter(|c| self.has(*c)).collect();
         let want = jump.take();
         egui::ScrollArea::vertical()
-            .max_height(ui.available_height() - 44.0)
+            .max_height(ui.available_height())
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -254,7 +284,7 @@ impl Emoji {
                                 );
                             }
                             // Лёгкое увеличение под курсором, как в Telegram.
-                            let side = 26.0 + 4.0 * k_hover;
+                            let side = 30.0 + 4.0 * k_hover;
                             if let Some(img) = self.image(c, side) {
                                 img.paint_at(ui, egui::Rect::from_center_size(r.center(), Vec2::splat(side)));
                             }
@@ -265,29 +295,6 @@ impl Emoji {
                     }
                 }
             });
-        // Нижняя полоса разделов.
-        ui.add_space(4.0);
-        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
-        ui.painter().line_segment(
-            [bar.left_top(), bar.right_top()],
-            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
-        );
-        let n = CATEGORIES.len() as f32;
-        for (cat, (_, icon)) in CATEGORIES.iter().enumerate() {
-            let c = egui::pos2(bar.left() + bar.width() * (cat as f32 + 0.5) / n, bar.center().y);
-            let r = egui::Rect::from_center_size(c, Vec2::splat(30.0));
-            let resp = ui.interact(r, ui.make_persistent_id(("emcat", cat)), Sense::click());
-            let k = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-            let side = 18.0 + 3.0 * k;
-            if let Some(img) = self.image(*icon, side) {
-                // Не выбранные значки приглушены.
-                img.tint(Color32::from_white_alpha((150.0 + 105.0 * k) as u8))
-                    .paint_at(ui, egui::Rect::from_center_size(c, Vec2::splat(side)));
-            }
-            if resp.clicked() {
-                *jump = Some(cat);
-            }
-        }
         chosen
     }
 }

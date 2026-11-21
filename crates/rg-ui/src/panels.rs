@@ -13,6 +13,22 @@ pub(crate) enum StickerAct {
     Thumb(i64),
     Send(i64),
     SelectSet(usize),
+    /// Загрузить установленные наборы эмодзи.
+    EmojiSets,
+    /// Загрузить рекомендуемые наборы эмодзи.
+    Featured,
+    /// Показать набор эмодзи с номером (или вернуться к обычным эмодзи).
+    Pack(Option<usize>),
+    /// Открыть или закрыть окно «Добавить эмодзи».
+    AddOpen(bool),
+    /// Добавить рекомендуемый набор с номером.
+    Install(usize),
+    /// Загрузить значок набора эмодзи с номером.
+    SetIcon(usize),
+    /// Загрузить содержимое набора эмодзи с номером.
+    LoadPack(usize),
+    /// Вставить в поле ввода (обычный эмодзи для набора Premium).
+    Insert(String),
 }
 
 impl App {
@@ -188,6 +204,195 @@ impl App {
         }
     }
 
+    /// Нижняя полоса вкладки «Эмодзи»: разделы (значки Telegram), наборы эмодзи и «+».
+    pub(crate) fn emoji_bar(&self, ui: &mut egui::Ui, jump: &mut Option<usize>, acts: &mut Vec<StickerAct>) {
+        if !self.emoji_sets_requested {
+            acts.push(StickerAct::EmojiSets);
+        }
+        ui.add_space(2.0);
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::hover());
+        ui.painter().line_segment(
+            [bar.left_top(), bar.right_top()],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+        );
+        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+        let cell = 36.0;
+        egui::ScrollArea::horizontal()
+            .id_salt("emoji-bar")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(&mut inner, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    ui.set_height(38.0);
+                    for (cat, icon) in super::emoji::CATEGORY_ICONS.iter().enumerate() {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(cell, 38.0), Sense::click());
+                        let active = self.emoji_pack.is_none() && !self.emoji_add_open;
+                        let k = tween(ui.ctx(), ("emcat", cat), f32::from(u8::from(resp.hovered())), 0.1);
+                        let c = lerp_color(SUBTEXT, WHITE, if active { 0.4 + 0.6 * k } else { k });
+                        icons::tg(ui.painter(), icon, r.center(), c);
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            *jump = Some(cat);
+                            acts.push(StickerAct::Pack(None));
+                            acts.push(StickerAct::AddOpen(false));
+                        }
+                    }
+                    for (i, set) in self.emoji_sets.iter().enumerate() {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(cell, 38.0), Sense::click());
+                        let sel = self.emoji_pack == Some(i);
+                        let k = tween(ui.ctx(), ("empack", i), f32::from(u8::from(sel || resp.hovered())), 0.1);
+                        let side = 22.0 + 2.0 * k;
+                        let area = Rect::from_center_size(r.center(), Vec2::splat(side));
+                        let first = self.sticker_lists.get(&set.id).and_then(|l| l.first());
+                        let tex = self
+                            .sticker_tex
+                            .get(&set.id)
+                            .or_else(|| first.and_then(|f| self.sticker_tex.get(&f.id)));
+                        if let Some(t) = tex {
+                            egui::Image::new(t)
+                                .fit_to_exact_size(area.size())
+                                .tint(Color32::from_white_alpha((150.0 + 105.0 * k) as u8))
+                                .paint_at(ui, area);
+                        } else {
+                            if ui.is_rect_visible(r) {
+                                acts.push(StickerAct::SetIcon(i));
+                            }
+                            let initial = set.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                            ui.painter().circle_filled(r.center(), 10.0, Color32::from_rgb(60, 60, 68));
+                            ui.painter().text(r.center(), Align2::CENTER_CENTER, initial, FontId::proportional(12.0), WHITE);
+                        }
+                        if sel {
+                            ui.painter().rect_filled(
+                                Rect::from_center_size(Pos2::new(r.center().x, r.bottom() - 2.0), Vec2::new(18.0, 2.5)),
+                                CornerRadius::same(1),
+                                WHITE,
+                            );
+                        }
+                        if resp.on_hover_text(&set.title).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            acts.push(StickerAct::Pack(Some(i)));
+                            acts.push(StickerAct::AddOpen(false));
+                        }
+                    }
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(cell, 38.0), Sense::click());
+                    let k = tween(ui.ctx(), "emadd", f32::from(u8::from(resp.hovered() || self.emoji_add_open)), 0.1);
+                    icons::tg(ui.painter(), "menu/add", r.center(), lerp_color(SUBTEXT, WHITE, k));
+                    if resp.on_hover_text("Добавить эмодзи").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        acts.push(StickerAct::AddOpen(!self.emoji_add_open));
+                        acts.push(StickerAct::Featured);
+                    }
+                });
+            });
+        ui.advance_cursor_after_rect(bar);
+    }
+
+    /// Содержимое набора эмодзи: сетка миниатюр, нажатие вставляет обычный эмодзи.
+    pub(crate) fn pack_view(&self, ui: &mut egui::Ui, i: usize, acts: &mut Vec<StickerAct>) {
+        let Some(set) = self.emoji_sets.get(i) else { return };
+        let list = self.sticker_lists.get(&set.id);
+        if list.is_none() {
+            acts.push(StickerAct::LoadPack(i));
+        }
+        let cell = 40.0;
+        let cols = ((ui.available_width() / cell).floor() as usize).max(1);
+        egui::ScrollArea::vertical()
+            .id_salt(("pack", set.id))
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let (head, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+                ui.painter().text(
+                    Pos2::new(head.left() + 8.0, head.bottom() - 6.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("{} · {}", set.title, set.count),
+                    FontId::proportional(12.5),
+                    Color32::from_rgb(150, 150, 158),
+                );
+                for row in list.map(|l| l.chunks(cols)).into_iter().flatten() {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(cell * cols as f32, cell), Sense::hover());
+                    for (k, st) in row.iter().enumerate() {
+                        let r = Rect::from_min_size(Pos2::new(rect.left() + k as f32 * cell, rect.top()), Vec2::splat(cell));
+                        let resp = ui.interact(r, ui.make_persistent_id(("pk", st.id)), Sense::click());
+                        let h = tween(ui.ctx(), ("pkh", st.id), f32::from(u8::from(resp.hovered())), 0.1);
+                        if h > 0.01 {
+                            ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(8), Color32::from_rgba_unmultiplied(255, 255, 255, (26.0 * h) as u8));
+                        }
+                        let side = 28.0 + 4.0 * h;
+                        let area = Rect::from_center_size(r.center(), Vec2::splat(side));
+                        if let Some(tex) = self.sticker_tex.get(&st.id) {
+                            egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
+                        } else if st.has_preview() && ui.is_rect_visible(r) {
+                            acts.push(StickerAct::Thumb(st.id));
+                        }
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !st.emoji.is_empty() {
+                            acts.push(StickerAct::Insert(st.emoji.clone()));
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Окно «Добавить эмодзи»: рекомендуемые наборы с кнопкой «Добавить».
+    pub(crate) fn featured_view(&self, ui: &mut egui::Ui, acts: &mut Vec<StickerAct>) {
+        if self.featured_sets.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Загрузка…").color(SUBTEXT));
+            });
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("featured")
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                for (i, set) in self.featured_sets.iter().enumerate() {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::hover());
+                    let icon = Rect::from_center_size(Pos2::new(rect.left() + 28.0, rect.center().y), Vec2::splat(34.0));
+                    match set.cover.as_ref().and_then(|c| self.sticker_tex.get(&c.id)) {
+                        Some(t) => egui::Image::new(t).fit_to_exact_size(icon.size()).paint_at(ui, icon),
+                        None => {
+                            if let Some(c) = &set.cover
+                                && c.has_preview()
+                                && ui.is_rect_visible(rect)
+                            {
+                                acts.push(StickerAct::Thumb(c.id));
+                            }
+                            ui.painter().circle_filled(icon.center(), 15.0, Color32::from_rgb(60, 60, 68));
+                        }
+                    }
+                    ui.painter().text(
+                        Pos2::new(rect.left() + 54.0, rect.center().y - 8.0),
+                        Align2::LEFT_CENTER,
+                        &set.title,
+                        FontId::proportional(14.0),
+                        WHITE,
+                    );
+                    ui.painter().text(
+                        Pos2::new(rect.left() + 54.0, rect.center().y + 9.0),
+                        Align2::LEFT_CENTER,
+                        format!("{} эмодзи", set.count),
+                        FontId::proportional(12.0),
+                        SUBTEXT,
+                    );
+                    let btn = Rect::from_center_size(Pos2::new(rect.right() - 52.0, rect.center().y), Vec2::new(86.0, 28.0));
+                    let resp = ui.interact(btn, ui.make_persistent_id(("feat", set.id)), Sense::click());
+                    let k = tween(ui.ctx(), ("feath", set.id), f32::from(u8::from(resp.hovered() && !set.installed)), 0.1);
+                    let p = ui.painter();
+                    if set.installed {
+                        p.text(btn.center(), Align2::CENTER_CENTER, "Добавлено", FontId::proportional(12.5), SUBTEXT);
+                    } else {
+                        p.rect_stroke(btn, CornerRadius::same(14), Stroke::new(1.0, lerp_color(SUBTEXT, WHITE, k)), egui::StrokeKind::Inside);
+                        p.text(btn.center(), Align2::CENTER_CENTER, "Добавить", FontId::proportional(12.5), lerp_color(DIALOG_TEXT, WHITE, k));
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            acts.push(StickerAct::Install(i));
+                        }
+                    }
+                }
+            });
+    }
+
     /// Вкладка «Стикеры»: сетка выбранного набора и полоса наборов внизу.
     pub(crate) fn sticker_tab(&self, ui: &mut egui::Ui, emoji: Option<&Emoji>, acts: &mut Vec<StickerAct>) {
         if !self.stickers_requested {
@@ -230,7 +435,7 @@ impl App {
                         let area = Rect::from_center_size(r.center(), Vec2::splat(side));
                         if let Some(tex) = self.sticker_tex.get(&st.id) {
                             egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
-                        } else if st.is_static() {
+                        } else if st.has_preview() {
                             if ui.is_rect_visible(r) {
                                 acts.push(StickerAct::Thumb(st.id));
                             }

@@ -335,9 +335,17 @@ impl App {
                         }
                     });
                     if tab == 0 {
-                        if let Some(emoji) = self.emoji.as_ref() {
-                            picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
-                        }
+                        let h = (ui.available_height() - 42.0).max(60.0);
+                        ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| {
+                            if self.emoji_add_open {
+                                self.featured_view(ui, &mut sacts);
+                            } else if let Some(i) = self.emoji_pack {
+                                self.pack_view(ui, i, &mut sacts);
+                            } else if let Some(emoji) = self.emoji.as_ref() {
+                                picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
+                            }
+                        });
+                        self.emoji_bar(ui, &mut jump, &mut sacts);
                     } else {
                         self.sticker_tab(ui, self.emoji.as_ref(), &mut sacts);
                     }
@@ -371,6 +379,44 @@ impl App {
                     self.send(Cmd::SendSticker(id, reply));
                 }
                 A::SelectSet(i) => self.sticker_cur = i,
+                A::EmojiSets => {
+                    self.emoji_sets_requested = true;
+                    self.send(Cmd::EmojiSets);
+                }
+                A::Featured => {
+                    if self.emoji_add_open || self.featured_sets.is_empty() {
+                        self.send(Cmd::FeaturedEmoji);
+                    }
+                }
+                A::Pack(p) => self.emoji_pack = p,
+                A::AddOpen(o) => self.emoji_add_open = o,
+                A::Install(i) => {
+                    if let Some(set) = self.featured_sets.get(i).cloned() {
+                        self.send(Cmd::InstallSet(set));
+                    }
+                }
+                A::SetIcon(i) => {
+                    if let Some(set) = self.emoji_sets.get(i).cloned()
+                        && self.set_icon_req.insert(set.id)
+                    {
+                        if set.thumb_version.is_some() {
+                            self.send(Cmd::SetIcon(set));
+                        } else {
+                            self.send(Cmd::LoadSetRow(set));
+                        }
+                    }
+                }
+                A::LoadPack(i) => {
+                    if let Some(set) = self.emoji_sets.get(i).cloned()
+                        && let std::collections::hash_map::Entry::Vacant(e) = self.sticker_lists.entry(set.id)
+                    {
+                        e.insert(Vec::new());
+                        self.send(Cmd::LoadSetRow(set));
+                    }
+                }
+                A::Insert(text) => {
+                    self.input.push_str(&text);
+                }
             }
         }
         if let Some(c) = picked {

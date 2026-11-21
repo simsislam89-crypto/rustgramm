@@ -108,6 +108,13 @@ struct App {
     sticker_tex: HashMap<i64, egui::TextureHandle>,
     sticker_req: HashSet<i64>,
     stickers_requested: bool,
+    /// Установленные и рекомендуемые наборы эмодзи, выбранный набор, окно «Добавить».
+    emoji_sets: Vec<StickerSetRow>,
+    featured_sets: Vec<StickerSetRow>,
+    emoji_sets_requested: bool,
+    emoji_pack: Option<usize>,
+    emoji_add_open: bool,
+    set_icon_req: HashSet<i64>,
     /// Идентификаторы уже показанных сообщений и время появления новых (для плавного входа).
     known: HashSet<i32>,
     arrived: HashMap<i32, f64>,
@@ -221,6 +228,12 @@ impl App {
             sticker_tex: HashMap::new(),
             sticker_req: HashSet::new(),
             stickers_requested: false,
+            emoji_sets: Vec::new(),
+            featured_sets: Vec::new(),
+            emoji_sets_requested: false,
+            emoji_pack: None,
+            emoji_add_open: false,
+            set_icon_req: HashSet::new(),
             known: HashSet::new(),
             arrived: HashMap::new(),
             chat_opened: std::time::Instant::now(),
@@ -317,6 +330,13 @@ impl App {
                     self.sticker_sets = s;
                     self.sticker_cur = 0;
                 }
+                Ev::EmojiSets(s) => {
+                    if self.emoji_pack.is_some_and(|i| i >= s.len()) {
+                        self.emoji_pack = None;
+                    }
+                    self.emoji_sets = s;
+                }
+                Ev::FeaturedEmoji(s) => self.featured_sets = s,
                 Ev::StickerList(id, l) => {
                     self.sticker_lists.insert(id, l);
                 }

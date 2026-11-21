@@ -928,6 +928,13 @@ pub struct StickerSetRow {
     pub access_hash: i64,
     pub title: String,
     pub count: i32,
+    /// Версия значка набора (для загрузки его миниатюры).
+    pub thumb_version: Option<i32>,
+    /// Набор пользовательских эмодзи (Premium-эмодзи).
+    pub emojis: bool,
+    pub installed: bool,
+    /// Документ-обложка (для рекомендуемых наборов), если известен.
+    pub cover: Option<Box<StickerRow>>,
 }
 
 /// Один стикер набора.
@@ -938,12 +945,69 @@ pub struct StickerRow {
     pub file_ref: Vec<u8>,
     pub mime: String,
     pub emoji: String,
+    /// Тип лучшей миниатюры документа (для анимированных стикеров и эмодзи), пусто — нет.
+    pub thumb: String,
 }
 
 impl StickerRow {
-    /// Можно ли показать картинку: только статичные WebP (анимированные — TGS и WebM — нет).
+    /// Статичный WebP: файл целиком можно показать картинкой.
     pub fn is_static(&self) -> bool {
         self.mime == "image/webp"
+    }
+
+    /// Есть ли что показать: сам файл или миниатюра анимированного стикера.
+    pub fn has_preview(&self) -> bool {
+        self.is_static() || !self.thumb.is_empty()
+    }
+}
+
+/// Лучшая миниатюра документа (самая крупная из обычных, без «stripped»).
+fn best_thumb(d: &grammers_client::tl::types::Document) -> String {
+    use grammers_client::tl::enums::PhotoSize as P;
+    d.thumbs
+        .iter()
+        .flatten()
+        .filter_map(|t| match t {
+            P::Size(x) => Some((x.w * x.h, x.r#type.clone())),
+            P::Progressive(x) => Some((x.w * x.h, x.r#type.clone())),
+            _ => None,
+        })
+        .max_by_key(|(a, _)| *a)
+        .map(|(_, t)| t)
+        .unwrap_or_default()
+}
+
+fn sticker_row_of(d: &grammers_client::tl::types::Document) -> StickerRow {
+    use grammers_client::tl;
+    let emoji = d
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            tl::enums::DocumentAttribute::Sticker(x) => Some(x.alt.clone()),
+            tl::enums::DocumentAttribute::CustomEmoji(x) => Some(x.alt.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    StickerRow {
+        id: d.id,
+        access_hash: d.access_hash,
+        file_ref: d.file_reference.clone(),
+        mime: d.mime_type.clone(),
+        emoji,
+        thumb: best_thumb(d),
+    }
+}
+
+fn set_row_of(x: &grammers_client::tl::types::StickerSet, installed: bool) -> StickerSetRow {
+    StickerSetRow {
+        id: x.id,
+        access_hash: x.access_hash,
+        title: x.title.clone(),
+        count: x.count,
+        thumb_version: x.thumb_version,
+        emojis: x.emojis,
+        installed,
+        cover: None,
     }
 }
 
@@ -1076,17 +1140,77 @@ impl Engine {
             .iter()
             .filter_map(|x| {
                 let tl::enums::StickerSet::Set(x) = x;
-                (!x.masks && !x.emojis && !x.archived).then(|| StickerSetRow {
-                    id: x.id,
-                    access_hash: x.access_hash,
-                    title: x.title.clone(),
-                    count: x.count,
-                })
+                (!x.masks && !x.emojis && !x.archived).then(|| set_row_of(x, true))
             })
             .collect())
     }
 
-    /// Стикеры набора.
+    /// Установленные наборы пользовательских (Premium) эмодзи.
+    pub async fn emoji_sets(&self) -> Result<Vec<StickerSetRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetEmojiStickers { hash: 0 })
+            .await?;
+        let tl::enums::messages::AllStickers::Stickers(s) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(s.sets
+            .iter()
+            .filter_map(|x| {
+                let tl::enums::StickerSet::Set(x) = x;
+                (!x.archived).then(|| set_row_of(x, true))
+            })
+            .collect())
+    }
+
+    /// Рекомендуемые Telegram наборы эмодзи; `installed` — уже добавлены.
+    pub async fn featured_emoji_sets(&self) -> Result<Vec<StickerSetRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetFeaturedEmojiStickers { hash: 0 })
+            .await?;
+        let tl::enums::messages::FeaturedStickers::Stickers(s) = res else {
+            return Ok(Vec::new());
+        };
+        use tl::enums::StickerSetCovered as C;
+        Ok(s.sets
+            .iter()
+            .map(|c| {
+                let (set, cover) = match c {
+                    C::Covered(x) => (&x.set, Some(&x.cover)),
+                    C::StickerSetMultiCovered(x) => (&x.set, x.covers.first()),
+                    C::StickerSetFullCovered(x) => (&x.set, x.documents.first()),
+                    C::StickerSetNoCovered(x) => (&x.set, None),
+                };
+                let tl::enums::StickerSet::Set(set) = set;
+                let mut row = set_row_of(set, set.installed_date.is_some());
+                row.cover = cover.and_then(|d| match d {
+                    tl::enums::Document::Document(d) => Some(Box::new(sticker_row_of(d))),
+                    _ => None,
+                });
+                row
+            })
+            .collect())
+    }
+
+    /// Добавить набор себе.
+    pub async fn install_set(&self, set: &StickerSetRow) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::messages::InstallStickerSet {
+                stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
+                    id: set.id,
+                    access_hash: set.access_hash,
+                }),
+                archived: false,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Стикеры (эмодзи) набора.
     pub async fn sticker_set(&self, set: &StickerSetRow) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
         use grammers_client::tl;
         let res = self
@@ -1106,34 +1230,24 @@ impl Engine {
             .iter()
             .filter_map(|d| {
                 let tl::enums::Document::Document(d) = d else { return None };
-                let emoji = d
-                    .attributes
-                    .iter()
-                    .find_map(|a| match a {
-                        tl::enums::DocumentAttribute::Sticker(x) => Some(x.alt.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                Some(StickerRow {
-                    id: d.id,
-                    access_hash: d.access_hash,
-                    file_ref: d.file_reference.clone(),
-                    mime: d.mime_type.clone(),
-                    emoji,
-                })
+                Some(sticker_row_of(d))
             })
             .collect())
     }
 
-    /// Файл стикера в кэше (`cache/stickers/<id>.webp`).
+    /// Файл стикера или его миниатюры в кэше (`cache/stickers/<id>.webp`, `<id>_t.webp`).
     pub async fn sticker_file(&self, st: &StickerRow) -> Result<Option<PathBuf>, BoxErr> {
         use grammers_client::tl;
-        if !st.is_static() {
+        let (name, thumb) = if st.is_static() {
+            (format!("{}.webp", st.id), String::new())
+        } else if !st.thumb.is_empty() {
+            (format!("{}_t.webp", st.id), st.thumb.clone())
+        } else {
             return Ok(None);
-        }
+        };
         let dir = self.dirs.cache.join("stickers");
         std::fs::create_dir_all(&dir)?;
-        let file = dir.join(format!("{}.webp", st.id));
+        let file = dir.join(name);
         if file.exists() {
             return Ok(Some(file));
         }
@@ -1142,7 +1256,32 @@ impl Engine {
                 id: st.id,
                 access_hash: st.access_hash,
                 file_reference: st.file_ref.clone(),
-                thumb_size: String::new(),
+                thumb_size: thumb,
+            },
+        ));
+        self.client.download_media(&loc, &file).await?;
+        Ok(Some(file))
+    }
+
+    /// Миниатюра значка набора (`cache/stickers/set_<id>.webp`).
+    pub async fn set_icon(&self, set: &StickerSetRow) -> Result<Option<PathBuf>, BoxErr> {
+        use grammers_client::tl;
+        let Some(version) = set.thumb_version else {
+            return Ok(None);
+        };
+        let dir = self.dirs.cache.join("stickers");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("set_{}.webp", set.id));
+        if file.exists() {
+            return Ok(Some(file));
+        }
+        let loc = RawLocation(tl::enums::InputFileLocation::InputStickerSetThumb(
+            tl::types::InputStickerSetThumb {
+                stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
+                    id: set.id,
+                    access_hash: set.access_hash,
+                }),
+                thumb_version: version,
             },
         ));
         self.client.download_media(&loc, &file).await?;

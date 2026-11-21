@@ -80,6 +80,16 @@ pub enum Cmd {
     StickerThumb(i64),
     /// Отправить стикер (идентификатор документа) в открытый чат, при ответе — на сообщение.
     SendSticker(i64, Option<i32>),
+    /// Установленные наборы пользовательских эмодзи.
+    EmojiSets,
+    /// Рекомендуемые наборы эмодзи (для добавления).
+    FeaturedEmoji,
+    /// Добавить набор эмодзи себе.
+    InstallSet(StickerSetRow),
+    /// Содержимое набора (эмодзи или стикеры), заданного строкой.
+    LoadSetRow(StickerSetRow),
+    /// Миниатюра значка набора (приходит как `StickerImg` с идентификатором набора).
+    SetIcon(StickerSetRow),
     Settings(Box<Settings>),
 }
 
@@ -104,6 +114,8 @@ pub enum Ev {
     StickerSets(Vec<StickerSetRow>),
     StickerList(i64, Vec<StickerRow>),
     StickerImg(i64, Box<eframe::egui::ColorImage>),
+    EmojiSets(Vec<StickerSetRow>),
+    FeaturedEmoji(Vec<StickerSetRow>),
     Status(String),
     Error(String),
 }
@@ -124,7 +136,7 @@ fn builtin_keys() -> Option<Config> {
     .ok()
 }
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     let dir = std::env::var("RG_HOME")
         .map(PathBuf::from)
         .ok()
@@ -505,6 +517,53 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 144)).await
                     {
                         out.send(Ev::StickerImg(doc, Box::new(img)));
+                    }
+                });
+            }
+            Cmd::EmojiSets => match engine.emoji_sets().await {
+                Ok(s) => out.send(Ev::EmojiSets(s)),
+                Err(e) => out.err(format!("Наборы эмодзи: {e}")),
+            },
+            Cmd::FeaturedEmoji => match engine.featured_emoji_sets().await {
+                Ok(s) => {
+                    for set in &s {
+                        if let Some(c) = &set.cover {
+                            sticker_docs.insert(c.id, (**c).clone());
+                        }
+                    }
+                    out.send(Ev::FeaturedEmoji(s));
+                }
+                Err(e) => out.err(format!("Рекомендуемые эмодзи: {e}")),
+            },
+            Cmd::InstallSet(set) => match engine.install_set(&set).await {
+                Ok(()) => {
+                    out.send(Ev::Status(format!("Добавлен набор «{}»", set.title)));
+                    if let Ok(s) = engine.emoji_sets().await {
+                        out.send(Ev::EmojiSets(s));
+                    }
+                    if let Ok(s) = engine.featured_emoji_sets().await {
+                        out.send(Ev::FeaturedEmoji(s));
+                    }
+                }
+                Err(e) => out.err(format!("Набор не добавлен: {e}")),
+            },
+            Cmd::LoadSetRow(set) => match engine.sticker_set(&set).await {
+                Ok(list) => {
+                    for st in &list {
+                        sticker_docs.insert(st.id, st.clone());
+                    }
+                    out.send(Ev::StickerList(set.id, list));
+                }
+                Err(e) => out.err(format!("Набор: {e}")),
+            },
+            Cmd::SetIcon(set) => {
+                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    if let Ok(Some(path)) = eng.set_icon(&set).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 96)).await
+                    {
+                        out.send(Ev::StickerImg(set.id, Box::new(img)));
                     }
                 });
             }
