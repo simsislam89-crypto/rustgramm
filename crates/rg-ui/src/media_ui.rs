@@ -22,7 +22,7 @@ pub enum Load {
 }
 
 /// Дуга хода загрузки по часовой стрелке от верха.
-fn progress_ring(p: &egui::Painter, c: Pos2, r: f32, frac: f32) {
+fn progress_ring(p: &egui::Painter, c: Pos2, r: f32, frac: f32, color: Color32) {
     let n = 48;
     let end = frac.clamp(0.0, 1.0) * std::f32::consts::TAU;
     let pts: Vec<Pos2> = (0..=n)
@@ -31,7 +31,25 @@ fn progress_ring(p: &egui::Painter, c: Pos2, r: f32, frac: f32) {
             c + Vec2::new(a.cos(), a.sin()) * r
         })
         .collect();
-    p.add(egui::Shape::line(pts, Stroke::new(2.5, Color32::WHITE)));
+    p.add(egui::Shape::line(pts, Stroke::new(2.5, color)));
+}
+
+/// Доля загрузки 0..1 (неизвестный размер — 0).
+fn load_frac(done: u64, total: u64) -> f32 {
+    if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 }
+}
+
+/// Круглая кнопка загрузки файла/голосового как в Telegram: на тёмном кружке кольцо хода и
+/// крестик отмены, пока идёт загрузка; иначе ничего (рисует вызывающий). Возвращает подпись
+/// «скачано / всего» для строки под названием.
+fn fetch_overlay(ui: &egui::Ui, c: Pos2, r: f32, load: Load) -> Option<String> {
+    let Load::Active(done, total) = load else { return None };
+    let p = ui.painter();
+    p.circle_filled(c, r, Color32::from_black_alpha(190));
+    progress_ring(p, c, r - 2.0, load_frac(done, total).max(0.04), Color32::WHITE);
+    icons::tg(p, "history_file_cancel", c, Color32::WHITE);
+    ui.ctx().request_repaint();
+    Some(format!("{} / {}", human_size(done), human_size(total)))
 }
 
 /// «м:сс» для длительности.
@@ -112,8 +130,7 @@ pub fn card(
             let mut chip_text = String::new();
             match load {
                 Load::Active(done, total) => {
-                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    progress_ring(p, c, 24.0, frac.max(0.04));
+                    progress_ring(p, c, 24.0, load_frac(done, total).max(0.04), Color32::WHITE);
                     icons::tg(p, "history_file_cancel", c, Color32::WHITE);
                     chip_text = format!("{} / {}", human_size(done), human_size(total));
                     ui.ctx().request_repaint();
@@ -152,6 +169,8 @@ pub fn card(
             let c = Pos2::new(rect.left() + 22.0, rect.center().y);
             p.circle_filled(c, 20.0, WHITE);
             play_triangle(p, c + Vec2::new(1.5, 0.0), 17.0, INK_DARK);
+            let progress = fetch_overlay(ui, c, 20.0, load);
+            let p = ui.painter();
             let bars_left = rect.left() + 52.0;
             let bars_w = (rect.right() - bars_left - 4.0).max(40.0);
             if info.kind == MediaKind::Voice {
@@ -182,11 +201,11 @@ pub fn card(
             p.text(
                 Pos2::new(bars_left, rect.bottom() - 8.0),
                 Align2::LEFT_CENTER,
-                if info.duration > 0 { mmss(info.duration) } else { human_size(info.size) },
+                progress.unwrap_or_else(|| if info.duration > 0 { mmss(info.duration) } else { human_size(info.size) }),
                 FontId::proportional(12.0),
                 date_c,
             );
-            cards.push((rect, Act::Open(m.id)));
+            cards.push((rect, if matches!(load, Load::Active(..)) { Act::CancelFetch(m.id) } else { Act::Open(m.id) }));
         }
         MediaKind::File => {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::hover());
@@ -194,6 +213,8 @@ pub fn card(
             let icon = Rect::from_min_size(rect.min + Vec2::new(0.0, 1.0), Vec2::splat(44.0));
             p.rect_filled(icon, CornerRadius::same(10), Color32::from_rgb(70, 70, 78));
             p.text(icon.center(), Align2::CENTER_CENTER, ext_badge(&info.name), FontId::proportional(12.0), WHITE);
+            let progress = fetch_overlay(ui, icon.center(), 22.0, load);
+            let p = ui.painter();
             p.text(
                 Pos2::new(icon.right() + 10.0, rect.center().y - 8.0),
                 Align2::LEFT_CENTER,
@@ -204,11 +225,11 @@ pub fn card(
             p.text(
                 Pos2::new(icon.right() + 10.0, rect.center().y + 10.0),
                 Align2::LEFT_CENTER,
-                human_size(info.size),
+                progress.unwrap_or_else(|| human_size(info.size)),
                 FontId::proportional(12.0),
                 date_c,
             );
-            cards.push((rect, Act::Save(m.id)));
+            cards.push((rect, if matches!(load, Load::Active(..)) { Act::CancelFetch(m.id) } else { Act::Save(m.id) }));
         }
         MediaKind::AnimatedSticker | MediaKind::Other(_) => {
             ui.label(RichText::new(format!("[{}]", info.name)).color(date_c));
@@ -321,6 +342,13 @@ mod tests {
     fn duration_format() {
         assert_eq!(mmss(7), "0:07");
         assert_eq!(mmss(125), "2:05");
+    }
+
+    #[test]
+    fn load_fraction_is_clamped() {
+        assert_eq!(load_frac(0, 0), 0.0);
+        assert_eq!(load_frac(50, 100), 0.5);
+        assert_eq!(load_frac(300, 100), 1.0);
     }
 
     #[test]
