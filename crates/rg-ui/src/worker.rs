@@ -93,12 +93,8 @@ fn keys_from_file(home: &std::path::Path) -> Option<Config> {
 fn load_settings(path: &std::path::Path) -> Settings {
     match std::fs::read_to_string(path) {
         Ok(s) => Settings::from_json(&s).unwrap_or_default(),
-        // Первый запуск: сохранение удалённых и правок включено.
-        Err(_) => Settings {
-            save_deleted: true,
-            save_edit_history: true,
-            ..Settings::default()
-        },
+        // Первый запуск: максимум приватности (см. `Settings::first_run`).
+        Err(_) => Settings::first_run(),
     }
 }
 

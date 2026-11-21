@@ -154,17 +154,26 @@ pub struct Connected {
     pub updates: tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>,
 }
 
-/// Подключение: пул отправителей с защищённой сессией. Сведений об устройстве не раскрываем.
-pub async fn connect_with_updates(cfg: &Config) -> Result<Connected, Box<dyn std::error::Error>> {
-    use grammers_mtsender::{ConnectionParams, SenderPool};
-    let session = open_session(cfg).await?;
-    let params = ConnectionParams {
+/// Сведения о клиенте для `initConnection`: одинаковые у всех пользователей и ничего не
+/// говорят об устройстве. Модель, версия ОС и язык системы не отправляются
+/// (grammers по умолчанию взял бы их из системы).
+pub fn privacy_params(proxy_url: Option<String>) -> grammers_mtsender::ConnectionParams {
+    grammers_mtsender::ConnectionParams {
         device_model: "Rustgramm".to_owned(),
         system_version: "Rustgramm OS".to_owned(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        proxy_url: cfg.proxy_url.clone(),
-        ..ConnectionParams::default()
-    };
+        system_lang_code: "en".to_owned(),
+        lang_code: "en".to_owned(),
+        proxy_url,
+        ..grammers_mtsender::ConnectionParams::default()
+    }
+}
+
+/// Подключение: пул отправителей с защищённой сессией. Сведений об устройстве не раскрываем.
+pub async fn connect_with_updates(cfg: &Config) -> Result<Connected, Box<dyn std::error::Error>> {
+    use grammers_mtsender::SenderPool;
+    let session = open_session(cfg).await?;
+    let params = privacy_params(cfg.proxy_url.clone());
     let SenderPool {
         runner,
         handle,
@@ -228,6 +237,18 @@ mod tests {
             ..c
         };
         assert!(matches!(bad.guard(), Err(ConfigError::ProxyNotAllowed(_))));
+    }
+
+    #[test]
+    fn client_info_reveals_nothing_about_the_device() {
+        let p = privacy_params(Some("socks5://127.0.0.1:1080".to_owned()));
+        assert_eq!(p.device_model, "Rustgramm");
+        assert_eq!(p.system_version, "Rustgramm OS");
+        assert_eq!((p.system_lang_code.as_str(), p.lang_code.as_str()), ("en", "en"));
+        assert_eq!(p.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
+        // Версия приложения — только наша, а не системная.
+        assert_eq!(p.app_version, env!("CARGO_PKG_VERSION"));
+        assert!(!p.use_ipv6);
     }
 
     #[test]

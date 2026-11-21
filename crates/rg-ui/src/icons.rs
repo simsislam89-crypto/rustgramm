@@ -14,6 +14,14 @@ pub fn menu(p: &Painter, c: Pos2, color: Color32) {
     }
 }
 
+/// Стрелка «назад».
+pub fn back(p: &Painter, c: Pos2, color: Color32) {
+    let s = Stroke::new(2.2, color);
+    line(p, c + Vec2::new(7.0, 0.0), c + Vec2::new(-7.0, 0.0), s);
+    line(p, c + Vec2::new(-7.0, 0.0), c + Vec2::new(-1.0, -6.0), s);
+    line(p, c + Vec2::new(-7.0, 0.0), c + Vec2::new(-1.0, 6.0), s);
+}
+
 /// Лупа.
 pub fn search(p: &Painter, c: Pos2, color: Color32) {
     let s = Stroke::new(1.8, color);

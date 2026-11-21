@@ -1,0 +1,40 @@
+[package]
+name = "rg-android"
+description = "Rustgramm for Android: NativeActivity shell around the shared rg-ui interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "rg_android"
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+rg-ui = { path = "../rg-ui" }
+android-activity = { version = "0.6", features = ["native-activity"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+
+# Сборка APK: `cargo apk build -p rg-android --release` (см. scripts/make-apk.sh).
+[package.metadata.android]
+package = "app.rustgramm"
+apk_name = "Rustgramm"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Rustgramm"
+debuggable = false
+
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode"
+launch_mode = "singleTask"
+orientation = "unspecified"
+window_soft_input_mode = "adjustResize"
+
+# Единственное разрешение — сеть. Ни аналитики, ни геолокации, ни контактов, ни телефона.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"

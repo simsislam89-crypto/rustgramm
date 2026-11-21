@@ -116,6 +116,20 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Настройки первого запуска: максимум приватности. Режим призрака включён (Telegram не
+    /// получает «прочитано», «в сети» и прогресс загрузки), удалённые сообщения и правки
+    /// сохраняются только на этом устройстве. Отправка сообщения по-прежнему отмечает чат
+    /// прочитанным, так что переписка выглядит обычной.
+    pub fn first_run() -> Self {
+        let mut s = Self {
+            save_deleted: true,
+            save_edit_history: true,
+            ..Self::default()
+        };
+        s.ghost.set_active(true);
+        s
+    }
+
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
@@ -145,6 +159,19 @@ mod tests {
         assert!(!g.send_read_messages && !g.send_online_packets && g.send_offline_after_online);
         g.set_active(false);
         assert!(g.send_read_messages && g.send_online_packets && !g.send_offline_after_online);
+    }
+
+    #[test]
+    fn first_run_is_private_by_default() {
+        let s = Settings::first_run();
+        assert!(s.ghost.active);
+        assert!(!s.ghost.send_read_messages);
+        assert!(!s.ghost.send_online_packets);
+        assert!(!s.ghost.send_upload_progress);
+        assert!(!s.ghost.send_read_stories);
+        assert!(s.ghost.mark_read_after_action);
+        assert!(s.save_deleted && s.save_edit_history);
+        assert_eq!(s.translation, TranslationProvider::Telegram);
     }
 
     #[test]

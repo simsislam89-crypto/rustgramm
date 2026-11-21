@@ -1,6 +1,7 @@
-//! Оформление как у Telegram Desktop (ночная тема) с заменой синего на оранжевый.
-//! Каждый цвет взят из `night.tdesktop-theme` AyuGram v7.2.9; синий превращён в оранжевый
-//! перестановкой каналов R и B (`tg`): оттенок поворачивается, яркость сохраняется.
+//! Оформление как у Telegram Desktop (ночная тема): фоны тёмно-синие (`navy`), а все синие
+//! акценты — кнопки, выделение, бейджи, исходящие пузыри, ссылки — оранжевые (`tg`).
+//! Цвета взяты из `night.tdesktop-theme` AyuGram v7.2.9; акцент меняется перестановкой каналов R↔B:
+//! оттенок поворачивается, яркость сохраняется.
 
 use std::sync::Arc;
 
@@ -8,7 +9,12 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Sense, Stroke, Vec2,
 };
 
-/// Цвет из палитры Telegram `0xRRGGBB` с синим → оранжевым.
+/// Цвет из палитры Telegram `0xRRGGBB` как есть: тёмно-синие фоны и серо-голубой текст ночной темы.
+pub const fn navy(hex: u32) -> Color32 {
+    Color32::from_rgb(((hex >> 16) & 0xff) as u8, ((hex >> 8) & 0xff) as u8, (hex & 0xff) as u8)
+}
+
+/// Акцентный цвет из палитры Telegram `0xRRGGBB` с синим → оранжевым.
 pub const fn tg(hex: u32) -> Color32 {
     let r = ((hex >> 16) & 0xff) as u8;
     let g = ((hex >> 8) & 0xff) as u8;
@@ -17,34 +23,34 @@ pub const fn tg(hex: u32) -> Color32 {
 }
 
 // windowBg, windowBgOver, windowSubTextFg
-pub const WINDOW_BG: Color32 = tg(0x17212b);
-pub const WINDOW_OVER: Color32 = tg(0x232e3c);
-pub const SUBTEXT: Color32 = tg(0x708499);
+pub const WINDOW_BG: Color32 = navy(0x17212b);
+pub const WINDOW_OVER: Color32 = navy(0x232e3c);
+pub const SUBTEXT: Color32 = navy(0x708499);
 // windowBgActive (акцент), activeButtonBg
 pub const ACCENT: Color32 = tg(0x5288c1);
 pub const BUTTON: Color32 = tg(0x2f6ea5);
 pub const BUTTON_OVER: Color32 = tg(0x3476ab);
 pub const WHITE: Color32 = Color32::from_rgb(245, 245, 245);
 // chat list
-pub const DIALOG_OVER: Color32 = tg(0x202b36);
+pub const DIALOG_OVER: Color32 = navy(0x202b36);
 pub const DIALOG_ACTIVE: Color32 = tg(0x2b5278);
-pub const DIALOG_DATE: Color32 = tg(0x8696a8);
-pub const DIALOG_TEXT: Color32 = tg(0x7f91a4);
+pub const DIALOG_DATE: Color32 = navy(0x8696a8);
+pub const DIALOG_TEXT: Color32 = navy(0x7f91a4);
 pub const UNREAD: Color32 = tg(0x4082bc);
-pub const UNREAD_MUTED: Color32 = tg(0x3e546a);
-pub const FILTER_INPUT: Color32 = tg(0x242f3d);
-pub const TITLE_BG: Color32 = tg(0x242f3d);
-pub const SIDEBAR_BG: Color32 = tg(0x0e1621);
+pub const UNREAD_MUTED: Color32 = navy(0x3e546a);
+pub const FILTER_INPUT: Color32 = navy(0x242f3d);
+pub const TITLE_BG: Color32 = navy(0x242f3d);
+pub const SIDEBAR_BG: Color32 = navy(0x0e1621);
 // history
-pub const CHAT_BG: Color32 = tg(0x0e1621);
-pub const MSG_IN_BG: Color32 = tg(0x182533);
+pub const CHAT_BG: Color32 = navy(0x0e1621);
+pub const MSG_IN_BG: Color32 = navy(0x182533);
 pub const MSG_OUT_BG: Color32 = tg(0x2b5278);
-pub const MSG_IN_DATE: Color32 = tg(0x6d7f8f);
+pub const MSG_IN_DATE: Color32 = navy(0x6d7f8f);
 pub const MSG_OUT_DATE: Color32 = tg(0x7da8d3);
 pub const MSG_OUT_TEXT: Color32 = tg(0xe4ecf2);
 pub const OUT_TICK: Color32 = tg(0x6bbfff);
-pub const SERVICE_BG: Color32 = Color32::from_rgba_premultiplied(0x40 / 2, 0x30 / 2, 0x21 / 2, 0xd5);
-pub const COMPOSE_BG: Color32 = tg(0x17212b);
+pub const SERVICE_BG: Color32 = Color32::from_rgba_premultiplied(28, 40, 53, 0xd5);
+pub const COMPOSE_BG: Color32 = navy(0x17212b);
 pub const DANGER: Color32 = Color32::from_rgb(230, 80, 70);
 pub const ACCENT_TEXT: Color32 = Color32::WHITE;
 
@@ -59,6 +65,8 @@ pub const MSG_RADIUS: u8 = 15;
 pub const COLUMN_LEFT_MIN: f32 = 260.0;
 pub const COLUMN_LEFT_MAX: f32 = 540.0;
 pub const COLUMN_LEFT_NORMAL: f32 = 380.0;
+/// Уже этого окно показывает одну колонку (телефон): список чатов или чат.
+pub const NARROW_WIDTH: f32 = 720.0;
 
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);

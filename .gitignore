@@ -7,3 +7,5 @@
 /.rg/
 /dist/
 api.keys
+*.jks
+keystore.pass

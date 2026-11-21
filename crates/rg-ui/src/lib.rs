@@ -383,6 +383,8 @@ impl App {
             }
             ui.separator();
             ui.weak("Соединения: только серверы Telegram");
+            ui.weak("Не передаются: модель устройства, версия ОС,");
+            ui.weak("язык системы, «в сети», «прочитано» (в режиме призрака)");
         });
         if s != self.settings {
             self.settings = s.clone();
@@ -524,9 +526,19 @@ impl App {
         }
     }
 
-    fn header_ui(&mut self, ui: &mut egui::Ui) {
+    fn header_ui(&mut self, ui: &mut egui::Ui, narrow: bool) {
         ui.horizontal_centered(|ui| {
-            ui.add_space(12.0);
+            ui.add_space(if narrow { 4.0 } else { 12.0 });
+            if narrow {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+                icons::back(ui.painter(), rect.center(), WHITE);
+                if resp.clicked() {
+                    self.selected = None;
+                    self.messages.clear();
+                    self.textures.clear();
+                    self.requested.clear();
+                }
+            }
             if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)) {
                 avatar(ui, &d.name, d.id, 42.0);
                 ui.label(RichText::new(&d.name).strong().size(16.0).color(WHITE));
@@ -741,15 +753,25 @@ impl eframe::App for App {
                 .show(ui, |ui| self.login_ui(ui));
             return;
         }
-        egui::Panel::left("dialogs")
-            .default_size(COLUMN_LEFT_NORMAL)
-            .size_range(COLUMN_LEFT_MIN..=COLUMN_LEFT_MAX)
-            .frame(egui::Frame::new().fill(WINDOW_BG))
-            .show(ui, |ui| self.dialogs_ui(ui));
+        // Узкое окно (телефон): одна колонка — либо список чатов, либо открытый чат.
+        let narrow = ui.available_width() < NARROW_WIDTH;
+        if narrow && self.selected.is_none() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(WINDOW_BG))
+                .show(ui, |ui| self.dialogs_ui(ui));
+            return;
+        }
+        if !narrow {
+            egui::Panel::left("dialogs")
+                .default_size(COLUMN_LEFT_NORMAL)
+                .size_range(COLUMN_LEFT_MIN..=COLUMN_LEFT_MAX)
+                .frame(egui::Frame::new().fill(WINDOW_BG))
+                .show(ui, |ui| self.dialogs_ui(ui));
+        }
         egui::Panel::top("header")
             .exact_size(TOP_BAR_HEIGHT)
             .frame(egui::Frame::new().fill(WINDOW_BG))
-            .show(ui, |ui| self.header_ui(ui));
+            .show(ui, |ui| self.header_ui(ui, narrow));
         if !self.status.is_empty() || !self.error.is_empty() {
             egui::Panel::bottom("status")
                 .frame(
