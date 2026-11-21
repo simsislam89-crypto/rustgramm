@@ -54,8 +54,8 @@ fn row_bg(ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
 fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
     let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
     // Ручка и цвет дорожки плавно переезжают при смене значения.
-    let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.3);
-    // Ручка с пружинным перелётом, как переключатель на iPhone; цвет — линейно.
+    let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.15);
+    // Ручка едет с замедлением к краю, цвет — линейно (переключатель Telegram, 150 мс).
     let k = if on { spring(lin) } else { 1.0 - spring(1.0 - lin) };
     let fill = lerp_color(TRACK_OFF, ACCENT, lin);
     ui.painter().rect_filled(track, CornerRadius::same(7), fill);
@@ -73,7 +73,7 @@ pub fn toggle_icon(ui: &mut egui::Ui, icon: super::icons::Ico, label: &str, valu
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
     row_bg(ui, rect, &resp);
     let p = ui.painter();
-    super::icons::ico(p, Pos2::new(rect.left() + 30.0, rect.center().y), icon, 22.0, DIALOG_DATE);
+    super::icons::ico(p, Pos2::new(rect.left() + 30.0, rect.center().y), icon, DIALOG_DATE);
     p.text(
         Pos2::new(rect.left() + 64.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -109,13 +109,18 @@ pub fn toggle_ex(
         x += 38.0;
     }
     if let Some((n, m, open)) = counter {
+        let label_w = p
+            .layout_no_wrap(format!("{n}/{m}"), FontId::proportional(13.0), WHITE)
+            .size()
+            .x;
         p.text(
             Pos2::new(x + 2.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("{n}/{m} {}", if open { "⌃" } else { "⌄" }),
+            format!("{n}/{m}"),
             FontId::proportional(13.0),
             WHITE,
         );
+        super::icons::chevron(p, Pos2::new(x + label_w + 14.0, rect.center().y), open, WHITE);
     }
     switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value, label);
     if resp.clicked() {
@@ -168,14 +173,8 @@ pub fn nav_row(ui: &mut egui::Ui, icon: &str, label: &str, value: &str) -> bool 
     let p = ui.painter();
     let mut x = rect.left() + PAD;
     if !icon.is_empty() {
-        p.text(
-            Pos2::new(x + 8.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
-            icon,
-            FontId::proportional(16.0),
-            SUBTEXT,
-        );
-        x += 38.0;
+        super::icons::any(p, icon, Pos2::new(x + 12.0, rect.center().y), SUBTEXT);
+        x += 44.0;
     }
     p.text(
         Pos2::new(x, rect.center().y),
@@ -261,4 +260,24 @@ pub fn sub_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
         return true;
     }
     false
+}
+
+/// Строка контекстного меню Telegram: значок слева, подпись, высота 34 px, красная для опасных.
+pub fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, danger: bool) -> bool {
+    let w = ui.available_width().max(210.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, t2(WINDOW_OVER));
+    }
+    let (icon_c, text_c) = if danger { (DANGER, DANGER) } else { (DIALOG_DATE, WHITE) };
+    super::icons::tg(p, icon, Pos2::new(rect.left() + 26.0, rect.center().y), icon_c);
+    p.text(
+        Pos2::new(rect.left() + 53.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(14.0),
+        text_c,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }

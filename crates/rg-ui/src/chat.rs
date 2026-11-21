@@ -8,7 +8,7 @@ use eframe::egui::{self, Align, Color32, FontId, Layout, Rect, RichText, Sense, 
 use rg_core::engine::MessageRow;
 use rg_settings::AyuSettings;
 
-use super::{App, Cmd, icons, theme::*};
+use super::{App, Cmd, icons, kit, theme::*};
 
 /// Быстрые реакции в контекстном меню.
 const REACTIONS: [&str; 6] = ["👍", "❤", "🔥", "😂", "😮", "😢"];
@@ -93,12 +93,57 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
+                // Три точки: меню чата.
+                let (rect, dots) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+                if dots.hovered() {
+                    ui.painter().circle_filled(rect.center(), 20.0, t(WINDOW_OVER));
+                }
+                icons::dots(ui.painter(), rect.center(), if dots.hovered() { WHITE } else { DIALOG_DATE });
+                let sel = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.pinned, d.muted, d.archived, d.saved)));
+                let mut act: Option<Cmd> = None;
+                let mut search = false;
+                egui::Popup::menu(&dots.on_hover_cursor(egui::CursorIcon::PointingHand)).show(|ui| {
+                    ui.set_min_width(210.0);
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    if kit::menu_item(ui, "menu/search", "Поиск", false) {
+                        search = true;
+                        ui.close();
+                    }
+                    if let Some((i, pinned, muted, archived, saved)) = sel {
+                        if kit::menu_item(ui, if pinned { "menu/unpin" } else { "menu/pin" }, if pinned { "Открепить" } else { "Закрепить" }, false) {
+                            act = Some(Cmd::PinDialog(i, !pinned));
+                            ui.close();
+                        }
+                        if kit::menu_item(ui, if muted { "menu/unmute" } else { "menu/mute" }, if muted { "Включить звук" } else { "Отключить звук" }, false) {
+                            act = Some(Cmd::MuteDialog(i, !muted));
+                            ui.close();
+                        }
+                        if kit::menu_item(ui, "menu/read", "Прочитать на сервере", false) {
+                            act = Some(Cmd::ForceRead);
+                            ui.close();
+                        }
+                        if !saved
+                            && kit::menu_item(
+                                ui,
+                                if archived { "menu/unarchive" } else { "menu/archive" },
+                                if archived { "Вернуть из архива" } else { "В архив" },
+                                false,
+                            )
+                        {
+                            act = Some(Cmd::Archive(i, !archived));
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some(cmd) = act {
+                    self.send(cmd);
+                }
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
                 if resp.hovered() {
                     ui.painter().circle_filled(rect.center(), 20.0, t(WINDOW_OVER));
                 }
-                icons::search(ui.painter(), rect.center(), DIALOG_DATE);
-                if resp.on_hover_text("Поиск по чату").clicked() {
+                icons::search(ui.painter(), rect.center(), if resp.hovered() { WHITE } else { DIALOG_DATE });
+                if resp.on_hover_text("Поиск по чату").clicked() || search {
                     self.search_open = !self.search_open;
                     if !self.search_open {
                         self.chat_search.clear();
@@ -154,7 +199,9 @@ impl App {
                 ui.label(RichText::new(body.unwrap_or_default()).color(DIALOG_TEXT).size(13.0));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                let (r, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+                icons::tg(ui.painter(), "info/info_close", r.center(), if resp.hovered() { WHITE } else { SUBTEXT });
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     cancel = true;
                 }
             });
@@ -175,11 +222,11 @@ impl App {
             ui.set_min_height(46.0);
             #[cfg(not(target_os = "android"))]
             if s.field_attach_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
-                icons::attach(ui.painter(), rect.center(), if resp.hovered() { ACCENT } else { DIALOG_DATE });
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(46.0, 46.0), Sense::click());
+                icons::attach(ui.painter(), rect.center(), if resp.hovered() { WHITE } else { DIALOG_DATE });
                 attach = resp.on_hover_text("Отправить файл").clicked();
             }
-            let reserve = 100.0 + if s.field_emoji_button { 36.0 } else { 0.0 };
+            let reserve = 100.0 + if s.field_emoji_button { 46.0 } else { 0.0 };
             let width = (ui.available_width() - reserve).max(80.0);
             let id = ui.make_persistent_id("composer-input");
             let focused = ui.memory(|m| m.has_focus(id));
@@ -197,25 +244,13 @@ impl App {
                     .margin(Vec2::new(4.0, 8.0)),
             );
             if s.field_emoji_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(46.0, 46.0), Sense::click());
                 self.emoji_btn = rect;
                 let k = tween(ui.ctx(), "emoji-btn", f32::from(u8::from(resp.hovered() || self.emoji_open)), 0.12);
                 let color = lerp_color(DIALOG_DATE, WHITE, k);
-                // Смайлик из линий: круг, глаза, улыбка.
-                let c = rect.center();
-                let st = egui::Stroke::new(1.5, color);
-                ui.painter().circle_stroke(c, 9.0, st);
-                ui.painter().circle_filled(c + Vec2::new(-3.2, -2.5), 1.1, color);
-                ui.painter().circle_filled(c + Vec2::new(3.2, -2.5), 1.1, color);
-                ui.painter().add(egui::Shape::line(
-                    (0..=8)
-                        .map(|i| {
-                            let a = std::f32::consts::PI * (0.2 + 0.6 * i as f32 / 8.0);
-                            c + Vec2::new(a.cos() * 5.2, a.sin() * 5.2 - 0.4)
-                        })
-                        .collect(),
-                    st,
-                ));
+                // Кольцо рисуется кодом (как в Telegram), лицо — значок из набора.
+                ui.painter().circle_stroke(rect.center(), 10.5, egui::Stroke::new(1.5, color));
+                icons::tg(ui.painter(), "chat/input_smile_face", rect.center(), color);
                 if resp.clicked() {
                     self.emoji_pinned = !self.emoji_pinned;
                     self.emoji_open = self.emoji_pinned;
@@ -595,7 +630,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label("Сообщение удалится в Telegram. Копия останется у вас, если включено «Сохранять удалённые».");
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
+                        if kit::menu_item(ui, "menu/delete", "Удалить", true) {
                             self.send(Cmd::Delete(id));
                             close = true;
                         }
@@ -737,11 +772,11 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
     };
     let mut k_in = 1.0_f32;
     if let Some(t0) = env.arrived.get(&m.id) {
-        k_in = ((env.time - t0) / 0.45).clamp(0.0, 1.0) as f32;
+        k_in = ((env.time - t0) / 0.15).clamp(0.0, 1.0) as f32;
         if k_in < 1.0 {
             ui.ctx().request_repaint();
-            // Новое сообщение «всплывает» снизу пружиной, как в iMessage.
-            ui.add_space(((1.0 - spring(k_in)) * 26.0).max(0.0));
+            // Новое сообщение чуть поднимается снизу за 150 мс, как в Telegram Desktop.
+            ui.add_space(((1.0 - spring(k_in)) * 14.0).max(0.0));
         }
     }
     ui.with_layout(layout, |ui| {
@@ -851,20 +886,32 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                     }
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let mut extra = String::new();
+                        let mut extra: Vec<(&str, String)> = Vec::new();
                         if m.pinned {
-                            extra.push_str("📌 ");
+                            extra.push(("history_pin", String::new()));
                         }
                         if m.reactions > 0 && reactions_visible(s) {
-                            extra.push_str(&format!("♥ {} ", m.reactions));
+                            extra.push(("dialogs/dialogs_reaction", m.reactions.to_string()));
                         }
                         if let Some(v) = m.views {
-                            extra.push_str(&format!("👁 {v} "));
+                            extra.push(("history_views", v.to_string()));
                         }
-                        let extra_w = extra.chars().count() as f32 * 7.0;
+                        let extra_w: f32 = extra
+                            .iter()
+                            .map(|(n, t)| {
+                                icons::native_size(n).map_or(0.0, |s| s.x)
+                                    + t.chars().count() as f32 * 7.0
+                                    + 8.0
+                            })
+                            .sum();
                         ui.add_space((w - meta_w - extra_w).max(0.0));
-                        if !extra.is_empty() {
-                            ui.label(RichText::new(extra).size(12.0).color(date_c));
+                        for (n, t) in extra {
+                            let sz = icons::native_size(n).unwrap_or(Vec2::splat(12.0));
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(sz.x, 14.0), Sense::hover());
+                            icons::tg(ui.painter(), n, r.center(), date_c);
+                            if !t.is_empty() {
+                                ui.label(RichText::new(t).size(12.0).color(date_c));
+                            }
                         }
                         ui.label(RichText::new(meta).size(12.0).color(date_c));
                         if m.outgoing {
@@ -935,52 +982,54 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         });
         ui.separator();
     }
-    let mut item = |ui: &mut egui::Ui, label: &str, act: Act| {
-        if ui.button(label).clicked() {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, act: Act| {
+        if kit::menu_item(ui, icon, label, false) {
             acts.push(act);
             ui.close();
         }
     };
     if !m.deleted {
-        item(ui, "Ответить", Act::Reply(m.id, m.text.clone()));
+        item(ui, "menu/reply", "Ответить", Act::Reply(m.id, m.text.clone()));
     }
     if !m.text.is_empty() {
-        item(ui, "Копировать текст", Act::Copy(m.text.clone()));
+        item(ui, "menu/copy", "Копировать текст", Act::Copy(m.text.clone()));
     }
     if m.media.as_ref().is_some_and(|i| i.is_downloadable()) {
-        item(ui, "Сохранить файл", Act::Save(m.id));
-        item(ui, "Открыть", Act::Open(m.id));
+        item(ui, "menu/download", "Сохранить файл", Act::Save(m.id));
+        item(ui, "menu/show_in_folder", "Открыть", Act::Open(m.id));
     }
     if m.outgoing && !m.deleted {
-        item(ui, "Изменить", Act::Edit(m.id, m.text.clone()));
+        item(ui, "menu/edit", "Изменить", Act::Edit(m.id, m.text.clone()));
     }
     if !m.deleted {
-        item(ui, "Переслать", Act::Forward(m.id));
+        item(ui, "menu/forward", "Переслать", Act::Forward(m.id));
         item(
             ui,
+            if m.pinned { "menu/unpin" } else { "menu/pin" },
             if m.pinned { "Открепить" } else { "Закрепить" },
             Act::Pin(m.id, !m.pinned),
         );
     }
     if s.menu_repeat_message.shown(env.shift) && !m.text.is_empty() {
-        item(ui, "Повторить", Act::Repeat(m.text.clone()));
+        item(ui, "menu/restore", "Повторить", Act::Repeat(m.text.clone()));
     }
     if s.menu_add_filter.shown(env.shift) && !m.text.is_empty() {
-        item(ui, "Добавить в фильтры", Act::AddFilter(m.text.clone()));
+        item(ui, "menu/tag_filter", "Добавить в фильтры", Act::AddFilter(m.text.clone()));
     }
     if s.menu_hide_message.shown(env.shift) {
-        item(ui, "Скрыть сообщение", Act::Hide(m.id));
+        item(ui, "menu/stealth", "Скрыть сообщение", Act::Hide(m.id));
     }
     if m.edits > 0 {
-        item(ui, "История правок", Act::History(m.id));
+        item(ui, "menu/edited_status", "История правок", Act::History(m.id));
     }
     if s.menu_message_details.shown(env.shift) {
-        item(ui, "Сведения", Act::Details(m.id));
-        item(ui, "Копировать ID", Act::CopyId(m.id));
+        item(ui, "menu/info", "Сведения", Act::Details(m.id));
+        item(ui, "menu/copy", "Копировать ID", Act::CopyId(m.id));
     }
     if !m.deleted {
         ui.separator();
-        if ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
+        if kit::menu_item(ui, "menu/delete", "Удалить", true) {
             acts.push(Act::Delete(m.id));
             ui.close();
         }

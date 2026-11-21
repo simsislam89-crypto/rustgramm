@@ -86,7 +86,7 @@ impl App {
     /// Окно «Контакты»: поиск и список с фото и статусом; клик открывает чат.
     #[allow(deprecated)]
     pub(crate) fn contacts_window(&mut self, ctx: &egui::Context) {
-        let raw = tween(ctx, "contacts-win", f32::from(u8::from(self.contacts_open)), 0.38);
+        let raw = tween(ctx, "contacts-win", f32::from(u8::from(self.contacts_open)), 0.2);
         if raw < 0.005 && !self.contacts_open {
             return;
         }
@@ -128,7 +128,7 @@ impl App {
                         );
                         let x = Rect::from_center_size(Pos2::new(head.right() - 24.0, head.center().y), Vec2::splat(34.0));
                         let xr = ui.interact(x, ui.make_persistent_id("contacts-x"), Sense::click());
-                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(15.0), if xr.hovered() { WHITE } else { SUBTEXT });
+                        icons::tg(ui.painter(), "info/info_close", x.center(), if xr.hovered() { WHITE } else { SUBTEXT });
                         if xr.clicked() {
                             self.contacts_open = false;
                         }

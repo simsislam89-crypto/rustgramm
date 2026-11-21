@@ -128,18 +128,13 @@ pub fn ease_out(t: f32) -> f32 {
     if t >= 1.0 { 1.0 } else { 1.0 - 2f32.powf(-10.0 * t) }
 }
 
-/// Пружина как на iPhone: быстрый подъём, небольшой перелёт и затухание (~0.85 демпфирования).
-/// `k` — линейный прогресс 0..1, результат тянется к 1 с лёгким перелётом.
+/// Кривая появления, как у Telegram Desktop: быстрый старт и мягкая посадка без перелёта
+/// (длительности 100–200 мс берутся из `.style` Telegram: `universalDuration` 120,
+/// `dialogsFilterSlideDuration` 200, `emojiPanDuration` 200, `historyToDownDuration` 150).
+/// Имя прежнее: так же вызывается во всех окнах и панелях.
 pub fn spring(k: f32) -> f32 {
     let k = k.clamp(0.0, 1.0);
-    if k >= 1.0 {
-        return 1.0;
-    }
-    // Недодемпфированный осциллятор: x(t) = 1 - e^{-ζωt}(cos ωd t + ζω/ωd sin ωd t).
-    let (zeta, omega) = (0.72_f32, 13.0_f32);
-    let wd = omega * (1.0 - zeta * zeta).sqrt();
-    let x = k * 0.9;
-    1.0 - (-zeta * omega * x).exp() * ((wd * x).cos() + zeta * omega / wd * (wd * x).sin())
+    1.0 - (1.0 - k).powi(3)
 }
 
 /// Линейная смесь цветов.

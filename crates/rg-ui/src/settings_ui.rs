@@ -27,7 +27,7 @@ pub(crate) mod page {
 
 fn title_of(p: usize) -> &'static str {
     match p {
-        page::AYU => "AyuGram",
+        page::AYU => "Rustgramm",
         page::FILTERS => "Фильтры",
         page::GENERAL => "Общие",
         page::APPEARANCE => "Внешний вид",
@@ -35,7 +35,7 @@ fn title_of(p: usize) -> &'static str {
         page::OTHER => "Прочее",
         page::SHARED => "Общие фильтры",
         page::SHADOW => "Теневой бан",
-        _ => "AyuGram Desktop",
+        _ => "Rustgramm",
     }
 }
 
@@ -110,17 +110,11 @@ impl App {
                 ui.painter().text(
                     Pos2::new(head.left() + 18.0, prefs.center().y),
                     Align2::LEFT_CENTER,
-                    "AyuGram Preferences",
+                    "Настройки Rustgramm",
                     FontId::proportional(13.0),
                     ACCENT,
                 );
-                ui.painter().text(
-                    Pos2::new(head.right() - 22.0, prefs.center().y),
-                    Align2::CENTER_CENTER,
-                    "⌄",
-                    FontId::proportional(14.0),
-                    SUBTEXT,
-                );
+                icons::chevron_down(ui.painter(), Pos2::new(head.right() - 22.0, prefs.center().y), SUBTEXT);
                 if pr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     act = Some("prefs");
                 }
@@ -129,7 +123,7 @@ impl App {
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
                     }
-                    icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, 22.0, DIALOG_DATE);
+                    icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, DIALOG_DATE);
                     ui.painter().text(
                         Pos2::new(r.left() + 64.0, r.center().y),
                         Align2::LEFT_CENTER,
@@ -231,7 +225,7 @@ impl App {
     #[allow(deprecated)]
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         self.logout_window(ctx);
-        let raw = tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.38);
+        let raw = tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.2);
         let appear = spring(raw);
         if raw < 0.005 && !self.settings_open {
             return;
@@ -297,13 +291,7 @@ impl App {
                             Vec2::splat(34.0),
                         );
                         let xr = ui.interact(x, ui.make_persistent_id("prefs-close"), Sense::click());
-                        ui.painter().text(
-                            x.center(),
-                            Align2::CENTER_CENTER,
-                            "✕",
-                            FontId::proportional(15.0),
-                            if xr.hovered() { WHITE } else { SUBTEXT },
-                        );
+                        icons::tg(ui.painter(), "info/info_close", x.center(), if xr.hovered() { WHITE } else { SUBTEXT });
                         if xr.clicked() {
                             close = true;
                         }
@@ -416,12 +404,12 @@ fn menu_page(ui: &mut egui::Ui) -> Option<usize> {
     section(ui, "Категории");
     let mut go = None;
     for (icon, name, p) in [
-        ("♡", "AyuGram", page::AYU),
-        ("⚑", "Фильтры", page::FILTERS),
-        ("▦", "Общие", page::GENERAL),
-        ("◐", "Внешний вид", page::APPEARANCE),
-        ("💬", "Чаты", page::CHATS),
-        ("☆", "Прочее", page::OTHER),
+        ("heart", "Rustgramm", page::AYU),
+        ("menu/tag_filter", "Фильтры", page::FILTERS),
+        ("grid", "Общие", page::GENERAL),
+        ("menu/palette", "Внешний вид", page::APPEARANCE),
+        ("menu/chat_bubble", "Чаты", page::CHATS),
+        ("menu/favorite", "Прочее", page::OTHER),
     ] {
         if nav_row(ui, icon, name, "") {
             go = Some(p);
@@ -869,13 +857,13 @@ fn chats_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
 fn other_page(ui: &mut egui::Ui, logout_ask: &mut bool) -> bool {
     section(ui, "Прочее");
     let mut reset = false;
-    if nav_row(ui, "🔗", "Зарегистрировать tg:// ссылки", "") {
+    if nav_row(ui, "menu/link", "Зарегистрировать tg:// ссылки", "") {
         register_url_scheme(ui.ctx());
     }
-    if nav_row(ui, "↺", "Сбросить настройки", "") {
+    if nav_row(ui, "menu/restore", "Сбросить настройки", "") {
         reset = true;
     }
-    if nav_row(ui, "⎋", "Выйти из аккаунта", "") {
+    if nav_row(ui, "menu/leave", "Выйти из аккаунта", "") {
         *logout_ask = true;
     }
     desc(ui, "Отчёты о сбоях, проверка обновлений и любая телеметрия в Rustgramm отсутствуют: соединения идут только на серверы Telegram.");

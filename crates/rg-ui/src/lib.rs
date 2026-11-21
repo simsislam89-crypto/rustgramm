@@ -606,8 +606,7 @@ impl App {
             let (srect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
             ui.painter()
                 .rect_filled(srect, egui::CornerRadius::same(18), t(FILTER_INPUT));
-            icons::search(ui.painter(), srect.left_center() + Vec2::new(20.0, 0.0), DIALOG_DATE);
-            let inner = srect.shrink2(Vec2::new(38.0, 4.0));
+            let inner = srect.shrink2(Vec2::new(18.0, 4.0));
             ui.put(
                 inner,
                 egui::TextEdit::singleline(&mut self.search)
@@ -713,7 +712,7 @@ impl App {
                 } else if d.pinned {
                     // Закреплённый чат без непрочитанных: значок кнопки вместо бейджа.
                     let c = egui::pos2(rect.right() - 22.0, rect.bottom() - 24.0);
-                    icons::ico(p, c, icons::Ico::Pin, 15.0, date_c);
+                    icons::tg(p, "dialogs/dialogs_pinned", c, date_c);
                     right = c.x - 12.0;
                 }
                 let date = if d.date > 0 {
@@ -757,7 +756,7 @@ impl App {
                         .x;
                     let x = rect.left() + 68.0 + w + 14.0;
                     if x < clip_right - 8.0 {
-                        icons::ico(p, egui::pos2(x, rect.top() + 21.0), icons::Ico::Mute, 14.0, date_c);
+                        icons::tg(p, "dialogs/dialogs_mute", egui::pos2(x - 4.0, rect.top() + 21.0), date_c);
                     }
                 }
                 match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
@@ -783,24 +782,36 @@ impl App {
                     open = Some(i);
                 }
                 egui::Popup::context_menu(&resp).show(|ui| {
-                    ui.set_min_width(190.0);
-                    let mut item = |ui: &mut egui::Ui, label: &str, a: DialogAct| {
-                        if ui.button(label).clicked() {
+                    ui.set_min_width(210.0);
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, a: DialogAct| {
+                        if kit::menu_item(ui, icon, label, false) {
                             dact = Some((i, a));
                             ui.close();
                         }
                     };
-                    item(ui, if d.pinned { "Открепить" } else { "Закрепить" }, DialogAct::Pin(!d.pinned));
-                    item(ui, if d.muted { "Включить звук" } else { "Отключить звук" }, DialogAct::Mute(!d.muted));
-                    if d.unread > 0 {
-                        item(ui, "Прочитать на сервере", DialogAct::Read);
-                    }
                     if !d.saved {
                         item(
                             ui,
+                            if d.archived { "menu/unarchive" } else { "menu/archive" },
                             if d.archived { "Вернуть из архива" } else { "В архив" },
                             DialogAct::Archive(!d.archived),
                         );
+                    }
+                    item(
+                        ui,
+                        if d.pinned { "menu/unpin" } else { "menu/pin" },
+                        if d.pinned { "Открепить" } else { "Закрепить" },
+                        DialogAct::Pin(!d.pinned),
+                    );
+                    item(
+                        ui,
+                        if d.muted { "menu/unmute" } else { "menu/mute" },
+                        if d.muted { "Включить звук" } else { "Отключить звук" },
+                        DialogAct::Mute(!d.muted),
+                    );
+                    if d.unread > 0 {
+                        item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
                     }
                 });
             }
@@ -830,16 +841,10 @@ enum DialogAct {
     Archive(bool),
 }
 
-/// Значок папки «Архив»: скруглённый квадрат со стрелкой вниз в коробку.
+/// Значок папки «Архив»: серый круг и значок «ящик со стрелкой» из набора Telegram.
 fn paint_archive_icon(p: &egui::Painter, c: egui::Pos2, size: f32) {
     p.circle_filled(c, size / 2.0, Color32::from_rgb(70, 70, 78));
-    let s = egui::Stroke::new(1.8, Color32::WHITE);
-    let k = size / 48.0;
-    let top = c + Vec2::new(0.0, -4.0) * k;
-    p.line_segment([top + Vec2::new(0.0, -8.0) * k, top + Vec2::new(0.0, 6.0) * k], s);
-    p.line_segment([top + Vec2::new(-5.0, 1.0) * k, top + Vec2::new(0.0, 6.0) * k], s);
-    p.line_segment([top + Vec2::new(5.0, 1.0) * k, top + Vec2::new(0.0, 6.0) * k], s);
-    p.line_segment([c + Vec2::new(-9.0, 9.0) * k, c + Vec2::new(9.0, 9.0) * k], s);
+    icons::tg(p, "archive_userpic", c, Color32::WHITE);
 }
 
 /// Строка «Архив» в начале списка; `true` — нажата.
@@ -995,12 +1000,12 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| self.composer_ui(ui));
         }
-        // Лента въезжает справа с пружиной при открытии чата (переход как на iPhone).
-        let push = (self.chat_opened.elapsed().as_secs_f32() / 0.5).clamp(0.0, 1.0);
+        // Лента мягко подъезжает при открытии чата (150 мс, без перелёта).
+        let push = (self.chat_opened.elapsed().as_secs_f32() / 0.15).clamp(0.0, 1.0);
         if push < 1.0 && self.selected.is_some() {
             ctx.request_repaint();
         }
-        let slide = if self.selected.is_some() { (1.0 - spring(push)) * 36.0 } else { 0.0 };
+        let slide = if self.selected.is_some() { (1.0 - spring(push)) * 12.0 } else { 0.0 };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
