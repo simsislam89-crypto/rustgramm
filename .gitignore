@@ -1,0 +1,6 @@
+/target
+/upstream
+*.apk
+.env
+*.session
+.claude/
