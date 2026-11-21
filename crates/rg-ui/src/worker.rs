@@ -50,6 +50,8 @@ pub enum Cmd {
     Search(String),
     /// Подгрузить сообщения старше указанного идентификатора.
     Older(i32),
+    /// Отметить открытый чат прочитанным принудительно (мимо режима призрака).
+    ForceRead,
     Settings(Box<Settings>),
 }
 
@@ -336,6 +338,14 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
                 out.send(Ev::EditHistory(id, engine.edit_history(&d.peer, id).await));
+            }
+            Cmd::ForceRead => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.force_read(d.peer).await {
+                    Ok(()) => out.send(Ev::Status("Отмечено прочитанным на сервере".into())),
+                    Err(e) => out.err(format!("Не отмечено: {e}")),
+                }
             }
             Cmd::Edit(id, text) => {
                 let Some(i) = current else { continue };

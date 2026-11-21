@@ -1,79 +1,222 @@
-//! Главное меню и окно «Настройки AyuGram»: те же разделы, что в оригинале.
+//! Левая панель (главное меню) и окно «AyuGram Preferences» — как в AyuGram Desktop 7.2.9:
+//! категории AyuGram / Filters / General / Appearance / Chats / Other. Порядок строк и
+//! подписи сняты с живого окна оригинала.
 
-use eframe::egui::{self, RichText, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Vec2};
 use rg_settings::{
     ChannelBottomButton, MenuVisibility, PeerIdDisplay, SendWithoutSound, Settings,
 };
 
-use super::{App, Cmd, theme::*};
+use super::kit::{self, divider, desc, nav_row, section, slider, sub_toggle, toggle, toggle_ex, value_row};
+use super::{App, Cmd, icons, theme::*};
 
-const TABS: [&str; 6] = [
-    "Призрак",
-    "Сохранение и фильтры",
-    "Внешний вид",
-    "Чаты и меню",
-    "Поле ввода",
-    "Прочее",
-];
+const BOX_W: f32 = 380.0;
 
-fn check(ui: &mut egui::Ui, value: &mut bool, label: &str) {
-    ui.checkbox(value, label);
+/// Номера страниц окна настроек.
+pub(crate) mod page {
+    pub const MENU: usize = 0;
+    pub const AYU: usize = 1;
+    pub const FILTERS: usize = 2;
+    pub const GENERAL: usize = 3;
+    pub const APPEARANCE: usize = 4;
+    pub const CHATS: usize = 5;
+    pub const OTHER: usize = 6;
+    pub const SHARED: usize = 7;
+    pub const SHADOW: usize = 8;
 }
 
-fn menu_choice(ui: &mut egui::Ui, value: &mut MenuVisibility, label: &str) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        egui::ComboBox::from_id_salt(label)
-            .selected_text(match value {
-                MenuVisibility::Hidden => "скрыт",
-                MenuVisibility::Visible => "виден",
-                MenuVisibility::WithModifier => "с Shift",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(value, MenuVisibility::Hidden, "скрыт");
-                ui.selectable_value(value, MenuVisibility::Visible, "виден");
-                ui.selectable_value(value, MenuVisibility::WithModifier, "с Shift");
-            });
-    });
+fn title_of(p: usize) -> &'static str {
+    match p {
+        page::AYU => "AyuGram",
+        page::FILTERS => "Фильтры",
+        page::GENERAL => "Общие",
+        page::APPEARANCE => "Внешний вид",
+        page::CHATS => "Чаты",
+        page::OTHER => "Прочее",
+        page::SHARED => "Общие фильтры",
+        page::SHADOW => "Теневой бан",
+        _ => "AyuGram Desktop",
+    }
+}
+
+fn menu_value(v: MenuVisibility) -> &'static str {
+    match v {
+        MenuVisibility::Hidden => "Скрыто",
+        MenuVisibility::Visible => "Показано",
+        MenuVisibility::WithModifier => "В расширенном меню",
+    }
+}
+
+fn next_menu(v: MenuVisibility) -> MenuVisibility {
+    match v {
+        MenuVisibility::Hidden => MenuVisibility::Visible,
+        MenuVisibility::Visible => MenuVisibility::WithModifier,
+        MenuVisibility::WithModifier => MenuVisibility::Hidden,
+    }
 }
 
 impl App {
-    /// Главное меню (три полосы): быстрые переключатели и вход в настройки.
-    pub(crate) fn main_menu(&mut self, resp: &egui::Response) {
+    /// Левая выдвижная панель: профиль, разделы, переключатели ночной темы и призрака.
+    #[allow(deprecated)] // Area::new требует Id, а замена Id::new ещё не даёт стабильного id
+    pub(crate) fn drawer(&mut self, ctx: &egui::Context) {
+        if !self.drawer_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let w = 275.0_f32.min(screen.width());
+        // Затемнение: клик вне панели закрывает её.
+        egui::Area::new(egui::Id::new("drawer-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, Color32::from_black_alpha(110));
+                if resp.clicked() {
+                    self.drawer_open = false;
+                }
+            });
         let mut s = self.settings.clone();
+        let a = s.ayu.clone();
         let me = self.me.clone();
-        let mut open_settings = false;
-        egui::Popup::menu(resp).show(|ui| {
-            ui.set_min_width(260.0);
-            ui.label(RichText::new(&me).strong().color(WHITE));
-            ui.separator();
-            if s.ayu.drawer_ghost_toggle {
-                let mut ghost = s.ghost.active;
-                if ui.checkbox(&mut ghost, "Режим призрака").changed() {
-                    s.ghost.set_active(ghost);
+        let mut act: Option<&str> = None;
+        egui::Area::new(egui::Id::new("drawer"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(w, screen.height()), Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, WINDOW_BG);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                let ui = &mut child;
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                // Шапка: аватар, имя, ссылка на настройки AyuGram.
+                let (head, _) = ui.allocate_exact_size(Vec2::new(w, 152.0), Sense::hover());
+                draw_avatar(ui.painter(), Pos2::new(head.left() + 46.0, head.top() + 46.0), &me, 1, 56.0);
+                ui.painter().text(
+                    Pos2::new(head.left() + 18.0, head.top() + 96.0),
+                    Align2::LEFT_CENTER,
+                    &me,
+                    FontId::proportional(15.0),
+                    WHITE,
+                );
+                let prefs = Rect::from_min_size(
+                    Pos2::new(head.left() + 8.0, head.top() + 108.0),
+                    Vec2::new(w - 16.0, 28.0),
+                );
+                let pr = ui.interact(prefs, ui.make_persistent_id("prefs-link"), Sense::click());
+                ui.painter().text(
+                    Pos2::new(head.left() + 18.0, prefs.center().y),
+                    Align2::LEFT_CENTER,
+                    "AyuGram Preferences",
+                    FontId::proportional(13.0),
+                    ACCENT,
+                );
+                ui.painter().text(
+                    Pos2::new(head.right() - 22.0, prefs.center().y),
+                    Align2::CENTER_CENTER,
+                    "⌄",
+                    FontId::proportional(14.0),
+                    SUBTEXT,
+                );
+                if pr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    act = Some("prefs");
+                }
+                let item = |ui: &mut egui::Ui, icon: &str, text: &str| -> bool {
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 0.0, WINDOW_OVER);
+                    }
+                    ui.painter().text(
+                        Pos2::new(r.left() + 30.0, r.center().y),
+                        Align2::CENTER_CENTER,
+                        icon,
+                        FontId::proportional(16.0),
+                        SUBTEXT,
+                    );
+                    ui.painter().text(
+                        Pos2::new(r.left() + 64.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        text,
+                        FontId::proportional(14.0),
+                        WHITE,
+                    );
+                    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                };
+                if a.drawer_my_profile && item(ui, "◯", "Мой профиль") {
+                    act = Some("profile");
+                }
+                kit::divider(ui);
+                if a.drawer_new_group && item(ui, "👥", "Новая группа") {
+                    act = Some("group");
+                }
+                if a.drawer_new_channel && item(ui, "📢", "Новый канал") {
+                    act = Some("channel");
+                }
+                if a.drawer_contacts && item(ui, "👤", "Контакты") {
+                    act = Some("contacts");
+                }
+                if a.drawer_calls && item(ui, "📞", "Звонки") {
+                    act = Some("calls");
+                }
+                if a.drawer_saved_messages && item(ui, "🔖", "Избранное") {
+                    act = Some("saved");
+                }
+                if a.drawer_l_read_toggle && item(ui, "✉", "Прочитать на сервере") {
+                    act = Some("read");
+                }
+                if item(ui, "⚙", "Настройки") {
+                    act = Some("settings");
+                }
+                if a.drawer_night_mode_toggle {
+                    let mut night = true;
+                    toggle(ui, "Ночной режим", &mut night);
+                }
+                if a.drawer_ghost_toggle {
+                    let mut ghost = s.ghost.active;
+                    if toggle(ui, "Режим призрака", &mut ghost) {
+                        s.ghost.set_active(ghost);
+                    }
+                }
+                if a.drawer_streamer_toggle {
+                    let mut st = s.ayu.streamer_mode;
+                    if toggle(ui, "Режим стримера", &mut st) {
+                        s.ayu.streamer_mode = st;
+                    }
+                }
+            });
+        match act {
+            Some("prefs") => {
+                self.drawer_open = false;
+                self.settings_open = true;
+                self.settings_tab = page::MENU;
+            }
+            Some("settings") => {
+                self.drawer_open = false;
+                self.settings_open = true;
+                self.settings_tab = page::MENU;
+            }
+            Some("saved") => {
+                self.drawer_open = false;
+                if let Some(i) = self.dialogs.iter().position(|d| d.saved) {
+                    self.open_dialog(i);
                 }
             }
-            if s.ayu.drawer_s_read_toggle {
-                check(ui, &mut s.ayu.save_deleted_messages, "Сохранять удалённые сообщения");
-                check(ui, &mut s.ayu.save_messages_history, "История правок");
+            Some("read") => {
+                self.drawer_open = false;
+                self.send(Cmd::ForceRead);
             }
-            if s.ayu.drawer_night_mode_toggle {
-                ui.weak("Тема: ночная (единственная)");
+            Some(other) => {
+                self.drawer_open = false;
+                let name = match other {
+                    "profile" => "Профиль",
+                    "group" => "Создание группы",
+                    "channel" => "Создание канала",
+                    "contacts" => "Контакты",
+                    _ => "Звонки",
+                };
+                self.status = format!("{name}: этот раздел будет в следующем этапе");
             }
-            let mut streamer = s.ayu.streamer_mode;
-            if s.ayu.drawer_streamer_toggle && ui.checkbox(&mut streamer, "Режим стримера").changed() {
-                s.ayu.streamer_mode = streamer;
-            }
-            ui.separator();
-            if ui.button("Настройки").clicked() {
-                open_settings = true;
-                ui.close();
-            }
-            ui.separator();
-            ui.weak("Соединения: только серверы Telegram");
-        });
-        if open_settings {
-            self.settings_open = true;
+            None => {}
         }
         if s != self.settings {
             self.settings = s.clone();
@@ -81,41 +224,122 @@ impl App {
         }
     }
 
+    /// Окно настроек: заголовок со стрелкой «назад» и крестиком, список строк.
+    #[allow(deprecated)]
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
         }
-        let mut open = true;
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("prefs-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, Color32::from_black_alpha(140));
+                if resp.clicked() {
+                    self.settings_open = false;
+                }
+            });
         let mut s = self.settings.clone();
         let mut tab = self.settings_tab;
+        let mut close = false;
         let mut new_filter = std::mem::take(&mut self.filter_new);
-        egui::Window::new("Настройки")
-            .open(&mut open)
-            .collapsible(false)
-            .default_size(Vec2::new(560.0, 520.0))
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        let mut shadow_new = std::mem::take(&mut self.shadow_new);
+        let mut expanded = self.expanded;
+        let mut reset = false;
+        let max_h = (screen.height() - 40.0).clamp(240.0, 700.0);
+        egui::Area::new(egui::Id::new("prefs-box"))
+            .order(egui::Order::Tooltip)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (i, t) in TABS.iter().enumerate() {
-                        if ui.selectable_label(tab == i, *t).clicked() {
-                            tab = i;
+                egui::Frame::new()
+                    .fill(WINDOW_BG)
+                    .corner_radius(CornerRadius::same(10))
+                    .show(ui, |ui| {
+                        let width = BOX_W.min(screen.width() - 16.0);
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        // Шапка.
+                        let (head, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
+                        if tab != page::MENU {
+                            let back = Rect::from_center_size(
+                                Pos2::new(head.left() + 26.0, head.center().y),
+                                Vec2::splat(34.0),
+                            );
+                            let r = ui.interact(back, ui.make_persistent_id("prefs-back"), Sense::click());
+                            icons::back(ui.painter(), back.center(), if r.hovered() { WHITE } else { SUBTEXT });
+                            if r.clicked() {
+                                tab = match tab {
+                                    page::SHARED | page::SHADOW => page::FILTERS,
+                                    _ => page::MENU,
+                                };
+                            }
+                            ui.painter().text(
+                                Pos2::new(head.left() + 52.0, head.center().y),
+                                Align2::LEFT_CENTER,
+                                title_of(tab),
+                                FontId::proportional(16.0),
+                                WHITE,
+                            );
                         }
-                    }
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| match tab {
-                    0 => ghost_tab(ui, &mut s),
-                    1 => saving_tab(ui, &mut s, &mut new_filter),
-                    2 => look_tab(ui, &mut s),
-                    3 => chats_tab(ui, &mut s),
-                    4 => field_tab(ui, &mut s),
-                    _ => other_tab(ui, &mut s),
-                });
+                        let x = Rect::from_center_size(
+                            Pos2::new(head.right() - 24.0, head.center().y),
+                            Vec2::splat(34.0),
+                        );
+                        let xr = ui.interact(x, ui.make_persistent_id("prefs-close"), Sense::click());
+                        ui.painter().text(
+                            x.center(),
+                            Align2::CENTER_CENTER,
+                            "✕",
+                            FontId::proportional(15.0),
+                            if xr.hovered() { WHITE } else { SUBTEXT },
+                        );
+                        if xr.clicked() {
+                            close = true;
+                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(max_h - 50.0)
+                            .min_scrolled_height(match tab {
+                                page::AYU | page::GENERAL | page::APPEARANCE | page::CHATS => max_h - 50.0,
+                                _ => 120.0,
+                            })
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                match tab {
+                                    page::AYU => ayu_page(ui, &mut s, &mut expanded),
+                                    page::FILTERS => {
+                                        if let Some(p) = filters_page(ui, &mut s) {
+                                            tab = p;
+                                        }
+                                    }
+                                    page::GENERAL => general_page(ui, &mut s, &mut expanded),
+                                    page::APPEARANCE => appearance_page(ui, &mut s),
+                                    page::CHATS => chats_page(ui, &mut s, &mut expanded),
+                                    page::OTHER => reset = other_page(ui),
+                                    page::SHARED => shared_page(ui, &mut s, &mut new_filter),
+                                    page::SHADOW => shadow_page(ui, &mut s, &mut shadow_new),
+                                    _ => {
+                                        if let Some(p) = menu_page(ui) {
+                                            tab = p;
+                                        }
+                                    }
+                                }
+                            });
+                    });
             });
         self.filter_new = new_filter;
+        self.shadow_new = shadow_new;
+        self.expanded = expanded;
         self.settings_tab = tab;
-        if !open {
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.settings_open = false;
+        }
+        if reset {
+            s = Settings::first_run();
+            self.status = "Настройки сброшены".to_owned();
         }
         if s != self.settings {
             self.settings = s.clone();
@@ -124,74 +348,153 @@ impl App {
     }
 }
 
-fn ghost_tab(ui: &mut egui::Ui, s: &mut Settings) {
-    let mut active = s.ghost.active;
-    if ui.checkbox(&mut active, "Режим призрака (всё ниже выключается разом)").changed() {
-        s.ghost.set_active(active);
-    }
-    ui.separator();
-    let g = &mut s.ghost;
-    check(ui, &mut g.send_read_messages, "Отправлять «прочитано» (сообщения)");
-    check(ui, &mut g.send_read_stories, "Отправлять просмотры историй");
-    check(ui, &mut g.send_online_packets, "Отправлять статус «в сети»");
-    check(ui, &mut g.send_upload_progress, "Отправлять прогресс загрузки / «печатает…»");
-    check(ui, &mut g.send_offline_after_online, "Сразу «не в сети» после «в сети»");
-    check(ui, &mut g.mark_read_after_action, "Отмечать прочитанным после моего сообщения");
-    check(ui, &mut g.use_scheduled_messages, "Отправлять через отложенные (в режиме призрака)");
-    ui.horizontal(|ui| {
-        ui.label("Отправка без звука");
-        egui::ComboBox::from_id_salt("silent")
-            .selected_text(match g.send_without_sound {
-                SendWithoutSound::Never => "никогда",
-                SendWithoutSound::InGhostMode => "в режиме призрака",
-                SendWithoutSound::Always => "всегда",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut g.send_without_sound, SendWithoutSound::Never, "никогда");
-                ui.selectable_value(&mut g.send_without_sound, SendWithoutSound::InGhostMode, "в режиме призрака");
-                ui.selectable_value(&mut g.send_without_sound, SendWithoutSound::Always, "всегда");
-            });
-    });
-    ui.separator();
-    ui.label(RichText::new("Закрепить значение (режим призрака его не меняет)").strong());
-    check(ui, &mut g.locked_read_messages, "«Прочитано»");
-    check(ui, &mut g.locked_read_stories, "Просмотры историй");
-    check(ui, &mut g.locked_online_packets, "«В сети»");
-    check(ui, &mut g.locked_upload_progress, "Прогресс загрузки");
-    check(ui, &mut g.locked_offline_after_online, "«Не в сети»");
-    check(ui, &mut s.ayu.use_global_ghost_mode, "Один режим призрака для всех аккаунтов");
-    check(
-        ui,
-        &mut s.ayu.suggest_ghost_mode_before_viewing_story,
-        "Предлагать режим призрака перед просмотром истории",
+/// Категории и ссылки (верхний уровень).
+fn menu_page(ui: &mut egui::Ui) -> Option<usize> {
+    let w = ui.available_width();
+    let (head, _) = ui.allocate_exact_size(Vec2::new(w, 130.0), Sense::hover());
+    let c = Pos2::new(head.center().x, head.top() + 42.0);
+    ui.painter().circle_filled(c, 30.0, navy(0x2b2a4a));
+    icons::logo(ui.painter(), c, 20.0, WHITE);
+    ui.painter().text(
+        Pos2::new(head.center().x, head.top() + 88.0),
+        Align2::CENTER_CENTER,
+        format!("Rustgramm v{}", env!("CARGO_PKG_VERSION")),
+        FontId::proportional(14.0),
+        WHITE,
     );
+    ui.painter().text(
+        Pos2::new(head.center().x, head.top() + 108.0),
+        Align2::CENTER_CENTER,
+        "Клиент Telegram на Rust: данные только на серверах Telegram",
+        FontId::proportional(11.0),
+        SUBTEXT,
+    );
+    divider(ui);
+    section(ui, "Категории");
+    let mut go = None;
+    for (icon, name, p) in [
+        ("♡", "AyuGram", page::AYU),
+        ("⚑", "Фильтры", page::FILTERS),
+        ("▦", "Общие", page::GENERAL),
+        ("◐", "Внешний вид", page::APPEARANCE),
+        ("💬", "Чаты", page::CHATS),
+        ("☆", "Прочее", page::OTHER),
+    ] {
+        if nav_row(ui, icon, name, "") {
+            go = Some(p);
+        }
+    }
+    ui.add_space(8.0);
+    go
 }
 
-fn saving_tab(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
-    let a = &mut s.ayu;
-    check(ui, &mut a.save_deleted_messages, "Сохранять удалённые сообщения");
-    check(ui, &mut a.save_messages_history, "Сохранять историю правок");
-    check(ui, &mut a.save_for_bots, "Сохранять и в чатах с ботами");
-    check(ui, &mut a.semi_transparent_deleted_messages, "Удалённые — полупрозрачные");
+fn ghost_counter(s: &Settings) -> usize {
+    let g = &s.ghost;
+    [
+        !g.send_read_messages,
+        !g.send_read_stories,
+        !g.send_online_packets,
+        !g.send_upload_progress,
+        g.send_offline_after_online,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count()
+}
+
+fn ayu_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
+    section(ui, "Основы призрака");
+    let n = ghost_counter(s);
+    let mut master = s.ghost.active;
+    let open = *expanded & 1 != 0;
+    // Строка «Режим призрака n/5 ⌄»: клик по подписи раскрывает список, по переключателю — вкл/выкл.
+    if toggle_ex(ui, "Режим призрака", Some((n, 5, open)), false, &mut master) {
+        if ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x < ui.min_rect().right() - 80.0) {
+            *expanded ^= 1;
+        } else {
+            s.ghost.set_active(master);
+        }
+    }
+    if *expanded & 1 != 0 {
+        let g = &mut s.ghost;
+        let mut v = !g.send_read_messages;
+        if sub_toggle(ui, "Не отправлять «прочитано»", &mut v) {
+            g.send_read_messages = !v;
+        }
+        let mut v = !g.send_read_stories;
+        if sub_toggle(ui, "Не отправлять просмотры историй", &mut v) {
+            g.send_read_stories = !v;
+        }
+        let mut v = !g.send_online_packets;
+        if sub_toggle(ui, "Не отправлять «в сети»", &mut v) {
+            g.send_online_packets = !v;
+        }
+        let mut v = !g.send_upload_progress;
+        if sub_toggle(ui, "Не отправлять «печатает…»", &mut v) {
+            g.send_upload_progress = !v;
+        }
+        sub_toggle(ui, "Сразу «не в сети»", &mut g.send_offline_after_online);
+    }
+    toggle(ui, "Прочитывать при действии", &mut s.ghost.mark_read_after_action);
+    desc(ui, "Автоматически отмечает сообщения прочитанными, когда вы отправляете новое или ставите реакцию.");
+    toggle(ui, "Отложенные сообщения", &mut s.ghost.use_scheduled_messages);
+    desc(ui, "Исходящие отправляются отложенно (примерно через 12 секунд, медиа — дольше). Вы не будете в сети. Не используйте в ненадёжных сетях.");
+    let label = match s.ghost.send_without_sound {
+        SendWithoutSound::Never => "Никогда",
+        SendWithoutSound::InGhostMode => "В режиме призрака",
+        SendWithoutSound::Always => "Всегда",
+    };
+    if value_row(ui, "Отправка без звука", label, false) {
+        s.ghost.send_without_sound = match s.ghost.send_without_sound {
+            SendWithoutSound::Never => SendWithoutSound::InGhostMode,
+            SendWithoutSound::InGhostMode => SendWithoutSound::Always,
+            SendWithoutSound::Always => SendWithoutSound::Never,
+        };
+    }
+    desc(ui, "Исходящие сообщения по умолчанию уходят без звука.");
+    toggle(
+        ui,
+        "Предупреждение об историях",
+        &mut s.ayu.suggest_ghost_mode_before_viewing_story,
+    );
+    desc(ui, "Показывает предупреждение перед открытием истории с предложением включить режим призрака.");
+    section(ui, "Шпионская часть");
+    toggle(ui, "Сохранять удалённые сообщения", &mut s.ayu.save_deleted_messages);
+    toggle(ui, "Сохранять историю правок", &mut s.ayu.save_messages_history);
+    divider(ui);
+    toggle(ui, "Сохранять в чатах с ботами", &mut s.ayu.save_for_bots);
+    divider(ui);
+    section(ui, "Прочее");
+    toggle(ui, "Локальный Telegram Premium", &mut s.ayu.local_premium);
+    toggle(ui, "Отключить рекламу", &mut s.ayu.disable_ads);
+    ui.add_space(8.0);
+}
+
+fn filters_page(ui: &mut egui::Ui, s: &mut Settings) -> Option<usize> {
+    section(ui, "Фильтры сообщений");
+    toggle(ui, "Включить фильтры", &mut s.ayu.filters_enabled);
+    toggle(ui, "Общие фильтры в чатах", &mut s.ayu.filters_enabled_in_chats);
+    toggle(ui, "Скрывать заблокированных", &mut s.ayu.hide_from_blocked);
+    divider(ui);
+    let mut go = None;
+    if nav_row(ui, "", "Общие фильтры", "") {
+        go = Some(page::SHARED);
+    }
+    if nav_row(ui, "", "Теневой бан", "") {
+        go = Some(page::SHADOW);
+    }
+    ui.add_space(8.0);
+    go
+}
+
+fn shared_page(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
+    section(ui, "Правила");
     ui.horizontal(|ui| {
-        ui.label("Метка удалённого");
-        ui.add(egui::TextEdit::singleline(&mut a.deleted_mark).desired_width(60.0));
-    });
-    ui.horizontal(|ui| {
-        ui.label("Метка изменённого");
-        ui.add(egui::TextEdit::singleline(&mut a.edited_mark).hint_text("изм.").desired_width(60.0));
-    });
-    ui.separator();
-    check(ui, &mut a.filters_enabled, "Фильтры сообщений включены");
-    check(ui, &mut a.filters_enabled_in_chats, "Применять фильтры и в списке чатов");
-    check(ui, &mut a.hide_from_blocked, "Скрывать сообщения заблокированных");
-    check(ui, &mut a.filter_zalgo, "Чистить «зальго» (нагромождение диакритики)");
-    ui.separator();
-    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
         ui.add(
             egui::TextEdit::singleline(new_filter)
                 .hint_text("Текст или регулярное выражение")
-                .desired_width(280.0),
+                .desired_width(220.0),
         );
         let t = new_filter.trim().to_owned();
         if ui.button("Добавить").clicked() && !t.is_empty() {
@@ -203,14 +506,15 @@ fn saving_tab(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
             s.ayu.filters_enabled = true;
         }
     });
+    ui.add_space(6.0);
     let mut remove = None;
     for (i, f) in s.filters.iter_mut().enumerate() {
+        toggle(ui, &f.text.chars().take(28).collect::<String>(), &mut f.enabled);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut f.enabled, "");
-            ui.label(RichText::new(&f.text).monospace());
+            ui.add_space(kit::PAD);
             ui.checkbox(&mut f.is_regex, "regex");
             ui.checkbox(&mut f.case_sensitive, "Aa");
-            if ui.small_button("✕").clicked() {
+            if ui.small_button("Удалить").clicked() {
                 remove = Some(i);
             }
         });
@@ -218,144 +522,330 @@ fn saving_tab(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
     if let Some(i) = remove {
         s.filters.remove(i);
     }
+    if s.filters.is_empty() {
+        desc(ui, "Правил пока нет. Сообщения, подходящие под правило, скрываются в ленте.");
+    }
 }
 
-fn look_tab(ui: &mut egui::Ui, s: &mut Settings) {
-    let a = &mut s.ayu;
-    ui.add(egui::Slider::new(&mut a.message_bubble_radius, 0..=20).text("Радиус пузырей"));
-    ui.add(egui::Slider::new(&mut a.wide_multiplier_pct, 50..=200).text("Ширина пузырей, %"));
-    ui.add(egui::Slider::new(&mut a.avatar_corners, 0..=23).text("Скругление аватарок"));
-    check(ui, &mut a.single_corner_radius, "Один радиус для всех углов пузыря");
-    check(ui, &mut a.remove_message_tail, "Убрать «хвостик» пузыря");
-    check(ui, &mut a.show_background, "Показывать фон чата");
-    check(ui, &mut a.disable_custom_backgrounds, "Игнорировать фоны, заданные в чатах");
-    check(ui, &mut a.show_header_decorations, "Украшения шапки");
-    check(ui, &mut a.show_colorful_replies, "Цветные ответы");
-    check(ui, &mut a.simple_quotes_and_replies, "Простые цитаты и ответы");
-    check(ui, &mut a.replace_bottom_info_with_icons, "Значки вместо текста внизу пузыря");
-    check(ui, &mut a.show_message_seconds, "Секунды во времени сообщения");
-    check(ui, &mut a.show_date, "Дата в пузыре");
-    check(ui, &mut a.show_reactions, "Панель реакций у сообщений");
-    check(ui, &mut a.reveal_spoilers, "Раскрывать спойлеры по наведению");
-    check(ui, &mut a.material_switches, "Переключатели в стиле Material");
-    check(ui, &mut a.adaptive_cover_color, "Адаптивный цвет обложки профиля");
-    check(ui, &mut a.improve_link_previews, "Улучшенные превью ссылок");
+fn shadow_page(ui: &mut egui::Ui, s: &mut Settings, new_id: &mut String) {
+    section(ui, "Скрытые пользователи");
     ui.horizontal(|ui| {
-        ui.label("Моноширинный шрифт");
-        ui.add(egui::TextEdit::singleline(&mut a.mono_font).hint_text("по умолчанию").desired_width(180.0));
+        ui.add_space(kit::PAD);
+        ui.add(
+            egui::TextEdit::singleline(new_id)
+                .hint_text("ID пользователя")
+                .desired_width(200.0),
+        );
+        if ui.button("Добавить").clicked()
+            && let Ok(id) = new_id.trim().parse::<i64>()
+            && !s.ayu.shadow_ban_ids.contains(&id)
+        {
+            s.ayu.shadow_ban_ids.push(id);
+            new_id.clear();
+        }
     });
-    ui.horizontal(|ui| {
-        ui.label("Идентификатор чата");
-        egui::ComboBox::from_id_salt("peerid")
-            .selected_text(match a.show_peer_id {
-                PeerIdDisplay::Hidden => "не показывать",
-                PeerIdDisplay::BotApi => "Bot API",
-                PeerIdDisplay::Telegram => "Telegram",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut a.show_peer_id, PeerIdDisplay::Hidden, "не показывать");
-                ui.selectable_value(&mut a.show_peer_id, PeerIdDisplay::BotApi, "Bot API");
-                ui.selectable_value(&mut a.show_peer_id, PeerIdDisplay::Telegram, "Telegram");
-            });
-    });
+    ui.add_space(6.0);
+    let mut remove = None;
+    for (i, id) in s.ayu.shadow_ban_ids.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            ui.label(RichText::new(id.to_string()).color(WHITE));
+            if ui.small_button("Убрать").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        s.ayu.shadow_ban_ids.remove(i);
+    }
+    desc(ui, "Сообщения этих пользователей не показываются в ленте. Идентификатор виден в «Сведениях» сообщения.");
 }
 
-fn chats_tab(ui: &mut egui::Ui, s: &mut Settings) {
+fn general_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
+    section(ui, "Перевод сообщений");
+    value_row(ui, "Переводчик", "Telegram", true);
+    divider(ui);
+    section(ui, "Общие");
     let a = &mut s.ayu;
-    ui.label(RichText::new("Контекстное меню сообщения").strong());
-    menu_choice(ui, &mut a.menu_reactions_panel, "Панель реакций");
-    menu_choice(ui, &mut a.menu_views_panel, "Просмотры");
-    menu_choice(ui, &mut a.menu_hide_message, "Скрыть сообщение");
-    menu_choice(ui, &mut a.menu_user_messages, "Сообщения пользователя");
-    menu_choice(ui, &mut a.menu_message_details, "Сведения о сообщении");
-    menu_choice(ui, &mut a.menu_repeat_message, "Повторить сообщение");
-    menu_choice(ui, &mut a.menu_add_filter, "Добавить в фильтры");
-    ui.separator();
-    ui.label(RichText::new("Главное меню").strong());
-    check(ui, &mut a.drawer_my_profile, "Мой профиль");
-    check(ui, &mut a.drawer_bots, "Боты");
-    check(ui, &mut a.drawer_new_group, "Новая группа");
-    check(ui, &mut a.drawer_new_channel, "Новый канал");
-    check(ui, &mut a.drawer_contacts, "Контакты");
-    check(ui, &mut a.drawer_calls, "Звонки");
-    check(ui, &mut a.drawer_saved_messages, "Избранное");
-    check(ui, &mut a.drawer_ghost_toggle, "Переключатель режима призрака");
-    check(ui, &mut a.drawer_s_read_toggle, "Переключатели сохранения");
-    check(ui, &mut a.drawer_l_read_toggle, "Переключатель «Не читать»");
-    check(ui, &mut a.drawer_night_mode_toggle, "Ночная тема");
-    check(ui, &mut a.drawer_streamer_toggle, "Режим стримера");
-    ui.separator();
-    ui.label(RichText::new("Каналы и группы").strong());
-    check(ui, &mut a.show_channel_reactions, "Реакции в каналах");
-    check(ui, &mut a.show_group_reactions, "Реакции в группах");
-    check(ui, &mut a.show_private_chat_reactions, "Реакции в личных чатах");
-    check(ui, &mut a.collapse_similar_channels, "Сворачивать похожие каналы");
-    check(ui, &mut a.hide_similar_channels, "Скрывать похожие каналы");
-    check(ui, &mut a.quick_admin_shortcuts, "Быстрые действия администратора");
-    ui.horizontal(|ui| {
-        ui.label("Нижняя кнопка канала");
-        egui::ComboBox::from_id_salt("chbtn")
-            .selected_text(match a.channel_bottom_button {
-                ChannelBottomButton::Hidden => "нет",
-                ChannelBottomButton::Mute => "без звука",
-                ChannelBottomButton::Discuss => "обсуждение",
-                ChannelBottomButton::DiscussWithFallback => "обсуждение или звук",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut a.channel_bottom_button, ChannelBottomButton::Hidden, "нет");
-                ui.selectable_value(&mut a.channel_bottom_button, ChannelBottomButton::Mute, "без звука");
-                ui.selectable_value(&mut a.channel_bottom_button, ChannelBottomButton::Discuss, "обсуждение");
-                ui.selectable_value(
-                    &mut a.channel_bottom_button,
-                    ChannelBottomButton::DiscussWithFallback,
-                    "обсуждение или звук",
-                );
-            });
-    });
+    toggle(ui, "Отключить истории", &mut a.disable_stories);
+    toggle(ui, "Не предупреждать об открытии ссылок", &mut a.disable_open_link_warning);
+    let n = usize::from(a.collapse_similar_channels) + usize::from(a.hide_similar_channels);
+    let mut any = n > 0;
+    if toggle_ex(ui, "Отключить похожие каналы", Some((n, 2, *expanded & 2 != 0)), false, &mut any) {
+        if ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x < ui.min_rect().right() - 80.0) {
+            *expanded ^= 2;
+        } else {
+            a.collapse_similar_channels = any;
+            a.hide_similar_channels = any;
+        }
+    }
+    if *expanded & 2 != 0 {
+        sub_toggle(ui, "Сворачивать", &mut a.collapse_similar_channels);
+        sub_toggle(ui, "Скрывать", &mut a.hide_similar_channels);
+    }
+    toggle(ui, "Отключить задержку уведомлений", &mut a.disable_notifications_delay);
+    divider(ui);
+    toggle_ex(ui, "Чистка «зальго»", None, true, &mut a.filter_zalgo);
+    toggle(ui, "Улучшенные превью ссылок", &mut a.improve_link_previews);
+    let n = [a.sticker_confirmation, a.gif_confirmation, a.voice_confirmation, a.round_confirmation]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    let mut any = n > 0;
+    if toggle_ex(ui, "Подтверждение отправки", Some((n, 4, *expanded & 4 != 0)), false, &mut any) {
+        if ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x < ui.min_rect().right() - 80.0) {
+            *expanded ^= 4;
+        } else {
+            a.sticker_confirmation = any;
+            a.gif_confirmation = any;
+            a.voice_confirmation = any;
+            a.round_confirmation = any;
+        }
+    }
+    if *expanded & 4 != 0 {
+        sub_toggle(ui, "Стикеры", &mut a.sticker_confirmation);
+        sub_toggle(ui, "GIF", &mut a.gif_confirmation);
+        sub_toggle(ui, "Голосовые", &mut a.voice_confirmation);
+        sub_toggle(ui, "Видеокружки", &mut a.round_confirmation);
+    }
+    toggle(ui, "Секунды во времени сообщения", &mut a.show_message_seconds);
+    let id = match a.show_peer_id {
+        PeerIdDisplay::Hidden => "Скрыт",
+        PeerIdDisplay::BotApi => "Bot API",
+        PeerIdDisplay::Telegram => "Telegram",
+    };
+    if value_row(ui, "Показывать ID", id, false) {
+        a.show_peer_id = match a.show_peer_id {
+            PeerIdDisplay::Hidden => PeerIdDisplay::BotApi,
+            PeerIdDisplay::BotApi => PeerIdDisplay::Telegram,
+            PeerIdDisplay::Telegram => PeerIdDisplay::Hidden,
+        };
+    }
+    divider(ui);
+    section(ui, "Веб-приложения");
+    toggle(ui, "Представляться Android", &mut a.spoof_webview_as_android);
+    let n = usize::from(a.increase_webview_height) + usize::from(a.increase_webview_width);
+    let mut any = n > 0;
+    if toggle_ex(ui, "Большое окно", Some((n, 2, *expanded & 8 != 0)), false, &mut any) {
+        if ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x < ui.min_rect().right() - 80.0) {
+            *expanded ^= 8;
+        } else {
+            a.increase_webview_height = any;
+            a.increase_webview_width = any;
+        }
+    }
+    if *expanded & 8 != 0 {
+        sub_toggle(ui, "Выше", &mut a.increase_webview_height);
+        sub_toggle(ui, "Шире", &mut a.increase_webview_width);
+    }
+    ui.add_space(8.0);
 }
 
-fn field_tab(ui: &mut egui::Ui, s: &mut Settings) {
+fn appearance_page(ui: &mut egui::Ui, s: &mut Settings) {
     let a = &mut s.ayu;
-    ui.label(RichText::new("Кнопки поля ввода").strong());
-    check(ui, &mut a.field_attach_button, "Скрепка");
-    check(ui, &mut a.field_commands_button, "Команды бота");
-    check(ui, &mut a.field_emoji_button, "Эмодзи");
-    check(ui, &mut a.field_microphone_button, "Микрофон");
-    check(ui, &mut a.field_auto_delete_button, "Автоудаление");
-    check(ui, &mut a.field_gift_button, "Подарок");
-    check(ui, &mut a.field_ai_editor_button, "ИИ-редактор");
-    check(ui, &mut a.show_attach_popup, "Всплывающее меню скрепки");
-    check(ui, &mut a.show_emoji_popup, "Всплывающая панель эмодзи");
-    ui.separator();
-    ui.label(RichText::new("Подтверждать перед отправкой").strong());
-    check(ui, &mut a.sticker_confirmation, "Стикеры");
-    check(ui, &mut a.gif_confirmation, "GIF");
-    check(ui, &mut a.voice_confirmation, "Голосовые");
-    check(ui, &mut a.round_confirmation, "Видеокружки");
+    section(ui, "Значок приложения");
+    // Сетка 4×3 кружков; цвета повторяют набор оригинала.
+    let palette = [
+        0x3a3260, 0x8f6af0, 0x5865f2, 0x14150f, 0xd9423f, 0xf4f4f4, 0xf4f4f4, 0xf6f0f4, 0x1f8f86, 0x2a2840,
+        0x6a4fb0, 0xd7332f,
+    ];
+    let cur: usize = a.app_icon.parse().unwrap_or(0);
+    let w = ui.available_width();
+    for row in 0..3 {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 64.0), Sense::hover());
+        for col in 0..4 {
+            let i = row * 4 + col;
+            let c = Pos2::new(rect.left() + w * (col as f32 + 0.5) / 4.0, rect.center().y);
+            let r = Rect::from_center_size(c, Vec2::splat(52.0));
+            let resp = ui.interact(r, ui.make_persistent_id(("icon", i)), Sense::click());
+            if cur == i {
+                ui.painter().rect_filled(r, CornerRadius::same(8), WINDOW_OVER);
+            }
+            ui.painter().circle_filled(c, 20.0, navy(palette[i]));
+            icons::logo(ui.painter(), c, 13.0, Color32::WHITE);
+            if resp.clicked() {
+                a.app_icon = i.to_string();
+            }
+        }
+    }
+    divider(ui);
+    toggle(ui, "Скрыть значок уведомлений", &mut a.hide_notification_badge);
+    desc(ui, "Скрывает счётчик на значке приложения в панели задач и в трее.");
+    let corners = if a.avatar_corners >= 23 { "КРУГ" } else { "СКРУГЛЕНИЕ" };
+    section(ui, &format!("Скругление аватарок  [{corners}]"));
+    let mut v = a.avatar_corners;
+    if slider(ui, "", &mut v, (0, 23), String::new()) {
+        a.avatar_corners = v;
+    }
+    toggle(ui, "Один радиус для всех форм", &mut a.single_corner_radius);
+    desc(ui, "Форумы получат ту же форму аватарок, что и чаты.");
+    section(ui, "Оформление");
+    toggle(ui, "Переключатели MD3", &mut a.material_switches);
+    toggle(ui, "Отключить фоны чатов", &mut a.disable_custom_backgrounds);
+    toggle(ui, "Скрыть статусы Premium", &mut a.hide_premium_statuses);
+    let font = if a.mono_font.is_empty() { "По умолчанию".to_owned() } else { a.mono_font.clone() };
+    if value_row(ui, "Моноширинный шрифт", &font, false) {
+        a.mono_font = if a.mono_font.is_empty() { "Consolas".to_owned() } else { String::new() };
+    }
+    divider(ui);
+    section(ui, "Папки чатов");
+    toggle(ui, "Скрыть счётчики уведомлений", &mut a.hide_notification_counters);
+    toggle(ui, "Скрыть вкладку «Все чаты»", &mut a.hide_all_chats_folder);
+    divider(ui);
+    section(ui, "Элементы трея");
+    toggle(ui, "Режим призрака", &mut a.tray_ghost_toggle);
+    toggle(ui, "Режим стримера", &mut a.tray_streamer_toggle);
+    divider(ui);
+    section(ui, "Элементы меню");
+    toggle(ui, "Мой профиль", &mut a.drawer_my_profile);
+    toggle(ui, "Боты", &mut a.drawer_bots);
+    toggle(ui, "Новая группа", &mut a.drawer_new_group);
+    toggle(ui, "Новый канал", &mut a.drawer_new_channel);
+    toggle(ui, "Контакты", &mut a.drawer_contacts);
+    toggle(ui, "Звонки", &mut a.drawer_calls);
+    toggle(ui, "Избранное", &mut a.drawer_saved_messages);
+    toggle(ui, "Прочитать на сервере", &mut a.drawer_l_read_toggle);
+    toggle(ui, "Секретное чтение", &mut a.drawer_s_read_toggle);
+    toggle(ui, "Ночной режим", &mut a.drawer_night_mode_toggle);
+    toggle(ui, "Режим призрака", &mut a.drawer_ghost_toggle);
+    toggle(ui, "Режим стримера", &mut a.drawer_streamer_toggle);
+    ui.add_space(8.0);
 }
 
-fn other_tab(ui: &mut egui::Ui, s: &mut Settings) {
+fn chats_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     let a = &mut s.ayu;
-    check(ui, &mut a.disable_ads, "Отключить рекламу");
-    check(ui, &mut a.disable_stories, "Отключить истории");
-    check(ui, &mut a.hide_premium_statuses, "Скрывать статусы Premium");
-    check(ui, &mut a.local_premium, "Локальный Premium (только интерфейс)");
-    check(ui, &mut a.show_only_added_emojis_and_stickers, "Только добавленные эмодзи и стикеры");
-    check(ui, &mut a.unlimited_recent_stickers, "Неограниченные недавние стикеры");
-    check(ui, &mut a.disable_greeting_sticker, "Без стикера-приветствия");
-    check(ui, &mut a.hide_fast_share, "Скрыть быструю пересылку");
-    check(ui, &mut a.hide_notification_counters, "Скрыть счётчики уведомлений");
-    check(ui, &mut a.hide_notification_badge, "Скрыть значок уведомлений");
-    check(ui, &mut a.hide_all_chats_folder, "Скрыть папку «Все чаты»");
-    check(ui, &mut a.disable_notifications_delay, "Без задержки уведомлений");
-    check(ui, &mut a.disable_open_link_warning, "Не предупреждать об открытии ссылок");
-    check(ui, &mut a.show_message_shot, "Снимок сообщения");
-    check(ui, &mut a.streamer_mode, "Режим стримера");
-    ui.separator();
-    ui.label(RichText::new("Веб-приложения").strong());
-    check(ui, &mut a.spoof_webview_as_android, "Представляться Android");
-    check(ui, &mut a.increase_webview_height, "Увеличить высоту");
-    check(ui, &mut a.increase_webview_width, "Увеличить ширину");
-    ui.separator();
-    ui.weak("Отправка отчётов о сбоях и обновления из интернета в Rustgramm отсутствуют.");
+    section(ui, "Стикеры и эмодзи");
+    toggle(ui, "Только добавленные эмодзи и стикеры", &mut a.show_only_added_emojis_and_stickers);
+    toggle(ui, "Неограниченные недавние стикеры", &mut a.unlimited_recent_stickers);
+    let hidden = [!a.show_channel_reactions, !a.show_group_reactions, !a.show_private_chat_reactions];
+    let n = hidden.iter().filter(|b| **b).count();
+    let mut any = n > 0;
+    if toggle_ex(ui, "Скрыть реакции", Some((n, 3, *expanded & 16 != 0)), false, &mut any) {
+        if ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x < ui.min_rect().right() - 80.0) {
+            *expanded ^= 16;
+        } else {
+            a.show_channel_reactions = !any;
+            a.show_group_reactions = !any;
+            a.show_private_chat_reactions = !any;
+        }
+    }
+    if *expanded & 16 != 0 {
+        let mut v = !a.show_channel_reactions;
+        if sub_toggle(ui, "В каналах", &mut v) {
+            a.show_channel_reactions = !v;
+        }
+        let mut v = !a.show_group_reactions;
+        if sub_toggle(ui, "В группах", &mut v) {
+            a.show_group_reactions = !v;
+        }
+        let mut v = !a.show_private_chat_reactions;
+        if sub_toggle(ui, "В личных чатах", &mut v) {
+            a.show_private_chat_reactions = !v;
+        }
+    }
+    divider(ui);
+    section(ui, "Группы и каналы");
+    let btn = match a.channel_bottom_button {
+        ChannelBottomButton::Hidden => "Скрыта",
+        ChannelBottomButton::Mute => "Без звука",
+        ChannelBottomButton::Discuss => "Обсудить",
+        ChannelBottomButton::DiscussWithFallback => "Обсудить",
+    };
+    if value_row(ui, "Нижняя кнопка канала", btn, false) {
+        a.channel_bottom_button = match a.channel_bottom_button {
+            ChannelBottomButton::Hidden => ChannelBottomButton::Mute,
+            ChannelBottomButton::Mute => ChannelBottomButton::Discuss,
+            ChannelBottomButton::Discuss => ChannelBottomButton::DiscussWithFallback,
+            ChannelBottomButton::DiscussWithFallback => ChannelBottomButton::Hidden,
+        };
+    }
+    toggle(ui, "Быстрые действия администратора", &mut a.quick_admin_shortcuts);
+    toggle(ui, "Отключить стикер-приветствие", &mut a.disable_greeting_sticker);
+    toggle(ui, "Снимок сообщения", &mut a.show_message_shot);
+    desc(ui, "Позволяет сделать снимок выбранных сообщений.");
+    divider(ui);
+    section(ui, "Сообщения");
+    toggle(ui, "Значки вместо текста", &mut a.replace_bottom_info_with_icons);
+    toggle(ui, "Убрать хвостик пузыря", &mut a.remove_message_tail);
+    toggle(ui, "Скрыть боковую кнопку «Поделиться»", &mut a.hide_fast_share);
+    let mut plain = !a.show_colorful_replies;
+    if toggle(ui, "Отключить цветные ответы", &mut plain) {
+        a.show_colorful_replies = !plain;
+    }
+    toggle_ex(ui, "Полупрозрачные удалённые", None, true, &mut a.semi_transparent_deleted_messages);
+    divider(ui);
+    let mut r = a.message_bubble_radius;
+    let shown = r.to_string();
+    if slider(ui, "Радиус пузыря", &mut r, (0, 20), shown) {
+        a.message_bubble_radius = r;
+    }
+    divider(ui);
+    let mut m = a.wide_multiplier_pct;
+    let shown = format!("{:.2}", f64::from(m) / 100.0);
+    if slider(ui, "Множитель ширины сообщений", &mut m, (50, 200), shown) {
+        a.wide_multiplier_pct = m;
+    }
+    desc(ui, "Ширину сообщений можно изменить для удобства на широких мониторах.");
+    section(ui, "Контекстное меню");
+    for (label, v) in [
+        ("Панель реакций", &mut a.menu_reactions_panel),
+        ("Просмотры", &mut a.menu_views_panel),
+        ("Скрыть", &mut a.menu_hide_message),
+        ("Сообщения пользователя", &mut a.menu_user_messages),
+        ("Сведения", &mut a.menu_message_details),
+        ("Повторить", &mut a.menu_repeat_message),
+        ("Добавить в фильтры", &mut a.menu_add_filter),
+    ] {
+        if value_row(ui, label, menu_value(*v), false) {
+            *v = next_menu(*v);
+        }
+    }
+    divider(ui);
+    section(ui, "Поле ввода");
+    toggle(ui, "Скрепка", &mut a.field_attach_button);
+    toggle(ui, "Команды", &mut a.field_commands_button);
+    toggle(ui, "Эмодзи", &mut a.field_emoji_button);
+    toggle(ui, "Микрофон", &mut a.field_microphone_button);
+    toggle(ui, "Автоудаление", &mut a.field_auto_delete_button);
+    toggle(ui, "Подарок", &mut a.field_gift_button);
+    toggle(ui, "ИИ-редактор", &mut a.field_ai_editor_button);
+    toggle(ui, "Всплывающее меню скрепки", &mut a.show_attach_popup);
+    toggle(ui, "Всплывающая панель эмодзи", &mut a.show_emoji_popup);
+    ui.add_space(8.0);
+}
+
+/// Страница «Прочее». Возвращает `true`, если нажато «Сбросить настройки».
+fn other_page(ui: &mut egui::Ui) -> bool {
+    section(ui, "Прочее");
+    let mut reset = false;
+    if nav_row(ui, "🔗", "Зарегистрировать tg:// ссылки", "") {
+        register_url_scheme(ui.ctx());
+    }
+    if nav_row(ui, "↺", "Сбросить настройки", "") {
+        reset = true;
+    }
+    desc(ui, "Отчёты о сбоях, проверка обновлений и любая телеметрия в Rustgramm отсутствуют: соединения идут только на серверы Telegram.");
+    reset
+}
+
+/// Регистрирует Rustgramm обработчиком ссылок `tg://` для текущего пользователя.
+fn register_url_scheme(ctx: &egui::Context) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(exe) = std::env::current_exe() {
+            let exe = exe.to_string_lossy().into_owned();
+            let run = |args: &[&str]| {
+                let _ = std::process::Command::new("reg")
+                    .args(args)
+                    .creation_flags(0x0800_0000)
+                    .status();
+            };
+            run(&["add", r"HKCU\Software\Classes\tg", "/ve", "/d", "URL:Telegram Link", "/f"]);
+            run(&["add", r"HKCU\Software\Classes\tg", "/v", "URL Protocol", "/d", "", "/f"]);
+            let cmd = format!("\"{exe}\" \"%1\"");
+            run(&["add", r"HKCU\Software\Classes\tg\shell\open\command", "/ve", "/d", &cmd, "/f"]);
+        }
+    }
+    ctx.request_repaint();
 }

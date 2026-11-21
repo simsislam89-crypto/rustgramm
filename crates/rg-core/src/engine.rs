@@ -31,6 +31,8 @@ pub struct DialogRow {
     pub unread: i32,
     pub pinned: bool,
     pub muted: bool,
+    /// Чат с самим собой (Избранное).
+    pub saved: bool,
 }
 
 /// Сообщение для интерфейса.
@@ -55,6 +57,8 @@ pub struct MessageRow {
     pub views: Option<i32>,
     /// Число реакций.
     pub reactions: i32,
+    /// Отправитель (формат Bot API), 0 если неизвестен.
+    pub sender_id: i64,
 }
 
 impl MessageRow {
@@ -75,6 +79,7 @@ impl MessageRow {
             edit_date: None,
             views: None,
             reactions: 0,
+            sender_id: 0,
         }
     }
 }
@@ -149,6 +154,11 @@ impl Engine {
         Ok(true)
     }
 
+    /// «Прочитать на сервере»: отметка о прочтении отправляется всегда, даже в режиме призрака.
+    pub async fn force_read(&self, peer: PeerRef) -> Result<(), grammers_client::InvocationError> {
+        self.client.mark_as_read(peer).await
+    }
+
     pub async fn dialogs(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
         let mut it = self.client.iter_dialogs();
         let now = std::time::SystemTime::now()
@@ -178,6 +188,7 @@ impl Engine {
                 unread,
                 pinned,
                 muted,
+                saved: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.is_self()),
             });
         }
         Ok(out)
@@ -231,6 +242,9 @@ impl Engine {
                 rows.retain(|r| !set.hides(key, &r.text));
             }
         }
+        if !cfg.ayu.shadow_ban_ids.is_empty() {
+            rows.retain(|r| !cfg.ayu.shadow_ban_ids.contains(&r.sender_id));
+        }
         if cfg.ayu.filter_zalgo {
             for r in &mut rows {
                 r.text = rg_ayu::filters::strip_zalgo(&r.text);
@@ -277,6 +291,9 @@ impl Engine {
             edit_date: m.edit_date().map(|d| d.as_second()),
             views: m.view_count(),
             reactions: m.reaction_count().unwrap_or(0),
+            sender_id: m
+                .sender_id()
+                .map_or(0, |p| p.bot_api_dialog_id_unchecked()),
         }
     }
 

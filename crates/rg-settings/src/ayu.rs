@@ -198,6 +198,8 @@ pub struct AyuSettings {
     pub use_global_ghost_mode: bool,
     pub suggest_ghost_mode_before_viewing_story: bool,
     pub app_icon: String,
+    /// Пользователи, чьи сообщения скрыты (Shadow Ban), идентификаторы Bot API.
+    pub shadow_ban_ids: Vec<i64>,
 }
 
 impl Default for AyuSettings {
@@ -295,6 +297,7 @@ impl Default for AyuSettings {
             use_global_ghost_mode: yes(),
             suggest_ghost_mode_before_viewing_story: yes(),
             app_icon: String::new(),
+            shadow_ban_ids: Vec::new(),
         }
     }
 }

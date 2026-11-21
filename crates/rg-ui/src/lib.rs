@@ -4,6 +4,7 @@
 mod chat;
 pub mod emoji;
 pub mod icons;
+mod kit;
 mod settings_ui;
 pub mod theme;
 pub mod worker;
@@ -62,6 +63,10 @@ struct App {
     settings_open: bool,
     settings_tab: usize,
     filter_new: String,
+    drawer_open: bool,
+    shadow_new: String,
+    /// Раскрытые строки со счётчиком «n/m» (битовая маска).
+    expanded: u32,
     older_pending: bool,
     history_end: bool,
     scroll_to: Option<i32>,
@@ -139,6 +144,9 @@ impl App {
             settings_open: false,
             settings_tab: 0,
             filter_new: String::new(),
+            drawer_open: false,
+            shadow_new: String::new(),
+            expanded: 0,
             older_pending: false,
             history_end: false,
             scroll_to: None,
@@ -163,6 +171,13 @@ impl App {
                 let _ = self.cmd.send(Cmd::Preview(idx, id));
             }
         }
+    }
+
+    /// Открыть чат из списка.
+    fn open_dialog(&mut self, i: usize) {
+        self.reset_chat_state();
+        self.selected = Some(i);
+        self.send(Cmd::Open(i));
     }
 
     /// Закрыть открытый чат и сбросить состояние ленты.
@@ -453,7 +468,9 @@ impl App {
                 ui.painter().circle_filled(rect.center(), 20.0, WINDOW_OVER);
             }
             icons::menu(ui.painter(), rect.center(), DIALOG_DATE);
-            self.main_menu(&resp);
+            if resp.clicked() {
+                self.drawer_open = true;
+            }
             let w = ui.available_width() - 8.0;
             let (srect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
             ui.painter()
@@ -570,9 +587,7 @@ impl App {
             }
         });
         if let Some(i) = open {
-            self.reset_chat_state();
-            self.selected = Some(i);
-            self.send(Cmd::Open(i));
+            self.open_dialog(i);
         }
     }
 }
@@ -648,6 +663,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.messages_ui(ui));
         self.emoji_window(&ctx);
         self.chat_windows(&ctx);
+        self.drawer(&ctx);
         self.settings_window(&ctx);
     }
 }
@@ -721,6 +737,7 @@ fn demo_app(mode: &str) -> App {
             unread: *unread,
             pinned: i == 0,
             muted: *muted,
+            saved: false,
         });
     }
     app.selected = Some(0);
@@ -761,6 +778,7 @@ fn demo_app(mode: &str) -> App {
         app.settings_open = true;
         app.settings_tab = tab.parse().unwrap_or(0);
     }
+    app.drawer_open = mode == "drawer";
     app
 }
 
