@@ -84,6 +84,24 @@ pub fn set_opacity(pct: u8) {
     ALPHA.store((u16::from(pct) * 255 / 100) as u8, Ordering::Relaxed);
 }
 
+/// Единая подложка окна: рисуется один раз под всеми панелями, чтобы на стыках не было швов.
+pub const BACKDROP: Color32 = Color32::from_rgb(10, 10, 12);
+
+/// Лёгкий светлый налёт поверх подложки: панели списка, шапки, поле ввода.
+pub fn tint_panel() -> Color32 {
+    Color32::from_white_alpha(7)
+}
+
+/// Тёмный налёт ленты сообщений.
+pub fn tint_chat() -> Color32 {
+    Color32::from_black_alpha(70)
+}
+
+/// Налёт заголовка окна.
+pub fn tint_title() -> Color32 {
+    Color32::from_white_alpha(11)
+}
+
 /// Фон с учётом прозрачности окна.
 pub fn t(c: Color32) -> Color32 {
     with_alpha(c, ALPHA.load(Ordering::Relaxed))

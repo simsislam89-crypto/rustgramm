@@ -68,6 +68,27 @@ pub fn toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
     toggle_ex(ui, label, None, false, value)
 }
 
+/// Строка с переключателем и линейным значком слева (пункты левой панели).
+pub fn toggle_icon(ui: &mut egui::Ui, icon: super::icons::Ico, label: &str, value: &mut bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
+    row_bg(ui, rect, &resp);
+    let p = ui.painter();
+    super::icons::ico(p, Pos2::new(rect.left() + 30.0, rect.center().y), icon, 22.0, DIALOG_DATE);
+    p.text(
+        Pos2::new(rect.left() + 64.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(14.0),
+        WHITE,
+    );
+    switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value, label);
+    if resp.clicked() {
+        *value = !*value;
+        return true;
+    }
+    false
+}
+
 /// Строка с переключателем, бейджем BETA и счётчиком «n/m».
 pub fn toggle_ex(
     ui: &mut egui::Ui,

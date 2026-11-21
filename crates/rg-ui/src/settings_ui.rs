@@ -124,18 +124,12 @@ impl App {
                 if pr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     act = Some("prefs");
                 }
-                let item = |ui: &mut egui::Ui, icon: &str, text: &str| -> bool {
+                let item = |ui: &mut egui::Ui, icon: icons::Ico, text: &str| -> bool {
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
                     }
-                    ui.painter().text(
-                        Pos2::new(r.left() + 30.0, r.center().y),
-                        Align2::CENTER_CENTER,
-                        icon,
-                        FontId::proportional(16.0),
-                        SUBTEXT,
-                    );
+                    icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, 22.0, DIALOG_DATE);
                     ui.painter().text(
                         Pos2::new(r.left() + 64.0, r.center().y),
                         Align2::LEFT_CENTER,
@@ -145,38 +139,38 @@ impl App {
                     );
                     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 };
-                if a.drawer_my_profile && item(ui, "◯", "Мой профиль") {
+                if a.drawer_my_profile && item(ui, icons::Ico::Profile, "Мой профиль") {
                     act = Some("profile");
                 }
                 kit::divider(ui);
-                if a.drawer_new_group && item(ui, "👥", "Новая группа") {
+                if a.drawer_new_group && item(ui, icons::Ico::Group, "Новая группа") {
                     act = Some("group");
                 }
-                if a.drawer_new_channel && item(ui, "📢", "Новый канал") {
+                if a.drawer_new_channel && item(ui, icons::Ico::Channel, "Новый канал") {
                     act = Some("channel");
                 }
-                if a.drawer_contacts && item(ui, "👤", "Контакты") {
+                if a.drawer_contacts && item(ui, icons::Ico::Contacts, "Контакты") {
                     act = Some("contacts");
                 }
-                if a.drawer_calls && item(ui, "📞", "Звонки") {
+                if a.drawer_calls && item(ui, icons::Ico::Calls, "Звонки") {
                     act = Some("calls");
                 }
-                if a.drawer_saved_messages && item(ui, "🔖", "Избранное") {
+                if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
                     act = Some("saved");
                 }
-                if a.drawer_l_read_toggle && item(ui, "✉", "Прочитать на сервере") {
+                if a.drawer_l_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
                     act = Some("read");
                 }
-                if item(ui, "⚙", "Настройки") {
+                if item(ui, icons::Ico::Settings, "Настройки") {
                     act = Some("settings");
                 }
                 if a.drawer_night_mode_toggle {
                     let mut night = true;
-                    toggle(ui, "Ночной режим", &mut night);
+                    kit::toggle_icon(ui, icons::Ico::Moon, "Ночной режим", &mut night);
                 }
                 if a.drawer_ghost_toggle {
                     let mut ghost = s.ghost.active;
-                    if toggle(ui, "Режим призрака", &mut ghost) {
+                    if kit::toggle_icon(ui, icons::Ico::Ghost, "Режим призрака", &mut ghost) {
                         s.ghost.set_active(ghost);
                     }
                 }
@@ -207,6 +201,12 @@ impl App {
             Some("read") => {
                 self.drawer_open = false;
                 self.send(Cmd::ForceRead);
+            }
+            Some("contacts") => {
+                self.drawer_open = false;
+                self.contacts_open = true;
+                self.contact_search.clear();
+                self.send(Cmd::Contacts);
             }
             Some(other) => {
                 self.drawer_open = false;

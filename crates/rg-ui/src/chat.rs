@@ -256,11 +256,12 @@ impl App {
         if appear < 0.01 {
             return;
         }
-        let Some(emoji) = self.emoji.as_ref() else { return };
         let mut picked = None;
         let mut jump = self.emoji_jump.take();
+        let mut tab = self.emoji_tab;
+        let mut sacts: Vec<super::panels::StickerAct> = Vec::new();
         let screen = ctx.content_rect();
-        let size = Vec2::new(344.0_f32.min(screen.width() - 16.0), 320.0_f32.min(screen.height() - 120.0));
+        let size = Vec2::new(344.0_f32.min(screen.width() - 16.0), 340.0_f32.min(screen.height() - 120.0));
         // Панель поднимается над кнопкой с пружинистой посадкой, как лист на iPhone.
         let rise = (1.0 - spring(appear)) * 22.0;
         let pos = egui::pos2(
@@ -281,10 +282,62 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_min_size(size);
                     ui.set_max_size(size);
-                    picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
+                    // Вкладки «Эмодзи» и «Стикеры».
+                    ui.horizontal(|ui| {
+                        for (n, name) in ["Эмодзи", "Стикеры"].iter().enumerate() {
+                            let g = ui.painter().layout_no_wrap((*name).to_owned(), FontId::proportional(14.0), WHITE);
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 24.0, 30.0), Sense::click());
+                            let k = tween(ui.ctx(), ("emtab", n), f32::from(u8::from(tab == n)), 0.16);
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(14.0), lerp_color(DIALOG_TEXT, WHITE, k));
+                            ui.painter().rect_filled(
+                                Rect::from_center_size(egui::pos2(r.center().x, r.bottom() - 1.0), Vec2::new((r.width() - 16.0) * k, 2.5)),
+                                egui::CornerRadius::same(1),
+                                WHITE,
+                            );
+                            if resp.clicked() {
+                                tab = n;
+                            }
+                        }
+                    });
+                    if tab == 0 {
+                        if let Some(emoji) = self.emoji.as_ref() {
+                            picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
+                        }
+                    } else {
+                        self.sticker_tab(ui, self.emoji.as_ref(), &mut sacts);
+                    }
                 });
         });
+        self.emoji_tab = tab;
         self.emoji_jump = jump;
+        for a in sacts {
+            use super::panels::StickerAct as A;
+            match a {
+                A::LoadSets => {
+                    self.stickers_requested = true;
+                    self.send(Cmd::Stickers);
+                }
+                A::LoadSet(i) => {
+                    if let Some(id) = self.sticker_sets.get(i).map(|s| s.id) {
+                        // Пустой список-заглушка, пока идёт загрузка, чтобы не слать запрос каждый кадр.
+                        if let std::collections::hash_map::Entry::Vacant(e) = self.sticker_lists.entry(id) {
+                            e.insert(Vec::new());
+                            self.send(Cmd::StickerSet(i));
+                        }
+                    }
+                }
+                A::Thumb(id) => {
+                    if self.sticker_req.insert(id) {
+                        self.send(Cmd::StickerThumb(id));
+                    }
+                }
+                A::Send(id) => {
+                    let reply = self.reply.take().map(|(r, _)| r);
+                    self.send(Cmd::SendSticker(id, reply));
+                }
+                A::SelectSet(i) => self.sticker_cur = i,
+            }
+        }
         if let Some(c) = picked {
             self.input.push(c);
             let mut recent: String = std::iter::once(c)
@@ -359,13 +412,30 @@ impl App {
                     if searching && list.is_empty() {
                         ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(SUBTEXT)));
                     }
-                    for m in list.iter().filter(|m| !hidden.contains(&m.id)) {
+                    let visible: Vec<&MessageRow> = list.iter().filter(|m| !hidden.contains(&m.id)).collect();
+                    let mut i = 0;
+                    while i < visible.len() {
+                        let m = visible[i];
+                        // Подряд идущие сообщения одного альбома показываем одним пузырём.
+                        let mut j = i + 1;
+                        if let (Some(g), false) = (m.grouped, m.deleted) {
+                            while j < visible.len() && visible[j].grouped == Some(g) && !visible[j].deleted {
+                                j += 1;
+                            }
+                        }
+                        let album = &visible[i..j];
                         if prev_date.is_none_or(|p| !same_day(p, m.date)) {
                             day_pill(ui, env.avail, day_label(m.date, now));
                         }
                         prev_date = Some(m.date);
-                        bubble(ui, m, &env, &mut acts);
+                        if album.len() > 1 {
+                            let caption = album.iter().find(|x| !x.text.is_empty()).copied().unwrap_or(album[album.len() - 1]);
+                            bubble(ui, caption, album, &env, &mut acts);
+                        } else {
+                            bubble(ui, m, &[], &env, &mut acts);
+                        }
                         ui.add_space(4.0);
+                        i = j;
                     }
                     ui.add_space(8.0);
                 })
@@ -658,7 +728,7 @@ fn day_pill(ui: &mut egui::Ui, avail: f32, label: String) {
 }
 
 /// Один пузырь сообщения с контекстным меню.
-fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
+fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, acts: &mut Vec<Act>) {
     let s = env.s;
     let layout = if m.outgoing {
         Layout::right_to_left(Align::TOP)
@@ -707,6 +777,9 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         if m.media.is_some() {
             w = w.max(if env.tex.contains_key(&m.id) { 240.0 } else { 190.0 });
         }
+        if album.len() > 1 {
+            w = max_inner.min(310.0);
+        }
         let w = w.min(max_inner);
         let radius = egui::CornerRadius::same(s.bubble_radius());
         let bid = ui.make_persistent_id(("m", m.id));
@@ -751,7 +824,9 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                         let mark = if s.deleted_mark.is_empty() { String::new() } else { format!("{} ", s.deleted_mark) };
                         ui.label(RichText::new(format!("{mark}удалено")).color(DANGER).strong());
                     }
-                    if let Some(info) = &m.media {
+                    if album.len() > 1 {
+                        super::media_ui::album(ui, album, w, env.tex, &mut cards);
+                    } else if let Some(info) = &m.media {
                         super::media_ui::card(ui, m, info, w, env.tex.get(&m.id), text_c, date_c, &mut cards);
                     }
                     if !m.text.is_empty() && !m.entities.is_empty() {

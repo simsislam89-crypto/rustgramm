@@ -35,6 +35,18 @@ pub struct DialogRow {
     pub saved: bool,
     /// Лежит в архиве.
     pub archived: bool,
+    pub kind: DialogKind,
+    /// Собеседник есть в контактах.
+    pub contact: bool,
+}
+
+/// Тип чата для фильтров папок.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    User,
+    Bot,
+    Group,
+    Channel,
 }
 
 /// Вид форматирования фрагмента текста.
@@ -130,6 +142,8 @@ pub struct MessageRow {
     pub sender_id: i64,
     /// Форматирование текста.
     pub entities: Vec<Entity>,
+    /// Номер альбома: сообщения с одним номером показываются одним пузырём.
+    pub grouped: Option<i64>,
 }
 
 impl MessageRow {
@@ -152,6 +166,7 @@ impl MessageRow {
             reactions: 0,
             sender_id: 0,
             entities: Vec::new(),
+            grouped: None,
         }
     }
 }
@@ -258,11 +273,15 @@ impl Engine {
         for d in dialogs {
             let tl::enums::Dialog::Dialog(d) = d else { continue };
             let pid = grammers_session::types::PeerId::from(&d.peer);
+            let mut kind = DialogKind::Group;
+            let mut contact = false;
             let (name, peer) = match &d.peer {
                 tl::enums::Peer::User(u) => {
                     let Some(user) = users.iter().find(|x| matches!(x, tl::enums::User::User(y) if y.id == u.user_id)) else { continue };
                     let name = match user {
                         tl::enums::User::User(y) => {
+                            kind = if y.bot { DialogKind::Bot } else { DialogKind::User };
+                            contact = y.contact;
                             format!("{} {}", y.first_name.clone().unwrap_or_default(), y.last_name.clone().unwrap_or_default())
                                 .trim()
                                 .to_owned()
@@ -282,7 +301,12 @@ impl Engine {
                 tl::enums::Peer::Channel(c) => {
                     let Some(chat) = chats.iter().find(|x| matches!(x, tl::enums::Chat::Channel(y) if y.id == c.channel_id)) else { continue };
                     let name = match chat {
-                        tl::enums::Chat::Channel(y) => y.title.clone(),
+                        tl::enums::Chat::Channel(y) => {
+                            if y.broadcast {
+                                kind = DialogKind::Channel;
+                            }
+                            y.title.clone()
+                        }
                         _ => String::new(),
                     };
                     (name, grammers_session::types::PeerRef::from(chat))
@@ -311,6 +335,8 @@ impl Engine {
                 muted,
                 saved: false,
                 archived: true,
+                kind,
+                contact,
             });
         }
         Ok(out)
@@ -370,6 +396,7 @@ impl Engine {
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(d) = it.next().await? else { break };
+            let archived = matches!(&d.raw, grammers_client::tl::enums::Dialog::Dialog(x) if x.folder_id == Some(1));
             let (unread, pinned, muted) = match &d.raw {
                 grammers_client::tl::enums::Dialog::Dialog(x) => (
                     x.unread_count.max(i32::from(x.unread_mark)),
@@ -392,7 +419,14 @@ impl Engine {
                 pinned,
                 muted,
                 saved: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.is_self()),
-                archived: false,
+                archived,
+                kind: match d.peer() {
+                    grammers_client::peer::Peer::User(u) if u.is_bot() => DialogKind::Bot,
+                    grammers_client::peer::Peer::User(_) => DialogKind::User,
+                    grammers_client::peer::Peer::Channel(_) => DialogKind::Channel,
+                    _ => DialogKind::Group,
+                },
+                contact: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.contact()),
             });
         }
         Ok(out)
@@ -416,19 +450,34 @@ impl Engine {
     ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
         let key = peer_key(&peer);
         let mut it = self.client.iter_messages(peer).offset_id(before_id);
-        let mut rows = Vec::new();
-        while rows.len() < limit {
+        let mut msgs = Vec::new();
+        while msgs.len() < limit {
             let Some(m) = it.next().await? else { break };
-            self.remember(key, m.id(), m.text(), m.date().as_second()).await;
-            rows.push(self.row(key, &m).await);
+            msgs.push(m);
         }
+        // Правки одним запросом; запись в базу — в фоне пачкой, лента не ждёт диск.
+        let counts = self.store.edit_counts(key).await.unwrap_or_default();
+        if self.settings().ayu.save_deleted_messages {
+            let batch: Vec<(i32, String, i64)> = msgs
+                .iter()
+                .map(|m| (m.id(), m.text().to_owned(), m.date().as_second()))
+                .collect();
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                let _ = store.remember_many(key, &batch).await;
+            });
+        }
+        let mut rows: Vec<MessageRow> = msgs
+            .iter()
+            .map(|m| Self::row(key, m, counts.get(&m.id()).copied().unwrap_or(0)))
+            .collect();
         if before_id == 0 {
             // Удалённые, но сохранённые у нас, возвращаем на место по времени.
             for s in self.deleted(key).await {
                 if !rows.iter().any(|r| r.id == s.msg_id) {
                     let mut r = MessageRow::plain(s.msg_id, s.text, false, s.date);
                     r.deleted = true;
-                    r.edits = self.edit_count(key, s.msg_id).await;
+                    r.edits = counts.get(&s.msg_id).copied().unwrap_or(0);
                     rows.push(r);
                 }
             }
@@ -468,7 +517,7 @@ impl Engine {
         rows
     }
 
-    async fn row(&self, key: i64, m: &grammers_client::message::Message) -> MessageRow {
+    fn row(_key: i64, m: &grammers_client::message::Message, edits: usize) -> MessageRow {
         let reply_to = m.reply_to_message_id().map(|id| (id, String::new()));
         let forwarded_from = m.forward_header().map(|h| {
             let grammers_client::tl::enums::MessageFwdHeader::Header(h) = h;
@@ -482,7 +531,7 @@ impl Engine {
             outgoing: m.outgoing(),
             date: m.date().as_second(),
             deleted: false,
-            edits: self.edit_count(key, m.id()).await,
+            edits,
             media: m.media().as_ref().map(media::describe),
             sender: m
                 .sender()
@@ -502,6 +551,7 @@ impl Engine {
                 .fmt_entities()
                 .map(|e| convert_entities(m.text(), e))
                 .unwrap_or_default(),
+            grouped: m.grouped_id(),
         }
     }
 
@@ -517,7 +567,7 @@ impl Engine {
         let mut rows = Vec::new();
         while rows.len() < limit {
             let Some(m) = it.next().await? else { break };
-            rows.push(self.row(key, &m).await);
+            rows.push(Self::row(key, &m, 0));
         }
         rows.sort_by_key(|r| (r.date, r.id));
         Ok(rows)
@@ -748,9 +798,6 @@ impl Engine {
         self.store.deleted(peer).await.unwrap_or_default()
     }
 
-    async fn edit_count(&self, peer: i64, id: i32) -> usize {
-        self.store.history(peer, id).await.map_or(0, |h| h.len())
-    }
 
     /// Прежние версии правок сообщения.
     pub async fn edit_history(&self, peer: &PeerRef, id: i32) -> Vec<String> {
@@ -815,6 +862,364 @@ mod grammers_tl_types_id {
     pub const READ_HISTORY: u32 = functions::messages::ReadHistory::CONSTRUCTOR_ID;
 }
 
+/// Папка чатов (фильтр диалогов).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRow {
+    pub id: i32,
+    pub title: String,
+    pub contacts: bool,
+    pub non_contacts: bool,
+    pub groups: bool,
+    pub broadcasts: bool,
+    pub bots: bool,
+    pub exclude_muted: bool,
+    pub exclude_read: bool,
+    pub exclude_archived: bool,
+    /// Явно добавленные и закреплённые чаты (формат Bot API).
+    pub include: Vec<i64>,
+    pub exclude: Vec<i64>,
+}
+
+/// Входит ли чат в папку (правила Telegram: явные включения, затем типы и исключения).
+pub fn folder_matches(f: &FolderRow, d: &DialogRow) -> bool {
+    if f.exclude.contains(&d.id) {
+        return false;
+    }
+    if f.include.contains(&d.id) {
+        return true;
+    }
+    if d.archived && f.exclude_archived {
+        return false;
+    }
+    if f.exclude_muted && d.muted {
+        return false;
+    }
+    if f.exclude_read && d.unread == 0 {
+        return false;
+    }
+    match d.kind {
+        DialogKind::User => {
+            if d.contact {
+                f.contacts
+            } else {
+                f.non_contacts
+            }
+        }
+        DialogKind::Bot => f.bots,
+        DialogKind::Group => f.groups,
+        DialogKind::Channel => f.broadcasts,
+    }
+}
+
+/// Строка списка контактов.
+#[derive(Debug, Clone)]
+pub struct ContactRow {
+    pub peer: PeerRef,
+    pub id: i64,
+    pub name: String,
+    /// «в сети», «был(а) недавно» и т. п.
+    pub status: String,
+}
+
+/// Набор стикеров.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickerSetRow {
+    pub id: i64,
+    pub access_hash: i64,
+    pub title: String,
+    pub count: i32,
+}
+
+/// Один стикер набора.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickerRow {
+    pub id: i64,
+    pub access_hash: i64,
+    pub file_ref: Vec<u8>,
+    pub mime: String,
+    pub emoji: String,
+}
+
+impl StickerRow {
+    /// Можно ли показать картинку: только статичные WebP (анимированные — TGS и WebM — нет).
+    pub fn is_static(&self) -> bool {
+        self.mime == "image/webp"
+    }
+}
+
+/// Пометка статуса пользователя для списка контактов.
+fn status_text(s: &grammers_client::tl::enums::UserStatus) -> String {
+    use grammers_client::tl::enums::UserStatus as U;
+    match s {
+        U::Online(_) => "в сети".to_owned(),
+        U::Offline(o) => format!("был(а) в сети {}", fmt_ago(i64::from(o.was_online))),
+        U::Recently(_) => "был(а) недавно".to_owned(),
+        U::LastWeek(_) => "был(а) на этой неделе".to_owned(),
+        U::LastMonth(_) => "был(а) в этом месяце".to_owned(),
+        U::Empty => "был(а) давно".to_owned(),
+    }
+}
+
+/// «сегодня в 14:05» / «вчера» / «3 дн. назад» по метке времени.
+fn fmt_ago(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let d = (now - ts).max(0);
+    match d {
+        0..=59 => "только что".to_owned(),
+        60..=3599 => format!("{} мин. назад", d / 60),
+        3600..=86_399 => format!("{} ч. назад", d / 3600),
+        86_400..=172_799 => "вчера".to_owned(),
+        _ => format!("{} дн. назад", d / 86_400),
+    }
+}
+
+/// Загрузка файла по «сырому» расположению (для стикеров из наборов).
+struct RawLocation(grammers_client::tl::enums::InputFileLocation);
+
+impl grammers_client::media::Downloadable for RawLocation {
+    fn to_raw_input_location(&self) -> Option<grammers_client::tl::enums::InputFileLocation> {
+        Some(self.0.clone())
+    }
+}
+
+impl Engine {
+    /// Папки чатов пользователя (без «Все чаты» и общих папок-ссылок).
+    pub async fn folders(&self) -> Result<Vec<FolderRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let tl::enums::messages::DialogFilters::Filters(f) = self
+            .client
+            .invoke(&tl::functions::messages::GetDialogFilters {})
+            .await?;
+        let ids = |peers: &[tl::enums::InputPeer]| -> Vec<i64> {
+            peers
+                .iter()
+                .filter(|p| !matches!(p, tl::enums::InputPeer::Empty | tl::enums::InputPeer::PeerSelf))
+                .map(|p| PeerRef::from(p).id.bot_api_dialog_id_unchecked())
+                .collect()
+        };
+        let mut out = Vec::new();
+        for x in &f.filters {
+            if let tl::enums::DialogFilter::Filter(x) = x {
+                let mut include = ids(&x.include_peers);
+                include.extend(ids(&x.pinned_peers));
+                out.push(FolderRow {
+                    id: x.id,
+                    title: {
+                        let tl::enums::TextWithEntities::Entities(t) = &x.title;
+                        t.text.clone()
+                    },
+                    contacts: x.contacts,
+                    non_contacts: x.non_contacts,
+                    groups: x.groups,
+                    broadcasts: x.broadcasts,
+                    bots: x.bots,
+                    exclude_muted: x.exclude_muted,
+                    exclude_read: x.exclude_read,
+                    exclude_archived: x.exclude_archived,
+                    include,
+                    exclude: ids(&x.exclude_peers),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Контакты пользователя, по алфавиту.
+    pub async fn contacts(&self) -> Result<Vec<ContactRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
+            .await?;
+        let tl::enums::contacts::Contacts::Contacts(c) = res else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<ContactRow> = c
+            .users
+            .iter()
+            .filter_map(|u| match u {
+                tl::enums::User::User(y) if !y.deleted && !y.is_self => {
+                    let name = format!(
+                        "{} {}",
+                        y.first_name.clone().unwrap_or_default(),
+                        y.last_name.clone().unwrap_or_default()
+                    )
+                    .trim()
+                    .to_owned();
+                    Some(ContactRow {
+                        peer: PeerRef::from(u),
+                        id: y.id,
+                        name: if name.is_empty() { "Без имени".to_owned() } else { name },
+                        status: y.status.as_ref().map(status_text).unwrap_or_default(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|r| r.name.to_lowercase());
+        Ok(out)
+    }
+
+    /// Установленные наборы стикеров (без масок и наборов эмодзи).
+    pub async fn sticker_sets(&self) -> Result<Vec<StickerSetRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetAllStickers { hash: 0 })
+            .await?;
+        let tl::enums::messages::AllStickers::Stickers(s) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(s.sets
+            .iter()
+            .filter_map(|x| {
+                let tl::enums::StickerSet::Set(x) = x;
+                (!x.masks && !x.emojis && !x.archived).then(|| StickerSetRow {
+                    id: x.id,
+                    access_hash: x.access_hash,
+                    title: x.title.clone(),
+                    count: x.count,
+                })
+            })
+            .collect())
+    }
+
+    /// Стикеры набора.
+    pub async fn sticker_set(&self, set: &StickerSetRow) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetStickerSet {
+                stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
+                    id: set.id,
+                    access_hash: set.access_hash,
+                }),
+                hash: 0,
+            })
+            .await?;
+        let tl::enums::messages::StickerSet::Set(s) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(s.documents
+            .iter()
+            .filter_map(|d| {
+                let tl::enums::Document::Document(d) = d else { return None };
+                let emoji = d
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        tl::enums::DocumentAttribute::Sticker(x) => Some(x.alt.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some(StickerRow {
+                    id: d.id,
+                    access_hash: d.access_hash,
+                    file_ref: d.file_reference.clone(),
+                    mime: d.mime_type.clone(),
+                    emoji,
+                })
+            })
+            .collect())
+    }
+
+    /// Файл стикера в кэше (`cache/stickers/<id>.webp`).
+    pub async fn sticker_file(&self, st: &StickerRow) -> Result<Option<PathBuf>, BoxErr> {
+        use grammers_client::tl;
+        if !st.is_static() {
+            return Ok(None);
+        }
+        let dir = self.dirs.cache.join("stickers");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{}.webp", st.id));
+        if file.exists() {
+            return Ok(Some(file));
+        }
+        let loc = RawLocation(tl::enums::InputFileLocation::InputDocumentFileLocation(
+            tl::types::InputDocumentFileLocation {
+                id: st.id,
+                access_hash: st.access_hash,
+                file_reference: st.file_ref.clone(),
+                thumb_size: String::new(),
+            },
+        ));
+        self.client.download_media(&loc, &file).await?;
+        Ok(Some(file))
+    }
+
+    /// Отправить стикер из набора.
+    pub async fn send_sticker(
+        &self,
+        peer: PeerRef,
+        st: &StickerRow,
+        reply_to: Option<i32>,
+    ) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static SEQ: AtomicI64 = AtomicI64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as i64);
+        let random_id = nanos ^ (SEQ.fetch_add(1, Ordering::Relaxed) << 20);
+        let ghost = self.settings().ghost;
+        self.client
+            .invoke(&tl::functions::messages::SendMedia {
+                silent: ghost.should_send_without_sound(),
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.into(),
+                reply_to: reply_to.map(|id| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id: id,
+                        top_msg_id: None,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                        quote_rich: None,
+                    })
+                }),
+                media: tl::enums::InputMedia::Document(tl::types::InputMediaDocument {
+                    spoiler: false,
+                    id: tl::enums::InputDocument::Document(tl::types::InputDocument {
+                        id: st.id,
+                        access_hash: st.access_hash,
+                        file_reference: st.file_ref.clone(),
+                    }),
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                    query: None,
+                }),
+                message: String::new(),
+                random_id,
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })
+            .await?;
+        if ghost::should_mark_read_after_action(&ghost) {
+            self.client.mark_as_read(peer).await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,5 +1246,76 @@ mod tests {
     #[test]
     fn empty_and_unknown_entities_are_dropped() {
         assert!(convert_entities("abc", &[bold(1, 0)]).is_empty());
+    }
+
+    fn row(id: i64, kind: DialogKind) -> DialogRow {
+        DialogRow {
+            peer: grammers_session::types::PeerRef {
+                id: grammers_session::types::PeerId::user_unchecked(1),
+                auth: grammers_session::types::PeerAuth::default(),
+            },
+            id,
+            name: String::new(),
+            last: String::new(),
+            date: 0,
+            unread: 0,
+            pinned: false,
+            muted: false,
+            saved: false,
+            archived: false,
+            kind,
+            contact: false,
+        }
+    }
+
+    fn folder() -> FolderRow {
+        FolderRow {
+            id: 2,
+            title: "Работа".into(),
+            contacts: false,
+            non_contacts: false,
+            groups: true,
+            broadcasts: false,
+            bots: false,
+            exclude_muted: false,
+            exclude_read: false,
+            exclude_archived: true,
+            include: vec![10],
+            exclude: vec![20],
+        }
+    }
+
+    #[test]
+    fn folder_includes_by_type_and_by_id() {
+        let f = folder();
+        assert!(folder_matches(&f, &row(5, DialogKind::Group)));
+        assert!(!folder_matches(&f, &row(5, DialogKind::Channel)));
+        // Явно добавленный чат входит независимо от типа.
+        assert!(folder_matches(&f, &row(10, DialogKind::Channel)));
+    }
+
+    #[test]
+    fn folder_exclusions_win() {
+        let f = folder();
+        assert!(!folder_matches(&f, &row(20, DialogKind::Group)));
+        let mut archived = row(5, DialogKind::Group);
+        archived.archived = true;
+        assert!(!folder_matches(&f, &archived));
+    }
+
+    #[test]
+    fn folder_contacts_vs_strangers() {
+        let mut f = folder();
+        f.groups = false;
+        f.contacts = true;
+        let mut c = row(7, DialogKind::User);
+        assert!(!folder_matches(&f, &c));
+        c.contact = true;
+        assert!(folder_matches(&f, &c));
+    }
+
+    #[test]
+    fn relative_time_text() {
+        assert_eq!(fmt_ago(i64::MAX / 2), "только что");
     }
 }

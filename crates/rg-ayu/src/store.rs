@@ -63,6 +63,48 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Запомнить пачку сообщений одной транзакцией (в разы быстрее поштучной записи).
+    pub async fn remember_many(&self, peer: i64, items: &[(i32, String, i64)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute("BEGIN", ()).await?;
+        for (id, text, date) in items {
+            let r = self
+                .conn
+                .execute(
+                    "INSERT INTO messages(peer,msg_id,text,date) VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(peer,msg_id) DO UPDATE SET text=excluded.text",
+                    params![peer, i64::from(*id), text.as_str(), *date],
+                )
+                .await;
+            if let Err(e) = r {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+        self.conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    /// Сколько прежних версий есть у каждого сообщения чата одним запросом.
+    pub async fn edit_counts(&self, peer: i64) -> Result<std::collections::HashMap<i32, usize>> {
+        let mut out = std::collections::HashMap::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT msg_id, COUNT(*) FROM edits WHERE peer=?1 GROUP BY msg_id",
+                params![peer],
+            )
+            .await?;
+        while let Some(r) = rows.next().await? {
+            let id: i64 = r.get(0)?;
+            let n: i64 = r.get(1)?;
+            out.insert(id as i32, n.max(0) as usize);
+        }
+        Ok(out)
+    }
+
     /// Пометить удалёнными; возвращает, сколько из них у нас сохранено.
     pub async fn mark_deleted(&self, peer: i64, ids: &[i32]) -> Result<u64> {
         let mut n = 0;
@@ -250,5 +292,16 @@ mod tests {
         s.mark_deleted(1, &[1]).await.unwrap();
         s.remember(1, 1, "a", 10).await.unwrap();
         assert!(s.get(1, 1).await.unwrap().unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn remember_many_writes_batch_and_counts_edits() {
+        let s = MessageStore::in_memory().await.unwrap();
+        s.remember_many(5, &[(1, "a".into(), 10), (2, "b".into(), 11)]).await.unwrap();
+        assert_eq!(s.get(5, 2).await.unwrap().unwrap().text, "b");
+        s.record_edit(5, 1, "a2", 20).await.unwrap();
+        let c = s.edit_counts(5).await.unwrap();
+        assert_eq!(c.get(&1), Some(&1));
+        assert_eq!(c.get(&2), None);
     }
 }

@@ -6,7 +6,9 @@ use std::sync::mpsc::Sender;
 use grammers_client::SignInError;
 use grammers_client::client::{LoginToken, PasswordToken};
 use rg_ayu::store::MessageStore;
-use rg_core::engine::{DialogRow, Engine, MessageRow};
+use rg_core::engine::{
+    ContactRow, DialogKind, DialogRow, Engine, FolderRow, MessageRow, StickerRow, StickerSetRow,
+};
 use rg_core::{Config, connect_with_updates};
 use rg_settings::Settings;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -64,6 +66,20 @@ pub enum Cmd {
     MuteDialog(usize, bool),
     /// Прочитать чат с индексом на сервере.
     ReadDialog(usize),
+    /// Загрузить список контактов.
+    Contacts,
+    /// Открыть чат с контактом (добавляется в список, если его там нет).
+    OpenContact(grammers_session::types::PeerRef, i64, String),
+    /// Фото профиля для чата, которого нет в списке (контакты).
+    AvatarPeer(grammers_session::types::PeerRef, i64),
+    /// Загрузить наборы стикеров.
+    Stickers,
+    /// Загрузить стикеры набора с номером.
+    StickerSet(usize),
+    /// Превью стикера по идентификатору документа.
+    StickerThumb(i64),
+    /// Отправить стикер (идентификатор документа) в открытый чат, при ответе — на сообщение.
+    SendSticker(i64, Option<i32>),
     Settings(Box<Settings>),
 }
 
@@ -81,6 +97,13 @@ pub enum Ev {
     Found(usize, Vec<MessageRow>),
     EditHistory(i32, Vec<String>),
     Settings(Box<Settings>),
+    Folders(Vec<FolderRow>),
+    Contacts(Vec<ContactRow>),
+    /// Выбрать чат по идентификатору.
+    Select(i64),
+    StickerSets(Vec<StickerSetRow>),
+    StickerList(i64, Vec<StickerRow>),
+    StickerImg(i64, Box<eframe::egui::ColorImage>),
     Status(String),
     Error(String),
 }
@@ -244,7 +267,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     };
     let engine = Engine::new(connected.client.clone(), settings.clone(), store)
         .with_dirs(&home.join("cache"), &home.join("downloads"));
-    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    // Фото профилей маленькие: качаем много штук одновременно.
+    let avatar_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(24));
     let mut updates = Some(connected.updates);
     out.send(Ev::Settings(Box::new(settings)));
 
@@ -252,6 +277,8 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let mut password: Option<PasswordToken> = None;
     let mut dialogs: Vec<DialogRow> = Vec::new();
     let mut current: Option<usize> = None;
+    let mut sticker_sets: Vec<StickerSetRow> = Vec::new();
+    let mut sticker_docs: std::collections::HashMap<i64, StickerRow> = std::collections::HashMap::new();
 
     let authorized = connected.client.is_authorized().await.unwrap_or(false);
     let mut qr_mode = false;
@@ -386,29 +413,108 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::Archive(i, on) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 match engine.set_archived(d.peer, on).await {
-                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
                     Err(e) => out.err(format!("Архив: {e}")),
                 }
             }
             Cmd::PinDialog(i, on) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 match engine.set_pinned_dialog(d.peer, on).await {
-                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
                     Err(e) => out.err(format!("Закрепление: {e}")),
                 }
             }
             Cmd::MuteDialog(i, on) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 match engine.set_muted(d.peer, on).await {
-                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
                     Err(e) => out.err(format!("Звук: {e}")),
                 }
             }
             Cmd::ReadDialog(i) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 match engine.force_read(d.peer).await {
-                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
                     Err(e) => out.err(format!("Не отмечено: {e}")),
+                }
+            }
+            Cmd::Contacts => match engine.contacts().await {
+                Ok(c) => out.send(Ev::Contacts(c)),
+                Err(e) => out.err(format!("Контакты: {e}")),
+            },
+            Cmd::OpenContact(peer, id, name) => {
+                if !dialogs.iter().any(|d| d.id == id) {
+                    dialogs.insert(
+                        0,
+                        DialogRow {
+                            peer,
+                            id,
+                            name,
+                            last: String::new(),
+                            date: 0,
+                            unread: 0,
+                            pinned: false,
+                            muted: false,
+                            saved: false,
+                            archived: false,
+                            kind: DialogKind::User,
+                            contact: true,
+                        },
+                    );
+                    current = current.map(|i| i + 1);
+                    out.send(Ev::Dialogs(dialogs.clone()));
+                }
+                out.send(Ev::Select(id));
+            }
+            Cmd::AvatarPeer(peer, id) => {
+                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    if let Ok(Some(path)) = eng.avatar(peer).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 112)).await
+                    {
+                        out.send(Ev::Avatar(id, Box::new(img)));
+                    }
+                });
+            }
+            Cmd::Stickers => match engine.sticker_sets().await {
+                Ok(s) => {
+                    sticker_sets = s.clone();
+                    out.send(Ev::StickerSets(s));
+                }
+                Err(e) => out.err(format!("Стикеры: {e}")),
+            },
+            Cmd::StickerSet(i) => {
+                let Some(set) = sticker_sets.get(i).cloned() else { continue };
+                match engine.sticker_set(&set).await {
+                    Ok(list) => {
+                        for st in &list {
+                            sticker_docs.insert(st.id, st.clone());
+                        }
+                        out.send(Ev::StickerList(set.id, list));
+                    }
+                    Err(e) => out.err(format!("Набор стикеров: {e}")),
+                }
+            }
+            Cmd::StickerThumb(doc) => {
+                let Some(row) = sticker_docs.get(&doc).cloned() else { continue };
+                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    if let Ok(Some(path)) = eng.sticker_file(&row).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 144)).await
+                    {
+                        out.send(Ev::StickerImg(doc, Box::new(img)));
+                    }
+                });
+            }
+            Cmd::SendSticker(doc, reply) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let Some(row) = sticker_docs.get(&doc).cloned() else { continue };
+                match engine.send_sticker(d.peer, &row, reply).await {
+                    Ok(()) => reload(&engine, &out, d.peer, i).await,
+                    Err(e) => out.err(format!("Стикер не отправлен: {e}")),
                 }
             }
             Cmd::LogOut => {
@@ -492,7 +598,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::Avatar(i) => {
                 let Some(d) = dialogs.get(i) else { continue };
-                let (eng, out, limit, peer, id) = (engine.clone(), out.clone(), limit.clone(), d.peer, d.id);
+                let (eng, out, limit, peer, id) = (engine.clone(), out.clone(), avatar_limit.clone(), d.peer, d.id);
                 tokio::spawn(async move {
                     let Ok(_permit) = limit.acquire().await else { return };
                     if let Ok(Some(path)) = eng.avatar(peer).await
@@ -553,18 +659,31 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     }
 }
 
-/// Загрузить основной список и архив (архивные идут после основных).
+/// Загрузить основной список и архив одновременно. Основной запрос возвращает и чаты из архива
+/// с верным признаком `archived` (по `folder_id` диалога), поэтому он главный; из запроса архива
+/// берём только то, чего в основном списке нет (далёкие архивные чаты). Сам запрос архива
+/// возвращает и «Избранное», так что его признак не используется.
 async fn refresh_dialogs(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>) {
-    match engine.dialogs(200).await {
+    let (main, arch) = tokio::join!(engine.dialogs(300), engine.archived(100));
+    match main {
         Ok(mut d) => {
-            if let Ok(mut a) = engine.archived(100).await {
-                d.append(&mut a);
+            for x in arch.unwrap_or_default() {
+                if !d.iter().any(|y| y.id == x.id) {
+                    d.push(x);
+                }
             }
             *dialogs = d.clone();
             out.send(Ev::Dialogs(d));
         }
         Err(e) => out.err(format!("Чаты: {e}")),
     }
+}
+
+/// Обновить список чатов, сохранив открытый чат (по идентификатору, не по номеру строки).
+async fn refresh_keep(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>, current: &mut Option<usize>) {
+    let keep = current.and_then(|i| dialogs.get(i)).map(|d| d.id);
+    refresh_dialogs(engine, out, dialogs).await;
+    *current = keep.and_then(|id| dialogs.iter().position(|d| d.id == id));
 }
 
 /// Перечитать последние сообщения открытого чата.
@@ -585,6 +704,9 @@ async fn enter(
         out.send(Ev::Me(me.full_name()));
     }
     refresh_dialogs(engine, out, dialogs).await;
+    if let Ok(f) = engine.folders().await {
+        out.send(Ev::Folders(f));
+    }
     if let Some(rx) = updates.take() {
         let eng = engine.clone();
         let ctx = out.ctx.clone();

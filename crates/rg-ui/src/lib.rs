@@ -7,6 +7,7 @@ mod frame;
 pub mod icons;
 mod kit;
 mod media_ui;
+mod panels;
 mod rich;
 mod settings_ui;
 pub mod theme;
@@ -17,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui::{self, Color32, FontId, RichText, Sense, Vec2};
-use rg_core::engine::{DialogRow, MessageRow};
+use rg_core::engine::{
+    ContactRow, DialogRow, FolderRow, MessageRow, StickerRow, StickerSetRow, folder_matches,
+};
 use rg_settings::Settings;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -89,6 +92,22 @@ struct App {
     drawer_open: bool,
     /// Показан список архива вместо основного.
     in_archive: bool,
+    /// Папки чатов и выбранная (`None` — «Все чаты»).
+    folders: Vec<FolderRow>,
+    folder: Option<i32>,
+    /// Окно контактов.
+    contacts_open: bool,
+    contacts: Vec<ContactRow>,
+    contact_search: String,
+    contact_av_req: HashSet<i64>,
+    /// Вкладка панели: 0 — эмодзи, 1 — стикеры.
+    emoji_tab: usize,
+    sticker_sets: Vec<StickerSetRow>,
+    sticker_cur: usize,
+    sticker_lists: HashMap<i64, Vec<StickerRow>>,
+    sticker_tex: HashMap<i64, egui::TextureHandle>,
+    sticker_req: HashSet<i64>,
+    stickers_requested: bool,
     /// Идентификаторы уже показанных сообщений и время появления новых (для плавного входа).
     known: HashSet<i32>,
     arrived: HashMap<i32, f64>,
@@ -189,6 +208,19 @@ impl App {
             filter_new: String::new(),
             drawer_open: false,
             in_archive: false,
+            folders: Vec::new(),
+            folder: None,
+            contacts_open: false,
+            contacts: Vec::new(),
+            contact_search: String::new(),
+            contact_av_req: HashSet::new(),
+            emoji_tab: 0,
+            sticker_sets: Vec::new(),
+            sticker_cur: 0,
+            sticker_lists: HashMap::new(),
+            sticker_tex: HashMap::new(),
+            sticker_req: HashSet::new(),
+            stickers_requested: false,
             known: HashSet::new(),
             arrived: HashMap::new(),
             chat_opened: std::time::Instant::now(),
@@ -260,7 +292,38 @@ impl App {
                     self.error.clear();
                 }
                 Ev::Me(n) => self.me = n,
-                Ev::Dialogs(d) => self.dialogs = d,
+                Ev::Dialogs(d) => {
+                    // Открытый чат ищем по идентификатору: порядок строк мог измениться.
+                    let keep = self.selected.and_then(|i| self.dialogs.get(i)).map(|x| x.id);
+                    self.dialogs = d;
+                    if let Some(id) = keep {
+                        self.selected = self.dialogs.iter().position(|x| x.id == id);
+                    }
+                }
+                Ev::Folders(f) => {
+                    if self.folder.is_some_and(|id| !f.iter().any(|x| x.id == id)) {
+                        self.folder = None;
+                    }
+                    self.folders = f;
+                }
+                Ev::Contacts(c) => self.contacts = c,
+                Ev::Select(id) => {
+                    if let Some(i) = self.dialogs.iter().position(|d| d.id == id) {
+                        self.in_archive = self.dialogs[i].archived;
+                        self.open_dialog(i);
+                    }
+                }
+                Ev::StickerSets(s) => {
+                    self.sticker_sets = s;
+                    self.sticker_cur = 0;
+                }
+                Ev::StickerList(id, l) => {
+                    self.sticker_lists.insert(id, l);
+                }
+                Ev::StickerImg(id, img) => {
+                    let tex = ctx.load_texture(format!("s{id}"), *img, egui::TextureOptions::LINEAR);
+                    self.sticker_tex.insert(id, tex);
+                }
                 Ev::History(idx, m) if self.selected == Some(idx) => {
                     // Новые сообщения после первой загрузки появляются плавно.
                     let now_t = ctx.input(|i| i.time);
@@ -556,23 +619,34 @@ impl App {
         ui.add_space(4.0);
         let needle = self.search.to_lowercase();
         let now = self.now;
+        self.folder_tabs(ui);
         let mut open = None;
         let mut dact: Option<(usize, DialogAct)> = None;
         let mut toggle_archive = false;
         let archived_total = self.dialogs.iter().filter(|d| d.archived).count();
         let in_archive = self.in_archive;
+        let active_folder = self.folders.iter().find(|f| Some(f.id) == self.folder).cloned();
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if in_archive {
                 if archive_header(ui) {
                     toggle_archive = true;
                 }
-            } else if archived_total > 0 && needle.is_empty() && archive_row(ui, &self.dialogs) {
+            } else if archived_total > 0 && needle.is_empty() && active_folder.is_none() && archive_row(ui, &self.dialogs) {
                 toggle_archive = true;
             }
             for (i, d) in self.dialogs.iter().enumerate() {
-                if d.archived != in_archive {
-                    continue;
+                match &active_folder {
+                    Some(f) if !in_archive => {
+                        if !folder_matches(f, d) {
+                            continue;
+                        }
+                    }
+                    _ => {
+                        if d.archived != in_archive {
+                            continue;
+                        }
+                    }
                 }
                 if !needle.is_empty() && !d.name.to_lowercase().contains(&needle) {
                     continue;
@@ -636,6 +710,11 @@ impl App {
                         if selected { t(DIALOG_ACTIVE) } else { INK_DARK },
                     );
                     right = b.left() - 6.0;
+                } else if d.pinned {
+                    // Закреплённый чат без непрочитанных: значок кнопки вместо бейджа.
+                    let c = egui::pos2(rect.right() - 22.0, rect.bottom() - 24.0);
+                    icons::ico(p, c, icons::Ico::Pin, 15.0, date_c);
+                    right = c.x - 12.0;
                 }
                 let date = if d.date > 0 {
                     dialog_date(d.date, now)
@@ -666,6 +745,21 @@ impl App {
                     FontId::proportional(15.0),
                     name_c,
                 );
+                if d.muted {
+                    // Перечёркнутый динамик после имени, если звук отключён.
+                    let w = p
+                        .layout_no_wrap(
+                            (if d.saved { "Избранное" } else { d.name.as_str() }).to_owned(),
+                            FontId::proportional(15.0),
+                            name_c,
+                        )
+                        .size()
+                        .x;
+                    let x = rect.left() + 68.0 + w + 14.0;
+                    if x < clip_right - 8.0 {
+                        icons::ico(p, egui::pos2(x, rect.top() + 21.0), icons::Ico::Mute, 14.0, date_c);
+                    }
+                }
                 match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
                     Some(e) => e.paint_line(
                         ui,
@@ -821,6 +915,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::set_opacity(self.settings.window_opacity);
+        ui.painter()
+            .rect_filled(ctx.content_rect(), egui::CornerRadius::ZERO, t(BACKDROP));
         if !self.emoji_tried {
             self.emoji_tried = true;
             self.emoji = emoji::Emoji::load(&ctx);
@@ -840,13 +936,13 @@ impl eframe::App for App {
         {
             egui::Panel::top("titlebar")
                 .exact_size(34.0)
-                .frame(egui::Frame::new().fill(t(TITLE_BG)))
+                .frame(egui::Frame::new().fill(tint_title()))
                 .show(ui, |ui| self.titlebar(ui));
             self.resize_edges(ui);
         }
         if self.stage != Stage::Ready {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(t(WINDOW_BG)))
+                .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.login_ui(ui));
             return;
         }
@@ -854,7 +950,7 @@ impl eframe::App for App {
         let narrow = ui.available_width() < NARROW_WIDTH;
         if narrow && self.selected.is_none() {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(t(WINDOW_BG)))
+                .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
             return;
         }
@@ -862,12 +958,12 @@ impl eframe::App for App {
             egui::Panel::left("dialogs")
                 .default_size(COLUMN_LEFT_NORMAL)
                 .size_range(COLUMN_LEFT_MIN..=COLUMN_LEFT_MAX)
-                .frame(egui::Frame::new().fill(t(WINDOW_BG)))
+                .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
         }
         egui::Panel::top("header")
             .exact_size(TOP_BAR_HEIGHT)
-            .frame(egui::Frame::new().fill(t(WINDOW_BG)))
+            .frame(egui::Frame::new().fill(tint_panel()))
             .show(ui, |ui| self.header_ui(ui, narrow));
         if !self.status.is_empty() || !self.error.is_empty() {
             egui::Panel::bottom("status")
@@ -887,14 +983,14 @@ impl eframe::App for App {
         if self.search_open && self.selected.is_some() {
             egui::Panel::top("chat-search")
                 .exact_size(40.0)
-                .frame(egui::Frame::new().fill(t(WINDOW_BG)))
+                .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.search_bar(ui));
         }
         if self.selected.is_some() {
             egui::Panel::bottom("composer")
                 .frame(
                     egui::Frame::new()
-                        .fill(t(COMPOSE_BG))
+                        .fill(tint_panel())
                         .inner_margin(egui::Margin::symmetric(8, 4)),
                 )
                 .show(ui, |ui| self.composer_ui(ui));
@@ -908,7 +1004,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(t(CHAT_BG))
+                    .fill(tint_chat())
                     .inner_margin(egui::Margin {
                         left: (8.0 + slide.max(0.0)) as i8,
                         right: 8,
@@ -920,6 +1016,7 @@ impl eframe::App for App {
         self.emoji_window(&ctx);
         self.chat_windows(&ctx);
         self.viewer_window(&ctx);
+        self.contacts_window(&ctx);
         self.drawer(&ctx);
         self.settings_window(&ctx);
     }
@@ -1007,6 +1104,8 @@ fn demo_app(mode: &str) -> App {
             muted: *muted,
             saved: false,
             archived: false,
+            kind: rg_core::engine::DialogKind::User,
+            contact: true,
         });
     }
     for (i, (n, l)) in [("Старый чат", "Давно не писали"), ("Рассылка", "Скидки на всё")].iter().enumerate() {
@@ -1025,6 +1124,8 @@ fn demo_app(mode: &str) -> App {
             muted: false,
             saved: false,
             archived: true,
+            kind: rg_core::engine::DialogKind::User,
+            contact: false,
         });
     }
     app.selected = Some(0);

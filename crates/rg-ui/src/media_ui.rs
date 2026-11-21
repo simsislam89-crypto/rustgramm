@@ -167,6 +167,7 @@ pub fn card(
 }
 
 use eframe::egui::RichText;
+use std::collections::HashMap;
 
 fn placeholder(ui: &mut egui::Ui, w: f32, h: f32, label: &str, color: Color32, play: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
@@ -185,9 +186,86 @@ fn clip_text(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// Обрезка картинки «по заполнению»: доли текстуры, которые попадают в ячейку нужной формы.
+pub fn cover_uv(tex_size: Vec2, cell: Vec2) -> Rect {
+    if tex_size.x <= 0.0 || tex_size.y <= 0.0 || cell.x <= 0.0 || cell.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let (ta, ca) = (tex_size.x / tex_size.y, cell.x / cell.y);
+    if ta > ca {
+        let w = ca / ta;
+        Rect::from_min_max(Pos2::new((1.0 - w) / 2.0, 0.0), Pos2::new((1.0 + w) / 2.0, 1.0))
+    } else {
+        let h = ta / ca;
+        Rect::from_min_max(Pos2::new(0.0, (1.0 - h) / 2.0), Pos2::new(1.0, (1.0 + h) / 2.0))
+    }
+}
+
+/// Сетка альбома: по два превью в ряд (нечётное последнее — на всю ширину).
+pub fn album(
+    ui: &mut egui::Ui,
+    items: &[&MessageRow],
+    w: f32,
+    tex: &HashMap<i32, egui::TextureHandle>,
+    cards: &mut Vec<(Rect, Act)>,
+) {
+    let gap = 3.0;
+    let mut rest = items;
+    while !rest.is_empty() {
+        let n = if rest.len() == 1 { 1 } else { 2 };
+        let (row, tail) = rest.split_at(n);
+        rest = tail;
+        let cw = (w - gap * (n as f32 - 1.0)) / n as f32;
+        let ch = if n == 1 { cw * 0.62 } else { cw * 0.8 };
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, ch), Sense::hover());
+        for (k, m) in row.iter().enumerate() {
+            let cell = Rect::from_min_size(
+                Pos2::new(rect.left() + k as f32 * (cw + gap), rect.top()),
+                Vec2::new(cw, ch),
+            );
+            let cr = CornerRadius::same(6);
+            match tex.get(&m.id) {
+                Some(t) => {
+                    egui::Image::new(t)
+                        .uv(cover_uv(t.size_vec2(), cell.size()))
+                        .corner_radius(cr)
+                        .fit_to_exact_size(cell.size())
+                        .paint_at(ui, cell);
+                }
+                None => {
+                    ui.painter().rect_filled(cell, cr, Color32::from_rgb(34, 34, 40));
+                }
+            }
+            let is_video = m
+                .media
+                .as_ref()
+                .is_some_and(|i| matches!(i.kind, MediaKind::Video | MediaKind::Gif | MediaKind::Round));
+            if is_video {
+                let p = ui.painter();
+                p.circle_filled(cell.center(), 18.0, Color32::from_black_alpha(150));
+                play_triangle(p, cell.center() + Vec2::new(1.5, 0.0), 16.0, Color32::WHITE);
+            }
+            cards.push((cell, if is_video { Act::Open(m.id) } else { Act::Viewer(m.id) }));
+        }
+        ui.add_space(gap);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_crops_the_longer_side() {
+        // Широкая картинка в квадратной ячейке: обрезаются бока.
+        let uv = cover_uv(Vec2::new(200.0, 100.0), Vec2::new(50.0, 50.0));
+        assert!((uv.width() - 0.5).abs() < 1e-5 && (uv.height() - 1.0).abs() < 1e-5);
+        // Высокая — обрезаются верх и низ.
+        let uv = cover_uv(Vec2::new(100.0, 200.0), Vec2::new(50.0, 50.0));
+        assert!((uv.height() - 0.5).abs() < 1e-5 && (uv.width() - 1.0).abs() < 1e-5);
+        // Вырожденные размеры не ломают расчёт.
+        assert_eq!(cover_uv(Vec2::ZERO, Vec2::ZERO).width(), 1.0);
+    }
 
     #[test]
     fn duration_format() {

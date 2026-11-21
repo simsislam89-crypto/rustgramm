@@ -1,0 +1,267 @@
+//! Панели вокруг списка чатов: вкладки папок, окно контактов, вкладка стикеров в панели ввода.
+
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use rg_core::engine::folder_matches;
+
+use super::emoji::Emoji;
+use super::{App, Cmd, icons, theme::*};
+
+/// Что вкладка стикеров просит сделать (выполняется после отрисовки).
+pub(crate) enum StickerAct {
+    LoadSets,
+    LoadSet(usize),
+    Thumb(i64),
+    Send(i64),
+    SelectSet(usize),
+}
+
+impl App {
+    /// Полоса папок под строкой поиска: «Все чаты» и папки пользователя с счётчиками.
+    pub(crate) fn folder_tabs(&mut self, ui: &mut egui::Ui) {
+        if self.folders.is_empty() {
+            return;
+        }
+        let hide_all = self.settings.ayu.hide_all_chats_folder;
+        if hide_all && self.folder.is_none() {
+            self.folder = self.folders.first().map(|f| f.id);
+        }
+        // (идентификатор папки, подпись, непрочитанные без заглушённых)
+        let mut tabs: Vec<(Option<i32>, String, i32)> = Vec::new();
+        if !hide_all {
+            let n = self.dialogs.iter().filter(|d| !d.archived && !d.muted).map(|d| d.unread).sum();
+            tabs.push((None, "Все чаты".to_owned(), n));
+        }
+        for f in &self.folders {
+            let n = self
+                .dialogs
+                .iter()
+                .filter(|d| folder_matches(f, d) && !d.muted)
+                .map(|d| d.unread)
+                .sum();
+            tabs.push((Some(f.id), f.title.clone(), n));
+        }
+        let mut chosen = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("folder-tabs")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.add_space(8.0);
+                    for (id, title, unread) in &tabs {
+                        let selected = *id == self.folder;
+                        let label = if *unread > 0 { format!("{title}  {unread}") } else { title.clone() };
+                        let g = ui.painter().layout_no_wrap(
+                            label.clone(),
+                            FontId::proportional(14.0),
+                            WHITE,
+                        );
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, 34.0), Sense::click());
+                        let k = tween(ui.ctx(), ("ftab", id.unwrap_or(-1)), f32::from(u8::from(selected)), 0.18);
+                        let hover = tween(ui.ctx(), ("ftabh", id.unwrap_or(-1)), f32::from(u8::from(resp.hovered())), 0.12);
+                        let p = ui.painter();
+                        let color = lerp_color(lerp_color(DIALOG_TEXT, WHITE, hover), WHITE, k);
+                        p.text(rect.center() - Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, label, FontId::proportional(14.0), color);
+                        // Полоска под выбранной вкладкой растёт от центра.
+                        let w = (rect.width() - 14.0) * k;
+                        p.rect_filled(
+                            Rect::from_center_size(Pos2::new(rect.center().x, rect.bottom() - 1.5), Vec2::new(w, 2.5)),
+                            CornerRadius::same(1),
+                            WHITE,
+                        );
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            chosen = Some(*id);
+                        }
+                    }
+                });
+            });
+        if let Some(id) = chosen {
+            self.folder = id;
+            self.in_archive = false;
+        }
+        let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().rect_filled(line, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+    }
+
+    /// Окно «Контакты»: поиск и список с фото и статусом; клик открывает чат.
+    #[allow(deprecated)]
+    pub(crate) fn contacts_window(&mut self, ctx: &egui::Context) {
+        let raw = tween(ctx, "contacts-win", f32::from(u8::from(self.contacts_open)), 0.38);
+        if raw < 0.005 && !self.contacts_open {
+            return;
+        }
+        let appear = spring(raw);
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("contacts-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * raw) as u8));
+                if resp.clicked() {
+                    self.contacts_open = false;
+                }
+            });
+        let mut open_contact = None;
+        let mut want_avatar = Vec::new();
+        let max_h = (screen.height() - 60.0).clamp(240.0, 640.0);
+        egui::Area::new(egui::Id::new("contacts-box"))
+            .order(egui::Order::Tooltip)
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 18.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(raw.min(1.0).powf(0.6));
+                egui::Frame::new()
+                    .fill(t2(WINDOW_BG))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
+                    .corner_radius(CornerRadius::same(12))
+                    .show(ui, |ui| {
+                        let width = 380.0_f32.min(screen.width() - 16.0);
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        let (head, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
+                        ui.painter().text(
+                            Pos2::new(head.left() + 20.0, head.center().y),
+                            Align2::LEFT_CENTER,
+                            "Контакты",
+                            FontId::proportional(16.0),
+                            WHITE,
+                        );
+                        let x = Rect::from_center_size(Pos2::new(head.right() - 24.0, head.center().y), Vec2::splat(34.0));
+                        let xr = ui.interact(x, ui.make_persistent_id("contacts-x"), Sense::click());
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(15.0), if xr.hovered() { WHITE } else { SUBTEXT });
+                        if xr.clicked() {
+                            self.contacts_open = false;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.contact_search)
+                                    .hint_text("Поиск контактов")
+                                    .desired_width(width - 28.0)
+                                    .margin(Vec2::new(10.0, 7.0)),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        let needle = self.contact_search.to_lowercase();
+                        egui::ScrollArea::vertical().max_height(max_h - 110.0).auto_shrink([false, true]).show(ui, |ui| {
+                            if self.contacts.is_empty() {
+                                ui.add_space(20.0);
+                                ui.vertical_centered(|ui| ui.label(egui::RichText::new("Загрузка контактов…").color(SUBTEXT)));
+                            }
+                            for c in self.contacts.iter().filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle)) {
+                                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 56.0), Sense::click());
+                                let hover = tween(ui.ctx(), ("contact", c.id), f32::from(u8::from(resp.hovered())), 0.1);
+                                ui.painter().rect_filled(rect, 0.0, lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover));
+                                if ui.is_rect_visible(rect) && !self.avatars.contains_key(&c.id) {
+                                    want_avatar.push((c.peer, c.id));
+                                }
+                                draw_avatar(ui, rect.left_center() + Vec2::new(34.0, 0.0), &c.name, c.id, 40.0, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
+                                let p = ui.painter();
+                                p.text(rect.left_top() + Vec2::new(66.0, 11.0), Align2::LEFT_TOP, &c.name, FontId::proportional(15.0), WHITE);
+                                let online = c.status == "в сети";
+                                p.text(
+                                    rect.left_top() + Vec2::new(66.0, 32.0),
+                                    Align2::LEFT_TOP,
+                                    &c.status,
+                                    FontId::proportional(13.0),
+                                    if online { GREEN } else { SUBTEXT },
+                                );
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    open_contact = Some((c.peer, c.id, c.name.clone()));
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    });
+            });
+        for (peer, id) in want_avatar {
+            if self.contact_av_req.insert(id) {
+                self.send(Cmd::AvatarPeer(peer, id));
+            }
+        }
+        if let Some((peer, id, name)) = open_contact {
+            self.contacts_open = false;
+            self.send(Cmd::OpenContact(peer, id, name));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.contacts_open = false;
+        }
+    }
+
+    /// Вкладка «Стикеры»: сетка выбранного набора и полоса наборов внизу.
+    pub(crate) fn sticker_tab(&self, ui: &mut egui::Ui, emoji: Option<&Emoji>, acts: &mut Vec<StickerAct>) {
+        if !self.stickers_requested {
+            acts.push(StickerAct::LoadSets);
+        }
+        if self.sticker_sets.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(if self.stickers_requested { "Нет наборов стикеров" } else { "Загрузка…" }).color(SUBTEXT));
+            });
+            return;
+        }
+        let cur = self.sticker_cur.min(self.sticker_sets.len() - 1);
+        let set = &self.sticker_sets[cur];
+        let list = self.sticker_lists.get(&set.id);
+        if list.is_none() {
+            acts.push(StickerAct::LoadSet(cur));
+        }
+        let cols = 4usize;
+        let width = ui.available_width();
+        let cell = width / cols as f32;
+        egui::ScrollArea::vertical()
+            .max_height(ui.available_height() - 44.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&set.title).size(12.5).color(Color32::from_rgb(150, 150, 158)));
+                ui.add_space(4.0);
+                for row in list.map(|l| l.chunks(cols)).into_iter().flatten() {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, cell), Sense::hover());
+                    for (k, st) in row.iter().enumerate() {
+                        let r = Rect::from_min_size(Pos2::new(rect.left() + k as f32 * cell, rect.top()), Vec2::splat(cell));
+                        let resp = ui.interact(r, ui.make_persistent_id(("stk", st.id)), Sense::click());
+                        let h = tween(ui.ctx(), ("stkh", st.id), f32::from(u8::from(resp.hovered())), 0.1);
+                        if h > 0.01 {
+                            ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(10), Color32::from_rgba_unmultiplied(255, 255, 255, (22.0 * h) as u8));
+                        }
+                        let side = (cell - 14.0) * (1.0 + 0.06 * h);
+                        let area = Rect::from_center_size(r.center(), Vec2::splat(side));
+                        if let Some(tex) = self.sticker_tex.get(&st.id) {
+                            egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
+                        } else if st.is_static() {
+                            if ui.is_rect_visible(r) {
+                                acts.push(StickerAct::Thumb(st.id));
+                            }
+                            ui.painter().rect_filled(area.shrink(10.0), CornerRadius::same(12), Color32::from_rgba_unmultiplied(255, 255, 255, 10));
+                        } else if let Some(img) = emoji.and_then(|e| st.emoji.chars().next().and_then(|c| e.image(c, 34.0))) {
+                            // Анимированные стикеры (TGS/WebM) пока не воспроизводятся: показываем эмодзи.
+                            img.paint_at(ui, Rect::from_center_size(r.center(), Vec2::splat(34.0)));
+                        }
+                        if resp.clicked() {
+                            acts.push(StickerAct::Send(st.id));
+                        }
+                    }
+                }
+            });
+        ui.add_space(4.0);
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::hover());
+        ui.painter().line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)));
+        let n = self.sticker_sets.len().min(9);
+        for (i, s) in self.sticker_sets.iter().take(n).enumerate() {
+            let c = Pos2::new(bar.left() + bar.width() * (i as f32 + 0.5) / n as f32, bar.center().y);
+            let r = Rect::from_center_size(c, Vec2::splat(30.0));
+            let resp = ui.interact(r, ui.make_persistent_id(("stkset", i)), Sense::click());
+            let sel = tween(ui.ctx(), ("stkseth", i), f32::from(u8::from(i == cur || resp.hovered())), 0.12);
+            let p = ui.painter();
+            p.circle_filled(c, 13.0, lerp_color(Color32::from_rgb(52, 52, 58), Color32::from_rgb(88, 88, 96), sel));
+            let initial = s.title.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_default();
+            p.text(c, Align2::CENTER_CENTER, initial, FontId::proportional(13.0), WHITE);
+            if resp.clicked() {
+                acts.push(StickerAct::SelectSet(i));
+            }
+        }
+        let _ = icons::Ico::Sticker;
+    }
+}
