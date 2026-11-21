@@ -22,6 +22,7 @@ pub enum Stage {
 }
 
 pub enum Cmd {
+    Keys(String, String),
     Preview(usize, i32),
     Download(i32),
     RequestCode(String),
@@ -47,6 +48,20 @@ fn home() -> PathBuf {
     let dir = std::env::var("RG_HOME").map_or_else(|_| PathBuf::from(".rg"), PathBuf::from);
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+fn keys_from_file(home: &std::path::Path) -> Option<Config> {
+    let text = std::fs::read_to_string(home.join("api.keys")).ok()?;
+    let mut lines = text.lines();
+    let api_id: i32 = lines.next()?.trim().parse().ok()?;
+    let api_hash = lines.next()?.trim().to_owned();
+    Config::from_lookup(|k| match k {
+        "RG_API_ID" => Some(api_id.to_string()),
+        "RG_API_HASH" => Some(api_hash.clone()),
+        "RG_PROXY" => std::env::var("RG_PROXY").ok(),
+        _ => None,
+    })
+    .ok()
 }
 
 fn load_settings(path: &std::path::Path) -> Settings {
@@ -93,9 +108,24 @@ impl Out {
 async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui::Context) {
     let out = Out { ev, ctx };
     let home = home();
-    let Ok(mut cfg) = Config::from_env() else {
+    // Ключи: переменные окружения или файл `api.keys` (две строки: api_id, api_hash).
+    let mut cfg = loop {
+        if let Some(c) = Config::from_env().ok().or_else(|| keys_from_file(&home)) {
+            break c;
+        }
         out.send(Ev::Stage(Stage::NeedKeys));
-        return;
+        match cmds.recv().await {
+            Some(Cmd::Keys(id, hash)) => match id.trim().parse::<i32>() {
+                Ok(n) if n > 0 && !hash.trim().is_empty() => {
+                    let _ = std::fs::write(home.join("api.keys"), format!("{n}
+{}
+", hash.trim()));
+                }
+                _ => out.err("api_id — число, api_hash — строка из 32 символов"),
+            },
+            Some(_) => {}
+            None => return,
+        }
     };
     cfg.session_path = home.join("main.session").to_string_lossy().into_owned();
 
@@ -135,6 +165,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
 
     while let Some(cmd) = cmds.recv().await {
         match cmd {
+            Cmd::Keys(..) => {}
             Cmd::RequestCode(phone) => match connected.client.request_login_code(&phone, &cfg.api_hash).await {
                 Ok(t) => {
                     login = Some(t);

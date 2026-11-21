@@ -33,6 +33,8 @@ struct App {
     error: String,
     textures: HashMap<i32, egui::TextureHandle>,
     requested: HashSet<i32>,
+    key_id: String,
+    key_hash: String,
 }
 
 impl App {
@@ -54,6 +56,8 @@ impl App {
             error: String::new(),
             textures: HashMap::new(),
             requested: HashSet::new(),
+            key_id: String::new(),
+            key_hash: String::new(),
         }
     }
 
@@ -110,7 +114,15 @@ impl App {
                     ui.label("Подключение к Telegram…");
                 }
                 Stage::NeedKeys => {
-                    ui.label("Задайте RG_API_ID и RG_API_HASH (ключи с my.telegram.org) и перезапустите.");
+                    ui.label("Нужны ключи приложения с my.telegram.org (API development tools). Они хранятся только у вас на диске.");
+                    ui.label("api_id");
+                    ui.add(egui::TextEdit::singleline(&mut self.key_id));
+                    ui.label("api_hash");
+                    ui.add(egui::TextEdit::singleline(&mut self.key_hash).password(true));
+                    if ui.button("Сохранить и продолжить").clicked() {
+                        let hash = std::mem::take(&mut self.key_hash);
+                        self.send(Cmd::Keys(self.key_id.clone(), hash));
+                    }
                 }
                 Stage::NeedPhone => {
                     ui.label("Номер телефона в международном формате");
