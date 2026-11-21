@@ -155,7 +155,7 @@ pub async fn connect(
     let session = open_session(cfg).await?;
     let params = ConnectionParams {
         device_model: "Rustgramm".to_owned(),
-        system_version: String::new(),
+        system_version: "Rustgramm OS".to_owned(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         proxy_url: cfg.proxy_url.clone(),
         ..ConnectionParams::default()

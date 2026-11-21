@@ -486,3 +486,9 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - Аудит зависимостей: в grammers 0.12 нет зашитых внешних хостов; hickory-resolver используется только для хоста прокси (feature proxy); reqwest/hyper/openssl в дереве rg-core нет; libsql — локальный SQLite.
 - Грабли: `SessionData` не реализует `Session` — в тестах `MemorySession::from(SessionData)`; `ConnectionParams` собирать через `..Default::default()` (clippy ругается на присваивание полей).
 - Не проверено: живой вход в Telegram (нужны api_id/api_hash владельца и телефон) — делается вручную, ключи в репозиторий не коммитить.
+
+### Этап 3 (часть 1) выполнен (2026-11-21)
+- `crates/rg-ayu`: `ghost` — политика режима призрака по `CONSTRUCTOR_ID` TL (readHistory/readMessageContents для чатов и каналов, readStories/incrementStoryViews, статус «в сети», прогресс загрузки); `store` — SQLite (rusqlite bundled): удалённые сообщения, история правок, prune. 9 тестов.
+- Вход: `crates/rg-core/examples/login.rs` — интерактивный; код из Telegram и облачный пароль вводит сам пользователь (агент пароли не вводит). Секреты/номер в репозиторий не попадают, сессия в `.rg/` (в .gitignore).
+- Грабли: Telegram отклоняет пустую `system_version` (`CONNECTION_SYSTEM_EMPTY`) — задана «Rustgramm OS». Heredoc с кириллицей и апострофами в Bash ломается — файлы писать инструментом Write.
+- Дальше: подключить `verdict*` перед `client.invoke` в слое запросов и обработчик обновлений (UpdateDeleteMessages → mark_deleted, UpdateEditMessage → record_edit); живая проверка после входа.

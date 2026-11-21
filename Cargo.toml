@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rg-net", "crates/rg-settings", "crates/rg-core"]
+members = ["crates/rg-net", "crates/rg-settings", "crates/rg-core", "crates/rg-ayu"]
 
 [workspace.package]
 version = "0.1.0"

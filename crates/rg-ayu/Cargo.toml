@@ -1,0 +1,12 @@
+[package]
+name = "rg-ayu"
+description = "Rustgramm: ghost mode request policy and local deleted/edited message store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rg-settings = { path = "../rg-settings" }
+grammers-tl-types = "0.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
