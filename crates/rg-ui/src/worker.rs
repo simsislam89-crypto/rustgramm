@@ -52,6 +52,14 @@ pub enum Cmd {
     Older(i32),
     /// Отметить открытый чат прочитанным принудительно (мимо режима призрака).
     ForceRead,
+    /// Выйти из аккаунта: сессия и локальная база стираются, приложение перезапускается.
+    LogOut,
+    /// Архивировать (true) или вернуть из архива чат с индексом.
+    Archive(usize, bool),
+    PinDialog(usize, bool),
+    MuteDialog(usize, bool),
+    /// Прочитать чат с индексом на сервере.
+    ReadDialog(usize),
     Settings(Box<Settings>),
 }
 
@@ -112,6 +120,35 @@ fn keys_from_file(home: &std::path::Path) -> Option<Config> {
     .ok()
 }
 
+/// После выхода из аккаунта удаляет сессию, базу сообщений и кэш предыдущего аккаунта.
+/// Вызывается до подключения: файлы ещё не открыты. Настройки и загрузки остаются.
+fn wipe_if_logged_out(home: &std::path::Path) {
+    let flag = home.join("logout.flag");
+    if !flag.exists() {
+        return;
+    }
+    for name in [
+        "main.session",
+        "main.session-shm",
+        "main.session-wal",
+        "messages.db",
+        "messages.db-shm",
+        "messages.db-wal",
+    ] {
+        let _ = std::fs::remove_file(home.join(name));
+    }
+    let _ = std::fs::remove_dir_all(home.join("cache"));
+    let _ = std::fs::remove_file(flag);
+}
+
+/// Запускает новую копию приложения и завершает текущую.
+fn restart_app() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
+    std::process::exit(0);
+}
+
 fn load_settings(path: &std::path::Path) -> Settings {
     match std::fs::read_to_string(path) {
         Ok(s) => Settings::from_json(&s).unwrap_or_default(),
@@ -152,6 +189,7 @@ impl Out {
 async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui::Context) {
     let out = Out { ev, ctx };
     let home = home();
+    wipe_if_logged_out(&home);
     // Ключи: переменные окружения или файл `api.keys` (две строки: api_id, api_hash).
     let mut cfg = loop {
         if let Some(c) = Config::from_env()
@@ -339,6 +377,45 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let Some(d) = dialogs.get(i) else { continue };
                 out.send(Ev::EditHistory(id, engine.edit_history(&d.peer, id).await));
             }
+            Cmd::Archive(i, on) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.set_archived(d.peer, on).await {
+                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Err(e) => out.err(format!("Архив: {e}")),
+                }
+            }
+            Cmd::PinDialog(i, on) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.set_pinned_dialog(d.peer, on).await {
+                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Err(e) => out.err(format!("Закрепление: {e}")),
+                }
+            }
+            Cmd::MuteDialog(i, on) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.set_muted(d.peer, on).await {
+                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Err(e) => out.err(format!("Звук: {e}")),
+                }
+            }
+            Cmd::ReadDialog(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.force_read(d.peer).await {
+                    Ok(()) => refresh_dialogs(&engine, &out, &mut dialogs).await,
+                    Err(e) => out.err(format!("Не отмечено: {e}")),
+                }
+            }
+            Cmd::LogOut => {
+                match connected.client.sign_out().await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Сессия на сервере уже недействительна — локально всё равно чистим.
+                        out.err(format!("Выход: {e}"));
+                    }
+                }
+                let _ = std::fs::write(home.join("logout.flag"), b"1");
+                restart_app();
+            }
             Cmd::ForceRead => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
@@ -442,6 +519,20 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     }
 }
 
+/// Загрузить основной список и архив (архивные идут после основных).
+async fn refresh_dialogs(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>) {
+    match engine.dialogs(200).await {
+        Ok(mut d) => {
+            if let Ok(mut a) = engine.archived(100).await {
+                d.append(&mut a);
+            }
+            *dialogs = d.clone();
+            out.send(Ev::Dialogs(d));
+        }
+        Err(e) => out.err(format!("Чаты: {e}")),
+    }
+}
+
 /// Перечитать последние сообщения открытого чата.
 async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerRef, idx: usize) {
     if let Ok(rows) = engine.history(peer, 80).await {
@@ -459,13 +550,7 @@ async fn enter(
     if let Ok(me) = engine.client.get_me().await {
         out.send(Ev::Me(me.full_name()));
     }
-    match engine.dialogs(200).await {
-        Ok(d) => {
-            *dialogs = d.clone();
-            out.send(Ev::Dialogs(d));
-        }
-        Err(e) => out.err(format!("Чаты: {e}")),
-    }
+    refresh_dialogs(engine, out, dialogs).await;
     if let Some(rx) = updates.take() {
         let eng = engine.clone();
         let ctx = out.ctx.clone();

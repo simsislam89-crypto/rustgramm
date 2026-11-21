@@ -33,6 +33,8 @@ pub struct DialogRow {
     pub muted: bool,
     /// Чат с самим собой (Избранное).
     pub saved: bool,
+    /// Лежит в архиве.
+    pub archived: bool,
 }
 
 /// Сообщение для интерфейса.
@@ -159,6 +161,137 @@ impl Engine {
         self.client.mark_as_read(peer).await
     }
 
+    /// Чаты из папки «Архив» (folder_id = 1).
+    pub async fn archived(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: Some(1),
+                offset_date: 0,
+                offset_id: 0,
+                offset_peer: tl::enums::InputPeer::Empty,
+                limit: limit.min(100) as i32,
+                hash: 0,
+            })
+            .await?;
+        let (dialogs, messages, chats, users) = match res {
+            tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users),
+            tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users),
+            tl::enums::messages::Dialogs::NotModified(_) => return Ok(Vec::new()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let mut out = Vec::new();
+        for d in dialogs {
+            let tl::enums::Dialog::Dialog(d) = d else { continue };
+            let pid = grammers_session::types::PeerId::from(&d.peer);
+            let (name, peer) = match &d.peer {
+                tl::enums::Peer::User(u) => {
+                    let Some(user) = users.iter().find(|x| matches!(x, tl::enums::User::User(y) if y.id == u.user_id)) else { continue };
+                    let name = match user {
+                        tl::enums::User::User(y) => {
+                            format!("{} {}", y.first_name.clone().unwrap_or_default(), y.last_name.clone().unwrap_or_default())
+                                .trim()
+                                .to_owned()
+                        }
+                        tl::enums::User::Empty(_) => String::new(),
+                    };
+                    (name, grammers_session::types::PeerRef::from(user))
+                }
+                tl::enums::Peer::Chat(c) => {
+                    let Some(chat) = chats.iter().find(|x| matches!(x, tl::enums::Chat::Chat(y) if y.id == c.chat_id)) else { continue };
+                    let name = match chat {
+                        tl::enums::Chat::Chat(y) => y.title.clone(),
+                        _ => String::new(),
+                    };
+                    (name, grammers_session::types::PeerRef::from(chat))
+                }
+                tl::enums::Peer::Channel(c) => {
+                    let Some(chat) = chats.iter().find(|x| matches!(x, tl::enums::Chat::Channel(y) if y.id == c.channel_id)) else { continue };
+                    let name = match chat {
+                        tl::enums::Chat::Channel(y) => y.title.clone(),
+                        _ => String::new(),
+                    };
+                    (name, grammers_session::types::PeerRef::from(chat))
+                }
+            };
+            let (last, date) = messages
+                .iter()
+                .find_map(|m| match m {
+                    tl::enums::Message::Message(m)
+                        if m.id == d.top_message && grammers_session::types::PeerId::from(&m.peer_id) == pid =>
+                    {
+                        Some((m.message.chars().take(80).collect::<String>(), i64::from(m.date)))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let muted = matches!(&d.notify_settings, tl::enums::PeerNotifySettings::Settings(s) if s.mute_until.is_some_and(|t| i64::from(t) > now));
+            out.push(DialogRow {
+                peer,
+                id: pid.bot_api_dialog_id_unchecked(),
+                name: if name.is_empty() { "Без имени".to_owned() } else { name },
+                last,
+                date,
+                unread: d.unread_count.max(i32::from(d.unread_mark)),
+                pinned: d.pinned,
+                muted,
+                saved: false,
+                archived: true,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Переместить чат в архив или вернуть из него.
+    pub async fn set_archived(&self, peer: PeerRef, archive: bool) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::folders::EditPeerFolders {
+                folder_peers: vec![tl::enums::InputFolderPeer::Peer(tl::types::InputFolderPeer {
+                    peer: peer.into(),
+                    folder_id: i32::from(archive),
+                })],
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Закрепить чат в списке или открепить.
+    pub async fn set_pinned_dialog(&self, peer: PeerRef, pinned: bool) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::messages::ToggleDialogPin {
+                pinned,
+                peer: tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer: peer.into() }),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Отключить звук чата навсегда или включить.
+    pub async fn set_muted(&self, peer: PeerRef, muted: bool) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::UpdateNotifySettings {
+                peer: tl::enums::InputNotifyPeer::Peer(tl::types::InputNotifyPeer { peer: peer.into() }),
+                settings: tl::enums::InputPeerNotifySettings::Settings(tl::types::InputPeerNotifySettings {
+                    show_previews: None,
+                    silent: None,
+                    mute_until: Some(if muted { i32::MAX } else { 0 }),
+                    sound: None,
+                    stories_muted: None,
+                    stories_hide_sender: None,
+                    stories_sound: None,
+                }),
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn dialogs(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
         let mut it = self.client.iter_dialogs();
         let now = std::time::SystemTime::now()
@@ -189,6 +322,7 @@ impl Engine {
                 pinned,
                 muted,
                 saved: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.is_self()),
+                archived: false,
             });
         }
         Ok(out)

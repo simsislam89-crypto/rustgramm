@@ -64,6 +64,7 @@ struct App {
     settings_tab: usize,
     filter_new: String,
     drawer_open: bool,
+    logout_confirm: bool,
     shadow_new: String,
     /// Раскрытые строки со счётчиком «n/m» (битовая маска).
     expanded: u32,
@@ -145,6 +146,7 @@ impl App {
             settings_tab: 0,
             filter_new: String::new(),
             drawer_open: false,
+            logout_confirm: false,
             shadow_new: String::new(),
             expanded: 0,
             older_pending: false,
@@ -738,6 +740,7 @@ fn demo_app(mode: &str) -> App {
             pinned: i == 0,
             muted: *muted,
             saved: false,
+            archived: false,
         });
     }
     app.selected = Some(0);

@@ -227,6 +227,7 @@ impl App {
     /// Окно настроек: заголовок со стрелкой «назад» и крестиком, список строк.
     #[allow(deprecated)]
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
+        self.logout_window(ctx);
         if !self.settings_open {
             return;
         }
@@ -249,6 +250,7 @@ impl App {
         let mut shadow_new = std::mem::take(&mut self.shadow_new);
         let mut expanded = self.expanded;
         let mut reset = false;
+        let mut logout_ask = false;
         let max_h = (screen.height() - 40.0).clamp(240.0, 700.0);
         egui::Area::new(egui::Id::new("prefs-box"))
             .order(egui::Order::Tooltip)
@@ -318,7 +320,7 @@ impl App {
                                     page::GENERAL => general_page(ui, &mut s, &mut expanded),
                                     page::APPEARANCE => appearance_page(ui, &mut s),
                                     page::CHATS => chats_page(ui, &mut s, &mut expanded),
-                                    page::OTHER => reset = other_page(ui),
+                                    page::OTHER => reset = other_page(ui, &mut logout_ask),
                                     page::SHARED => shared_page(ui, &mut s, &mut new_filter),
                                     page::SHADOW => shadow_page(ui, &mut s, &mut shadow_new),
                                     _ => {
@@ -337,6 +339,11 @@ impl App {
         if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.settings_open = false;
         }
+        if logout_ask {
+            // Подтверждение рисуется поверх только при закрытом окне настроек.
+            self.logout_confirm = true;
+            self.settings_open = false;
+        }
         if reset {
             s = Settings::first_run();
             self.status = "Настройки сброшены".to_owned();
@@ -344,6 +351,36 @@ impl App {
         if s != self.settings {
             self.settings = s.clone();
             self.send(Cmd::Settings(Box::new(s)));
+        }
+    }
+}
+
+impl App {
+    /// Подтверждение выхода из аккаунта.
+    #[allow(deprecated)]
+    fn logout_window(&mut self, ctx: &egui::Context) {
+        if !self.logout_confirm {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new("Выйти из аккаунта?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Сессия на этом устройстве завершится, сохранённые сообщения и кэш этого аккаунта будут стёрты. Приложение перезапустится.");
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Выйти").color(DANGER)).clicked() {
+                        self.send(Cmd::LogOut);
+                        close = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.logout_confirm = false;
         }
     }
 }
@@ -815,7 +852,7 @@ fn chats_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
 }
 
 /// Страница «Прочее». Возвращает `true`, если нажато «Сбросить настройки».
-fn other_page(ui: &mut egui::Ui) -> bool {
+fn other_page(ui: &mut egui::Ui, logout_ask: &mut bool) -> bool {
     section(ui, "Прочее");
     let mut reset = false;
     if nav_row(ui, "🔗", "Зарегистрировать tg:// ссылки", "") {
@@ -823,6 +860,9 @@ fn other_page(ui: &mut egui::Ui) -> bool {
     }
     if nav_row(ui, "↺", "Сбросить настройки", "") {
         reset = true;
+    }
+    if nav_row(ui, "⎋", "Выйти из аккаунта", "") {
+        *logout_ask = true;
     }
     desc(ui, "Отчёты о сбоях, проверка обновлений и любая телеметрия в Rustgramm отсутствуют: соединения идут только на серверы Telegram.");
     reset
