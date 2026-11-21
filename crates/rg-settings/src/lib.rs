@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod ayu;
+pub use ayu::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SendWithoutSound {
@@ -110,9 +113,10 @@ pub struct Settings {
     pub translation: TranslationProvider,
     /// Хосты, разрешённые пользователем вручную (виден в интерфейсе).
     pub user_hosts: Vec<String>,
-    /// Сохранять удалённые и изменённые сообщения локально.
-    pub save_deleted: bool,
-    pub save_edit_history: bool,
+    /// Остальные настройки AyuGram (внешний вид, фильтры, меню, поле ввода).
+    pub ayu: AyuSettings,
+    /// Фильтры сообщений.
+    pub filters: Vec<Filter>,
 }
 
 impl Settings {
@@ -121,11 +125,7 @@ impl Settings {
     /// сохраняются только на этом устройстве. Отправка сообщения по-прежнему отмечает чат
     /// прочитанным, так что переписка выглядит обычной.
     pub fn first_run() -> Self {
-        let mut s = Self {
-            save_deleted: true,
-            save_edit_history: true,
-            ..Self::default()
-        };
+        let mut s = Self::default();
         s.ghost.set_active(true);
         s
     }
@@ -170,7 +170,7 @@ mod tests {
         assert!(!s.ghost.send_upload_progress);
         assert!(!s.ghost.send_read_stories);
         assert!(s.ghost.mark_read_after_action);
-        assert!(s.save_deleted && s.save_edit_history);
+        assert!(s.ayu.save_deleted_messages && s.ayu.save_messages_history);
         assert_eq!(s.translation, TranslationProvider::Telegram);
     }
 
@@ -211,7 +211,7 @@ mod tests {
     fn json_roundtrip() {
         let mut s = Settings::default();
         s.ghost.set_active(true);
-        s.save_deleted = true;
+        s.ayu.save_deleted_messages = false;
         assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
     }
 }

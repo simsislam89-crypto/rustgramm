@@ -9,6 +9,7 @@ use grammers_client::update::Update;
 use grammers_mtsender::UpdatesConfiguration;
 use grammers_session::types::PeerRef;
 use grammers_session::updates::UpdatesLike;
+use rg_ayu::filters::FilterSet;
 use rg_ayu::ghost::{self, Verdict};
 use rg_ayu::store::MessageStore;
 use rg_settings::Settings;
@@ -42,6 +43,40 @@ pub struct MessageRow {
     pub deleted: bool,
     pub edits: usize,
     pub media: Option<MediaInfo>,
+    /// Имя отправителя (для групп и каналов).
+    pub sender: String,
+    /// Ответ на сообщение: идентификатор и начало его текста, если оно есть в выборке.
+    pub reply_to: Option<(i32, String)>,
+    /// Источник пересылки.
+    pub forwarded_from: Option<String>,
+    pub pinned: bool,
+    /// Время последней правки (unix), если сообщение менялось.
+    pub edit_date: Option<i64>,
+    pub views: Option<i32>,
+    /// Число реакций.
+    pub reactions: i32,
+}
+
+impl MessageRow {
+    /// Строка без служебных полей (для сохранённых удалённых сообщений и тестов).
+    pub fn plain(id: i32, text: String, outgoing: bool, date: i64) -> Self {
+        Self {
+            id,
+            text,
+            outgoing,
+            date,
+            deleted: false,
+            edits: 0,
+            media: None,
+            sender: String::new(),
+            reply_to: None,
+            forwarded_from: None,
+            pinned: false,
+            edit_date: None,
+            views: None,
+            reactions: 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -154,38 +189,222 @@ impl Engine {
         peer: PeerRef,
         limit: usize,
     ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
+        self.history_before(peer, 0, limit).await
+    }
+
+    /// Сообщения старше `before_id` (0 — с самых новых). Для подгрузки при прокрутке вверх.
+    pub async fn history_before(
+        &self,
+        peer: PeerRef,
+        before_id: i32,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
         let key = peer_key(&peer);
-        let mut it = self.client.iter_messages(peer);
+        let mut it = self.client.iter_messages(peer).offset_id(before_id);
         let mut rows = Vec::new();
         while rows.len() < limit {
             let Some(m) = it.next().await? else { break };
             self.remember(key, m.id(), m.text(), m.date().as_second()).await;
-            rows.push(MessageRow {
-                id: m.id(),
-                text: m.text().to_owned(),
-                outgoing: m.outgoing(),
-                date: m.date().as_second(),
-                deleted: false,
-                edits: self.edit_count(key, m.id()).await,
-                media: m.media().as_ref().map(media::describe),
-            });
+            rows.push(self.row(key, &m).await);
         }
-        // Удалённые, но сохранённые у нас, возвращаем на место по времени.
-        for s in self.deleted(key).await {
-            if !rows.iter().any(|r| r.id == s.msg_id) {
-                rows.push(MessageRow {
-                    id: s.msg_id,
-                    text: s.text,
-                    outgoing: false,
-                    date: s.date,
-                    deleted: true,
-                    edits: self.edit_count(key, s.msg_id).await,
-                    media: None,
-                });
+        if before_id == 0 {
+            // Удалённые, но сохранённые у нас, возвращаем на место по времени.
+            for s in self.deleted(key).await {
+                if !rows.iter().any(|r| r.id == s.msg_id) {
+                    let mut r = MessageRow::plain(s.msg_id, s.text, false, s.date);
+                    r.deleted = true;
+                    r.edits = self.edit_count(key, s.msg_id).await;
+                    rows.push(r);
+                }
             }
         }
         rows.sort_by_key(|r| (r.date, r.id));
+        Ok(self.finish(key, rows))
+    }
+
+    /// Фильтры и «зальго» из настроек; подписи ответов по сообщениям выборки.
+    fn finish(&self, key: i64, mut rows: Vec<MessageRow>) -> Vec<MessageRow> {
+        let cfg = self.settings();
+        if cfg.ayu.filters_enabled {
+            let (set, _) = FilterSet::build(&cfg.filters);
+            if !set.is_empty() {
+                rows.retain(|r| !set.hides(key, &r.text));
+            }
+        }
+        if cfg.ayu.filter_zalgo {
+            for r in &mut rows {
+                r.text = rg_ayu::filters::strip_zalgo(&r.text);
+            }
+        }
+        let texts: std::collections::HashMap<i32, String> = rows
+            .iter()
+            .map(|r| (r.id, r.text.chars().take(80).collect()))
+            .collect();
+        for r in &mut rows {
+            if let Some((id, snippet)) = &mut r.reply_to
+                && let Some(t) = texts.get(id)
+            {
+                snippet.clone_from(t);
+            }
+        }
+        rows
+    }
+
+    async fn row(&self, key: i64, m: &grammers_client::message::Message) -> MessageRow {
+        let reply_to = m.reply_to_message_id().map(|id| (id, String::new()));
+        let forwarded_from = m.forward_header().map(|h| {
+            let grammers_client::tl::enums::MessageFwdHeader::Header(h) = h;
+            h.from_name
+                .or(h.post_author)
+                .unwrap_or_else(|| "скрытый отправитель".to_owned())
+        });
+        MessageRow {
+            id: m.id(),
+            text: m.text().to_owned(),
+            outgoing: m.outgoing(),
+            date: m.date().as_second(),
+            deleted: false,
+            edits: self.edit_count(key, m.id()).await,
+            media: m.media().as_ref().map(media::describe),
+            sender: m
+                .sender()
+                .and_then(|p| p.name())
+                .unwrap_or_default()
+                .to_owned(),
+            reply_to,
+            forwarded_from,
+            pinned: m.pinned(),
+            edit_date: m.edit_date().map(|d| d.as_second()),
+            views: m.view_count(),
+            reactions: m.reaction_count().unwrap_or(0),
+        }
+    }
+
+    /// Поиск по тексту внутри чата (на сервере); результат — по возрастанию времени.
+    pub async fn search(
+        &self,
+        peer: PeerRef,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
+        let key = peer_key(&peer);
+        let mut it = self.client.search_messages(peer).query(query);
+        let mut rows = Vec::new();
+        while rows.len() < limit {
+            let Some(m) = it.next().await? else { break };
+            rows.push(self.row(key, &m).await);
+        }
+        rows.sort_by_key(|r| (r.date, r.id));
         Ok(rows)
+    }
+
+    /// Отправить текст, при `reply_to` — ответом на сообщение.
+    pub async fn send_reply(
+        &self,
+        peer: PeerRef,
+        text: &str,
+        reply_to: Option<i32>,
+    ) -> Result<(), grammers_client::InvocationError> {
+        let ghost_mode = self.settings().ghost;
+        let msg = grammers_client::message::InputMessage::new()
+            .text(text)
+            .reply_to(reply_to)
+            .silent(ghost_mode.should_send_without_sound());
+        self.client.send_message(peer, msg).await?;
+        if ghost::should_mark_read_after_action(&ghost_mode) {
+            self.client.mark_as_read(peer).await?;
+        }
+        Ok(())
+    }
+
+    /// Отправить файл (картинки уходят как фото, остальное — документом).
+    pub async fn send_file(
+        &self,
+        peer: PeerRef,
+        path: &Path,
+        caption: &str,
+        reply_to: Option<i32>,
+    ) -> Result<(), BoxErr> {
+        let up = self.client.upload_file(path).await?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let base = grammers_client::message::InputMessage::new()
+            .text(caption)
+            .reply_to(reply_to)
+            .silent(self.settings().ghost.should_send_without_sound());
+        let msg = if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+            base.photo(up)
+        } else {
+            base.file(up)
+        };
+        self.client.send_message(peer, msg).await?;
+        Ok(())
+    }
+
+    /// Изменить текст своего сообщения.
+    pub async fn edit(
+        &self,
+        peer: PeerRef,
+        id: i32,
+        text: &str,
+    ) -> Result<(), grammers_client::InvocationError> {
+        let msg = grammers_client::message::InputMessage::new().text(text);
+        self.client.edit_message(peer, id, msg).await
+    }
+
+    /// Удалить сообщения. Копия в локальном хранилище остаётся (функция AyuGram).
+    pub async fn delete(
+        &self,
+        peer: PeerRef,
+        ids: &[i32],
+    ) -> Result<usize, grammers_client::InvocationError> {
+        self.client.delete_messages(peer, ids).await
+    }
+
+    /// Переслать сообщения в другой чат.
+    pub async fn forward(
+        &self,
+        from: PeerRef,
+        to: PeerRef,
+        ids: &[i32],
+    ) -> Result<(), grammers_client::InvocationError> {
+        self.client
+            .forward_messages(to, ids, from)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn pin(
+        &self,
+        peer: PeerRef,
+        id: i32,
+        pinned: bool,
+    ) -> Result<(), grammers_client::InvocationError> {
+        if pinned {
+            self.client.pin_message(peer, id).await
+        } else {
+            self.client.unpin_message(peer, id).await
+        }
+    }
+
+    /// Поставить реакцию-эмодзи; пустая строка снимает свою реакцию.
+    pub async fn react(
+        &self,
+        peer: PeerRef,
+        id: i32,
+        emoji: &str,
+    ) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::message::InputReactions;
+        let reactions = if emoji.is_empty() {
+            InputReactions::remove()
+        } else {
+            InputReactions::from(emoji)
+        };
+        self.client.send_reactions(peer, id, reactions).await?;
+        Ok(())
     }
 
     /// Картинка для предпросмотра (фото или статичный стикер) в кэше на диске.
@@ -258,7 +477,7 @@ impl Engine {
     }
 
     async fn remember(&self, peer: i64, id: i32, text: &str, date: i64) {
-        if self.settings().save_deleted {
+        if self.settings().ayu.save_deleted_messages {
             let _ = self.store.remember(peer, id, text, date).await;
         }
     }
@@ -300,19 +519,19 @@ impl Engine {
     async fn apply(&self, upd: &Update) {
         let cfg = self.settings();
         match upd {
-            Update::NewMessage(m) if cfg.save_deleted => {
+            Update::NewMessage(m) if cfg.ayu.save_deleted_messages => {
                 let key = m.peer_id().bot_api_dialog_id_unchecked();
                 self.remember(key, m.id(), m.text(), m.date().as_second())
                     .await;
             }
-            Update::MessageEdited(m) if cfg.save_edit_history => {
+            Update::MessageEdited(m) if cfg.ayu.save_messages_history => {
                 let key = m.peer_id().bot_api_dialog_id_unchecked();
                 let _ = self
                     .store
                     .record_edit(key, m.id(), m.text(), m.date().as_second())
                     .await;
             }
-            Update::MessageDeleted(d) if cfg.save_deleted => {
+            Update::MessageDeleted(d) if cfg.ayu.save_deleted_messages => {
                 let _ = match d.channel_id() {
                     // Каналы в формате Bot API: -100 + id.
                     Some(ch) => {

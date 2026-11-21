@@ -1,17 +1,18 @@
 //! Общий интерфейс Rustgramm для ПК и Android в стиле Telegram Desktop (AyuGram v7.2.9),
 //! синий везде заменён на оранжевый. Данные уходят только на серверы Telegram (см. `rg-net`).
 
+mod chat;
 pub mod emoji;
 pub mod icons;
+mod settings_ui;
 pub mod theme;
 pub mod worker;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Vec2};
+use eframe::egui::{self, Color32, FontId, RichText, Sense, Vec2};
 use rg_core::engine::{DialogRow, MessageRow};
-use rg_core::media::{MediaKind, human_size};
 use rg_settings::Settings;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -44,6 +45,26 @@ struct App {
     proxy_open: bool,
     qr_cache: Option<(String, QrImage)>,
     now: i64,
+    /// Ответ на сообщение (идентификатор и начало текста).
+    reply: Option<(i32, String)>,
+    /// Идентификатор редактируемого сообщения.
+    editing: Option<i32>,
+    search_open: bool,
+    chat_search: String,
+    /// Результаты поиска по чату (`None` — обычная лента).
+    found: Option<Vec<MessageRow>>,
+    forward: Option<i32>,
+    forward_filter: String,
+    confirm_delete: Option<i32>,
+    details: Option<i32>,
+    edit_history: Option<(i32, Vec<String>)>,
+    hidden: HashSet<i32>,
+    settings_open: bool,
+    settings_tab: usize,
+    filter_new: String,
+    older_pending: bool,
+    history_end: bool,
+    scroll_to: Option<i32>,
 }
 
 /// Готовая сетка QR: размер стороны и тёмные модули.
@@ -104,11 +125,65 @@ impl App {
             proxy_open: false,
             qr_cache: None,
             now: 0,
+            reply: None,
+            editing: None,
+            search_open: false,
+            chat_search: String::new(),
+            found: None,
+            forward: None,
+            forward_filter: String::new(),
+            confirm_delete: None,
+            details: None,
+            edit_history: None,
+            hidden: HashSet::new(),
+            settings_open: false,
+            settings_tab: 0,
+            filter_new: String::new(),
+            older_pending: false,
+            history_end: false,
+            scroll_to: None,
         }
     }
 
     fn send(&self, c: Cmd) {
         let _ = self.cmd.send(c);
+    }
+
+    /// Предпросмотры только для свежих вложений и по одному разу.
+    fn request_previews(&mut self, idx: usize, rows: &[MessageRow]) {
+        let want: Vec<i32> = rows
+            .iter()
+            .rev()
+            .filter(|r| r.media.as_ref().is_some_and(|x| x.has_preview()))
+            .take(30)
+            .map(|r| r.id)
+            .collect();
+        for id in want {
+            if self.requested.insert(id) {
+                let _ = self.cmd.send(Cmd::Preview(idx, id));
+            }
+        }
+    }
+
+    /// Закрыть открытый чат и сбросить состояние ленты.
+    fn close_chat(&mut self) {
+        self.selected = None;
+        self.reset_chat_state();
+    }
+
+    fn reset_chat_state(&mut self) {
+        self.messages.clear();
+        self.textures.clear();
+        self.requested.clear();
+        self.found = None;
+        self.reply = None;
+        self.editing = None;
+        self.search_open = false;
+        self.chat_search.clear();
+        self.hidden.clear();
+        self.older_pending = false;
+        self.history_end = false;
+        self.scroll_to = None;
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -121,28 +196,38 @@ impl App {
                 Ev::Me(n) => self.me = n,
                 Ev::Dialogs(d) => self.dialogs = d,
                 Ev::History(idx, m) if self.selected == Some(idx) => {
-                    // Предпросмотры только для свежих вложений и по одному разу.
-                    let want: Vec<i32> = m
-                        .iter()
-                        .rev()
-                        .filter(|r| r.media.as_ref().is_some_and(|x| x.has_preview()))
-                        .take(30)
-                        .map(|r| r.id)
-                        .collect();
-                    for id in want {
-                        if self.requested.insert(id) {
-                            let _ = self.cmd.send(Cmd::Preview(idx, id));
-                        }
-                    }
+                    self.request_previews(idx, &m);
                     self.messages = m;
+                    self.older_pending = false;
                 }
+                Ev::Older(idx, rows) if self.selected == Some(idx) => {
+                    self.older_pending = false;
+                    if rows.is_empty() {
+                        self.history_end = true;
+                    } else {
+                        self.scroll_to = self.messages.first().map(|m| m.id);
+                        self.request_previews(idx, &rows);
+                        let known: HashSet<i32> = self.messages.iter().map(|m| m.id).collect();
+                        let mut all: Vec<MessageRow> =
+                            rows.into_iter().filter(|r| !known.contains(&r.id)).collect();
+                        all.append(&mut self.messages);
+                        self.messages = all;
+                    }
+                }
+                Ev::Older(..) => {}
+                Ev::Found(idx, rows) if self.selected == Some(idx) => {
+                    self.request_previews(idx, &rows);
+                    self.found = Some(rows);
+                }
+                Ev::Found(..) => {}
+                Ev::EditHistory(id, v) => self.edit_history = Some((id, v)),
                 Ev::History(..) => {}
                 Ev::Image(idx, id, img) if self.selected == Some(idx) => {
-                    let tex = ctx.load_texture(format!("m{id}"), img, egui::TextureOptions::LINEAR);
+                    let tex = ctx.load_texture(format!("m{id}"), *img, egui::TextureOptions::LINEAR);
                     self.textures.insert(id, tex);
                 }
                 Ev::Image(..) => {}
-                Ev::Settings(s) => self.settings = s,
+                Ev::Settings(s) => self.settings = *s,
                 Ev::Status(s) => self.status = s,
                 Ev::Error(e) => self.error = e,
             }
@@ -359,39 +444,6 @@ impl App {
 
     // ---------- главное окно ----------
 
-    /// Главное меню (три полосы): режим призрака и локальное хранение.
-    fn main_menu(&mut self, resp: &egui::Response) {
-        let mut s = self.settings.clone();
-        let me = self.me.clone();
-        egui::Popup::menu(resp).show(|ui| {
-            ui.set_min_width(260.0);
-            ui.label(RichText::new(&me).strong().color(WHITE));
-            ui.separator();
-            let mut ghost = s.ghost.active;
-            if ui.checkbox(&mut ghost, "Режим призрака").changed() {
-                s.ghost.set_active(ghost);
-            }
-            ui.checkbox(&mut s.save_deleted, "Сохранять удалённые сообщения");
-            ui.checkbox(&mut s.save_edit_history, "История правок");
-            let mut silent = s.ghost.should_send_without_sound();
-            if ui.checkbox(&mut silent, "Отправлять без звука").changed() {
-                s.ghost.send_without_sound = if silent {
-                    rg_settings::SendWithoutSound::Always
-                } else {
-                    rg_settings::SendWithoutSound::Never
-                };
-            }
-            ui.separator();
-            ui.weak("Соединения: только серверы Telegram");
-            ui.weak("Не передаются: модель устройства, версия ОС,");
-            ui.weak("язык системы, «в сети», «прочитано» (в режиме призрака)");
-        });
-        if s != self.settings {
-            self.settings = s.clone();
-            self.send(Cmd::Settings(s));
-        }
-    }
-
     fn dialogs_ui(&mut self, ui: &mut egui::Ui) {
         // Верхняя строка: меню и поле поиска.
         ui.add_space(6.0);
@@ -518,224 +570,9 @@ impl App {
             }
         });
         if let Some(i) = open {
+            self.reset_chat_state();
             self.selected = Some(i);
-            self.messages.clear();
-            self.textures.clear();
-            self.requested.clear();
             self.send(Cmd::Open(i));
-        }
-    }
-
-    fn header_ui(&mut self, ui: &mut egui::Ui, narrow: bool) {
-        ui.horizontal_centered(|ui| {
-            ui.add_space(if narrow { 4.0 } else { 12.0 });
-            if narrow {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
-                icons::back(ui.painter(), rect.center(), WHITE);
-                if resp.clicked() {
-                    self.selected = None;
-                    self.messages.clear();
-                    self.textures.clear();
-                    self.requested.clear();
-                }
-            }
-            if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)) {
-                avatar(ui, &d.name, d.id, 42.0);
-                ui.label(RichText::new(&d.name).strong().size(16.0).color(WHITE));
-            }
-        });
-    }
-
-    fn composer_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_centered(|ui| {
-            ui.add(egui::Button::new(RichText::new("📎").size(20.0).color(DIALOG_DATE)).frame(false));
-            let width = (ui.available_width() - 100.0).max(80.0);
-            let r = ui.add_sized(
-                [width, 36.0],
-                egui::TextEdit::singleline(&mut self.input)
-                    .hint_text("Написать сообщение…")
-                    .frame(egui::Frame::NONE)
-                    .margin(Vec2::new(4.0, 8.0)),
-            );
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui
-                .add(egui::Button::new(RichText::new("😊").size(20.0).color(DIALOG_DATE)).frame(false))
-                .clicked()
-            {
-                self.emoji_open = !self.emoji_open;
-            }
-            let (srect, sresp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
-            let active = !self.input.trim().is_empty();
-            icons::send(
-                ui.painter(),
-                srect.center(),
-                if active { ACCENT } else { DIALOG_DATE },
-            );
-            if (sresp.clicked() || enter) && active && self.selected.is_some() {
-                let text = std::mem::take(&mut self.input);
-                self.send(Cmd::Send(text));
-                r.request_focus();
-            }
-        });
-    }
-
-    fn emoji_window(&mut self, ctx: &egui::Context) {
-        if !self.emoji_open {
-            return;
-        }
-        egui::Window::new("emoji")
-            .title_bar(false)
-            .resizable(false)
-            .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-70.0, -64.0))
-            .show(ctx, |ui| {
-                egui::Grid::new("emoji-grid").spacing(Vec2::splat(4.0)).show(ui, |ui| {
-                    for (n, e) in emoji::EMOJI.iter().enumerate() {
-                        let b = egui::Button::new(RichText::new(*e).size(22.0)).frame(false);
-                        if ui.add(b).clicked() {
-                            self.input.push_str(e);
-                        }
-                        if (n + 1) % 8 == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-            });
-    }
-
-    fn messages_ui(&mut self, ui: &mut egui::Ui) {
-        if self.selected.is_none() {
-            ui.centered_and_justified(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(280.0, 40.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(20), SERVICE_BG);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Выберите, кому написать",
-                    FontId::proportional(14.0),
-                    Color32::WHITE,
-                );
-            });
-            return;
-        }
-        let now = self.now;
-        let mut download: Option<i32> = None;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                let avail = ui.available_width();
-                let mut prev_date: Option<i64> = None;
-                ui.add_space(8.0);
-                for m in &self.messages {
-                    if prev_date.is_none_or(|p| !same_day(p, m.date)) {
-                        // Разделитель дней: плашка по центру.
-                        let label = day_label(m.date, now);
-                        let galley = ui.painter().layout_no_wrap(
-                            label,
-                            FontId::proportional(14.0),
-                            Color32::WHITE,
-                        );
-                        let size = galley.size() + Vec2::new(24.0, 8.0);
-                        let (rect, _) =
-                            ui.allocate_exact_size(Vec2::new(avail, size.y + 8.0), Sense::hover());
-                        let pill = egui::Rect::from_center_size(rect.center(), size);
-                        ui.painter()
-                            .rect_filled(pill, egui::CornerRadius::same(14), SERVICE_BG);
-                        ui.painter().galley(
-                            pill.center() - galley.size() / 2.0,
-                            galley,
-                            Color32::WHITE,
-                        );
-                    }
-                    prev_date = Some(m.date);
-                    let layout = if m.outgoing {
-                        Layout::right_to_left(Align::TOP)
-                    } else {
-                        Layout::left_to_right(Align::TOP)
-                    };
-                    ui.with_layout(layout, |ui| {
-                        ui.add_space(6.0);
-                        let (fill, text_c, date_c) = if m.outgoing {
-                            (MSG_OUT_BG, MSG_OUT_TEXT, MSG_OUT_DATE)
-                        } else {
-                            (MSG_IN_BG, WHITE, MSG_IN_DATE)
-                        };
-                        // Ширина пузыря по содержимому, не больше msgMaxWidth.
-                        let max_inner = MSG_MAX_WIDTH.min(avail * 0.8) - 2.0 * MSG_PAD_X;
-                        let galley = ui.painter().layout(
-                            m.text.clone(),
-                            FontId::proportional(15.0),
-                            text_c,
-                            max_inner,
-                        );
-                        let mut meta = hhmm(m.date);
-                        if m.edits > 0 {
-                            meta = format!("изм. {meta}");
-                        }
-                        let tick_w = if m.outgoing { 22.0 } else { 0.0 };
-                        let meta_w = meta.chars().count() as f32 * 6.4 + tick_w + 4.0;
-                        let mut w = galley.size().x.max(meta_w + 8.0);
-                        if m.deleted {
-                            w = w.max(60.0);
-                        }
-                        if m.media.is_some() {
-                            w = w.max(if self.textures.contains_key(&m.id) { 240.0 } else { 190.0 });
-                        }
-                        let w = w.min(max_inner);
-                        egui::Frame::new()
-                            .fill(fill)
-                            .corner_radius(egui::CornerRadius::same(MSG_RADIUS))
-                            .inner_margin(egui::Margin::symmetric(MSG_PAD_X as i8, MSG_PAD_Y as i8))
-                            .show(ui, |ui| {
-                                ui.set_width(w);
-                                ui.style_mut().visuals.override_text_color = Some(text_c);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 2.0;
-                                    if m.deleted {
-                                        ui.label(RichText::new("удалено").color(DANGER).strong());
-                                    }
-                                    if let Some(tex) = self.textures.get(&m.id) {
-                                        ui.add(egui::Image::new(tex).max_width(w).corner_radius(10));
-                                    }
-                                    if let Some(info) = &m.media {
-                                        if !self.textures.contains_key(&m.id) {
-                                            let size = if info.size > 0 {
-                                                format!(" · {}", human_size(info.size))
-                                            } else {
-                                                String::new()
-                                            };
-                                            ui.label(format!("[{}{size}]", info.name));
-                                        }
-                                        let can_save = matches!(
-                                            info.kind,
-                                            MediaKind::Photo | MediaKind::Sticker | MediaKind::File
-                                        );
-                                        if can_save && ui.small_button("Скачать").clicked() {
-                                            download = Some(m.id);
-                                        }
-                                    }
-                                    if !m.text.is_empty() {
-                                        ui.label(RichText::new(&m.text).color(text_c));
-                                    }
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        ui.add_space((w - meta_w).max(0.0));
-                                        ui.label(RichText::new(meta).size(12.0).color(date_c));
-                                        if m.outgoing {
-                                            let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 12.0), Sense::hover());
-                                            icons::tick(ui.painter(), r.center(), OUT_TICK, true);
-                                        }
-                                    });
-                                });
-                            });
-                    });
-                    ui.add_space(4.0);
-                }
-                ui.add_space(8.0);
-            });
-        if let Some(id) = download {
-            self.send(Cmd::Download(id));
         }
     }
 }
@@ -787,13 +624,18 @@ impl eframe::App for App {
                     }
                 });
         }
+        if self.search_open && self.selected.is_some() {
+            egui::Panel::top("chat-search")
+                .exact_size(40.0)
+                .frame(egui::Frame::new().fill(WINDOW_BG))
+                .show(ui, |ui| self.search_bar(ui));
+        }
         if self.selected.is_some() {
             egui::Panel::bottom("composer")
-                .exact_size(54.0)
                 .frame(
                     egui::Frame::new()
                         .fill(COMPOSE_BG)
-                        .inner_margin(egui::Margin::symmetric(8, 0)),
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
                 )
                 .show(ui, |ui| self.composer_ui(ui));
         }
@@ -805,6 +647,8 @@ impl eframe::App for App {
             )
             .show(ui, |ui| self.messages_ui(ui));
         self.emoji_window(&ctx);
+        self.chat_windows(&ctx);
+        self.settings_window(&ctx);
     }
 }
 
@@ -836,13 +680,14 @@ pub fn run(options: eframe::NativeOptions) -> eframe::Result {
 
 pub fn run_desktop() -> eframe::Result {
     if let Some(mode) = std::env::var_os("RG_DEMO") {
-        return run_demo(mode.to_string_lossy() == "qr");
+        return run_demo(&mode.to_string_lossy());
     }
     run(native_options())
 }
 
 /// Демо-данные для проверки внешнего вида без сети и без аккаунта (`RG_DEMO=1` или `qr`).
-fn demo_app(qr: bool) -> App {
+fn demo_app(mode: &str) -> App {
+    let qr = mode == "qr";
     use grammers_session::types::{PeerAuth, PeerId, PeerRef};
     use rg_core::media::{MediaInfo, MediaKind};
     let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -880,13 +725,15 @@ fn demo_app(qr: bool) -> App {
     }
     app.selected = Some(0);
     let mk = |id: i32, day: i64, text: &str, outgoing, deleted, edits, media| MessageRow {
-        id,
-        text: text.to_owned(),
-        outgoing,
-        date: now - day * 86_400 + i64::from(id) * 90,
         deleted,
         edits,
         media,
+        ..MessageRow::plain(
+            id,
+            text.to_owned(),
+            outgoing,
+            now - day * 86_400 + i64::from(id) * 90,
+        )
     };
     app.messages = vec![
         mk(1, 1, "Привет! Ты уже видел новый интерфейс?", false, false, 0, None),
@@ -910,17 +757,22 @@ fn demo_app(qr: bool) -> App {
     ];
     app.settings = Settings::default();
     app.now = now;
+    if let Some(tab) = mode.strip_prefix("settings") {
+        app.settings_open = true;
+        app.settings_tab = tab.parse().unwrap_or(0);
+    }
     app
 }
 
 /// Запуск демо-окна.
-pub fn run_demo(qr: bool) -> eframe::Result {
+pub fn run_demo(mode: &str) -> eframe::Result {
+    let mode = mode.to_owned();
     eframe::run_native(
         "Rustgramm (демо)",
         native_options(),
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(demo_app(qr)))
+            Ok(Box::new(demo_app(&mode)))
         }),
     )
 }

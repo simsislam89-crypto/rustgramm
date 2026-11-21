@@ -34,17 +34,37 @@ pub enum Cmd {
     Code(String),
     Password(String),
     Open(usize),
-    Send(String),
-    Settings(Settings),
+    /// Текст и, при ответе, идентификатор исходного сообщения.
+    Send(String, Option<i32>),
+    Edit(i32, String),
+    /// Отправить файл с подписью (и ответом на сообщение).
+    SendFile(PathBuf, String, Option<i32>),
+    /// Прежние версии текста сообщения.
+    EditHistory(i32),
+    Delete(i32),
+    /// Переслать сообщение в чат с таким индексом списка.
+    Forward(i32, usize),
+    Pin(i32, bool),
+    React(i32, String),
+    /// Поиск в открытом чате; пустая строка — выйти из поиска.
+    Search(String),
+    /// Подгрузить сообщения старше указанного идентификатора.
+    Older(i32),
+    Settings(Box<Settings>),
 }
 
 pub enum Ev {
-    Image(usize, i32, eframe::egui::ColorImage),
+    Image(usize, i32, Box<eframe::egui::ColorImage>),
     Stage(Stage),
     Me(String),
     Dialogs(Vec<DialogRow>),
     History(usize, Vec<MessageRow>),
-    Settings(Settings),
+    /// Более старые сообщения (добавляются в начало); пустой список — история закончилась.
+    Older(usize, Vec<MessageRow>),
+    /// Результат поиска по чату.
+    Found(usize, Vec<MessageRow>),
+    EditHistory(i32, Vec<String>),
+    Settings(Box<Settings>),
     Status(String),
     Error(String),
 }
@@ -180,7 +200,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         .with_dirs(&home.join("cache"), &home.join("downloads"));
     let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let mut updates = Some(connected.updates);
-    out.send(Ev::Settings(settings));
+    out.send(Ev::Settings(Box::new(settings)));
 
     let mut login: Option<LoginToken> = None;
     let mut password: Option<PasswordToken> = None;
@@ -291,15 +311,90 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     Err(e) => out.err(format!("История: {e}")),
                 }
             }
-            Cmd::Send(text) => {
+            Cmd::Send(text, reply_to) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
-                if let Err(e) = engine.send(d.peer, &text).await {
+                if let Err(e) = engine.send_reply(d.peer, &text, reply_to).await {
                     out.err(format!("Не отправлено: {e}"));
                     continue;
                 }
-                if let Ok(rows) = engine.history(d.peer, 80).await {
-                    out.send(Ev::History(i, rows));
+                reload(&engine, &out, d.peer, i).await;
+            }
+            Cmd::SendFile(path, caption, reply_to) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                out.send(Ev::Status("Отправка файла…".into()));
+                match engine.send_file(d.peer, &path, &caption, reply_to).await {
+                    Ok(()) => {
+                        out.send(Ev::Status(String::new()));
+                        reload(&engine, &out, d.peer, i).await;
+                    }
+                    Err(e) => out.err(format!("Файл не отправлен: {e}")),
+                }
+            }
+            Cmd::EditHistory(id) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                out.send(Ev::EditHistory(id, engine.edit_history(&d.peer, id).await));
+            }
+            Cmd::Edit(id, text) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.edit(d.peer, id, &text).await {
+                    Ok(()) => reload(&engine, &out, d.peer, i).await,
+                    Err(e) => out.err(format!("Не изменено: {e}")),
+                }
+            }
+            Cmd::Delete(id) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.delete(d.peer, &[id]).await {
+                    Ok(_) => reload(&engine, &out, d.peer, i).await,
+                    Err(e) => out.err(format!("Не удалено: {e}")),
+                }
+            }
+            Cmd::Forward(id, to) => {
+                let Some(i) = current else { continue };
+                let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to)) else { continue };
+                match engine.forward(from.peer, dest.peer, &[id]).await {
+                    Ok(()) => out.send(Ev::Status(format!("Переслано: {}", dest.name))),
+                    Err(e) => out.err(format!("Не переслано: {e}")),
+                }
+            }
+            Cmd::Pin(id, pinned) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.pin(d.peer, id, pinned).await {
+                    Ok(()) => reload(&engine, &out, d.peer, i).await,
+                    Err(e) => out.err(format!("Закрепление: {e}")),
+                }
+            }
+            Cmd::React(id, emoji) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.react(d.peer, id, &emoji).await {
+                    Ok(()) => reload(&engine, &out, d.peer, i).await,
+                    Err(e) => out.err(format!("Реакция: {e}")),
+                }
+            }
+            Cmd::Search(q) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                if q.trim().is_empty() {
+                    reload(&engine, &out, d.peer, i).await;
+                    continue;
+                }
+                match engine.search(d.peer, q.trim(), 100).await {
+                    Ok(rows) => out.send(Ev::Found(i, rows)),
+                    Err(e) => out.err(format!("Поиск: {e}")),
+                }
+            }
+            Cmd::Older(before) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.history_before(d.peer, before, 60).await {
+                    Ok(rows) => out.send(Ev::Older(i, rows)),
+                    Err(e) => out.err(format!("История: {e}")),
                 }
             }
             Cmd::Preview(i, msg_id) => {
@@ -311,7 +406,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         && let Ok(Some(img)) =
                             tokio::task::spawn_blocking(move || decode(&path)).await
                     {
-                        out.send(Ev::Image(i, msg_id, img));
+                        out.send(Ev::Image(i, msg_id, Box::new(img)));
                     }
                 });
             }
@@ -328,11 +423,19 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::Settings(s) => {
+                let s = *s;
                 let json = s.to_json();
                 engine.update_settings(|cur| *cur = s);
                 let _ = std::fs::write(&settings_path, json);
             }
         }
+    }
+}
+
+/// Перечитать последние сообщения открытого чата.
+async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerRef, idx: usize) {
+    if let Ok(rows) = engine.history(peer, 80).await {
+        out.send(Ev::History(idx, rows));
     }
 }
 

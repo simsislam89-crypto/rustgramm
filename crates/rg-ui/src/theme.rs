@@ -186,6 +186,20 @@ pub fn hhmm(ts: i64) -> String {
         .unwrap_or_default()
 }
 
+/// «ЧЧ:ММ:СС» по местному времени.
+pub fn hhmmss(ts: i64) -> String {
+    zoned(ts)
+        .map(|z| z.strftime("%H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+/// «дд.мм.гггг ЧЧ:ММ:СС» по местному времени.
+pub fn full_date(ts: i64) -> String {
+    zoned(ts)
+        .map(|z| z.strftime("%d.%m.%Y %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
 /// Дата для списка чатов: сегодня — время, в пределах недели — день недели, иначе «дд.мм.гг».
 pub fn dialog_date(ts: i64, now: i64) -> String {
     let (Some(z), Some(n)) = (zoned(ts), zoned(now)) else {
