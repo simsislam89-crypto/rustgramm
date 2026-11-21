@@ -15,6 +15,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub enum Stage {
     Starting,
     NeedKeys,
+    /// Вход по QR: ссылка для кода (пустая, пока токен не получен).
+    Qr(String),
     NeedPhone,
     NeedCode,
     NeedPassword(String),
@@ -23,6 +25,9 @@ pub enum Stage {
 
 pub enum Cmd {
     Keys(String, String),
+    Proxy(String),
+    UsePhone,
+    UseQr,
     Preview(usize, i32),
     Download(i32),
     RequestCode(String),
@@ -44,8 +49,29 @@ pub enum Ev {
     Error(String),
 }
 
+/// Каталог данных на Android задаёт оболочка до запуска интерфейса.
+pub static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Ключи, вшитые при сборке (`RG_BUILTIN_API_ID` и `RG_BUILTIN_API_HASH`).
+fn builtin_keys() -> Option<Config> {
+    let id = option_env!("RG_BUILTIN_API_ID")?;
+    let hash = option_env!("RG_BUILTIN_API_HASH")?;
+    Config::from_lookup(|k| match k {
+        "RG_API_ID" => Some(id.to_owned()),
+        "RG_API_HASH" => Some(hash.to_owned()),
+        "RG_PROXY" => std::env::var("RG_PROXY").ok(),
+        _ => None,
+    })
+    .ok()
+}
+
 fn home() -> PathBuf {
-    let dir = std::env::var("RG_HOME").map_or_else(|_| PathBuf::from(".rg"), PathBuf::from);
+    let dir = std::env::var("RG_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| DATA_DIR.get().cloned())
+        .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Rustgramm")))
+        .unwrap_or_else(|| PathBuf::from(".rg"));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -110,7 +136,10 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let home = home();
     // Ключи: переменные окружения или файл `api.keys` (две строки: api_id, api_hash).
     let mut cfg = loop {
-        if let Some(c) = Config::from_env().ok().or_else(|| keys_from_file(&home)) {
+        if let Some(c) = Config::from_env()
+            .ok()
+            .or_else(|| keys_from_file(&home))
+            .or_else(builtin_keys) {
             break c;
         }
         out.send(Ev::Stage(Stage::NeedKeys));
@@ -128,6 +157,12 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         }
     };
     cfg.session_path = home.join("main.session").to_string_lossy().into_owned();
+    if cfg.proxy_url.is_none() {
+        cfg.proxy_url = std::fs::read_to_string(home.join("proxy.txt"))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| s.starts_with("socks5://"));
+    }
 
     let connected = match connect_with_updates(&cfg).await {
         Ok(c) => c,
@@ -157,15 +192,61 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let mut current: Option<usize> = None;
 
     let authorized = connected.client.is_authorized().await.unwrap_or(false);
+    let mut qr_mode = false;
     if authorized {
         enter(&engine, &out, &mut updates, &mut dialogs).await;
     } else {
-        out.send(Ev::Stage(Stage::NeedPhone));
+        qr_mode = true;
+        out.send(Ev::Stage(Stage::Qr(String::new())));
     }
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut last_url = String::new();
 
-    while let Some(cmd) = cmds.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            c = cmds.recv() => match c { Some(c) => c, None => break },
+            _ = tick.tick(), if qr_mode => {
+                match rg_core::qr::poll(&connected.client, &*connected.session, cfg.api_id, &cfg.api_hash).await {
+                    Ok(rg_core::qr::QrStep::Token { url }) => {
+                        if url != last_url {
+                            last_url = url.clone();
+                            out.send(Ev::Stage(Stage::Qr(url)));
+                        }
+                    }
+                    Ok(rg_core::qr::QrStep::Done) => {
+                        qr_mode = false;
+                        enter(&engine, &out, &mut updates, &mut dialogs).await;
+                    }
+                    Ok(rg_core::qr::QrStep::NeedPassword(p)) => {
+                        qr_mode = false;
+                        let hint = p.hint().unwrap_or("нет").to_owned();
+                        password = Some(p);
+                        out.send(Ev::Stage(Stage::NeedPassword(hint)));
+                    }
+                    Err(e) => out.err(format!("QR-вход: {e}")),
+                }
+                continue;
+            }
+        };
         match cmd {
             Cmd::Keys(..) => {}
+            Cmd::Proxy(url) => {
+                // Прокси вступает в силу при следующем запуске; принимается только socks5.
+                if url.is_empty() || url.starts_with("socks5://") {
+                    let _ = std::fs::write(home.join("proxy.txt"), url);
+                } else {
+                    out.err("Допустим только адрес вида socks5://host:port");
+                }
+            }
+            Cmd::UsePhone => {
+                qr_mode = false;
+                out.send(Ev::Stage(Stage::NeedPhone));
+            }
+            Cmd::UseQr => {
+                qr_mode = true;
+                last_url.clear();
+                out.send(Ev::Stage(Stage::Qr(String::new())));
+            }
             Cmd::RequestCode(phone) => match connected.client.request_login_code(&phone, &cfg.api_hash).await {
                 Ok(t) => {
                     login = Some(t);

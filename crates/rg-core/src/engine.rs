@@ -25,6 +25,11 @@ pub struct DialogRow {
     pub id: i64,
     pub name: String,
     pub last: String,
+    /// Время последнего сообщения (unix), 0 если нет.
+    pub date: i64,
+    pub unread: i32,
+    pub pinned: bool,
+    pub muted: bool,
 }
 
 /// Сообщение для интерфейса.
@@ -111,9 +116,20 @@ impl Engine {
 
     pub async fn dialogs(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
         let mut it = self.client.iter_dialogs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(d) = it.next().await? else { break };
+            let (unread, pinned, muted) = match &d.raw {
+                grammers_client::tl::enums::Dialog::Dialog(x) => (
+                    x.unread_count.max(i32::from(x.unread_mark)),
+                    x.pinned,
+                    matches!(&x.notify_settings, grammers_client::tl::enums::PeerNotifySettings::Settings(s) if s.mute_until.is_some_and(|t| i64::from(t) > now)),
+                ),
+                _ => (0, false, false),
+            };
             out.push(DialogRow {
                 peer: d.peer_ref(),
                 id: d.peer_id().bot_api_dialog_id_unchecked(),
@@ -123,6 +139,10 @@ impl Engine {
                     .as_ref()
                     .map(|m| m.text().chars().take(80).collect())
                     .unwrap_or_default(),
+                date: d.last_message.as_ref().map_or(0, |m| m.date().as_second()),
+                unread,
+                pinned,
+                muted,
             });
         }
         Ok(out)

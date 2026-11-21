@@ -149,6 +149,7 @@ pub async fn open_session(
 
 /// Клиент и канал обновлений, полученные после подключения.
 pub struct Connected {
+    pub session: Arc<GuardedSession<SqliteSession>>,
     pub client: grammers_client::Client,
     pub updates: tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>,
 }
@@ -168,10 +169,14 @@ pub async fn connect_with_updates(cfg: &Config) -> Result<Connected, Box<dyn std
         runner,
         handle,
         updates,
-    } = SenderPool::with_configuration(session, cfg.api_id, params);
+    } = SenderPool::with_configuration(session.clone(), cfg.api_id, params);
     let client = grammers_client::Client::new(handle);
     tokio::spawn(runner.run());
-    Ok(Connected { client, updates })
+    Ok(Connected {
+        session,
+        client,
+        updates,
+    })
 }
 
 /// Подключение без обработки обновлений.
@@ -181,6 +186,7 @@ pub async fn connect(cfg: &Config) -> Result<grammers_client::Client, Box<dyn st
 
 pub mod engine;
 pub mod media;
+pub mod qr;
 
 #[cfg(test)]
 mod tests {
