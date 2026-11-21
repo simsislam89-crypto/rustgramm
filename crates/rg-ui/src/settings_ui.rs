@@ -59,7 +59,8 @@ impl App {
     /// Левая выдвижная панель: профиль, разделы, переключатели ночной темы и призрака.
     #[allow(deprecated)] // Area::new требует Id, а замена Id::new ещё не даёт стабильного id
     pub(crate) fn drawer(&mut self, ctx: &egui::Context) {
-        if !self.drawer_open {
+        let open = ease_out(tween(ctx, "drawer", f32::from(u8::from(self.drawer_open)), 0.22));
+        if open < 0.005 && !self.drawer_open {
             return;
         }
         let screen = ctx.content_rect();
@@ -71,7 +72,7 @@ impl App {
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
                 ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_black_alpha(110));
+                    .rect_filled(rect, 0.0, Color32::from_black_alpha((110.0 * open) as u8));
                 if resp.clicked() {
                     self.drawer_open = false;
                 }
@@ -82,10 +83,10 @@ impl App {
         let mut act: Option<&str> = None;
         egui::Area::new(egui::Id::new("drawer"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(Pos2::ZERO)
+            .fixed_pos(Pos2::new(-(1.0 - open) * w, 0.0))
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(w, screen.height()), Sense::hover());
-                ui.painter().rect_filled(rect, 0.0, WINDOW_BG);
+                ui.painter().rect_filled(rect, 0.0, t2(WINDOW_BG));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let ui = &mut child;
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -124,7 +125,7 @@ impl App {
                 let item = |ui: &mut egui::Ui, icon: &str, text: &str| -> bool {
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
                     if resp.hovered() {
-                        ui.painter().rect_filled(r, 0.0, WINDOW_OVER);
+                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
                     }
                     ui.painter().text(
                         Pos2::new(r.left() + 30.0, r.center().y),
@@ -228,7 +229,8 @@ impl App {
     #[allow(deprecated)]
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         self.logout_window(ctx);
-        if !self.settings_open {
+        let appear = ease_out(tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.2));
+        if appear < 0.005 && !self.settings_open {
             return;
         }
         let screen = ctx.content_rect();
@@ -238,7 +240,7 @@ impl App {
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
                 ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_black_alpha(140));
+                    .rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * appear) as u8));
                 if resp.clicked() {
                     self.settings_open = false;
                 }
@@ -254,10 +256,11 @@ impl App {
         let max_h = (screen.height() - 40.0).clamp(240.0, 700.0);
         egui::Area::new(egui::Id::new("prefs-box"))
             .order(egui::Order::Tooltip)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 18.0))
             .show(ctx, |ui| {
+                ui.set_opacity(appear);
                 egui::Frame::new()
-                    .fill(WINDOW_BG)
+                    .fill(t2(WINDOW_BG))
                     .corner_radius(CornerRadius::same(10))
                     .show(ui, |ui| {
                         let width = BOX_W.min(screen.width() - 16.0);
@@ -679,6 +682,14 @@ fn general_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
 }
 
 fn appearance_page(ui: &mut egui::Ui, s: &mut Settings) {
+    section(ui, "Окно");
+    let mut o = i32::from(s.window_opacity);
+    let shown = format!("{o}%");
+    if slider(ui, "Прозрачность окна", &mut o, (15, 100), shown) {
+        s.window_opacity = o.clamp(15, 100) as u8;
+    }
+    desc(ui, "Чем меньше значение, тем сильнее окно просвечивает. По умолчанию 86%.");
+    divider(ui);
     let a = &mut s.ayu;
     section(ui, "Значок приложения");
     // Сетка 4×3 кружков; цвета повторяют набор оригинала.
@@ -696,7 +707,7 @@ fn appearance_page(ui: &mut egui::Ui, s: &mut Settings) {
             let r = Rect::from_center_size(c, Vec2::splat(52.0));
             let resp = ui.interact(r, ui.make_persistent_id(("icon", i)), Sense::click());
             if cur == i {
-                ui.painter().rect_filled(r, CornerRadius::same(8), WINDOW_OVER);
+                ui.painter().rect_filled(r, CornerRadius::same(8), t(WINDOW_OVER));
             }
             ui.painter().circle_filled(c, 20.0, navy(palette[i]));
             icons::logo(ui.painter(), c, 13.0, Color32::WHITE);

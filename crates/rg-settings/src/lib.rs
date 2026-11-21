@@ -108,7 +108,7 @@ impl GhostMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub ghost: GhostMode,
@@ -121,6 +121,22 @@ pub struct Settings {
     pub extera: ExteraSettings,
     /// Фильтры сообщений.
     pub filters: Vec<Filter>,
+    /// Непрозрачность окна, проценты (15..=100); по умолчанию 86.
+    pub window_opacity: u8,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            ghost: GhostMode::default(),
+            translation: TranslationProvider::default(),
+            user_hosts: Vec::new(),
+            ayu: AyuSettings::default(),
+            extera: ExteraSettings::default(),
+            filters: Vec::new(),
+            window_opacity: 86,
+        }
+    }
 }
 
 impl Settings {
@@ -209,6 +225,13 @@ mod tests {
         assert!(s.ghost.active);
         assert!(s.ghost.send_read_stories);
         assert!(Settings::from_json("{}").is_ok());
+    }
+
+    #[test]
+    fn opacity_defaults_to_86_and_survives_old_files() {
+        assert_eq!(Settings::default().window_opacity, 86);
+        assert_eq!(Settings::from_json("{}").unwrap().window_opacity, 86);
+        assert_eq!(Settings::from_json(r#"{"window_opacity":40}"#).unwrap().window_opacity, 40);
     }
 
     #[test]

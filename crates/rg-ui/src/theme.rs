@@ -1,58 +1,62 @@
-//! Оформление как у Telegram Desktop (ночная тема): фоны тёмно-синие (`navy`), а все синие
-//! акценты — кнопки, выделение, бейджи, исходящие пузыри, ссылки — оранжевые (`tg`).
-//! Цвета взяты из `night.tdesktop-theme` AyuGram v7.2.9; акцент меняется перестановкой каналов R↔B:
-//! оттенок поворачивается, яркость сохраняется.
+//! Оформление Rustgramm: чёрно-белое, в духе LLM Launcher — одна «бумага», один «шрифт» чернил
+//! и ступени прозрачности. Цвета лишь по делу: красный для ошибок и удаления.
+//! Крупные фоны проходят через `t()` и учитывают прозрачность окна (86% по умолчанию).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Sense, Stroke, Vec2,
 };
 
-/// Цвет из палитры Telegram `0xRRGGBB` как есть: тёмно-синие фоны и серо-голубой текст ночной темы.
+/// Серый тон из палитры Telegram `0xRRGGBB`: тот же свет, но без цвета (для шкал в `kit`).
 pub const fn navy(hex: u32) -> Color32 {
-    Color32::from_rgb(((hex >> 16) & 0xff) as u8, ((hex >> 8) & 0xff) as u8, (hex & 0xff) as u8)
+    let r = (hex >> 16) & 0xff;
+    let g = (hex >> 8) & 0xff;
+    let b = hex & 0xff;
+    let l = ((r * 54 + g * 183 + b * 18) >> 8) as u8;
+    Color32::from_rgb(l, l, l)
 }
 
-/// Акцентный цвет из палитры Telegram `0xRRGGBB` с синим → оранжевым.
+/// То же для акцентных цветов Telegram.
 pub const fn tg(hex: u32) -> Color32 {
-    let r = ((hex >> 16) & 0xff) as u8;
-    let g = ((hex >> 8) & 0xff) as u8;
-    let b = (hex & 0xff) as u8;
-    Color32::from_rgb(b, g, r)
+    navy(hex)
 }
 
-// windowBg, windowBgOver, windowSubTextFg
-pub const WINDOW_BG: Color32 = navy(0x17212b);
-pub const WINDOW_OVER: Color32 = navy(0x232e3c);
-pub const SUBTEXT: Color32 = navy(0x708499);
-// windowBgActive (акцент), activeButtonBg
-pub const ACCENT: Color32 = tg(0x5288c1);
-pub const BUTTON: Color32 = tg(0x2f6ea5);
-pub const BUTTON_OVER: Color32 = tg(0x3476ab);
-pub const WHITE: Color32 = Color32::from_rgb(245, 245, 245);
-// chat list
-pub const DIALOG_OVER: Color32 = navy(0x202b36);
-pub const DIALOG_ACTIVE: Color32 = tg(0x2b5278);
-pub const DIALOG_DATE: Color32 = navy(0x8696a8);
-pub const DIALOG_TEXT: Color32 = navy(0x7f91a4);
-pub const UNREAD: Color32 = tg(0x4082bc);
-pub const UNREAD_MUTED: Color32 = navy(0x3e546a);
-pub const FILTER_INPUT: Color32 = navy(0x242f3d);
-pub const TITLE_BG: Color32 = navy(0x242f3d);
-pub const SIDEBAR_BG: Color32 = navy(0x0e1621);
-// history
-pub const CHAT_BG: Color32 = navy(0x0e1621);
-pub const MSG_IN_BG: Color32 = navy(0x182533);
-pub const MSG_OUT_BG: Color32 = tg(0x2b5278);
-pub const MSG_IN_DATE: Color32 = navy(0x6d7f8f);
-pub const MSG_OUT_DATE: Color32 = tg(0x7da8d3);
-pub const MSG_OUT_TEXT: Color32 = tg(0xe4ecf2);
-pub const OUT_TICK: Color32 = tg(0x6bbfff);
-pub const SERVICE_BG: Color32 = Color32::from_rgba_premultiplied(28, 40, 53, 0xd5);
-pub const COMPOSE_BG: Color32 = navy(0x17212b);
-pub const DANGER: Color32 = Color32::from_rgb(230, 80, 70);
+// ---- чернила и бумага
+pub const WINDOW_BG: Color32 = Color32::from_rgb(14, 14, 16);
+pub const WINDOW_OVER: Color32 = Color32::from_rgb(30, 30, 34);
+pub const SUBTEXT: Color32 = Color32::from_rgb(134, 134, 142);
+pub const ACCENT: Color32 = Color32::from_rgb(238, 238, 241);
+pub const BUTTON: Color32 = Color32::from_rgb(46, 46, 52);
+pub const BUTTON_OVER: Color32 = Color32::from_rgb(62, 62, 70);
+pub const WHITE: Color32 = Color32::from_rgb(238, 238, 241);
+pub const INK_DARK: Color32 = Color32::from_rgb(10, 10, 12);
+// список чатов
+pub const DIALOG_OVER: Color32 = Color32::from_rgb(24, 24, 28);
+pub const DIALOG_ACTIVE: Color32 = Color32::from_rgb(46, 46, 52);
+pub const DIALOG_DATE: Color32 = Color32::from_rgb(150, 150, 158);
+pub const DIALOG_TEXT: Color32 = Color32::from_rgb(134, 134, 142);
+pub const UNREAD: Color32 = Color32::from_rgb(238, 238, 241);
+pub const UNREAD_MUTED: Color32 = Color32::from_rgb(74, 74, 80);
+pub const FILTER_INPUT: Color32 = Color32::from_rgb(26, 26, 30);
+pub const TITLE_BG: Color32 = Color32::from_rgb(20, 20, 23);
+pub const SIDEBAR_BG: Color32 = Color32::from_rgb(8, 8, 10);
+// лента
+pub const CHAT_BG: Color32 = Color32::from_rgb(8, 8, 10);
+pub const MSG_IN_BG: Color32 = Color32::from_rgb(26, 26, 30);
+pub const MSG_OUT_BG: Color32 = Color32::from_rgb(56, 56, 63);
+pub const MSG_IN_DATE: Color32 = Color32::from_rgb(120, 120, 128);
+pub const MSG_OUT_DATE: Color32 = Color32::from_rgb(172, 172, 180);
+pub const MSG_OUT_TEXT: Color32 = Color32::from_rgb(244, 244, 246);
+pub const OUT_TICK: Color32 = Color32::from_rgb(214, 214, 220);
+pub const SERVICE_BG: Color32 = Color32::from_rgb(34, 34, 38);
+pub const COMPOSE_BG: Color32 = Color32::from_rgb(14, 14, 16);
+pub const DANGER: Color32 = Color32::from_rgb(242, 108, 108);
+pub const GREEN: Color32 = Color32::from_rgb(104, 224, 146);
 pub const ACCENT_TEXT: Color32 = Color32::WHITE;
+/// Тонкая линия-разделитель стекла.
+pub const LINE: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
 
 // Размеры (px) из dialogs.style, window.style и chat.style.
 pub const DIALOG_ROW_HEIGHT: f32 = 62.0;
@@ -68,47 +72,164 @@ pub const COLUMN_LEFT_NORMAL: f32 = 380.0;
 /// Уже этого окно показывает одну колонку (телефон): список чатов или чат.
 pub const NARROW_WIDTH: f32 = 720.0;
 
+// ---- прозрачность окна
+/// Непрозрачность фонов, 0..=255 (86% ≈ 219).
+static ALPHA: AtomicU8 = AtomicU8::new(219);
+/// Процент непрозрачности по умолчанию.
+pub const DEFAULT_OPACITY_PCT: u8 = 86;
+
+/// Задать непрозрачность фонов в процентах (15..=100).
+pub fn set_opacity(pct: u8) {
+    let pct = pct.clamp(15, 100);
+    ALPHA.store((u16::from(pct) * 255 / 100) as u8, Ordering::Relaxed);
+}
+
+/// Фон с учётом прозрачности окна.
+pub fn t(c: Color32) -> Color32 {
+    with_alpha(c, ALPHA.load(Ordering::Relaxed))
+}
+
+/// Фон окон и меню: чуть плотнее основного, чтобы текст читался при любой прозрачности.
+pub fn t2(c: Color32) -> Color32 {
+    with_alpha(c, ALPHA.load(Ordering::Relaxed).max(236))
+}
+
+fn with_alpha(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// Плавный переход к `target` за `dur` секунд (мгновенно при «уменьшении движения»).
+pub fn tween(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, dur: f32) -> f32 {
+    let id = egui::Id::NULL.with(id);
+    ctx.animate_value_with_time(id, target, dur)
+}
+
+/// Экспоненциальное замедление: быстрый старт, мягкая посадка.
+pub fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t >= 1.0 { 1.0 } else { 1.0 - 2f32.powf(-10.0 * t) }
+}
+
+/// Линейная смесь цветов.
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()), f(a.a(), b.a()))
+}
+
+pub const FAM_DISPLAY: &str = "display";
+
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
     let mut v = egui::Visuals::dark();
-    v.panel_fill = WINDOW_BG;
-    v.window_fill = WINDOW_BG;
-    v.extreme_bg_color = FILTER_INPUT;
-    v.faint_bg_color = WINDOW_OVER;
+    v.panel_fill = Color32::TRANSPARENT;
+    v.window_fill = t2(WINDOW_BG);
+    v.extreme_bg_color = Color32::from_rgba_unmultiplied(0, 0, 0, 90);
+    v.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, 9);
     v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = DIALOG_ACTIVE;
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 46);
     v.selection.stroke = Stroke::new(1.0, WHITE);
+    v.override_text_color = Some(WHITE);
+    v.text_options.font_hinting = true;
+    v.text_options.subpixel_binning = false;
+    let line = Color32::from_rgba_unmultiplied(255, 255, 255, 22);
+    let soft = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+    let hover = Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+    let fill = Color32::from_rgba_unmultiplied(255, 255, 255, 9);
+    v.widgets.noninteractive.bg_fill = Color32::TRANSPARENT;
+    v.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, soft);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, WHITE);
+    v.widgets.inactive.bg_fill = fill;
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, line);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, WHITE);
-    v.widgets.inactive.weak_bg_fill = FILTER_INPUT;
-    v.widgets.hovered.weak_bg_fill = WINDOW_OVER;
-    v.widgets.hovered.bg_fill = WINDOW_OVER;
+    v.widgets.hovered.bg_fill = hover;
+    v.widgets.hovered.weak_bg_fill = hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 32));
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, WHITE);
-    v.widgets.active.bg_fill = BUTTON;
-    v.widgets.active.weak_bg_fill = BUTTON;
-    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.active.bg_fill = hover;
+    v.widgets.active.weak_bg_fill = hover;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, WHITE);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, WHITE);
+    v.widgets.open = v.widgets.active;
     let r = CornerRadius::same(10);
     v.widgets.inactive.corner_radius = r;
     v.widgets.hovered.corner_radius = r;
     v.widgets.active.corner_radius = r;
     v.widgets.noninteractive.corner_radius = r;
-    v.window_stroke = Stroke::new(1.0, SIDEBAR_BG);
+    v.window_stroke = Stroke::new(1.0, line);
+    v.window_corner_radius = CornerRadius::same(14);
     ctx.set_visuals(v);
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 4.0);
         s.spacing.button_padding = Vec2::new(14.0, 7.0);
+        s.spacing.scroll.floating = true;
+        s.spacing.scroll.floating_allocated_width = 9.0;
+        s.spacing.scroll.floating_width = 5.0;
+        s.spacing.scroll.bar_width = 7.0;
+        s.spacing.scroll.handle_min_length = 28.0;
+        s.spacing.scroll.dormant_handle_opacity = 0.36;
+        s.spacing.scroll.active_handle_opacity = 0.72;
         s.text_styles
             .insert(egui::TextStyle::Body, FontId::proportional(15.0));
         s.text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(15.0));
+            .insert(egui::TextStyle::Button, FontId::proportional(14.5));
         s.text_styles
             .insert(egui::TextStyle::Small, FontId::proportional(12.0));
+        s.text_styles.insert(
+            egui::TextStyle::Heading,
+            FontId::new(20.0, FontFamily::Name(FAM_DISPLAY.into())),
+        );
     });
 }
 
-/// Системные шрифты: цветных эмодзи egui не рисует, но символы и эмодзи Segoe дают больше значков.
+/// Шрифт заголовков (Segoe UI Bold, как в LLM Launcher).
+pub fn display(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(FAM_DISPLAY.into()))
+}
+
+fn read_face(path: &str) -> Option<Arc<FontData>> {
+    // Подгонка под пиксельную сетку, без субпиксельных сдвигов: буквы выглядят «напечатанными».
+    let tweak = egui::FontTweak {
+        hinting: Some(true),
+        subpixel_binning: Some(false),
+        ..Default::default()
+    };
+    std::fs::read(path)
+        .ok()
+        .map(|b| Arc::new(FontData::from_owned(b).tweak(tweak)))
+}
+
+/// Системные шрифты Windows (Segoe UI, Consolas) плюс запасные символьные для значков.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    if let Some(f) = read_face("C:\\Windows\\Fonts\\segoeui.ttf") {
+        fonts.font_data.insert("segoe".into(), f);
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "segoe".into());
+    }
+    let bold = read_face("C:\\Windows\\Fonts\\segoeuib.ttf");
+    let display = fonts
+        .families
+        .entry(FontFamily::Name(FAM_DISPLAY.into()))
+        .or_default();
+    if let Some(f) = bold {
+        fonts.font_data.insert("segoe-bold".into(), f);
+        display.push("segoe-bold".into());
+    }
+    display.push("Ubuntu-Light".into());
+    if let Some(f) = read_face("C:\\Windows\\Fonts\\consola.ttf") {
+        fonts.font_data.insert("consola".into(), f);
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "consola".into());
+    }
     for (name, path) in [
         ("segoe-emoji", "C:\\Windows\\Fonts\\seguiemj.ttf"),
         ("segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
@@ -130,19 +251,11 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Цвет аватарки по идентификатору (палитра Telegram без синего).
+/// Серый оттенок аватарки по идентификатору: чёрно-белая палитра, ступени яркости.
 pub fn avatar_color(id: i64) -> Color32 {
-    const PALETTE: [(u8, u8, u8); 7] = [
-        (229, 115, 90),
-        (242, 160, 60),
-        (196, 140, 96),
-        (95, 190, 110),
-        (222, 110, 160),
-        (80, 190, 160),
-        (214, 176, 70),
-    ];
-    let (r, g, b) = PALETTE[(id.unsigned_abs() % PALETTE.len() as u64) as usize];
-    Color32::from_rgb(r, g, b)
+    const SHADES: [u8; 7] = [58, 74, 90, 104, 66, 82, 98];
+    let g = SHADES[(id.unsigned_abs() % SHADES.len() as u64) as usize];
+    Color32::from_rgb(g, g, g + 4)
 }
 
 /// Круглая аватарка с первой буквой имени.
@@ -238,21 +351,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn palette_is_orange_not_blue() {
-        // Все акценты тёплые: красного больше, чем синего.
-        for c in [ACCENT, BUTTON, UNREAD, DIALOG_ACTIVE, MSG_OUT_BG, OUT_TICK] {
-            assert!(c.r() > c.b(), "{c:?}");
+    fn palette_is_monochrome() {
+        for c in [ACCENT, BUTTON, UNREAD, DIALOG_ACTIVE, MSG_OUT_BG, OUT_TICK, WINDOW_BG, CHAT_BG] {
+            assert!(c.r().abs_diff(c.b()) <= 8 && c.g().abs_diff(c.b()) <= 8, "{c:?}");
         }
-        assert_eq!(tg(0x5288c1), Color32::from_rgb(0xc1, 0x88, 0x52));
+        let g = navy(0x5288c1);
+        assert!(g.r() == g.g() && g.g() == g.b());
     }
 
     #[test]
-    fn avatar_colors_are_stable_and_not_blue() {
+    fn opacity_scales_backgrounds() {
+        set_opacity(86);
+        assert_eq!(t(WINDOW_BG).a(), 219);
+        set_opacity(30);
+        assert_eq!(t(WINDOW_BG).a(), 76);
+        assert!(t2(WINDOW_BG).a() >= 236);
+        set_opacity(200);
+        assert_eq!(t(WINDOW_BG).a(), 255);
+        set_opacity(DEFAULT_OPACITY_PCT);
+    }
+
+    #[test]
+    fn avatar_colors_are_stable_greys() {
         assert_eq!(avatar_color(5), avatar_color(5));
         assert_eq!(avatar_color(-5), avatar_color(5));
         for id in 0..7 {
             let c = avatar_color(id);
-            assert!(c.b() <= c.r().max(c.g()), "{c:?}");
+            assert!(c.b().abs_diff(c.r()) <= 4, "{c:?}");
         }
     }
 

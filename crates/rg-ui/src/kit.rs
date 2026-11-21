@@ -14,7 +14,7 @@ const TRACK_OFF: Color32 = navy(0x4b5866);
 /// Полоса-разделитель между группами (как `AddSkip` + `AddDivider`).
 pub fn divider(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, SIDEBAR_BG);
+    ui.painter().rect_filled(rect, 0.0, t(SIDEBAR_BG));
 }
 
 /// Синий заголовок раздела.
@@ -24,8 +24,8 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
         Pos2::new(rect.left() + PAD, rect.bottom() - 8.0),
         egui::Align2::LEFT_BOTTOM,
         title,
-        FontId::proportional(14.0),
-        ACCENT,
+        display(13.0),
+        DIALOG_DATE,
     );
 }
 
@@ -46,24 +46,19 @@ pub fn desc(ui: &mut egui::Ui, text: &str) {
 
 fn row_bg(ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 0.0, WINDOW_OVER);
+        ui.painter().rect_filled(rect, 0.0, t(WINDOW_OVER));
     }
 }
 
 /// Переключатель Telegram: узкая «таблетка» и круглая ручка.
-fn switch(ui: &egui::Ui, center: Pos2, on: bool) {
+fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
     let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
-    let (fill, knob_x) = if on {
-        (ACCENT, track.right() - 1.0)
-    } else {
-        (TRACK_OFF, track.left() + 1.0)
-    };
+    // Ручка и цвет дорожки плавно переезжают при смене значения.
+    let k = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.16);
+    let fill = lerp_color(TRACK_OFF, ACCENT, k);
     ui.painter().rect_filled(track, CornerRadius::same(7), fill);
-    let knob = Pos2::new(
-        if on { knob_x - 6.0 } else { knob_x + 6.0 },
-        center.y,
-    );
-    ui.painter().circle_filled(knob, 6.0, WINDOW_BG);
+    let knob = Pos2::new(track.left() + 7.0 + k * (track.width() - 14.0), center.y);
+    ui.painter().circle_filled(knob, 6.0, INK_DARK);
 }
 
 /// Строка с переключателем; возвращает `true`, если значение изменилось.
@@ -99,7 +94,7 @@ pub fn toggle_ex(
             WHITE,
         );
     }
-    switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value);
+    switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value, label);
     if resp.clicked() {
         *value = !*value;
         return true;
@@ -237,7 +232,7 @@ pub fn sub_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
         FontId::proportional(13.0),
         DIALOG_TEXT,
     );
-    switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value);
+    switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value, label);
     if resp.clicked() {
         *value = !*value;
         return true;

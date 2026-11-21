@@ -41,6 +41,9 @@ struct Env<'a> {
     shift: bool,
     scroll_to: Option<i32>,
     group: bool,
+    arrived: &'a HashMap<i32, f64>,
+    time: f64,
+    emoji: Option<&'a super::emoji::Emoji>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -85,7 +88,7 @@ impl App {
                 ui.add_space(8.0);
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
                 if resp.hovered() {
-                    ui.painter().circle_filled(rect.center(), 20.0, WINDOW_OVER);
+                    ui.painter().circle_filled(rect.center(), 20.0, t(WINDOW_OVER));
                 }
                 icons::search(ui.painter(), rect.center(), DIALOG_DATE);
                 if resp.on_hover_text("Поиск по чату").clicked() {
@@ -225,30 +228,33 @@ impl App {
         if !self.emoji_open {
             return;
         }
+        let Some(emoji) = self.emoji.as_ref() else { return };
+        let mut picked = None;
+        let mut close = false;
         egui::Window::new("emoji")
             .title_bar(false)
             .resizable(false)
+            .fixed_size(Vec2::new(300.0, 270.0))
             .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-70.0, -64.0))
             .show(ctx, |ui| {
-                egui::Grid::new("emoji-grid").spacing(Vec2::splat(4.0)).show(ui, |ui| {
-                    for (n, e) in super::emoji::EMOJI.iter().enumerate() {
-                        let b = egui::Button::new(RichText::new(*e).size(22.0)).frame(false);
-                        if ui.add(b).clicked() {
-                            self.input.push_str(e);
-                        }
-                        if (n + 1) % 8 == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
+                picked = emoji.picker(ui);
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
             });
+        if let Some(c) = picked {
+            self.input.push(c);
+        }
+        if close {
+            self.emoji_open = false;
+        }
     }
 
     pub(crate) fn messages_ui(&mut self, ui: &mut egui::Ui) {
         if self.selected.is_none() {
             ui.centered_and_justified(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(280.0, 40.0), Sense::hover());
-                ui.painter().rect_filled(rect, egui::CornerRadius::same(20), SERVICE_BG);
+                ui.painter().rect_filled(rect, egui::CornerRadius::same(20), t(SERVICE_BG));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -259,6 +265,11 @@ impl App {
             });
             return;
         }
+        let fade = (self.chat_opened.elapsed().as_secs_f32() / 0.2).clamp(0.0, 1.0);
+        if fade < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        ui.set_opacity(ease_out(fade));
         let now = self.now;
         let group = self.messages.iter().any(|m| !m.outgoing && !m.sender.is_empty());
         let shift = ui.input(|i| i.modifiers.shift);
@@ -275,6 +286,9 @@ impl App {
                 shift,
                 scroll_to,
                 group,
+                arrived: &self.arrived,
+                time: ui.input(|i| i.time),
+                emoji: self.emoji.as_ref(),
             };
             let hidden = &self.hidden;
             egui::ScrollArea::vertical()
@@ -473,7 +487,7 @@ fn day_pill(ui: &mut egui::Ui, avail: f32, label: String) {
     let size = galley.size() + Vec2::new(24.0, 8.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, size.y + 8.0), Sense::hover());
     let pill = egui::Rect::from_center_size(rect.center(), size);
-    ui.painter().rect_filled(pill, egui::CornerRadius::same(14), SERVICE_BG);
+    ui.painter().rect_filled(pill, egui::CornerRadius::same(14), t(SERVICE_BG));
     ui.painter()
         .galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
 }
@@ -487,11 +501,18 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         Layout::left_to_right(Align::TOP)
     };
     ui.with_layout(layout, |ui| {
+        if let Some(t0) = env.arrived.get(&m.id) {
+            let k = ((env.time - t0) / 0.25).clamp(0.0, 1.0) as f32;
+            if k < 1.0 {
+                ui.ctx().request_repaint();
+            }
+            ui.set_opacity(ease_out(k));
+        }
         ui.add_space(6.0);
         let (mut fill, text_c, date_c) = if m.outgoing {
-            (MSG_OUT_BG, MSG_OUT_TEXT, MSG_OUT_DATE)
+            (t(MSG_OUT_BG), MSG_OUT_TEXT, MSG_OUT_DATE)
         } else {
-            (MSG_IN_BG, WHITE, MSG_IN_DATE)
+            (t(MSG_IN_BG), WHITE, MSG_IN_DATE)
         };
         if m.deleted && s.semi_transparent_deleted_messages {
             fill = fill.gamma_multiply(0.55);
@@ -573,7 +594,12 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                         ui.label(format!("[{}{size}]", info.name));
                     }
                     if !m.text.is_empty() {
-                        ui.label(RichText::new(&m.text).color(text_c));
+                        match env.emoji {
+                            Some(e) => e.rich_label(ui, &m.text, 15.0, text_c),
+                            None => {
+                                ui.label(RichText::new(&m.text).color(text_c));
+                            }
+                        }
                     }
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -621,7 +647,14 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     if s.menu_reactions_panel.shown(env.shift) && !m.deleted {
         ui.horizontal(|ui| {
             for e in REACTIONS {
-                if ui.add(egui::Button::new(RichText::new(e).size(20.0)).frame(false)).clicked() {
+                let img = env.emoji.and_then(|em| em.image(e.chars().next()?, 22.0));
+                let clicked = match img {
+                    Some(img) => ui.add(img.sense(Sense::click())).clicked(),
+                    None => ui
+                        .add(egui::Button::new(RichText::new(e).size(20.0)).frame(false))
+                        .clicked(),
+                };
+                if clicked {
                     acts.push(Act::React(m.id, e));
                     ui.close();
                 }
