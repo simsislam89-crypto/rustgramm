@@ -492,3 +492,11 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - Вход: `crates/rg-core/examples/login.rs` — интерактивный; код из Telegram и облачный пароль вводит сам пользователь (агент пароли не вводит). Секреты/номер в репозиторий не попадают, сессия в `.rg/` (в .gitignore).
 - Грабли: Telegram отклоняет пустую `system_version` (`CONNECTION_SYSTEM_EMPTY`) — задана «Rustgramm OS». Heredoc с кириллицей и апострофами в Bash ломается — файлы писать инструментом Write.
 - Дальше: подключить `verdict*` перед `client.invoke` в слое запросов и обработчик обновлений (UpdateDeleteMessages → mark_deleted, UpdateEditMessage → record_edit); живая проверка после входа.
+
+### Этапы 3 (ч.2) и 4 (ч.1) выполнены (2026-11-21)
+- Вход проверен вживую: аккаунт-дублёр, 8 диалогов, сессия в `.rg/main.session` (не в git).
+- `rg-core::engine::Engine`: dialogs/history/send/mark_read с политикой призрака (`rg-ayu::ghost`), `run_updates` пишет новые/изменённые/удалённые сообщения в хранилище. `connect_with_updates` отдаёт канал обновлений.
+- `rg-desktop` (egui/eframe 0.37): экран входа (телефон → код → облачный пароль вводятся в окне), список чатов, лента (удалённые помечены красным «удалено», «изменено: N»), отправка, переключатели «Призрак / Сохранять удалённые / История правок / Без звука». Фоновый поток tokio, событийный обмен, настройки в `<RG_HOME>/settings.json`, база `<RG_HOME>/messages.db`. Запуск: переменные RG_API_ID, RG_API_HASH (+ опц. RG_HOME, по умолчанию `.rg`), `cargo run -p rg-desktop`.
+- ГРАБЛИ: `rusqlite` (bundled) + `libsql` из grammers = два SQLite, линкер падает на дублях символов (`multiple definition of sqlite3_status`). Решение: хранилище на том же `libsql` (async). Не добавлять rusqlite/sqlx-sqlite.
+- egui 0.37: `App::ui(&mut Ui)` вместо `update`, панели `Panel::left/top/bottom(..).show(ui, ..)` (`show_inside` устарел).
+- Не сделано: медиа, стикеры, аватары, поиск, группы/каналы с темами, звонки; интерфейс без шрифта эмодзи; замеров скорости ещё нет (этап 7).

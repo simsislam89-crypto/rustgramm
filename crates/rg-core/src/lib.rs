@@ -147,10 +147,14 @@ pub async fn open_session(
     Ok(Arc::new(GuardedSession::new(inner, guard)))
 }
 
+/// Клиент и канал обновлений, полученные после подключения.
+pub struct Connected {
+    pub client: grammers_client::Client,
+    pub updates: tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>,
+}
+
 /// Подключение: пул отправителей с защищённой сессией. Сведений об устройстве не раскрываем.
-pub async fn connect(
-    cfg: &Config,
-) -> Result<grammers_client::Client, Box<dyn std::error::Error>> {
+pub async fn connect_with_updates(cfg: &Config) -> Result<Connected, Box<dyn std::error::Error>> {
     use grammers_mtsender::{ConnectionParams, SenderPool};
     let session = open_session(cfg).await?;
     let params = ConnectionParams {
@@ -160,12 +164,22 @@ pub async fn connect(
         proxy_url: cfg.proxy_url.clone(),
         ..ConnectionParams::default()
     };
-    let SenderPool { runner, handle, .. } =
-        SenderPool::with_configuration(session, cfg.api_id, params);
+    let SenderPool {
+        runner,
+        handle,
+        updates,
+    } = SenderPool::with_configuration(session, cfg.api_id, params);
     let client = grammers_client::Client::new(handle);
     tokio::spawn(runner.run());
-    Ok(client)
+    Ok(Connected { client, updates })
 }
+
+/// Подключение без обработки обновлений.
+pub async fn connect(cfg: &Config) -> Result<grammers_client::Client, Box<dyn std::error::Error>> {
+    Ok(connect_with_updates(cfg).await?.client)
+}
+
+pub mod engine;
 
 #[cfg(test)]
 mod tests {

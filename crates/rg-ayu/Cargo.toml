@@ -9,4 +9,7 @@ publish.workspace = true
 [dependencies]
 rg-settings = { path = "../rg-settings" }
 grammers-tl-types = "0.12"
-rusqlite = { version = "0.37", features = ["bundled"] }
+libsql = { version = "0.10", default-features = false, features = ["core"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

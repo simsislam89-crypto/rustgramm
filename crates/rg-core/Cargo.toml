@@ -11,7 +11,9 @@ rg-net = { path = "../rg-net" }
 grammers-mtsender = { version = "0.12", features = ["proxy"] }
 grammers-session = "0.12"
 grammers-client = "0.12"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+rg-settings = { path = "../rg-settings" }
+rg-ayu = { path = "../rg-ayu" }
 
 [dev-dependencies]
 rpassword = "7"
