@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "rg-android"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "android-activity",
  "eframe",
@@ -3040,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "rg-ayu"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "grammers-tl-types",
  "libsql",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "rg-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "grammers-client",
  "grammers-mtsender",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "rg-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "rg-ui",
@@ -3073,11 +3073,11 @@ dependencies = [
 
 [[package]]
 name = "rg-net"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "rg-settings"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3085,7 +3085,7 @@ dependencies = [
 
 [[package]]
 name = "rg-ui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "grammers-client",

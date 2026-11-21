@@ -29,7 +29,11 @@ pub enum Cmd {
     UsePhone,
     UseQr,
     Preview(usize, i32),
+    /// Загрузить фото профиля чата с индексом.
+    Avatar(usize),
     Download(i32),
+    /// Скачать вложение и открыть программой по умолчанию (безопасные типы) или показать в папке.
+    OpenFile(i32),
     RequestCode(String),
     Code(String),
     Password(String),
@@ -65,6 +69,8 @@ pub enum Cmd {
 
 pub enum Ev {
     Image(usize, i32, Box<eframe::egui::ColorImage>),
+    /// Фото профиля: идентификатор чата (Bot API) и картинка.
+    Avatar(i64, Box<eframe::egui::ColorImage>),
     Stage(Stage),
     Me(String),
     Dialogs(Vec<DialogRow>),
@@ -484,6 +490,18 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     Err(e) => out.err(format!("История: {e}")),
                 }
             }
+            Cmd::Avatar(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, limit, peer, id) = (engine.clone(), out.clone(), limit.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    if let Ok(Some(path)) = eng.avatar(peer).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 112)).await
+                    {
+                        out.send(Ev::Avatar(id, Box::new(img)));
+                    }
+                });
+            }
             Cmd::Preview(i, msg_id) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 let (eng, out, limit, peer) = (engine.clone(), out.clone(), limit.clone(), d.peer);
@@ -494,6 +512,22 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             tokio::task::spawn_blocking(move || decode(&path)).await
                     {
                         out.send(Ev::Image(i, msg_id, Box::new(img)));
+                    }
+                });
+            }
+            Cmd::OpenFile(msg_id) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    out.send(Ev::Status("Загрузка файла…".into()));
+                    match eng.download_file(peer, msg_id).await {
+                        Ok(Some(p)) => {
+                            rg_core::media::open_downloaded(&p);
+                            out.send(Ev::Status(format!("Сохранено: {}", p.display())));
+                        }
+                        Ok(None) => out.err("Вложение недоступно"),
+                        Err(e) => out.err(format!("Загрузка: {e}")),
                     }
                 });
             }
@@ -559,6 +593,14 @@ async fn enter(
         });
     }
     out.send(Ev::Stage(Stage::Ready));
+}
+
+/// Декодирует фото профиля и обрезает до квадрата `side` × `side`.
+fn decode_square(path: &std::path::Path, side: u32) -> Option<eframe::egui::ColorImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.resize_to_fill(side, side, image::imageops::FilterType::Triangle).to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
 
 /// Декодирует картинку и уменьшает до 640 px по большей стороне.

@@ -80,6 +80,8 @@ impl App {
         let mut s = self.settings.clone();
         let a = s.ayu.clone();
         let me = self.me.clone();
+        let me_tex = self.dialogs.iter().find(|d| d.saved).and_then(|d| self.avatars.get(&d.id));
+        let corners = s.ayu.avatar_corners;
         let mut act: Option<&str> = None;
         egui::Area::new(egui::Id::new("drawer"))
             .order(egui::Order::Tooltip)
@@ -92,7 +94,7 @@ impl App {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 // Шапка: аватар, имя, ссылка на настройки AyuGram.
                 let (head, _) = ui.allocate_exact_size(Vec2::new(w, 152.0), Sense::hover());
-                draw_avatar(ui.painter(), Pos2::new(head.left() + 46.0, head.top() + 46.0), &me, 1, 56.0);
+                draw_avatar(ui, Pos2::new(head.left() + 46.0, head.top() + 46.0), &me, 1, 56.0, me_tex, corners);
                 ui.painter().text(
                     Pos2::new(head.left() + 18.0, head.top() + 96.0),
                     Align2::LEFT_CENTER,
@@ -229,8 +231,9 @@ impl App {
     #[allow(deprecated)]
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         self.logout_window(ctx);
-        let appear = ease_out(tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.2));
-        if appear < 0.005 && !self.settings_open {
+        let raw = tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.38);
+        let appear = spring(raw);
+        if raw < 0.005 && !self.settings_open {
             return;
         }
         let screen = ctx.content_rect();
@@ -240,7 +243,7 @@ impl App {
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
                 ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * appear) as u8));
+                    .rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * raw) as u8));
                 if resp.clicked() {
                     self.settings_open = false;
                 }
@@ -258,7 +261,7 @@ impl App {
             .order(egui::Order::Tooltip)
             .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 18.0))
             .show(ctx, |ui| {
-                ui.set_opacity(appear);
+                ui.set_opacity(raw.min(1.0).powf(0.6));
                 egui::Frame::new()
                     .fill(t2(WINDOW_BG))
                     .corner_radius(CornerRadius::same(10))

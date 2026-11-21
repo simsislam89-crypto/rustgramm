@@ -6,6 +6,8 @@ pub mod emoji;
 mod frame;
 pub mod icons;
 mod kit;
+mod media_ui;
+mod rich;
 mod settings_ui;
 pub mod theme;
 mod win;
@@ -37,12 +39,18 @@ struct App {
     input: String,
     search: String,
     emoji_open: bool,
+    emoji_pinned: bool,
+    emoji_jump: Option<usize>,
+    emoji_btn: egui::Rect,
     emoji: Option<emoji::Emoji>,
     emoji_tried: bool,
     settings: Settings,
     status: String,
     error: String,
     textures: HashMap<i32, egui::TextureHandle>,
+    /// Фото профилей по идентификатору чата и уже запрошенные.
+    avatars: HashMap<i64, egui::TextureHandle>,
+    avatar_req: HashSet<i64>,
     requested: HashSet<i32>,
     key_id: String,
     key_hash: String,
@@ -63,6 +71,15 @@ struct App {
     forward: Option<i32>,
     forward_filter: String,
     confirm_delete: Option<i32>,
+    /// Адрес, ожидающий подтверждения «Открыть ссылку?».
+    link_confirm: Option<String>,
+    /// Раскрытые спойлеры (сообщение, номер куска).
+    spoilers: HashSet<(i32, usize)>,
+    /// Высота содержимого ленты без отступа снизу (для прижатия коротких переписок к низу).
+    msgs_h: f32,
+    /// Открытая в просмотрщике картинка (идентификатор сообщения) и масштаб.
+    viewer: Option<i32>,
+    viewer_zoom: f32,
     details: Option<i32>,
     edit_history: Option<(i32, Vec<String>)>,
     hidden: HashSet<i32>,
@@ -132,12 +149,17 @@ impl App {
             input: String::new(),
             search: String::new(),
             emoji_open: false,
+            emoji_pinned: false,
+            emoji_jump: None,
+            emoji_btn: egui::Rect::NOTHING,
             emoji: None,
             emoji_tried: false,
             settings: Settings::default(),
             status: String::new(),
             error: String::new(),
             textures: HashMap::new(),
+            avatars: HashMap::new(),
+            avatar_req: HashSet::new(),
             requested: HashSet::new(),
             key_id: String::new(),
             key_hash: String::new(),
@@ -154,6 +176,11 @@ impl App {
             forward: None,
             forward_filter: String::new(),
             confirm_delete: None,
+            link_confirm: None,
+            spoilers: HashSet::new(),
+            msgs_h: 0.0,
+            viewer: None,
+            viewer_zoom: 1.0,
             details: None,
             edit_history: None,
             hidden: HashSet::new(),
@@ -276,6 +303,10 @@ impl App {
                     self.textures.insert(id, tex);
                 }
                 Ev::Image(..) => {}
+                Ev::Avatar(id, img) => {
+                    let tex = ctx.load_texture(format!("a{id}"), *img, egui::TextureOptions::LINEAR);
+                    self.avatars.insert(id, tex);
+                }
                 Ev::Settings(s) => self.settings = *s,
                 Ev::Status(s) => self.status = s,
                 Ev::Error(e) => {
@@ -559,7 +590,18 @@ impl App {
                 };
                 let p = ui.painter();
                 p.rect_filled(rect, 0.0, fill);
-                draw_avatar(p, rect.left_center() + Vec2::new(32.0, 0.0), &d.name, d.id, DIALOG_PHOTO);
+                if ui.is_rect_visible(rect) && self.avatar_req.insert(d.id) {
+                    let _ = self.cmd.send(Cmd::Avatar(i));
+                }
+                draw_avatar(
+                    ui,
+                    rect.left_center() + Vec2::new(32.0, 0.0),
+                    if d.saved { "И" } else { &d.name },
+                    d.id,
+                    DIALOG_PHOTO,
+                    self.avatars.get(&d.id),
+                    self.settings.ayu.avatar_corners,
+                );
                 let (name_c, text_c, date_c) = if selected {
                     (Color32::WHITE, Color32::WHITE, Color32::WHITE)
                 } else {
@@ -857,15 +899,27 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| self.composer_ui(ui));
         }
+        // Лента въезжает справа с пружиной при открытии чата (переход как на iPhone).
+        let push = (self.chat_opened.elapsed().as_secs_f32() / 0.5).clamp(0.0, 1.0);
+        if push < 1.0 && self.selected.is_some() {
+            ctx.request_repaint();
+        }
+        let slide = if self.selected.is_some() { (1.0 - spring(push)) * 36.0 } else { 0.0 };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(t(CHAT_BG))
-                    .inner_margin(egui::Margin::symmetric(8, 0)),
+                    .inner_margin(egui::Margin {
+                        left: (8.0 + slide.max(0.0)) as i8,
+                        right: 8,
+                        top: 0,
+                        bottom: 0,
+                    }),
             )
             .show(ui, |ui| self.messages_ui(ui));
         self.emoji_window(&ctx);
         self.chat_windows(&ctx);
+        self.viewer_window(&ctx);
         self.drawer(&ctx);
         self.settings_window(&ctx);
     }
@@ -873,9 +927,17 @@ impl eframe::App for App {
 
 /// Настройки окна ПК.
 pub fn native_options() -> eframe::NativeOptions {
+    // RG_SIZE=ШxВ — размер окна для проверки узкой раскладки.
+    let size = std::env::var("RG_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])
+        })
+        .unwrap_or([1100.0, 720.0]);
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            .with_inner_size(size)
             .with_min_inner_size([420.0, 480.0])
             .with_title("Rustgramm")
             .with_transparent(true)
@@ -989,13 +1051,36 @@ fn demo_app(mode: &str) -> App {
             false,
             false,
             0,
-            Some(MediaInfo {
-                kind: MediaKind::File,
-                name: "report.pdf".to_owned(),
-                size: 1_572_864,
-            }),
+            Some(MediaInfo::basic(MediaKind::File, "report.pdf", 1_572_864)),
         ),
         mk(6, 0, "Спасибо, посмотрю вечером 👍❤️", true, false, 0, None),
+        MessageRow {
+            entities: vec![
+                rg_core::engine::Entity { kind: rg_core::engine::EntityKind::Bold, start: 0, end: 6, url: None },
+                rg_core::engine::Entity { kind: rg_core::engine::EntityKind::Italic, start: 7, end: 13, url: None },
+                rg_core::engine::Entity { kind: rg_core::engine::EntityKind::Code, start: 14, end: 17, url: None },
+                rg_core::engine::Entity { kind: rg_core::engine::EntityKind::Spoiler, start: 18, end: 24, url: None },
+                rg_core::engine::Entity { kind: rg_core::engine::EntityKind::Link, start: 25, end: 36, url: None },
+            ],
+            ..MessageRow::plain(7, "Жирный курсив код секрет example.com 🔥".to_owned(), false, now + 700)
+        },
+        MessageRow {
+            media: Some(MediaInfo {
+                duration: 14,
+                waveform: (0..60).map(|i| ((i * 7) % 28) as u8 + 2).collect(),
+                ..MediaInfo::basic(MediaKind::Voice, "Голосовое сообщение", 40_000)
+            }),
+            ..MessageRow::plain(8, String::new(), true, now + 800)
+        },
+        MessageRow {
+            media: Some(MediaInfo {
+                duration: 73,
+                dims: (1280, 720),
+                has_thumb: true,
+                ..MediaInfo::basic(MediaKind::Video, "Видео", 9_000_000)
+            }),
+            ..MessageRow::plain(9, "Запись экрана".to_owned(), false, now + 900)
+        },
     ];
     app.settings = Settings::default();
     app.now = now;

@@ -123,6 +123,8 @@ pub struct Settings {
     pub filters: Vec<Filter>,
     /// Непрозрачность окна, проценты (15..=100); по умолчанию 86.
     pub window_opacity: u8,
+    /// Недавно выбранные эмодзи (строка символов, новые впереди).
+    pub recent_emoji: String,
 }
 
 impl Default for Settings {
@@ -135,6 +137,7 @@ impl Default for Settings {
             extera: ExteraSettings::default(),
             filters: Vec::new(),
             window_opacity: 86,
+            recent_emoji: String::new(),
         }
     }
 }

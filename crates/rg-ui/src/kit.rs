@@ -54,8 +54,10 @@ fn row_bg(ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
 fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
     let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
     // Ручка и цвет дорожки плавно переезжают при смене значения.
-    let k = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.16);
-    let fill = lerp_color(TRACK_OFF, ACCENT, k);
+    let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.3);
+    // Ручка с пружинным перелётом, как переключатель на iPhone; цвет — линейно.
+    let k = if on { spring(lin) } else { 1.0 - spring(1.0 - lin) };
+    let fill = lerp_color(TRACK_OFF, ACCENT, lin);
     ui.painter().rect_filled(track, CornerRadius::same(7), fill);
     let knob = Pos2::new(track.left() + 7.0 + k * (track.width() - 14.0), center.y);
     ui.painter().circle_filled(knob, 6.0, INK_DARK);

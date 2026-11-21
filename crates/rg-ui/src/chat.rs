@@ -4,9 +4,8 @@
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Vec2};
+use eframe::egui::{self, Align, Color32, FontId, Layout, Rect, RichText, Sense, Vec2};
 use rg_core::engine::MessageRow;
-use rg_core::media::{MediaKind, human_size};
 use rg_settings::AyuSettings;
 
 use super::{App, Cmd, icons, theme::*};
@@ -15,7 +14,12 @@ use super::{App, Cmd, icons, theme::*};
 const REACTIONS: [&str; 6] = ["👍", "❤", "🔥", "😂", "😮", "😢"];
 
 /// Действие над сообщением, выбранное пользователем.
+#[derive(Clone)]
 pub(crate) enum Act {
+    /// Скачать вложение и открыть.
+    Open(i32),
+    /// Открыть картинку в просмотрщике.
+    Viewer(i32),
     Reply(i32, String),
     Copy(String),
     Edit(i32, String),
@@ -31,6 +35,8 @@ pub(crate) enum Act {
     Save(i32),
     History(i32),
     Goto(i32),
+    OpenUrl(String),
+    Spoiler(i32, usize),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -44,6 +50,7 @@ struct Env<'a> {
     arrived: &'a HashMap<i32, f64>,
     time: f64,
     emoji: Option<&'a super::emoji::Emoji>,
+    spoilers: &'a std::collections::HashSet<(i32, usize)>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -67,7 +74,7 @@ impl App {
                 }
             }
             if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)) {
-                avatar(ui, &d.name, d.id, 42.0);
+                avatar(ui, &d.name, d.id, 42.0, self.avatars.get(&d.id), self.settings.ayu.avatar_corners);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.add_space(6.0);
@@ -189,12 +196,32 @@ impl App {
                     .frame(egui::Frame::NONE)
                     .margin(Vec2::new(4.0, 8.0)),
             );
-            if s.field_emoji_button
-                && ui
-                    .add(egui::Button::new(RichText::new("😊").size(20.0).color(DIALOG_DATE)).frame(false))
-                    .clicked()
-            {
-                self.emoji_open = !self.emoji_open;
+            if s.field_emoji_button {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+                self.emoji_btn = rect;
+                let k = tween(ui.ctx(), "emoji-btn", f32::from(u8::from(resp.hovered() || self.emoji_open)), 0.12);
+                let color = lerp_color(DIALOG_DATE, WHITE, k);
+                // Смайлик из линий: круг, глаза, улыбка.
+                let c = rect.center();
+                let st = egui::Stroke::new(1.5, color);
+                ui.painter().circle_stroke(c, 9.0, st);
+                ui.painter().circle_filled(c + Vec2::new(-3.2, -2.5), 1.1, color);
+                ui.painter().circle_filled(c + Vec2::new(3.2, -2.5), 1.1, color);
+                ui.painter().add(egui::Shape::line(
+                    (0..=8)
+                        .map(|i| {
+                            let a = std::f32::consts::PI * (0.2 + 0.6 * i as f32 / 8.0);
+                            c + Vec2::new(a.cos() * 5.2, a.sin() * 5.2 - 0.4)
+                        })
+                        .collect(),
+                    st,
+                ));
+                if resp.clicked() {
+                    self.emoji_pinned = !self.emoji_pinned;
+                    self.emoji_open = self.emoji_pinned;
+                } else if resp.hovered() && s.show_emoji_popup {
+                    self.emoji_open = true;
+                }
             }
             let (srect, sresp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
             let active = !self.input.trim().is_empty();
@@ -225,28 +252,55 @@ impl App {
     }
 
     pub(crate) fn emoji_window(&mut self, ctx: &egui::Context) {
-        if !self.emoji_open {
+        let appear = tween(ctx, "emoji-panel", f32::from(u8::from(self.emoji_open)), 0.18);
+        if appear < 0.01 {
             return;
         }
         let Some(emoji) = self.emoji.as_ref() else { return };
         let mut picked = None;
-        let mut close = false;
-        egui::Window::new("emoji")
-            .title_bar(false)
-            .resizable(false)
-            .fixed_size(Vec2::new(300.0, 270.0))
-            .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-70.0, -64.0))
-            .show(ctx, |ui| {
-                picked = emoji.picker(ui);
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    close = true;
-                }
-            });
+        let mut jump = self.emoji_jump.take();
+        let screen = ctx.content_rect();
+        let size = Vec2::new(344.0_f32.min(screen.width() - 16.0), 320.0_f32.min(screen.height() - 120.0));
+        // Панель поднимается над кнопкой с пружинистой посадкой, как лист на iPhone.
+        let rise = (1.0 - spring(appear)) * 22.0;
+        let pos = egui::pos2(
+            (self.emoji_btn.right() - size.x + 20.0).clamp(8.0, screen.width() - size.x - 8.0),
+            self.emoji_btn.top() - size.y - 12.0 + rise,
+        );
+        #[allow(deprecated)]
+        let area = egui::Area::new(egui::Id::new("emoji-panel"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos);
+        let inner = area.show(ctx, |ui| {
+            ui.set_opacity(appear.clamp(0.0, 1.0));
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
+                .corner_radius(egui::CornerRadius::same(14))
+                .inner_margin(egui::Margin::symmetric(6, 6))
+                .show(ui, |ui| {
+                    ui.set_min_size(size);
+                    ui.set_max_size(size);
+                    picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
+                });
+        });
+        self.emoji_jump = jump;
         if let Some(c) = picked {
             self.input.push(c);
+            let mut recent: String = std::iter::once(c)
+                .chain(self.settings.recent_emoji.chars().filter(|x| *x != c))
+                .take(24)
+                .collect();
+            std::mem::swap(&mut recent, &mut self.settings.recent_emoji);
+            self.send(Cmd::Settings(Box::new(self.settings.clone())));
         }
-        if close {
+        // Закрытие: Esc или курсор ушёл с панели и кнопки (если панель не закреплена кликом).
+        let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+            inner.response.rect.expand(8.0).contains(p) || self.emoji_btn.expand(4.0).contains(p)
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (!over && !self.emoji_pinned) {
             self.emoji_open = false;
+            self.emoji_pinned = false;
         }
     }
 
@@ -271,12 +325,15 @@ impl App {
         }
         ui.set_opacity(ease_out(fade));
         let now = self.now;
-        let group = self.messages.iter().any(|m| !m.outgoing && !m.sender.is_empty());
+        // Имя отправителя показываем только в группах и каналах (их идентификаторы отрицательные).
+        let group = self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id < 0);
         let shift = ui.input(|i| i.modifiers.shift);
+        let viewport_h = ui.available_height();
         let scroll_to = self.scroll_to.take();
         let mut acts: Vec<Act> = Vec::new();
         let mut want_older = false;
         let searching = self.found.is_some();
+        let pad = (viewport_h - self.msgs_h).max(0.0);
         let out = {
             let list: &[MessageRow] = self.found.as_deref().unwrap_or(&self.messages);
             let env = Env {
@@ -289,6 +346,7 @@ impl App {
                 arrived: &self.arrived,
                 time: ui.input(|i| i.time),
                 emoji: self.emoji.as_ref(),
+                spoilers: &self.spoilers,
             };
             let hidden = &self.hidden;
             egui::ScrollArea::vertical()
@@ -296,7 +354,8 @@ impl App {
                 .stick_to_bottom(!searching)
                 .show(ui, |ui| {
                     let mut prev_date: Option<i64> = None;
-                    ui.add_space(8.0);
+                    // Короткая переписка прижата к низу, как в Telegram.
+                    ui.add_space(8.0 + pad);
                     if searching && list.is_empty() {
                         ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(SUBTEXT)));
                     }
@@ -311,6 +370,7 @@ impl App {
                     ui.add_space(8.0);
                 })
         };
+        self.msgs_h = (out.content_size.y - pad).max(0.0);
         // Достигли верха — просим более старую историю.
         if !searching && out.state.clamped_offset().y <= 4.0 && out.content_size.y > out.inner_rect.height() {
             want_older = true;
@@ -364,11 +424,29 @@ impl App {
             }
             Act::CopyId(id) => ctx.copy_text(id.to_string()),
             Act::Save(id) => self.send(Cmd::Download(id)),
+            Act::Open(id) => self.send(Cmd::OpenFile(id)),
+            Act::Viewer(id) => {
+                self.viewer = Some(id);
+                self.viewer_zoom = 1.0;
+            }
             Act::History(id) => {
                 self.details = Some(id);
                 self.send(Cmd::EditHistory(id));
             }
             Act::Goto(id) => self.scroll_to = Some(id),
+            Act::OpenUrl(url) => {
+                if self.settings.ayu.disable_open_link_warning {
+                    super::rich::open_url(&url);
+                } else {
+                    self.link_confirm = Some(url);
+                }
+            }
+            Act::Spoiler(id, idx) => {
+                // Повторный клик скрывает спойлер обратно.
+                if !self.spoilers.insert((id, idx)) {
+                    self.spoilers.remove(&(id, idx));
+                }
+            }
         }
     }
 
@@ -407,6 +485,35 @@ impl App {
             if !open {
                 self.forward = None;
                 self.forward_filter.clear();
+            }
+        }
+        if let Some(url) = self.link_confirm.clone() {
+            let mut close = false;
+            #[allow(deprecated)]
+            egui::Window::new("Открыть ссылку?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_max_width(360.0);
+                    ui.label("Ссылка откроется в браузере по умолчанию:");
+                    ui.label(RichText::new(&url).color(WHITE).strong());
+                    ui.horizontal(|ui| {
+                        if ui.button("Открыть").clicked() {
+                            super::rich::open_url(&url);
+                            close = true;
+                        }
+                        if ui.button("Скопировать").clicked() {
+                            ctx.copy_text(url.clone());
+                            close = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.link_confirm = None;
             }
         }
         if let Some(id) = self.confirm_delete {
@@ -480,6 +587,64 @@ impl App {
     }
 }
 
+impl App {
+    /// Просмотр фото на весь экран: колесо — масштаб, Esc или клик по фону — закрыть.
+    #[allow(deprecated)]
+    pub(crate) fn viewer_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.viewer else { return };
+        let screen = ctx.content_rect();
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let zoom_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        if zoom_delta != 0.0 {
+            self.viewer_zoom = (self.viewer_zoom * (1.0 + zoom_delta / 400.0)).clamp(0.5, 6.0);
+        }
+        let tex = self.textures.get(&id).cloned();
+        let zoom = self.viewer_zoom;
+        let mut acts: Vec<Act> = Vec::new();
+        egui::Area::new(egui::Id::new("viewer"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, bg) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(225));
+                if let Some(tex) = &tex {
+                    let size = tex.size_vec2();
+                    let fit = (screen.width() * 0.9 / size.x).min(screen.height() * 0.82 / size.y).min(3.0);
+                    let r = Rect::from_center_size(rect.center(), size * fit * zoom);
+                    let img = ui.put(r, egui::Image::new(tex).corner_radius(8).sense(Sense::click()));
+                    if bg.clicked() && !img.hovered() {
+                        close = true;
+                    }
+                } else if bg.clicked() {
+                    close = true;
+                }
+                let bar = Rect::from_center_size(
+                    egui::pos2(rect.center().x, rect.bottom() - 34.0),
+                    Vec2::new(330.0, 36.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Открыть оригинал").clicked() {
+                            acts.push(Act::Open(id));
+                        }
+                        if ui.button("Сохранить").clicked() {
+                            acts.push(Act::Save(id));
+                        }
+                        if ui.button("Закрыть").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        for a in acts {
+            self.apply(ctx, a);
+        }
+        if close {
+            self.viewer = None;
+        }
+    }
+}
+
 fn day_pill(ui: &mut egui::Ui, avail: f32, label: String) {
     let galley = ui
         .painter()
@@ -500,14 +665,17 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     } else {
         Layout::left_to_right(Align::TOP)
     };
-    ui.with_layout(layout, |ui| {
-        if let Some(t0) = env.arrived.get(&m.id) {
-            let k = ((env.time - t0) / 0.25).clamp(0.0, 1.0) as f32;
-            if k < 1.0 {
-                ui.ctx().request_repaint();
-            }
-            ui.set_opacity(ease_out(k));
+    let mut k_in = 1.0_f32;
+    if let Some(t0) = env.arrived.get(&m.id) {
+        k_in = ((env.time - t0) / 0.45).clamp(0.0, 1.0) as f32;
+        if k_in < 1.0 {
+            ui.ctx().request_repaint();
+            // Новое сообщение «всплывает» снизу пружиной, как в iMessage.
+            ui.add_space(((1.0 - spring(k_in)) * 26.0).max(0.0));
         }
+    }
+    ui.with_layout(layout, |ui| {
+        ui.set_opacity(ease_out((k_in * 2.5).min(1.0)));
         ui.add_space(6.0);
         let (mut fill, text_c, date_c) = if m.outgoing {
             (t(MSG_OUT_BG), MSG_OUT_TEXT, MSG_OUT_DATE)
@@ -541,6 +709,9 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         }
         let w = w.min(max_inner);
         let radius = egui::CornerRadius::same(s.bubble_radius());
+        let bid = ui.make_persistent_id(("m", m.id));
+        let mut cards: Vec<(Rect, Act)> = Vec::new();
+        let mut hot: Vec<(Rect, super::rich::Hit)> = Vec::new();
         let inner = egui::Frame::new()
             .fill(fill)
             .corner_radius(radius)
@@ -580,20 +751,22 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                         let mark = if s.deleted_mark.is_empty() { String::new() } else { format!("{} ", s.deleted_mark) };
                         ui.label(RichText::new(format!("{mark}удалено")).color(DANGER).strong());
                     }
-                    if let Some(tex) = env.tex.get(&m.id) {
-                        ui.add(egui::Image::new(tex).max_width(w).corner_radius(10));
+                    if let Some(info) = &m.media {
+                        super::media_ui::card(ui, m, info, w, env.tex.get(&m.id), text_c, date_c, &mut cards);
                     }
-                    if let Some(info) = &m.media
-                        && !env.tex.contains_key(&m.id)
-                    {
-                        let size = if info.size > 0 {
-                            format!(" · {}", human_size(info.size))
-                        } else {
-                            String::new()
-                        };
-                        ui.label(format!("[{}{size}]", info.name));
-                    }
-                    if !m.text.is_empty() {
+                    if !m.text.is_empty() && !m.entities.is_empty() {
+                        let runs = super::rich::build_runs(&m.text, &m.entities);
+                        hot.extend(super::rich::render(
+                            ui,
+                            env.emoji,
+                            &runs,
+                            15.0,
+                            text_c,
+                            WHITE,
+                            m.id,
+                            env.spoilers,
+                        ));
+                    } else if !m.text.is_empty() {
                         match env.emoji {
                             Some(e) => e.rich_label(ui, &m.text, 15.0, text_c),
                             None => {
@@ -627,7 +800,32 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                 });
             });
         let rect = inner.response.rect;
-        let resp = ui.interact(rect, ui.make_persistent_id(("m", m.id)), Sense::click());
+        // Один отклик на весь пузырь: правый клик — меню, левый — по области ссылки, спойлера или карточки.
+        let resp = ui.interact(rect, bid, Sense::click());
+        let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+        let over = |r: &Rect| pointer.is_some_and(|p| r.contains(p));
+        let on_card = cards.iter().find(|(r, _)| over(r)).map(|(_, a)| a.clone());
+        let on_hot = hot.iter().find(|(r, _)| over(r)).map(|(_, h)| h.clone());
+        if resp.hovered() && (on_card.is_some() || matches!(on_hot, Some(super::rich::Hit::Link(_) | super::rich::Hit::Spoiler(_)))) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // Спойлер раскрывается и при наведении, если так настроено (как в AyuGram).
+        if s.reveal_spoilers
+            && let Some(super::rich::Hit::Spoiler(i)) = &on_hot
+            && !env.spoilers.contains(&(m.id, *i))
+        {
+            acts.push(Act::Spoiler(m.id, *i));
+        }
+        if resp.clicked() {
+            if let Some(a) = on_card {
+                acts.push(a);
+            } else if let Some(h) = on_hot {
+                acts.push(match h {
+                    super::rich::Hit::Link(u) => Act::OpenUrl(u),
+                    super::rich::Hit::Spoiler(i) => Act::Spoiler(m.id, i),
+                });
+            }
+        }
         if env.scroll_to == Some(m.id) {
             resp.scroll_to_me(Some(Align::Center));
         }
@@ -674,8 +872,9 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     if !m.text.is_empty() {
         item(ui, "Копировать текст", Act::Copy(m.text.clone()));
     }
-    if m.media.as_ref().is_some_and(|i| matches!(i.kind, MediaKind::Photo | MediaKind::Sticker | MediaKind::File)) {
+    if m.media.as_ref().is_some_and(|i| i.is_downloadable()) {
         item(ui, "Сохранить файл", Act::Save(m.id));
+        item(ui, "Открыть", Act::Open(m.id));
     }
     if m.outgoing && !m.deleted {
         item(ui, "Изменить", Act::Edit(m.id, m.text.clone()));

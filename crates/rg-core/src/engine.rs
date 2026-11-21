@@ -37,6 +37,73 @@ pub struct DialogRow {
     pub archived: bool,
 }
 
+/// Вид форматирования фрагмента текста.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Code,
+    Pre,
+    Spoiler,
+    Quote,
+    /// Ссылка (в тексте или скрытая за словом).
+    Link,
+    Mention,
+    Hashtag,
+    Command,
+}
+
+/// Фрагмент форматирования в символах (не в UTF-16, как у Telegram).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    pub kind: EntityKind,
+    pub start: usize,
+    pub end: usize,
+    /// Адрес для `Link`, имя для `Mention`.
+    pub url: Option<String>,
+}
+
+/// Переводит сущности Telegram (смещения в UTF-16) в символьные индексы.
+pub fn convert_entities(text: &str, raw: &[grammers_client::tl::enums::MessageEntity]) -> Vec<Entity> {
+    use grammers_client::tl::enums::MessageEntity as E;
+    // Накопленное число UTF-16 единиц перед каждым символом.
+    let mut at16 = Vec::with_capacity(text.chars().count() + 1);
+    let mut n = 0usize;
+    for c in text.chars() {
+        at16.push(n);
+        n += c.len_utf16();
+    }
+    at16.push(n);
+    let to_char = |off: i32| at16.partition_point(|&x| x < off.max(0) as usize);
+    let mut out = Vec::new();
+    for e in raw {
+        let (kind, off, len, url) = match e {
+            E::Bold(x) => (EntityKind::Bold, x.offset, x.length, None),
+            E::Italic(x) => (EntityKind::Italic, x.offset, x.length, None),
+            E::Underline(x) => (EntityKind::Underline, x.offset, x.length, None),
+            E::Strike(x) => (EntityKind::Strike, x.offset, x.length, None),
+            E::Code(x) => (EntityKind::Code, x.offset, x.length, None),
+            E::Pre(x) => (EntityKind::Pre, x.offset, x.length, None),
+            E::Spoiler(x) => (EntityKind::Spoiler, x.offset, x.length, None),
+            E::Blockquote(x) => (EntityKind::Quote, x.offset, x.length, None),
+            E::Url(x) => (EntityKind::Link, x.offset, x.length, None),
+            E::TextUrl(x) => (EntityKind::Link, x.offset, x.length, Some(x.url.clone())),
+            E::Email(x) => (EntityKind::Link, x.offset, x.length, None),
+            E::Mention(x) => (EntityKind::Mention, x.offset, x.length, None),
+            E::Hashtag(x) => (EntityKind::Hashtag, x.offset, x.length, None),
+            E::BotCommand(x) => (EntityKind::Command, x.offset, x.length, None),
+            _ => continue,
+        };
+        let (start, end) = (to_char(off), to_char(off + len));
+        if end > start {
+            out.push(Entity { kind, start, end, url });
+        }
+    }
+    out
+}
+
 /// Сообщение для интерфейса.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRow {
@@ -61,6 +128,8 @@ pub struct MessageRow {
     pub reactions: i32,
     /// Отправитель (формат Bot API), 0 если неизвестен.
     pub sender_id: i64,
+    /// Форматирование текста.
+    pub entities: Vec<Entity>,
 }
 
 impl MessageRow {
@@ -82,6 +151,7 @@ impl MessageRow {
             views: None,
             reactions: 0,
             sender_id: 0,
+            entities: Vec::new(),
         }
     }
 }
@@ -428,6 +498,10 @@ impl Engine {
             sender_id: m
                 .sender_id()
                 .map_or(0, |p| p.bot_api_dialog_id_unchecked()),
+            entities: m
+                .fmt_entities()
+                .map(|e| convert_entities(m.text(), e))
+                .unwrap_or_default(),
         }
     }
 
@@ -558,6 +632,22 @@ impl Engine {
         Ok(())
     }
 
+    /// Фото профиля или чата в кэше (`cache/avatars/<id>.jpg`); `None`, если фото нет.
+    pub async fn avatar(&self, peer: PeerRef) -> Result<Option<PathBuf>, BoxErr> {
+        let dir = self.dirs.cache.join("avatars");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{}.jpg", peer_key(&peer)));
+        if file.exists() {
+            return Ok(Some(file));
+        }
+        let resolved = self.client.resolve_peer(peer).await?;
+        let Some(photo) = resolved.photo(false).await? else {
+            return Ok(None);
+        };
+        self.client.download_media(&photo, &file).await?;
+        Ok(Some(file))
+    }
+
     /// Картинка для предпросмотра (фото или статичный стикер) в кэше на диске.
     pub async fn preview_path(
         &self,
@@ -573,10 +663,24 @@ impl Engine {
         };
         let Some(media) = m.media() else { return Ok(None) };
         let info = media::describe(&media);
-        if !info.has_preview() || info.size > PREVIEW_LIMIT {
+        let is_thumb = matches!(info.kind, MediaKind::Video | MediaKind::Gif | MediaKind::Round);
+        if !info.has_preview() || (!is_thumb && info.size > PREVIEW_LIMIT) {
             return Ok(None);
         }
-        self.client.download_media(&media, &file).await?;
+        match &media {
+            // У видео, GIF и кружков для предпросмотра берём самую большую скачиваемую миниатюру.
+            grammers_client::media::Media::Document(d) if is_thumb => {
+                use grammers_client::media::Downloadable;
+                let thumbs = d.thumbs();
+                let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
+                    return Ok(None);
+                };
+                self.client.download_media(th, &file).await?;
+            }
+            _ => {
+                self.client.download_media(&media, &file).await?;
+            }
+        }
         media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
         Ok(Some(file))
     }
@@ -588,10 +692,17 @@ impl Engine {
         };
         let Some(media) = m.media() else { return Ok(None) };
         let info = media::describe(&media);
+        let ext = media::ext_for_mime(&info.mime);
         let name = match info.kind {
             MediaKind::Photo => format!("photo_{msg_id}.jpg"),
             MediaKind::Sticker => format!("sticker_{msg_id}.webp"),
-            _ => media::safe_file_name(&info.name),
+            MediaKind::Voice => format!("voice_{msg_id}.{ext}"),
+            MediaKind::Round => format!("round_{msg_id}.{ext}"),
+            MediaKind::Gif => format!("gif_{msg_id}.{ext}"),
+            _ => {
+                let n = media::safe_file_name(&info.name);
+                if n.contains('.') { n } else { format!("{n}.{ext}") }
+            }
         };
         let mut dest = self.dirs.downloads.join(&name);
         if dest.exists() {
@@ -702,4 +813,33 @@ impl Engine {
 mod grammers_tl_types_id {
     use grammers_client::tl::{Identifiable, functions};
     pub const READ_HISTORY: u32 = functions::messages::ReadHistory::CONSTRUCTOR_ID;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grammers_client::tl::{enums::MessageEntity, types};
+
+    fn bold(offset: i32, length: i32) -> MessageEntity {
+        MessageEntity::Bold(types::MessageEntityBold { offset, length })
+    }
+
+    #[test]
+    fn entities_use_char_indices() {
+        // «привет мир»: жирное «мир» — смещения те же (кириллица в BMP).
+        let e = convert_entities("привет мир", &[bold(7, 3)]);
+        assert_eq!(e, vec![Entity { kind: EntityKind::Bold, start: 7, end: 10, url: None }]);
+    }
+
+    #[test]
+    fn astral_chars_count_as_two_utf16_units() {
+        // «😀 ab»: эмодзи занимает 2 единицы UTF-16, но 1 символ; «ab» — смещение 3 → символ 2.
+        let e = convert_entities("😀 ab", &[bold(3, 2)]);
+        assert_eq!((e[0].start, e[0].end), (2, 4));
+    }
+
+    #[test]
+    fn empty_and_unknown_entities_are_dropped() {
+        assert!(convert_entities("abc", &[bold(1, 0)]).is_empty());
+    }
 }

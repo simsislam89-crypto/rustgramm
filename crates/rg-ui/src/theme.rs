@@ -110,6 +110,20 @@ pub fn ease_out(t: f32) -> f32 {
     if t >= 1.0 { 1.0 } else { 1.0 - 2f32.powf(-10.0 * t) }
 }
 
+/// Пружина как на iPhone: быстрый подъём, небольшой перелёт и затухание (~0.85 демпфирования).
+/// `k` — линейный прогресс 0..1, результат тянется к 1 с лёгким перелётом.
+pub fn spring(k: f32) -> f32 {
+    let k = k.clamp(0.0, 1.0);
+    if k >= 1.0 {
+        return 1.0;
+    }
+    // Недодемпфированный осциллятор: x(t) = 1 - e^{-ζωt}(cos ωd t + ζω/ωd sin ωd t).
+    let (zeta, omega) = (0.72_f32, 13.0_f32);
+    let wd = omega * (1.0 - zeta * zeta).sqrt();
+    let x = k * 0.9;
+    1.0 - (-zeta * omega * x).exp() * ((wd * x).cos() + zeta * omega / wd * (wd * x).sin())
+}
+
 /// Линейная смесь цветов.
 pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -258,14 +272,35 @@ pub fn avatar_color(id: i64) -> Color32 {
     Color32::from_rgb(g, g, g + 4)
 }
 
-/// Круглая аватарка с первой буквой имени.
-pub fn avatar(ui: &mut egui::Ui, name: &str, id: i64, size: f32) {
+/// Аватарка с первой буквой имени (круг).
+pub fn avatar(ui: &mut egui::Ui, name: &str, id: i64, size: f32, tex: Option<&egui::TextureHandle>, corners: i32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    draw_avatar(ui.painter(), rect.center(), name, id, size);
+    draw_avatar(ui, rect.center(), name, id, size, tex, corners);
 }
 
-pub fn draw_avatar(painter: &egui::Painter, center: egui::Pos2, name: &str, id: i64, size: f32) {
-    painter.circle_filled(center, size / 2.0, avatar_color(id));
+/// Аватарка: фото, если оно загружено, иначе серый круг с буквой. `corners` — скругление
+/// из настроек AyuGram (0..=23 для размера 48; 23 и больше — круг).
+pub fn draw_avatar(
+    ui: &egui::Ui,
+    center: egui::Pos2,
+    name: &str,
+    id: i64,
+    size: f32,
+    tex: Option<&egui::TextureHandle>,
+    corners: i32,
+) {
+    let rect = egui::Rect::from_center_size(center, Vec2::splat(size));
+    let radius = (corners.clamp(0, 23) as f32 * size / 46.0).min(size / 2.0);
+    let cr = CornerRadius::same(radius.round() as u8);
+    if let Some(tex) = tex {
+        egui::Image::new(tex)
+            .corner_radius(cr)
+            .fit_to_exact_size(Vec2::splat(size))
+            .paint_at(ui, rect);
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, cr, avatar_color(id));
     let initial = name
         .chars()
         .find(|c| c.is_alphanumeric())
