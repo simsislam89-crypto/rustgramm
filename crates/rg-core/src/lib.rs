@@ -180,6 +180,7 @@ pub async fn connect(cfg: &Config) -> Result<grammers_client::Client, Box<dyn st
 }
 
 pub mod engine;
+pub mod media;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,7 @@
 //! Движок: высокоуровневые операции клиента с режимом призрака и локальным хранилищем.
 //! Любая служебная отправка («прочитано») проходит через политику `rg-ayu::ghost`.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use grammers_client::Client;
@@ -11,6 +12,8 @@ use grammers_session::updates::UpdatesLike;
 use rg_ayu::ghost::{self, Verdict};
 use rg_ayu::store::MessageStore;
 use rg_settings::Settings;
+
+use crate::media::{self, MediaInfo, MediaKind};
 use tokio::sync::mpsc;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -33,6 +36,7 @@ pub struct MessageRow {
     pub date: i64,
     pub deleted: bool,
     pub edits: usize,
+    pub media: Option<MediaInfo>,
 }
 
 #[derive(Clone)]
@@ -40,7 +44,20 @@ pub struct Engine {
     pub client: Client,
     pub settings: Arc<RwLock<Settings>>,
     store: Arc<MessageStore>,
+    dirs: Arc<Dirs>,
 }
+
+/// Каталоги кэша предпросмотров и загрузок.
+#[derive(Debug, Default)]
+struct Dirs {
+    cache: PathBuf,
+    downloads: PathBuf,
+}
+
+/// Предел кэша предпросмотров.
+const CACHE_LIMIT: u64 = 200 * 1024 * 1024;
+/// Крупнее этого предпросмотр не качаем.
+const PREVIEW_LIMIT: u64 = 20 * 1024 * 1024;
 
 /// Идентификатор чата в виде, пригодном для хранения (формат Bot API).
 fn peer_key(peer: &PeerRef) -> i64 {
@@ -53,7 +70,19 @@ impl Engine {
             client,
             settings: Arc::new(RwLock::new(settings)),
             store: Arc::new(store),
+            dirs: Arc::new(Dirs::default()),
         }
+    }
+
+    /// Задать каталоги кэша и загрузок (создаются при необходимости).
+    pub fn with_dirs(mut self, cache: &Path, downloads: &Path) -> Self {
+        let _ = std::fs::create_dir_all(cache);
+        let _ = std::fs::create_dir_all(downloads);
+        self.dirs = Arc::new(Dirs {
+            cache: cache.to_owned(),
+            downloads: downloads.to_owned(),
+        });
+        self
     }
 
     pub fn settings(&self) -> Settings {
@@ -118,6 +147,7 @@ impl Engine {
                 date: m.date().as_second(),
                 deleted: false,
                 edits: self.edit_count(key, m.id()).await,
+                media: m.media().as_ref().map(media::describe),
             });
         }
         // Удалённые, но сохранённые у нас, возвращаем на место по времени.
@@ -130,11 +160,69 @@ impl Engine {
                     date: s.date,
                     deleted: true,
                     edits: self.edit_count(key, s.msg_id).await,
+                    media: None,
                 });
             }
         }
         rows.sort_by_key(|r| (r.date, r.id));
         Ok(rows)
+    }
+
+    /// Картинка для предпросмотра (фото или статичный стикер) в кэше на диске.
+    pub async fn preview_path(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+    ) -> Result<Option<PathBuf>, BoxErr> {
+        let file = self.dirs.cache.join(format!("{}_{msg_id}.img", peer_key(&peer)));
+        if file.exists() {
+            return Ok(Some(file));
+        }
+        let Some(m) = self.message_by_id(peer, msg_id).await? else {
+            return Ok(None);
+        };
+        let Some(media) = m.media() else { return Ok(None) };
+        let info = media::describe(&media);
+        if !info.has_preview() || info.size > PREVIEW_LIMIT {
+            return Ok(None);
+        }
+        self.client.download_media(&media, &file).await?;
+        media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
+        Ok(Some(file))
+    }
+
+    /// Скачать вложение в каталог загрузок под безопасным именем; существующие файлы не затираются.
+    pub async fn download_file(&self, peer: PeerRef, msg_id: i32) -> Result<Option<PathBuf>, BoxErr> {
+        let Some(m) = self.message_by_id(peer, msg_id).await? else {
+            return Ok(None);
+        };
+        let Some(media) = m.media() else { return Ok(None) };
+        let info = media::describe(&media);
+        let name = match info.kind {
+            MediaKind::Photo => format!("photo_{msg_id}.jpg"),
+            MediaKind::Sticker => format!("sticker_{msg_id}.webp"),
+            _ => media::safe_file_name(&info.name),
+        };
+        let mut dest = self.dirs.downloads.join(&name);
+        if dest.exists() {
+            dest = self.dirs.downloads.join(format!("{msg_id}_{name}"));
+        }
+        self.client.download_media(&media, &dest).await?;
+        Ok(Some(dest))
+    }
+
+    async fn message_by_id(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+    ) -> Result<Option<grammers_client::message::Message>, grammers_client::InvocationError> {
+        Ok(self
+            .client
+            .get_messages_by_id(peer, &[msg_id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     pub async fn send(&self, peer: PeerRef, text: &str) -> Result<(), grammers_client::InvocationError> {

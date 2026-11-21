@@ -500,3 +500,11 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - ГРАБЛИ: `rusqlite` (bundled) + `libsql` из grammers = два SQLite, линкер падает на дублях символов (`multiple definition of sqlite3_status`). Решение: хранилище на том же `libsql` (async). Не добавлять rusqlite/sqlx-sqlite.
 - egui 0.37: `App::ui(&mut Ui)` вместо `update`, панели `Panel::left/top/bottom(..).show(ui, ..)` (`show_inside` устарел).
 - Не сделано: медиа, стикеры, аватары, поиск, группы/каналы с темами, звонки; интерфейс без шрифта эмодзи; замеров скорости ещё нет (этап 7).
+
+### Этап 5 выполнен (2026-11-21)
+- `rg-core::media`: описание вложений (фото, статичный стикер WebP, анимированный стикер, файл, прочее), `safe_file_name` (защита от пути/`..`/зарезервированных имён Windows), `human_size`, `prune_cache` (кэш предпросмотров ≤ 200 МБ, старые файлы удаляются первыми). 7 тестов.
+- `Engine::preview_path` (фото/стикер → файл в `<RG_HOME>/cache`, не качает > 20 МБ), `Engine::download_file` (в `<RG_HOME>/downloads`, существующие файлы не затираются).
+- UI: миниатюры в ленте (декодирование `image` в `spawn_blocking`, до 4 одновременных загрузок, только 30 свежих вложений), подпись «[имя · размер]», кнопка «Скачать».
+- Релиз: `scripts/make-dist.sh` → `dist/Rustgramm.exe` (10,9 МБ, без консоли: `windows_subsystem = "windows"` в release). Сборка release с lto=fat ≈ 4 мин 20 с. Смоук-тест: процесс жив 8 с, окно «Rustgramm», ~134 МБ ОЗУ, `messages.db` пополняется. Визуально интерфейс не проверен (пользователь проверит сам).
+- Звонки не портированы: оценка в `docs/ROADMAP.md` (tgcalls/WebRTC, нужен webrtc-rs + E2E).
+- Грабли: `cargo build` второго процесса ждёт блокировку каталога — удобно ждать фоновую сборку.

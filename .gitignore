@@ -5,3 +5,4 @@
 *.session
 .claude/
 /.rg/
+/dist/

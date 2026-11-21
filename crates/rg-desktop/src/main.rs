@@ -1,12 +1,16 @@
 //! Rustgramm для ПК: один процесс, один поток интерфейса и один поток с tokio.
 //! Данные уходят только на серверы Telegram (см. `rg-net`).
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod worker;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
 use rg_core::engine::{DialogRow, MessageRow};
+use rg_core::media::{MediaKind, human_size};
 use rg_settings::Settings;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -27,6 +31,8 @@ struct App {
     settings: Settings,
     status: String,
     error: String,
+    textures: HashMap<i32, egui::TextureHandle>,
+    requested: HashSet<i32>,
 }
 
 impl App {
@@ -46,6 +52,8 @@ impl App {
             settings: Settings::default(),
             status: String::new(),
             error: String::new(),
+            textures: HashMap::new(),
+            requested: HashSet::new(),
         }
     }
 
@@ -53,7 +61,7 @@ impl App {
         let _ = self.cmd.send(c);
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(e) = self.ev.try_recv() {
             match e {
                 Ev::Stage(s) => {
@@ -62,7 +70,27 @@ impl App {
                 }
                 Ev::Me(n) => self.me = n,
                 Ev::Dialogs(d) => self.dialogs = d,
-                Ev::History(idx, m) if self.selected == Some(idx) => self.messages = m,
+                Ev::History(idx, m) if self.selected == Some(idx) => {
+                    // Предпросмотры только для свежих вложений и по одному разу.
+                    let want: Vec<i32> = m
+                        .iter()
+                        .rev()
+                        .filter(|r| r.media.as_ref().is_some_and(|x| x.has_preview()))
+                        .take(30)
+                        .map(|r| r.id)
+                        .collect();
+                    for id in want {
+                        if self.requested.insert(id) {
+                            let _ = self.cmd.send(Cmd::Preview(idx, id));
+                        }
+                    }
+                    self.messages = m;
+                }
+                Ev::Image(idx, id, img) if self.selected == Some(idx) => {
+                    let tex = ctx.load_texture(format!("m{id}"), img, egui::TextureOptions::LINEAR);
+                    self.textures.insert(id, tex);
+                }
+                Ev::Image(..) => {}
                 Ev::History(..) => {}
                 Ev::Settings(s) => self.settings = s,
                 Ev::Status(s) => self.status = s,
@@ -164,6 +192,8 @@ impl App {
                     if resp.clicked() {
                         self.selected = Some(i);
                         self.messages.clear();
+                        self.textures.clear();
+                        self.requested.clear();
                         let _ = self.cmd.send(Cmd::Open(i));
                     }
                 }
@@ -193,6 +223,7 @@ impl App {
                 });
                 return;
             }
+            let mut download: Option<i32> = None;
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                 for m in &self.messages {
                     let layout = if m.outgoing {
@@ -206,7 +237,29 @@ impl App {
                             if m.deleted {
                                 ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "удалено");
                             }
-                            ui.label(&m.text);
+                            if let Some(tex) = self.textures.get(&m.id) {
+                                ui.add(egui::Image::new(tex).max_width(320.0));
+                            }
+                            if let Some(info) = &m.media {
+                                if !self.textures.contains_key(&m.id) {
+                                    let size = if info.size > 0 {
+                                        format!(" · {}", human_size(info.size))
+                                    } else {
+                                        String::new()
+                                    };
+                                    ui.label(format!("[{}{size}]", info.name));
+                                }
+                                let can_save = matches!(
+                                    info.kind,
+                                    MediaKind::Photo | MediaKind::Sticker | MediaKind::File
+                                );
+                                if can_save && ui.small_button("Скачать").clicked() {
+                                    download = Some(m.id);
+                                }
+                            }
+                            if !m.text.is_empty() {
+                                ui.label(&m.text);
+                            }
                             if m.edits > 0 {
                                 ui.weak(format!("изменено: {}", m.edits));
                             }
@@ -214,13 +267,17 @@ impl App {
                     });
                 }
             });
+            if let Some(id) = download {
+                self.send(Cmd::Download(id));
+            }
         });
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        let ctx = ui.ctx().clone();
+        self.drain_events(&ctx);
         if self.stage != Stage::Ready {
             self.login_ui(ui);
             return;

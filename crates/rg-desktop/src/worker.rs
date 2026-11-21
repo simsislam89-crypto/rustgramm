@@ -22,6 +22,8 @@ pub enum Stage {
 }
 
 pub enum Cmd {
+    Preview(usize, i32),
+    Download(i32),
     RequestCode(String),
     Code(String),
     Password(String),
@@ -31,6 +33,7 @@ pub enum Cmd {
 }
 
 pub enum Ev {
+    Image(usize, i32, eframe::egui::ColorImage),
     Stage(Stage),
     Me(String),
     Dialogs(Vec<DialogRow>),
@@ -71,6 +74,7 @@ pub fn spawn(cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui::Co
     });
 }
 
+#[derive(Clone)]
 struct Out {
     ev: Sender<Ev>,
     ctx: eframe::egui::Context,
@@ -111,7 +115,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             return;
         }
     };
-    let engine = Engine::new(connected.client.clone(), settings.clone(), store);
+    let engine = Engine::new(connected.client.clone(), settings.clone(), store)
+        .with_dirs(&home.join("cache"), &home.join("downloads"));
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let mut updates = Some(connected.updates);
     out.send(Ev::Settings(settings));
 
@@ -188,6 +194,31 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     out.send(Ev::History(i, rows));
                 }
             }
+            Cmd::Preview(i, msg_id) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, limit, peer) = (engine.clone(), out.clone(), limit.clone(), d.peer);
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    if let Ok(Some(path)) = eng.preview_path(peer, msg_id).await
+                        && let Ok(Some(img)) =
+                            tokio::task::spawn_blocking(move || decode(&path)).await
+                    {
+                        out.send(Ev::Image(i, msg_id, img));
+                    }
+                });
+            }
+            Cmd::Download(msg_id) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.download_file(peer, msg_id).await {
+                        Ok(Some(p)) => out.send(Ev::Status(format!("Сохранено: {}", p.display()))),
+                        Ok(None) => out.err("Вложение недоступно"),
+                        Err(e) => out.err(format!("Загрузка: {e}")),
+                    }
+                });
+            }
             Cmd::Settings(s) => {
                 let json = s.to_json();
                 engine.update_settings(|cur| *cur = s);
@@ -222,4 +253,12 @@ async fn enter(
         });
     }
     out.send(Ev::Stage(Stage::Ready));
+}
+
+/// Декодирует картинку и уменьшает до 640 px по большей стороне.
+fn decode(path: &std::path::Path) -> Option<eframe::egui::ColorImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.thumbnail(640, 640).to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
