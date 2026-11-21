@@ -29,6 +29,8 @@ pub(crate) enum StickerAct {
     LoadPack(usize),
     /// Вставить в поле ввода (обычный эмодзи для набора Premium).
     Insert(String),
+    /// Загрузить сохранённые GIF.
+    Gifs,
 }
 
 impl App {
@@ -330,6 +332,48 @@ impl App {
                     }
                 }
             });
+    }
+
+    /// Вкладка GIF: сетка сохранённых анимаций (миниатюры), нажатие отправляет.
+    pub(crate) fn gif_tab(&self, ui: &mut egui::Ui, acts: &mut Vec<StickerAct>) {
+        if !self.gifs_requested {
+            acts.push(StickerAct::Gifs);
+        }
+        if self.gif_list.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(if self.gifs_requested { "Нет сохранённых GIF" } else { "Загрузка…" }).color(SUBTEXT));
+            });
+            return;
+        }
+        let cols = 3usize;
+        let width = ui.available_width();
+        let cell = width / cols as f32;
+        egui::ScrollArea::vertical().id_salt("gifs").auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            for row in self.gif_list.chunks(cols) {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(width, cell), Sense::hover());
+                for (k, g) in row.iter().enumerate() {
+                    let r = Rect::from_min_size(Pos2::new(rect.left() + k as f32 * cell, rect.top()), Vec2::splat(cell)).shrink(2.0);
+                    let resp = ui.interact(r, ui.make_persistent_id(("gif", g.id)), Sense::click());
+                    let h = tween(ui.ctx(), ("gifh", g.id), f32::from(u8::from(resp.hovered())), 0.1);
+                    match self.sticker_tex.get(&g.id) {
+                        Some(t) => {
+                            egui::Image::new(t).fit_to_exact_size(r.size()).corner_radius(8.0).tint(Color32::from_white_alpha((200.0 + 55.0 * h) as u8)).paint_at(ui, r);
+                        }
+                        None => {
+                            if g.has_preview() && ui.is_rect_visible(r) {
+                                acts.push(StickerAct::Thumb(g.id));
+                            }
+                            ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_rgba_unmultiplied(255, 255, 255, 12));
+                        }
+                    }
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        acts.push(StickerAct::Send(g.id));
+                    }
+                }
+            }
+        });
     }
 
     /// Окно «Добавить эмодзи»: рекомендуемые наборы с кнопкой «Добавить».

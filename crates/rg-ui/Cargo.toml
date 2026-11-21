@@ -19,5 +19,8 @@ qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 
+[target.'cfg(windows)'.dependencies]
+wry = { version = "0.57", default-features = false }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = { version = "0.15", default-features = false }

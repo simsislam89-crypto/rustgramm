@@ -202,6 +202,26 @@ impl App {
                 self.contact_search.clear();
                 self.send(Cmd::Contacts);
             }
+            Some("profile") => {
+                self.drawer_open = false;
+                if let Some(i) = self.dialogs.iter().position(|d| d.saved) {
+                    self.open_dialog(i);
+                    self.info_open = true;
+                }
+            }
+            Some("group") => {
+                self.drawer_open = false;
+                self.create_kind = 1;
+                self.create_title.clear();
+                self.create_members.clear();
+                self.send(Cmd::Contacts);
+            }
+            Some("channel") => {
+                self.drawer_open = false;
+                self.create_kind = 2;
+                self.create_title.clear();
+                self.create_about.clear();
+            }
             Some(other) => {
                 self.drawer_open = false;
                 let name = match other {
@@ -890,4 +910,94 @@ fn register_url_scheme(ctx: &egui::Context) {
         }
     }
     ctx.request_repaint();
+}
+
+impl App {
+    /// Окно «Новая группа» (название и участники из контактов) и «Новый канал» (название и описание).
+    #[allow(deprecated)]
+    pub(crate) fn create_window(&mut self, ctx: &egui::Context) {
+        if self.create_kind == 0 {
+            return;
+        }
+        let group = self.create_kind == 1;
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut create = false;
+        egui::Area::new(egui::Id::new("create-chat"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(t2(WINDOW_BG))
+                    .corner_radius(CornerRadius::same(10))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_width(340.0);
+                        ui.label(RichText::new(if group { "Новая группа" } else { "Новый канал" }).size(17.0).color(WHITE));
+                        ui.add_space(10.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.create_title)
+                                .hint_text(if group { "Название группы" } else { "Название канала" })
+                                .desired_width(f32::INFINITY),
+                        );
+                        if group {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Участники").size(12.5).color(SUBTEXT));
+                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                if self.contacts.is_empty() {
+                                    ui.label(RichText::new("Загрузка контактов…").color(SUBTEXT));
+                                }
+                                for c in &self.contacts {
+                                    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(r, CornerRadius::same(6), t2(WINDOW_OVER));
+                                    }
+                                    let on = self.create_members.contains(&c.id);
+                                    let box_r = Rect::from_center_size(Pos2::new(r.left() + 14.0, r.center().y), Vec2::splat(16.0));
+                                    ui.painter().rect_stroke(box_r, CornerRadius::same(4), egui::Stroke::new(1.5, if on { WHITE } else { SUBTEXT }), egui::StrokeKind::Middle);
+                                    if on {
+                                        icons::tg(ui.painter(), "info/info_close", box_r.center(), WHITE);
+                                    }
+                                    ui.painter().text(Pos2::new(r.left() + 36.0, r.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(14.0), WHITE);
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !self.create_members.remove(&c.id) {
+                                        self.create_members.insert(c.id);
+                                    }
+                                }
+                            });
+                        } else {
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.create_about)
+                                    .hint_text("Описание (необязательно)")
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            let ok = !self.create_title.trim().is_empty() && (!group || !self.create_members.is_empty());
+                            if ui.add_enabled(ok, egui::Button::new("Создать")).clicked() {
+                                create = true;
+                            }
+                            if ui.button("Отмена").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+        if create {
+            let title = self.create_title.trim().to_owned();
+            if group {
+                let members: Vec<_> = self.contacts.iter().filter(|c| self.create_members.contains(&c.id)).map(|c| c.peer).collect();
+                self.send(Cmd::CreateGroup(title, members));
+            } else {
+                self.send(Cmd::CreateChannel(title, self.create_about.trim().to_owned(), true));
+            }
+            close = true;
+        }
+        if close {
+            self.create_kind = 0;
+        }
+    }
 }

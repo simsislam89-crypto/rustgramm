@@ -74,6 +74,20 @@ pub enum Cmd {
     AvatarPeer(grammers_session::types::PeerRef, i64),
     /// Загрузить наборы стикеров.
     Stickers,
+    /// Обновить список чатов (счётчики, последние сообщения).
+    RefreshDialogs,
+    /// Сведения о чате с номером для правой панели.
+    PeerInfo(usize),
+    /// Загрузить сохранённые GIF.
+    Gifs,
+    /// Создать канал (название, описание, true — канал, false — супергруппа).
+    CreateChannel(String, String, bool),
+    /// Создать группу с участниками.
+    CreateGroup(String, Vec<grammers_session::types::PeerRef>),
+    /// Аватарка отправителя сообщения (идентификатор сообщения, идентификатор отправителя).
+    SenderAvatar(i32, i64),
+    /// Отметить открытый чат прочитанным (по правилам режима призрака).
+    MarkRead,
     /// Загрузить стикеры набора с номером.
     StickerSet(usize),
     /// Превью стикера по идентификатору документа.
@@ -116,6 +130,13 @@ pub enum Ev {
     StickerImg(i64, Box<eframe::egui::ColorImage>),
     EmojiSets(Vec<StickerSetRow>),
     FeaturedEmoji(Vec<StickerSetRow>),
+    /// Событие из потока обновлений Telegram.
+    Live(rg_core::engine::Live),
+    Gifs(Vec<StickerRow>),
+    /// Сведения о чате (идентификатор чата Bot API).
+    PeerInfo(i64, rg_core::engine::PeerInfo),
+    /// Ролик скачан: открыть во встроенном плеере.
+    PlayVideo(PathBuf),
     Status(String),
     Error(String),
 }
@@ -471,6 +492,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             archived: false,
                             kind: DialogKind::User,
                             contact: true,
+                            read_out: 0,
                         },
                     );
                     current = current.map(|i| i + 1);
@@ -519,6 +541,59 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         out.send(Ev::StickerImg(doc, Box::new(img)));
                     }
                 });
+            }
+            Cmd::RefreshDialogs => {
+                refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+            }
+            Cmd::SenderAvatar(msg_id, sender_id) => {
+                let Some(d) = current.and_then(|i| dialogs.get(i)) else { continue };
+                let (eng, out, limit, peer) = (engine.clone(), out.clone(), avatar_limit.clone(), d.peer);
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    let Some(r) = eng.sender_ref(peer, msg_id).await else { return };
+                    if let Ok(Some(path)) = eng.avatar(r).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 96)).await
+                    {
+                        out.send(Ev::Avatar(sender_id, Box::new(img)));
+                    }
+                });
+            }
+            Cmd::Gifs => match engine.saved_gifs().await {
+                Ok(list) => {
+                    for g in &list {
+                        sticker_docs.insert(g.id, g.clone());
+                    }
+                    out.send(Ev::Gifs(list));
+                }
+                Err(e) => out.err(format!("GIF: {e}")),
+            },
+            Cmd::CreateChannel(title, about, broadcast) => match engine.create_channel(&title, &about, broadcast).await {
+                Ok(()) => {
+                    out.send(Ev::Status(format!("Создано: «{title}»")));
+                    refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                }
+                Err(e) => out.err(format!("Не создано: {e}")),
+            },
+            Cmd::CreateGroup(title, members) => match engine.create_group(&title, &members).await {
+                Ok(()) => {
+                    out.send(Ev::Status(format!("Группа «{title}» создана")));
+                    refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                }
+                Err(e) => out.err(format!("Группа не создана: {e}")),
+            },
+            Cmd::PeerInfo(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng.peer_info(peer).await {
+                        Ok(info) => out.send(Ev::PeerInfo(id, info)),
+                        Err(e) => out.err(format!("Сведения о чате: {e}")),
+                    }
+                });
+            }
+            Cmd::MarkRead => {
+                let Some(d) = current.and_then(|i| dialogs.get(i)) else { continue };
+                let _ = engine.mark_read(d.peer).await;
             }
             Cmd::EmojiSets => match engine.emoji_sets().await {
                 Ok(s) => out.send(Ev::EmojiSets(s)),
@@ -688,8 +763,14 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     out.send(Ev::Status("Загрузка файла…".into()));
                     match eng.download_file(peer, msg_id).await {
                         Ok(Some(p)) => {
-                            rg_core::media::open_downloaded(&p);
-                            out.send(Ev::Status(format!("Сохранено: {}", p.display())));
+                            let ext = p.extension().and_then(|e| e.to_str()).map(str::to_lowercase).unwrap_or_default();
+                            if cfg!(windows) && matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv" | "m4v" | "gif" | "ogv") {
+                                out.send(Ev::PlayVideo(p));
+                                out.send(Ev::Status(String::new()));
+                            } else {
+                                rg_core::media::open_downloaded(&p);
+                                out.send(Ev::Status(format!("Сохранено: {}", p.display())));
+                            }
                         }
                         Ok(None) => out.err("Вложение недоступно"),
                         Err(e) => out.err(format!("Загрузка: {e}")),
@@ -769,8 +850,17 @@ async fn enter(
     if let Some(rx) = updates.take() {
         let eng = engine.clone();
         let ctx = out.ctx.clone();
+        let out = out.clone();
         tokio::spawn(async move {
-            let _ = eng.run_updates(rx, |_| ctx.request_repaint()).await;
+            let probe = eng.clone();
+            let _ = eng
+                .run_updates(rx, move |upd| {
+                    if let Some(ev) = probe.live(upd) {
+                        out.send(Ev::Live(ev));
+                    }
+                    ctx.request_repaint();
+                })
+                .await;
         });
     }
     out.send(Ev::Stage(Stage::Ready));

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Align, Color32, FontId, Layout, Rect, RichText, Sense, Vec2};
+use eframe::egui::{self, Align, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Vec2};
 use rg_core::engine::MessageRow;
 use rg_settings::AyuSettings;
 
@@ -51,6 +51,10 @@ struct Env<'a> {
     time: f64,
     emoji: Option<&'a super::emoji::Emoji>,
     spoilers: &'a std::collections::HashSet<(i32, usize)>,
+    read_out: i32,
+    avatars: &'a HashMap<i64, egui::TextureHandle>,
+    /// Сообщения, у которых слева рисуется аватарка отправителя (последнее в серии).
+    avatar_msgs: &'a std::collections::HashSet<i32>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -138,6 +142,21 @@ impl App {
                 if let Some(cmd) = act {
                     self.send(cmd);
                 }
+                // Переключатель правой панели со сведениями о чате.
+                let (prect, ptog) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+                if ptog.hovered() {
+                    ui.painter().circle_filled(prect.center(), 20.0, t(WINDOW_OVER));
+                }
+                {
+                    let col = if self.info_open || ptog.hovered() { WHITE } else { DIALOG_DATE };
+                    let r = Rect::from_center_size(prect.center(), Vec2::new(18.0, 15.0));
+                    ui.painter().rect_stroke(r, egui::CornerRadius::same(3), egui::Stroke::new(1.5, col), egui::StrokeKind::Middle);
+                    let strip = Rect::from_min_max(egui::pos2(r.right() - 6.0, r.top() + 1.0), egui::pos2(r.right() - 1.0, r.bottom() - 1.0));
+                    ui.painter().rect_filled(strip, egui::CornerRadius::same(1), col);
+                }
+                if ptog.on_hover_text("Сведения о чате").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.info_open = !self.info_open;
+                }
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
                 if resp.hovered() {
                     ui.painter().circle_filled(rect.center(), 20.0, t(WINDOW_OVER));
@@ -151,6 +170,103 @@ impl App {
                     }
                 }
             });
+        });
+    }
+
+    /// Правая панель: аватар, имя, статус и сведения о собеседнике, группе или канале.
+    pub(crate) fn info_ui(&mut self, ui: &mut egui::Ui) {
+        let Some((i, d)) = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.clone()))) else { return };
+        if self.info_req.insert(d.id) {
+            self.send(Cmd::PeerInfo(i));
+        }
+        let info = self.peer_infos.get(&d.id).cloned();
+        let w = ui.available_width();
+        ui.set_clip_rect(ui.max_rect());
+        let (head, _) = ui.allocate_exact_size(Vec2::new(w, 54.0), Sense::hover());
+        ui.painter().text(
+            head.left_center() + Vec2::new(18.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            if d.id < 0 { "Информация" } else { "Профиль" },
+            FontId::proportional(16.0),
+            WHITE,
+        );
+        let x = Rect::from_center_size(head.right_center() - Vec2::new(26.0, 0.0), Vec2::splat(36.0));
+        let xr = ui.interact(x, ui.make_persistent_id("info-close"), Sense::click());
+        icons::tg(ui.painter(), "info/info_close", x.center(), if xr.hovered() { WHITE } else { SUBTEXT });
+        if xr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.info_open = false;
+        }
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let (top, _) = ui.allocate_exact_size(Vec2::new(w, 168.0), Sense::hover());
+            let c = Pos2::new(top.center().x, top.top() + 52.0);
+            let r = Rect::from_center_size(c, Vec2::splat(88.0));
+            match self.avatars.get(&d.id) {
+                Some(t) => {
+                    egui::Image::new(t).fit_to_exact_size(r.size()).corner_radius(44.0).paint_at(ui, r);
+                }
+                None => {
+                    ui.painter().circle_filled(c, 44.0, avatar_color(d.id));
+                    ui.painter().text(
+                        c,
+                        egui::Align2::CENTER_CENTER,
+                        d.name.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_default(),
+                        FontId::proportional(36.0),
+                        Color32::WHITE,
+                    );
+                }
+            }
+            ui.painter().text(
+                Pos2::new(top.center().x, top.top() + 120.0),
+                egui::Align2::CENTER_CENTER,
+                &d.name,
+                FontId::proportional(18.0),
+                WHITE,
+            );
+            let sub = info
+                .as_ref()
+                .map(|x| {
+                    if x.members > 0 {
+                        format!("{} участников", x.members)
+                    } else {
+                        x.status.clone()
+                    }
+                })
+                .unwrap_or_default();
+            ui.painter().text(Pos2::new(top.center().x, top.top() + 144.0), egui::Align2::CENTER_CENTER, sub, FontId::proportional(13.0), SUBTEXT);
+            kit::divider(ui);
+            let Some(info) = info else {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Загрузка…").color(SUBTEXT)));
+                return;
+            };
+            let row = |ui: &mut egui::Ui, icon: &str, value: &str, label: &str, copy: bool| {
+                if value.is_empty() {
+                    return;
+                }
+                let galley = ui.painter().layout(value.to_owned(), FontId::proportional(14.0), WHITE, w - 80.0);
+                let h = (galley.size().y + 38.0).max(56.0);
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 0.0, t2(WINDOW_OVER));
+                }
+                icons::tg(ui.painter(), icon, Pos2::new(r.left() + 30.0, r.top() + 24.0), DIALOG_DATE);
+                ui.painter().galley(Pos2::new(r.left() + 64.0, r.top() + 12.0), galley.clone(), WHITE);
+                ui.painter().text(
+                    Pos2::new(r.left() + 64.0, r.top() + 14.0 + galley.size().y + 8.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(12.0),
+                    SUBTEXT,
+                );
+                if copy && resp.on_hover_text("Нажмите, чтобы скопировать").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    ui.ctx().copy_text(value.to_owned());
+                }
+            };
+            row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { format!("+{}", info.phone) }, "Телефон", true);
+            row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { format!("@{}", info.username) }, "Имя пользователя", true);
+            row(ui, "menu/info", &info.about, if d.id < 0 { "Описание" } else { "О себе" }, true);
+            row(ui, "menu/profile", &format!("{}", d.id), "ID", true);
         });
     }
 
@@ -319,7 +435,7 @@ impl App {
                     ui.set_max_size(size);
                     // Вкладки «Эмодзи» и «Стикеры».
                     ui.horizontal(|ui| {
-                        for (n, name) in ["Эмодзи", "Стикеры"].iter().enumerate() {
+                        for (n, name) in ["Эмодзи", "Стикеры", "GIF"].iter().enumerate() {
                             let g = ui.painter().layout_no_wrap((*name).to_owned(), FontId::proportional(14.0), WHITE);
                             let (r, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 24.0, 30.0), Sense::click());
                             let k = tween(ui.ctx(), ("emtab", n), f32::from(u8::from(tab == n)), 0.16);
@@ -346,8 +462,10 @@ impl App {
                             }
                         });
                         self.emoji_bar(ui, &mut jump, &mut sacts);
-                    } else {
+                    } else if tab == 1 {
                         self.sticker_tab(ui, self.emoji.as_ref(), &mut sacts);
+                    } else {
+                        self.gif_tab(ui, &mut sacts);
                     }
                 });
         });
@@ -379,6 +497,10 @@ impl App {
                     self.send(Cmd::SendSticker(id, reply));
                 }
                 A::SelectSet(i) => self.sticker_cur = i,
+                A::Gifs => {
+                    self.gifs_requested = true;
+                    self.send(Cmd::Gifs);
+                }
                 A::EmojiSets => {
                     self.emoji_sets_requested = true;
                     self.send(Cmd::EmojiSets);
@@ -470,7 +592,20 @@ impl App {
         let pad = (viewport_h - self.msgs_h).max(0.0);
         let out = {
             let list: &[MessageRow] = self.found.as_deref().unwrap_or(&self.messages);
+            let read_out = self.selected.and_then(|i| self.dialogs.get(i)).map_or(0, |d| d.read_out);
+            let mut avatar_msgs = std::collections::HashSet::new();
+            if group {
+                for (k, m) in list.iter().enumerate() {
+                    let next = list.get(k + 1);
+                    if !m.outgoing && next.is_none_or(|n| n.outgoing || n.sender_id != m.sender_id) {
+                        avatar_msgs.insert(m.id);
+                    }
+                }
+            }
             let env = Env {
+                read_out,
+                avatars: &self.avatars,
+                avatar_msgs: &avatar_msgs,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
                 tex: &self.textures,
@@ -674,9 +809,11 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
+                    ui.set_max_width(320.0);
                     ui.label("Сообщение удалится в Telegram. Копия останется у вас, если включено «Сохранять удалённые».");
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if kit::menu_item(ui, "menu/delete", "Удалить", true) {
+                        if ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
                             self.send(Cmd::Delete(id));
                             close = true;
                         }
@@ -828,6 +965,14 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
     ui.with_layout(layout, |ui| {
         ui.set_opacity(ease_out((k_in * 2.5).min(1.0)));
         ui.add_space(6.0);
+        if env.group && !m.outgoing {
+            if env.avatar_msgs.contains(&m.id) {
+                avatar(ui, &m.sender, m.sender_id, 34.0, env.avatars.get(&m.sender_id), s.avatar_corners);
+            } else {
+                ui.add_space(34.0);
+            }
+            ui.add_space(6.0);
+        }
         let (mut fill, text_c, date_c) = if m.outgoing {
             (t(MSG_OUT_BG), MSG_OUT_TEXT, MSG_OUT_DATE)
         } else {
@@ -901,10 +1046,6 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                             acts.push(Act::Goto(*rid));
                         }
                     }
-                    if m.deleted {
-                        let mark = if s.deleted_mark.is_empty() { String::new() } else { format!("{} ", s.deleted_mark) };
-                        ui.label(RichText::new(format!("{mark}удалено")).color(DANGER).strong());
-                    }
                     if album.len() > 1 {
                         super::media_ui::album(ui, album, w, env.tex, &mut cards);
                     } else if let Some(info) = &m.media {
@@ -942,14 +1083,23 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                         if let Some(v) = m.views {
                             extra.push(("history_views", v.to_string()));
                         }
-                        let extra_w: f32 = extra
+                        let note = m.deleted.then(|| {
+                            if s.deleted_mark.is_empty() { "удалено".to_owned() } else { format!("{} удалено", s.deleted_mark) }
+                        });
+                        let note_w = note.as_ref().map_or(0.0, |n| 20.0 + n.chars().count() as f32 * 6.4);
+                        if let Some(n) = &note {
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                            icons::tg(ui.painter(), "menu/delete", r.center(), DANGER);
+                            ui.label(RichText::new(n).size(12.0).color(DANGER));
+                        }
+                        let extra_w: f32 = note_w + extra
                             .iter()
                             .map(|(n, t)| {
                                 icons::native_size(n).map_or(0.0, |s| s.x)
                                     + t.chars().count() as f32 * 7.0
                                     + 8.0
                             })
-                            .sum();
+                            .sum::<f32>();
                         ui.add_space((w - meta_w - extra_w).max(0.0));
                         for (n, t) in extra {
                             let sz = icons::native_size(n).unwrap_or(Vec2::splat(12.0));
@@ -962,7 +1112,7 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                         ui.label(RichText::new(meta).size(12.0).color(date_c));
                         if m.outgoing {
                             let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 12.0), Sense::hover());
-                            icons::tick(ui.painter(), r.center(), OUT_TICK, true);
+                            icons::tick(ui.painter(), r.center(), OUT_TICK, m.id <= env.read_out);
                         }
                     });
                 });

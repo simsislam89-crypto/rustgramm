@@ -12,6 +12,8 @@ mod rich;
 mod settings_ui;
 pub mod theme;
 mod win;
+#[cfg(windows)]
+mod video;
 pub mod worker;
 
 use std::collections::{HashMap, HashSet};
@@ -110,6 +112,23 @@ struct App {
     stickers_requested: bool,
     /// Установленные и рекомендуемые наборы эмодзи, выбранный набор, окно «Добавить».
     emoji_sets: Vec<StickerSetRow>,
+    /// Открытый ролик: путь и окно плеера (создаётся при первом показе).
+    player_path: Option<std::path::PathBuf>,
+    /// Сохранённые GIF и окно создания группы/канала.
+    gif_list: Vec<StickerRow>,
+    gifs_requested: bool,
+    /// Создание: 0 — нет, 1 — группа, 2 — канал.
+    create_kind: u8,
+    create_title: String,
+    create_about: String,
+    create_members: HashSet<i64>,
+    /// Правая панель сведений о чате.
+    info_open: bool,
+    peer_infos: HashMap<i64, rg_core::engine::PeerInfo>,
+    info_req: HashSet<i64>,
+    #[cfg(windows)]
+    player: Option<video::VideoView>,
+    refresh_at: Option<std::time::Instant>,
     featured_sets: Vec<StickerSetRow>,
     emoji_sets_requested: bool,
     emoji_pack: Option<usize>,
@@ -229,6 +248,19 @@ impl App {
             sticker_req: HashSet::new(),
             stickers_requested: false,
             emoji_sets: Vec::new(),
+            player_path: None,
+            gif_list: Vec::new(),
+            gifs_requested: false,
+            create_kind: 0,
+            create_title: String::new(),
+            create_about: String::new(),
+            create_members: HashSet::new(),
+            info_open: false,
+            peer_infos: HashMap::new(),
+            info_req: HashSet::new(),
+            #[cfg(windows)]
+            player: None,
+            refresh_at: None,
             featured_sets: Vec::new(),
             emoji_sets_requested: false,
             emoji_pack: None,
@@ -251,7 +283,162 @@ impl App {
     }
 
     /// Предпросмотры только для свежих вложений и по одному разу.
+    /// Событие из потока обновлений: сообщения доходят сразу, без перезахода в чат.
+    fn on_live(&mut self, ctx: &egui::Context, l: rg_core::engine::Live) {
+        use rg_core::engine::Live;
+        let open_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
+        match l {
+            Live::Message(key, row) => {
+                let row = *row;
+                if open_id == Some(key) {
+                    let idx = self.selected.unwrap_or(0);
+                    let now_t = ctx.input(|i| i.time);
+                    if self.known.insert(row.id) {
+                        self.arrived.insert(row.id, now_t);
+                    }
+                    self.request_previews(idx, std::slice::from_ref(&row));
+                    let incoming = !row.outgoing;
+                    match self.messages.iter_mut().find(|m| m.id == row.id) {
+                        Some(old) => {
+                            let (deleted, edits) = (old.deleted, old.edits);
+                            *old = row;
+                            old.deleted = deleted;
+                            old.edits = edits + usize::from(old.edit_date.is_some());
+                        }
+                        None => {
+                            self.messages.push(row);
+                            self.messages.sort_by_key(|m| (m.date, m.id));
+                        }
+                    }
+                    // Окно в фокусе и чат открыт: отмечаем прочитанным (режим призрака учитывается).
+                    if incoming && ctx.input(|i| i.focused) {
+                        self.send(Cmd::MarkRead);
+                    }
+                }
+                self.refresh_at.get_or_insert(std::time::Instant::now());
+            }
+            Live::Deleted(ch, ids) => {
+                let keep = self.settings.ayu.save_deleted_messages;
+                let hit = ch.is_none() || ch == open_id;
+                if hit {
+                    if keep {
+                        for m in self.messages.iter_mut().filter(|m| ids.contains(&m.id)) {
+                            m.deleted = true;
+                        }
+                    } else {
+                        self.messages.retain(|m| !ids.contains(&m.id));
+                    }
+                }
+                self.refresh_at.get_or_insert(std::time::Instant::now());
+            }
+            Live::ReadOutbox(key, max) => {
+                if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key) {
+                    d.read_out = d.read_out.max(max);
+                }
+            }
+        }
+    }
+
+    /// Просмотрщик ролика: тёмная подложка, окно плеера по центру, закрытие по Esc, крестику и клику вне видео.
+    #[cfg(windows)]
+    #[allow(deprecated)]
+    fn player_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(path) = self.player_path.clone() else {
+            if let Some(p) = self.player.take() {
+                p.stop();
+            }
+            return;
+        };
+        let screen = ctx.content_rect();
+        let ppp = ctx.pixels_per_point();
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            || self.player.as_ref().is_some_and(video::VideoView::wants_close);
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        let avail = egui::Rect::from_min_max(screen.min + Vec2::new(60.0, 64.0), screen.max - Vec2::new(60.0, 56.0));
+        let w = avail.width().min(avail.height() * 16.0 / 9.0).max(160.0);
+        let vr = egui::Rect::from_center_size(avail.center(), Vec2::new(w, w * 9.0 / 16.0));
+        if self.player.is_none() {
+            let dir = worker::home().join("player");
+            match video::VideoView::new(frame, &path, &dir, false) {
+                Ok(v) => self.player = Some(v),
+                Err(e) => {
+                    self.error = e;
+                    self.error_at = self.now;
+                    rg_core::media::open_downloaded(&path);
+                    self.player_path = None;
+                    return;
+                }
+            }
+        }
+        if let Some(v) = self.player.as_mut() {
+            v.place((
+                (vr.min.x * ppp).round() as i32,
+                (vr.min.y * ppp).round() as i32,
+                (vr.width() * ppp).round() as u32,
+                (vr.height() * ppp).round() as u32,
+            ));
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        egui::Area::new(egui::Id::new("player-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(225));
+                ui.painter().text(
+                    rect.left_top() + Vec2::new(24.0, 32.0),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    FontId::proportional(14.0),
+                    WHITE,
+                );
+                ui.painter().text(
+                    rect.center_bottom() - Vec2::new(0.0, 28.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Пробел — пауза · ← → — перемотка · F — на весь экран · M — звук · Esc — закрыть",
+                    FontId::proportional(12.0),
+                    SUBTEXT,
+                );
+                let x = egui::Rect::from_center_size(rect.right_top() + Vec2::new(-36.0, 32.0), Vec2::splat(36.0));
+                let xr = ui.interact(x, ui.make_persistent_id("player-close"), Sense::click());
+                icons::tg(ui.painter(), "info/info_close", x.center(), if xr.hovered() { WHITE } else { SUBTEXT });
+                let over_x = xr.hovered();
+                if xr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    close = true;
+                }
+                if resp.clicked() && !over_x {
+                    close = true;
+                }
+            });
+        if close {
+            if let Some(p) = self.player.take() {
+                p.stop();
+            }
+            self.player_path = None;
+        }
+    }
+
+    /// Раз в секунду после событий обновляем список чатов (счётчики, последние сообщения).
+    fn flush_refresh(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.refresh_at {
+            if t.elapsed().as_millis() >= 900 {
+                self.refresh_at = None;
+                self.send(Cmd::RefreshDialogs);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+
     fn request_previews(&mut self, idx: usize, rows: &[MessageRow]) {
+        // В группах подгружаем аватарки отправителей (по одному запросу на человека).
+        if self.dialogs.get(idx).is_some_and(|d| d.id < 0) {
+            for r in rows.iter().rev().filter(|r| !r.outgoing && r.sender_id != 0) {
+                if self.contact_av_req.insert(r.sender_id) && !self.avatars.contains_key(&r.sender_id) {
+                    let _ = self.cmd.send(Cmd::SenderAvatar(r.id, r.sender_id));
+                }
+            }
+        }
         let want: Vec<i32> = rows
             .iter()
             .rev()
@@ -329,6 +516,12 @@ impl App {
                 Ev::StickerSets(s) => {
                     self.sticker_sets = s;
                     self.sticker_cur = 0;
+                }
+                Ev::Live(l) => self.on_live(ctx, l),
+                Ev::PlayVideo(p) => self.player_path = Some(p),
+                Ev::Gifs(g) => self.gif_list = g,
+                Ev::PeerInfo(id, info) => {
+                    self.peer_infos.insert(id, info);
                 }
                 Ev::EmojiSets(s) => {
                     if self.emoji_pack.is_some_and(|i| i >= s.len()) {
@@ -937,7 +1130,8 @@ impl eframe::App for App {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.flush_refresh(ui.ctx());
         let ctx = ui.ctx().clone();
         theme::set_opacity(self.settings.window_opacity);
         ui.painter()
@@ -985,6 +1179,13 @@ impl eframe::App for App {
                 .size_range(COLUMN_LEFT_MIN..=COLUMN_LEFT_MAX)
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
+        }
+        let info_k = theme::tween(&ctx, "info-panel", f32::from(u8::from(self.info_open && self.selected.is_some() && !narrow)), 0.2);
+        if info_k > 0.01 && self.selected.is_some() {
+            egui::Panel::right("info")
+                .exact_size(320.0 * ease_out(info_k))
+                .frame(egui::Frame::new().fill(tint_panel()))
+                .show(ui, |ui| self.info_ui(ui));
         }
         egui::Panel::top("header")
             .exact_size(TOP_BAR_HEIGHT)
@@ -1043,7 +1244,12 @@ impl eframe::App for App {
         self.viewer_window(&ctx);
         self.contacts_window(&ctx);
         self.drawer(&ctx);
+        self.create_window(&ctx);
         self.settings_window(&ctx);
+        #[cfg(windows)]
+        self.player_overlay(&ctx, frame);
+        #[cfg(not(windows))]
+        let _ = frame;
     }
 }
 
@@ -1131,6 +1337,7 @@ fn demo_app(mode: &str) -> App {
             archived: false,
             kind: rg_core::engine::DialogKind::User,
             contact: true,
+            read_out: 0,
         });
     }
     for (i, (n, l)) in [("Старый чат", "Давно не писали"), ("Рассылка", "Скидки на всё")].iter().enumerate() {
@@ -1151,6 +1358,7 @@ fn demo_app(mode: &str) -> App {
             archived: true,
             kind: rg_core::engine::DialogKind::User,
             contact: false,
+            read_out: 0,
         });
     }
     app.selected = Some(0);

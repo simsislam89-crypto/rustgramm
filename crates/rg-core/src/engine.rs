@@ -38,6 +38,30 @@ pub struct DialogRow {
     pub kind: DialogKind,
     /// Собеседник есть в контактах.
     pub contact: bool,
+    /// Наибольший идентификатор своего сообщения, прочитанного собеседником (две галочки).
+    pub read_out: i32,
+}
+
+/// Сведения о собеседнике, группе или канале для правой панели.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub name: String,
+    pub username: String,
+    pub about: String,
+    pub phone: String,
+    pub status: String,
+    pub members: i32,
+}
+
+/// Событие потока обновлений для открытого чата и списка.
+#[derive(Debug, Clone)]
+pub enum Live {
+    /// Новое или изменённое сообщение чата (ключ в формате Bot API).
+    Message(i64, Box<MessageRow>),
+    /// Удалены сообщения (для каналов — ключ канала, иначе `None`).
+    Deleted(Option<i64>, Vec<i32>),
+    /// Собеседник прочитал свои сообщения до `max_id` включительно.
+    ReadOutbox(i64, i32),
 }
 
 /// Тип чата для фильтров папок.
@@ -337,6 +361,7 @@ impl Engine {
                 archived: true,
                 kind,
                 contact,
+                read_out: d.read_outbox_max_id,
             });
         }
         Ok(out)
@@ -427,6 +452,10 @@ impl Engine {
                     _ => DialogKind::Group,
                 },
                 contact: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.contact()),
+                read_out: match &d.raw {
+                    grammers_client::tl::enums::Dialog::Dialog(x) => x.read_outbox_max_id,
+                    _ => 0,
+                },
             });
         }
         Ok(out)
@@ -439,6 +468,82 @@ impl Engine {
         limit: usize,
     ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
         self.history_before(peer, 0, limit).await
+    }
+
+    /// Сведения о чате для правой панели (имя, @имя, о себе, телефон, статус, число участников).
+    pub async fn peer_info(&self, peer: PeerRef) -> Result<PeerInfo, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let mut info = PeerInfo::default();
+        match tl::enums::InputPeer::from(peer) {
+            tl::enums::InputPeer::User(u) => {
+                let tl::enums::users::UserFull::Full(f) = self
+                    .client
+                    .invoke(&tl::functions::users::GetFullUser {
+                        id: tl::enums::InputUser::User(tl::types::InputUser {
+                            user_id: u.user_id,
+                            access_hash: u.access_hash,
+                        }),
+                    })
+                    .await?;
+                let tl::enums::UserFull::Full(full) = f.full_user;
+                info.about = full.about.unwrap_or_default();
+                if let Some(tl::enums::User::User(x)) = f.users.iter().find(|x| matches!(x, tl::enums::User::User(y) if y.id == u.user_id)) {
+                    info.name = [x.first_name.clone(), x.last_name.clone()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    info.username = x.username.clone().unwrap_or_default();
+                    info.phone = x.phone.clone().unwrap_or_default();
+                    if let Some(s) = &x.status {
+                        info.status = status_text(s);
+                    }
+                }
+            }
+            tl::enums::InputPeer::Channel(c) => {
+                let tl::enums::messages::ChatFull::Full(f) = self
+                    .client
+                    .invoke(&tl::functions::channels::GetFullChannel {
+                        channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                            channel_id: c.channel_id,
+                            access_hash: c.access_hash,
+                        }),
+                    })
+                    .await?;
+                if let tl::enums::ChatFull::ChannelFull(full) = f.full_chat {
+                    info.about = full.about;
+                    info.members = full.participants_count.unwrap_or(0);
+                }
+                if let Some(tl::enums::Chat::Channel(y)) = f.chats.iter().find(|x| matches!(x, tl::enums::Chat::Channel(y) if y.id == c.channel_id)) {
+                    info.name = y.title.clone();
+                    info.username = y.username.clone().unwrap_or_default();
+                }
+            }
+            tl::enums::InputPeer::Chat(c) => {
+                let tl::enums::messages::ChatFull::Full(f) = self
+                    .client
+                    .invoke(&tl::functions::messages::GetFullChat { chat_id: c.chat_id })
+                    .await?;
+                if let tl::enums::ChatFull::Full(full) = f.full_chat {
+                    info.about = full.about;
+                    if let Some(tl::enums::ChatParticipants::Participants(p)) = Some(full.participants) {
+                        info.members = p.participants.len() as i32;
+                    }
+                }
+                if let Some(tl::enums::Chat::Chat(y)) = f.chats.iter().find(|x| matches!(x, tl::enums::Chat::Chat(y) if y.id == c.chat_id)) {
+                    info.name = y.title.clone();
+                }
+            }
+            _ => {}
+        }
+        Ok(info)
+    }
+
+    /// Ссылка на отправителя сообщения (для загрузки его аватарки в группах).
+    pub async fn sender_ref(&self, peer: PeerRef, msg_id: i32) -> Option<PeerRef> {
+        let msgs = self.client.get_messages_by_id(peer, &[msg_id]).await.ok()?;
+        let m = msgs.into_iter().next()??;
+        m.sender()?.to_ref().await.ok()?
     }
 
     /// Сообщения старше `before_id` (0 — с самых новых). Для подгрузки при прокрутке вверх.
@@ -825,6 +930,32 @@ impl Engine {
         }
     }
 
+    /// Превращает обновление в событие для интерфейса (без сетевых запросов).
+    pub fn live(&self, upd: &Update) -> Option<Live> {
+        match upd {
+            Update::NewMessage(m) | Update::MessageEdited(m) => {
+                let key = m.peer_id().bot_api_dialog_id_unchecked();
+                let rows = self.finish(key, vec![Self::row(key, m, 0)]);
+                rows.into_iter().next().map(|r| Live::Message(key, Box::new(r)))
+            }
+            Update::MessageDeleted(d) => Some(Live::Deleted(
+                d.channel_id().map(|ch| -1_000_000_000_000 - ch),
+                d.messages().to_vec(),
+            )),
+            Update::Raw(r) => {
+                use grammers_client::tl::enums::{Peer, Update as U};
+                let U::ReadHistoryOutbox(x) = &r.raw else { return None };
+                let key = match &x.peer {
+                    Peer::User(u) => u.user_id,
+                    Peer::Chat(c) => -c.chat_id,
+                    Peer::Channel(c) => -1_000_000_000_000 - c.channel_id,
+                };
+                Some(Live::ReadOutbox(key, x.max_id))
+            }
+            _ => None,
+        }
+    }
+
     async fn apply(&self, upd: &Update) {
         let cfg = self.settings();
         match upd {
@@ -1145,6 +1276,64 @@ impl Engine {
             .collect())
     }
 
+    /// Сохранённые GIF пользователя (документы с миниатюрами).
+    pub async fn saved_gifs(&self) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self.client.invoke(&tl::functions::messages::GetSavedGifs { hash: 0 }).await?;
+        let tl::enums::messages::SavedGifs::Gifs(g) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(g.gifs
+            .iter()
+            .filter_map(|d| match d {
+                tl::enums::Document::Document(d) => Some(sticker_row_of(d)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Создать канал (`broadcast`) или супергруппу.
+    pub async fn create_channel(&self, title: &str, about: &str, broadcast: bool) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::channels::CreateChannel {
+                broadcast,
+                megagroup: !broadcast,
+                for_import: false,
+                forum: false,
+                title: title.to_owned(),
+                about: about.to_owned(),
+                geo_point: None,
+                address: None,
+                ttl_period: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Создать обычную группу с выбранными контактами.
+    pub async fn create_group(&self, title: &str, members: &[PeerRef]) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let users = members
+            .iter()
+            .filter_map(|p| match tl::enums::InputPeer::from(*p) {
+                tl::enums::InputPeer::User(u) => Some(tl::enums::InputUser::User(tl::types::InputUser {
+                    user_id: u.user_id,
+                    access_hash: u.access_hash,
+                })),
+                _ => None,
+            })
+            .collect();
+        self.client
+            .invoke(&tl::functions::messages::CreateChat {
+                users,
+                title: title.to_owned(),
+                ttl_period: None,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Установленные наборы пользовательских (Premium) эмодзи.
     pub async fn emoji_sets(&self) -> Result<Vec<StickerSetRow>, grammers_client::InvocationError> {
         use grammers_client::tl;
@@ -1404,6 +1593,7 @@ mod tests {
             archived: false,
             kind,
             contact: false,
+            read_out: 0,
         }
     }
 
