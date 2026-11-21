@@ -2,7 +2,7 @@
 //! По умолчанию разрешены только серверы Telegram. Остальное — только по явному
 //! решению пользователя (`allow_user_host`), которое видно в настройках.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Домены Telegram (хост равен домену или является его поддоменом).
 pub const TELEGRAM_DOMAINS: &[&str] = &[
@@ -25,6 +25,14 @@ pub const TELEGRAM_NETS: &[(Ipv4Addr, u8)] = &[
     (Ipv4Addr::new(91, 108, 56, 0), 22),
     (Ipv4Addr::new(95, 161, 64, 0), 20),
     (Ipv4Addr::new(185, 76, 151, 0), 24),
+];
+
+/// Подсети IPv6 Telegram (префикс, длина).
+pub const TELEGRAM_NETS_V6: &[(Ipv6Addr, u8)] = &[
+    (Ipv6Addr::new(0x2001, 0x0b28, 0xf23d, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x2001, 0x0b28, 0xf23f, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x2001, 0x067c, 0x04e8, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x2a0a, 0xf280, 0, 0, 0, 0, 0, 0), 32),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +75,23 @@ impl Guard {
         }
         domain_match(&host, TELEGRAM_DOMAINS)
             || self.user_hosts.iter().any(|h| h == &host)
+    }
+
+    /// Проверка IP-адреса соединения (IPv4, IPv6, IPv4 внутри IPv6).
+    pub fn ip_allowed(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.host_allowed(&v4.to_string()),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return self.host_allowed(&v4.to_string());
+                }
+                let v = u128::from(v6);
+                TELEGRAM_NETS_V6.iter().any(|(net, bits)| {
+                    let mask = u128::MAX << (128 - u32::from(*bits));
+                    v & mask == u128::from(*net) & mask
+                }) || self.user_hosts.contains(&v6.to_string())
+            }
+        }
     }
 
     /// Проверка URL: только https и только разрешённый хост.
@@ -164,5 +189,19 @@ mod tests {
         g.allow_user_host("Translate.Example.org.");
         assert!(g.check("https://translate.example.org/x").is_ok());
         assert!(g.check("https://other.example.org/").is_err());
+    }
+}
+
+#[cfg(test)]
+mod ip_tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_and_mapped() {
+        let g = Guard::new();
+        assert!(g.ip_allowed("2001:b28:f23d:f001::a".parse().unwrap()));
+        assert!(g.ip_allowed("::ffff:149.154.167.51".parse().unwrap()));
+        assert!(!g.ip_allowed("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!g.ip_allowed("2606:4700::1111".parse().unwrap()));
     }
 }

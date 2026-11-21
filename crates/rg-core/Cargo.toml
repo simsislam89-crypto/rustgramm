@@ -1,0 +1,14 @@
+[package]
+name = "rg-core"
+description = "Rustgramm core: Telegram MTProto client over the rg-net guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rg-net = { path = "../rg-net" }
+grammers-mtsender = { version = "0.12", features = ["proxy"] }
+grammers-session = "0.12"
+grammers-client = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

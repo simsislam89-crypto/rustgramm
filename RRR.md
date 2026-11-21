@@ -479,3 +479,10 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `crates/rg-settings`: порт GhostMode из AyuGram без телеметрии, `serde(default)`, 6 тестов.
 - clippy `-D warnings` чист; `cargo fmt` не проверен (rustfmt не установлен в тулчейне).
 - Дорожная карта — `docs/ROADMAP.md`. Следующий этап 2: `rg-core` (MTProto через grammers).
+
+### Этап 2 выполнен (2026-11-21)
+- `crates/rg-core`: `GuardedSession<S>` — обёртка над `grammers_session::Session`; адреса DC вне сетей Telegram (v4/v6/mapped) отбрасываются, счётчик `blocked()`. `Config::from_env` (RG_API_ID, RG_API_HASH, RG_SESSION, RG_PROXY=socks5://…; свои ключи с my.telegram.org, в код не зашиты). `connect()` — SenderPool, device_model «Rustgramm», версия ОС пустая.
+- `rg-net`: добавлены IPv6-сети Telegram и `ip_allowed`.
+- Аудит зависимостей: в grammers 0.12 нет зашитых внешних хостов; hickory-resolver используется только для хоста прокси (feature proxy); reqwest/hyper/openssl в дереве rg-core нет; libsql — локальный SQLite.
+- Грабли: `SessionData` не реализует `Session` — в тестах `MemorySession::from(SessionData)`; `ConnectionParams` собирать через `..Default::default()` (clippy ругается на присваивание полей).
+- Не проверено: живой вход в Telegram (нужны api_id/api_hash владельца и телефон) — делается вручную, ключи в репозиторий не коммитить.
