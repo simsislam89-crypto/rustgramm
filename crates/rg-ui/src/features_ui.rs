@@ -564,12 +564,19 @@ impl App {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size(Vec2::new(660.0, 480.0))
+            .default_size(Vec2::new(680.0, 490.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 26, 246))
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(34)))
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(egui::Margin::same(14)),
+            )
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.columns(2, |cols| {
-                    // Левая колонка: список секретных чатов + создание нового.
-                    cols[0].set_min_width(210.0);
+                    // Левая колонка: список секретных чатов + создание нового (без обрезки и без квадратов!).
+                    cols[0].set_min_width(220.0);
                     cols[0].horizontal(|ui| {
                         ui.label(RichText::new("Ваши секретные чаты").strong().color(WHITE));
                         if ui.small_button("Обновить").clicked() {
@@ -577,7 +584,7 @@ impl App {
                         }
                     });
                     cols[0].add_space(4.0);
-                    egui::ScrollArea::vertical().max_height(210.0).id_salt("sec-list").show(&mut cols[0], |ui| {
+                    egui::ScrollArea::vertical().max_height(190.0).id_salt("sec-list").show(&mut cols[0], |ui| {
                         if self.secret_chats.is_empty() {
                             ui.label(RichText::new("Нет активных секретных чатов").size(12.0).color(SUBTEXT));
                         }
@@ -589,18 +596,42 @@ impl App {
                                 _ => &c.state,
                             };
                             let lbl = format!("{} [{}]", c.peer_name, badge);
-                            if ui.selectable_label(sel, RichText::new(lbl).color(if sel { ORANGE } else { WHITE })).clicked() {
+                            if ui.selectable_label(sel, RichText::new(lbl).color(if sel { c_orange() } else { WHITE })).clicked() {
                                 select_chat = Some(c.chat_id);
                             }
                         }
                     });
                     cols[0].separator();
-                    cols[0].label(RichText::new("+ Начать новый секретный чат").size(12.5).color(ORANGE));
-                    egui::ScrollArea::vertical().max_height(175.0).id_salt("sec-new").show(&mut cols[0], |ui| {
-                        for d in self.dialogs.iter().filter(|d| d.kind == rg_core::engine::DialogKind::User && !d.saved).take(25) {
-                            if ui.button(&d.name).clicked() {
-                                start_with = Some((d.peer, d.name.clone()));
+                    cols[0].label(RichText::new("+ Начать новый секретный чат").size(12.5).color(c_orange()));
+                    cols[0].add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(190.0).id_salt("sec-new").show(&mut cols[0], |ui| {
+                        for d in self.dialogs.iter().filter(|d| d.kind == rg_core::engine::DialogKind::User && !d.saved).take(30) {
+                            let safe_name = if d.name.trim().is_empty() {
+                                format!("Пользователь {}", d.id)
+                            } else {
+                                d.name.clone()
+                            };
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 8.0, 32.0), Sense::click());
+                            let hk = tween(ui.ctx(), ("sec-u", d.id), f32::from(u8::from(resp.hovered())), 0.1);
+                            ui.painter().rect_filled(
+                                r,
+                                CornerRadius::same(8),
+                                lerp_color(Color32::from_white_alpha(12), Color32::from_white_alpha(26), hk),
+                            );
+                            let inner_r = r.shrink2(Vec2::new(10.0, 4.0));
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(inner_r), |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    if let Some(em) = self.emoji.as_ref() {
+                                        em.rich_label(ui, &safe_name, 13.5, WHITE);
+                                    } else {
+                                        ui.label(RichText::new(&safe_name).size(13.5).color(WHITE));
+                                    }
+                                });
+                            });
+                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                start_with = Some((d.peer, safe_name));
                             }
+                            ui.add_space(4.0);
                         }
                     });
 
@@ -885,6 +916,27 @@ impl App {
                                 rights: st.default_rights,
                             });
                         }
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.label(RichText::new("Медленный режим (Slow Mode)").strong().color(WHITE));
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for (secs, lbl) in [
+                                (0, "Выкл"),
+                                (10, "10 с"),
+                                (30, "30 с"),
+                                (60, "1 мин"),
+                                (300, "5 мин"),
+                                (900, "15 мин"),
+                                (3600, "1 час"),
+                            ] {
+                                let sel = self.admin_slowmode_secs == secs;
+                                if ui.selectable_label(sel, lbl).clicked() {
+                                    self.admin_slowmode_secs = secs;
+                                    cmds.push(Cmd::SetSlowMode(st.peer, secs));
+                                }
+                            }
+                        });
                     }
                     2 => {
                         ui.horizontal(|ui| {
@@ -1495,6 +1547,499 @@ impl App {
         }
         if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.themes_open = false;
+        }
+    }
+
+    // =========================================================================
+    // 10. Новые функции Telegram (v0.19.0): Отложенные, Чек-листы, Опросы, Хэштеги, Ctrl+K
+    // =========================================================================
+
+    #[allow(deprecated)]
+    pub(crate) fn scheduled_window(&mut self, ctx: &egui::Context) {
+        if !self.scheduled_open {
+            return;
+        }
+        let mut open = true;
+        let mut send_now: Option<i32> = None;
+        let mut delete_id: Option<i32> = None;
+        let mut refresh = false;
+        egui::Window::new("⏰ Отложенные сообщения и напоминания")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(440.0, 420.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Запланированные сообщения этого чата").size(12.5).color(SUBTEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Обновить").clicked() {
+                            refresh = true;
+                        }
+                    });
+                });
+                ui.separator();
+                if self.scheduled_msgs.is_empty() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Нет отложенных сообщений").color(SUBTEXT));
+                        ui.label(
+                            RichText::new("Нажмите ПКМ по кнопке отправки в чате → «Отложить / Напоминание»")
+                                .size(12.0)
+                                .color(SUBTEXT),
+                        );
+                    });
+                } else {
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for m in &self.scheduled_msgs {
+                            egui::Frame::new()
+                                .fill(t(SIDEBAR_BG))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width() - 8.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(full_date(m.date)).size(11.5).color(c_orange()));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button(RichText::new("Удалить").color(DANGER)).clicked() {
+                                                delete_id = Some(m.id);
+                                            }
+                                            if ui.small_button("Отправить сейчас").clicked() {
+                                                send_now = Some(m.id);
+                                            }
+                                        });
+                                    });
+                                    ui.label(RichText::new(&m.text).size(13.5).color(WHITE));
+                                });
+                            ui.add_space(6.0);
+                        }
+                    });
+                }
+            });
+        if refresh {
+            self.send(Cmd::LoadScheduled);
+        }
+        if let Some(id) = send_now {
+            self.send(Cmd::SendScheduledNow(vec![id]));
+        }
+        if let Some(id) = delete_id {
+            self.send(Cmd::DeleteScheduled(vec![id]));
+        }
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.scheduled_open = false;
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn todo_creator_window(&mut self, ctx: &egui::Context) {
+        if !self.todo_modal_open {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("📋 Новый чек-лист (To-Do)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(390.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Заголовок списка").size(12.5).color(SUBTEXT));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.todo_title)
+                        .hint_text("Например: Задачи на сегодня")
+                        .desired_width(360.0),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Пункты").size(12.5).color(SUBTEXT));
+                let mut remove_idx: Option<usize> = None;
+                let todo_len = self.todo_items.len();
+                for (i, item) in self.todo_items.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{}.", i + 1)).color(c_orange()));
+                        ui.add(
+                            egui::TextEdit::singleline(item)
+                                .hint_text("Пункт чек-листа…")
+                                .desired_width(300.0),
+                        );
+                        if todo_len > 2 && ui.small_button("×").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                }
+                if let Some(ri) = remove_idx {
+                    self.todo_items.remove(ri);
+                }
+                if self.todo_items.len() < 15 && ui.small_button("+ Добавить пункт").clicked() {
+                    self.todo_items.push(String::new());
+                }
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.todo_others_complete, "Разрешить собеседникам отмечать пункты");
+                ui.checkbox(&mut self.todo_others_append, "Разрешить добавлять новые пункты");
+                ui.add_space(10.0);
+                let valid = !self.todo_title.trim().is_empty()
+                    && self.todo_items.iter().any(|x| !x.trim().is_empty());
+                if ui
+                    .add_enabled_ui(valid, |ui| orange_button(ui, "Отправить чек-лист", Vec2::new(200.0, 34.0)))
+                    .inner
+                    .clicked()
+                {
+                    submit = true;
+                }
+            });
+        if submit {
+            let items: Vec<String> = self
+                .todo_items
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.send(Cmd::SendTodo {
+                title: self.todo_title.trim().to_owned(),
+                items,
+                others_can_complete: self.todo_others_complete,
+                others_can_append: self.todo_others_append,
+            });
+            self.todo_title.clear();
+            self.todo_items = vec![String::new(), String::new()];
+            self.todo_modal_open = false;
+        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.todo_modal_open = false;
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn poll_creator_window(&mut self, ctx: &egui::Context) {
+        if !self.poll_modal_open {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("📊 Новый опрос / Викторина")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(400.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Вопрос").size(12.5).color(SUBTEXT));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.poll_question)
+                        .hint_text("Задайте вопрос…")
+                        .desired_width(370.0),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Варианты ответа").size(12.5).color(SUBTEXT));
+                let mut remove_idx: Option<usize> = None;
+                let poll_len = self.poll_options.len();
+                for (i, opt) in self.poll_options.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if self.poll_quiz {
+                            ui.radio_value(&mut self.poll_correct, i, "");
+                        } else {
+                            ui.label(RichText::new(format!("{}.", i + 1)).color(c_orange()));
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(opt)
+                                .hint_text(format!("Вариант {}", i + 1))
+                                .desired_width(305.0),
+                        );
+                        if poll_len > 2 && ui.small_button("×").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                }
+                if let Some(ri) = remove_idx {
+                    self.poll_options.remove(ri);
+                    self.poll_correct = self.poll_correct.min(self.poll_options.len().saturating_sub(1));
+                }
+                if self.poll_options.len() < 10 && ui.small_button("+ Добавить вариант").clicked() {
+                    self.poll_options.push(String::new());
+                }
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.poll_anonymous, "Анонимное голосование");
+                if ui.checkbox(&mut self.poll_quiz, "Режим викторины (один правильный ответ)").changed() && self.poll_quiz {
+                    self.poll_multiple = false;
+                }
+                if !self.poll_quiz {
+                    ui.checkbox(&mut self.poll_multiple, "Выбор нескольких ответов");
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.poll_explanation)
+                            .hint_text("Пояснение к ответу (необязательно)")
+                            .desired_width(370.0),
+                    );
+                }
+                ui.add_space(10.0);
+                let opts_ok = self.poll_options.iter().filter(|x| !x.trim().is_empty()).count() >= 2;
+                let valid = !self.poll_question.trim().is_empty() && opts_ok;
+                if ui
+                    .add_enabled_ui(valid, |ui| orange_button(ui, "Отправить опрос", Vec2::new(190.0, 34.0)))
+                    .inner
+                    .clicked()
+                {
+                    submit = true;
+                }
+            });
+        if submit {
+            let options: Vec<String> = self
+                .poll_options
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.send(Cmd::SendPoll {
+                question: self.poll_question.trim().to_owned(),
+                options,
+                anonymous: self.poll_anonymous,
+                multiple_choice: self.poll_multiple && !self.poll_quiz,
+                quiz: self.poll_quiz,
+                correct_idx: self.poll_quiz.then_some(self.poll_correct),
+                explanation: self.poll_explanation.trim().to_owned(),
+            });
+            self.poll_question.clear();
+            self.poll_options = vec![String::new(), String::new()];
+            self.poll_explanation.clear();
+            self.poll_modal_open = false;
+        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.poll_modal_open = false;
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn hashtag_search_window(&mut self, ctx: &egui::Context) {
+        let Some((mut tag, rows)) = self.hashtag_modal.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut search_again: Option<String> = None;
+        egui::Window::new(format!("Глобальный поиск #{tag}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(480.0, 440.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("#").strong().color(c_orange()));
+                    let r = ui.add(egui::TextEdit::singleline(&mut tag).desired_width(300.0));
+                    if (orange_button(ui, "Искать", Vec2::new(84.0, 28.0)).clicked()
+                        || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                        && !tag.trim().is_empty()
+                    {
+                        search_again = Some(tag.trim().trim_start_matches('#').to_owned());
+                    }
+                });
+                ui.separator();
+                if rows.is_empty() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Ищем публикации по хэштегу в публичных каналах…").color(SUBTEXT));
+                    });
+                } else {
+                    egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
+                        for m in &rows {
+                            egui::Frame::new()
+                                .fill(t(SIDEBAR_BG))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width() - 8.0);
+                                    ui.horizontal(|ui| {
+                                        let who = if m.sender.is_empty() { "Публичный канал" } else { &m.sender };
+                                        ui.label(RichText::new(who).strong().size(12.5).color(c_orange()));
+                                        ui.label(RichText::new(full_date(m.date)).size(11.0).color(SUBTEXT));
+                                    });
+                                    let txt = if m.text.is_empty() { "[Медиа]" } else { &m.text };
+                                    ui.label(RichText::new(txt).size(13.0).color(WHITE));
+                                });
+                            ui.add_space(6.0);
+                        }
+                    });
+                }
+            });
+        if let Some(new_tag) = search_again {
+            self.hashtag_modal = Some((new_tag.clone(), Vec::new()));
+            self.send(Cmd::SearchHashtag(new_tag));
+        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.hashtag_modal = None;
+        } else if let Some((cur_tag, _)) = self.hashtag_modal.as_mut() {
+            *cur_tag = tag;
+        }
+    }
+
+    /// 10. Палитра быстрого перехода `Ctrl+K` (Quick Switcher) по всем чатам (до 5000+) и командам.
+    #[allow(deprecated)]
+    pub(crate) fn quick_switcher_window(&mut self, ctx: &egui::Context) {
+        let raw = tween(ctx, "ctrl-k-palette", f32::from(u8::from(self.palette_open)), 0.16);
+        if raw < 0.01 && !self.palette_open {
+            return;
+        }
+        let appear = ios_spring(raw);
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("palette-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                paint_frosted_scrim(ui.painter(), r, raw);
+                if resp.clicked() {
+                    self.palette_open = false;
+                }
+            });
+
+        #[derive(Clone)]
+        enum PaletteHit {
+            Dialog(usize),
+            Cmd(&'static str),
+        }
+        let q = self.palette_query.trim().to_lowercase();
+        let mut hits: Vec<(String, String, PaletteHit)> = Vec::new();
+        for (idx, d) in self.dialogs.iter().enumerate() {
+            let name = if d.saved { "Избранное" } else { d.name.as_str() };
+            if q.is_empty() || name.to_lowercase().contains(&q) {
+                let sub = if d.archived { "Архив" } else if d.saved { "Личное хранилище" } else { &d.last };
+                hits.push((name.to_owned(), sub.chars().take(44).collect(), PaletteHit::Dialog(idx)));
+                if hits.len() >= 14 {
+                    break;
+                }
+            }
+        }
+        const ACTIONS: [(&str, &str, &str); 9] = [
+            ("Настройки Telegram", "Профиль, приватность, прокси, логи", "settings"),
+            ("Мои звёзды и подарки ⭐", "Баланс Stars и витрина подарков", "stars"),
+            ("Telegram Бизнес", "Часы работы и быстрые ответы", "business"),
+            ("Темы и иконки AyuGram", ".tdesktop-theme / .attheme / паки иконок", "themes"),
+            ("Секретные чаты (E2E)", "Шифрование MTProto 2.0", "secret"),
+            ("Переключить Режим призрака", "Не читать сообщения и истории", "ghost"),
+            ("Создать чек-лист (To-Do)", "Интерактивный список в открытый чат", "todo"),
+            ("Создать опрос / викторину", "В открытый чат", "poll"),
+            ("Добавить ещё один аккаунт", "Без ограничений на количество аккаунтов", "add_acc"),
+        ];
+        for (title, sub, key) in ACTIONS {
+            if q.is_empty() || title.to_lowercase().contains(&q) || sub.to_lowercase().contains(&q) {
+                hits.push((format!("⚡ {title}"), sub.to_owned(), PaletteHit::Cmd(key)));
+            }
+        }
+        if !hits.is_empty() {
+            self.palette_sel = self.palette_sel.min(hits.len() - 1);
+        } else {
+            self.palette_sel = 0;
+        }
+
+        let mut chosen: Option<PaletteHit> = None;
+        if self.palette_open {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) && !hits.is_empty() {
+                self.palette_sel = (self.palette_sel + 1) % hits.len();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) && !hits.is_empty() {
+                self.palette_sel = if self.palette_sel == 0 { hits.len() - 1 } else { self.palette_sel - 1 };
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                && let Some((_, _, h)) = hits.get(self.palette_sel)
+            {
+                chosen = Some(h.clone());
+            }
+        }
+
+        let card_w = 460.0_f32.min(screen.width() - 28.0);
+        egui::Area::new(egui::Id::new("palette-box"))
+            .order(egui::Order::Tooltip)
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 68.0 + (1.0 - appear) * 16.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(appear.clamp(0.02, 1.0));
+                egui::Frame::new()
+                    .fill(Color32::TRANSPARENT)
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        paint_frosted_glass_panel(ui.painter(), ui.max_rect().expand(12.0), 16.0, raw);
+                        let inp = ui.add(
+                            egui::TextEdit::singleline(&mut self.palette_query)
+                                .hint_text("Быстрый переход: чат, команда, настройки… (Ctrl+K)")
+                                .desired_width(card_w - 8.0)
+                                .margin(Vec2::new(10.0, 8.0)),
+                        );
+                        if self.palette_open {
+                            inp.request_focus();
+                        }
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical().max_height(330.0).id_salt("palette-list").show(ui, |ui| {
+                            for (i, (title, sub, hit)) in hits.iter().enumerate() {
+                                let sel = i == self.palette_sel;
+                                let (r, resp) = ui.allocate_exact_size(Vec2::new(card_w - 8.0, 40.0), Sense::click());
+                                if sel || resp.hovered() {
+                                    ui.painter().rect_filled(
+                                        r,
+                                        CornerRadius::same(9),
+                                        if sel {
+                                            Color32::from_rgba_unmultiplied(c_orange().r(), c_orange().g(), c_orange().b(), 44)
+                                        } else {
+                                            t(WINDOW_OVER)
+                                        },
+                                    );
+                                }
+                                ui.painter().text(
+                                    Pos2::new(r.left() + 12.0, r.center().y - 7.0),
+                                    Align2::LEFT_CENTER,
+                                    title,
+                                    FontId::proportional(13.5),
+                                    if sel { c_orange() } else { WHITE },
+                                );
+                                ui.painter().text(
+                                    Pos2::new(r.left() + 12.0, r.center().y + 9.0),
+                                    Align2::LEFT_CENTER,
+                                    sub,
+                                    FontId::proportional(11.0),
+                                    SUBTEXT,
+                                );
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    chosen = Some(hit.clone());
+                                }
+                            }
+                        });
+                    });
+            });
+
+        if let Some(hit) = chosen {
+            self.palette_open = false;
+            match hit {
+                PaletteHit::Dialog(idx) => {
+                    if let Some(d) = self.dialogs.get(idx) {
+                        self.in_archive = d.archived;
+                    }
+                    self.open_dialog(idx);
+                }
+                PaletteHit::Cmd("settings") => self.open_tg_settings(),
+                PaletteHit::Cmd("stars") => {
+                    self.stars_modal_open = true;
+                    self.send(Cmd::LoadStarsStatus);
+                    self.send(Cmd::LoadSavedGifts(None));
+                    self.send(Cmd::LoadStarGiftsCatalog);
+                }
+                PaletteHit::Cmd("business") => {
+                    self.business_open = true;
+                    self.send(Cmd::LoadQuickReplies);
+                }
+                PaletteHit::Cmd("themes") => self.themes_open = true,
+                PaletteHit::Cmd("secret") => {
+                    self.secret_open = true;
+                    self.send(Cmd::LoadSecretChats);
+                }
+                PaletteHit::Cmd("ghost") => {
+                    let on = !self.settings.ghost.active;
+                    self.settings.ghost.set_active(on);
+                    self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                }
+                PaletteHit::Cmd("todo") if self.selected.is_some() => self.todo_modal_open = true,
+                PaletteHit::Cmd("poll") if self.selected.is_some() => self.poll_modal_open = true,
+                PaletteHit::Cmd("add_acc") => self.send(Cmd::AddAccountAuto),
+                PaletteHit::Cmd(_) => {}
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.palette_open = false;
         }
     }
 }

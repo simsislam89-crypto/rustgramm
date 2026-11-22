@@ -671,8 +671,13 @@ fn theme_opacity_and_blur_state() {
     assert!(tint_title().a() <= 11);
 
     set_opacity(DEFAULT_OPACITY_PCT);
+    assert_eq!(DEFAULT_OPACITY_PCT, 70);
+    assert_eq!(t(WINDOW_BG).a(), 178);
+    assert_eq!(t_btn(ORANGE).a(), 178);
+    set_opacity(100);
     assert_eq!(t(WINDOW_BG).a(), 255);
     assert_eq!(t_btn(ORANGE).a(), 255);
+    set_opacity(DEFAULT_OPACITY_PCT);
 }
 
 #[test]

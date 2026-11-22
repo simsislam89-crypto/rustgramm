@@ -90,9 +90,18 @@ impl App {
             .fixed_pos(Pos2::new(-(1.0 - open) * w, 0.0))
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(w, screen.height()), Sense::hover());
-                ui.painter().rect_filled(rect, 0.0, t2(WINDOW_BG));
+                // Многослойное матовое стекло для левой шторки (глубже, чище, без плоского квадрата).
+                paint_frosted_glass_panel(ui.painter(), rect, 0.0, open);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let ui = &mut child;
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let footer_h = 38.0;
+                // Полноценная вертикальная прокрутка левого меню (работает при любом числе аккаунтов и разрешении!).
+                egui::ScrollArea::vertical()
+                    .id_salt("drawer-scroll")
+                    .max_height((screen.height() - footer_h).max(160.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 // Шапка: аватар, имя, ссылка на настройки AyuGram.
                 let (head, _) = ui.allocate_exact_size(Vec2::new(w, 152.0), Sense::hover());
@@ -118,7 +127,7 @@ impl App {
                     Align2::LEFT_CENTER,
                     "Настройки Rustgramm",
                     FontId::proportional(13.0),
-                    ACCENT,
+                    c_orange(),
                 );
                 icons::chevron_down(ui.painter(), Pos2::new(head.right() - 22.0, prefs.center().y), SUBTEXT);
                 if pr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -126,10 +135,11 @@ impl App {
                 }
                 let item = |ui: &mut egui::Ui, icon: icons::Ico, text: &str| -> bool {
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
+                    let ih = tween(ui.ctx(), ("drw-it", text), f32::from(u8::from(resp.hovered())), 0.12);
+                    if ih > 0.01 {
+                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER).gamma_multiply(ih));
                     }
-                    icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, DIALOG_DATE);
+                    icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, lerp_color(DIALOG_DATE, WHITE, ih));
                     let clip = Rect::from_min_max(
                         Pos2::new(r.left() + 62.0, r.top()),
                         Pos2::new((r.right() - 12.0).max(r.left() + 70.0), r.bottom()),
@@ -143,7 +153,7 @@ impl App {
                     );
                     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 };
-                // Список аккаунтов с реальными никнеймами / @username (анти-корреляция работает в фоне).
+                // Неограниченный список аккаунтов (без лимита в 3 слота даже без Premium!).
                 for acc in &s.accounts {
                     let is_cur = acc.slot == s.active_account;
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 44.0), Sense::click());
@@ -186,7 +196,7 @@ impl App {
                         Align2::LEFT_CENTER,
                         &title,
                         FontId::proportional(13.5),
-                        if is_cur { ORANGE } else { WHITE },
+                        if is_cur { c_orange() } else { WHITE },
                     );
                     cp.text(
                         Pos2::new(r.left() + 56.0, r.center().y + 8.0),
@@ -201,7 +211,7 @@ impl App {
                             Align2::RIGHT_CENTER,
                             "✓",
                             FontId::proportional(13.5),
-                            ORANGE,
+                            c_orange(),
                         );
                     } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         switch_slot = Some(acc.slot);
@@ -230,21 +240,13 @@ impl App {
                 if item(ui, icons::Ico::Ghost, "Секретные чаты (E2E)") {
                     act = Some("secret");
                 }
-                if item(ui, icons::Ico::Saved, "Звёзды и Подарки ⭐") {
-                    act = Some("stars");
-                }
-                if item(ui, icons::Ico::Folder, "Telegram Бизнес") {
-                    act = Some("business");
-                }
-                if item(ui, icons::Ico::Moon, "Темы и иконки AyuGram") {
-                    act = Some("themes");
-                }
                 if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
                     act = Some("saved");
                 }
                 if a.drawer_s_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
                     act = Some("read");
                 }
+                // «Telegram Бизнес», «Мои звёзды» и «Подарки» перенесены в «Настройки» (как в официальном Telegram!).
                 if item(ui, icons::Ico::Settings, "Настройки") {
                     act = Some("settings");
                 }
@@ -264,6 +266,8 @@ impl App {
                         s.ayu.streamer_mode = st;
                     }
                 }
+                ui.add_space(10.0);
+                    });
                 // Аккуратная подпись версии внизу шторки с проверкой обновлений по клику.
                 let foot = Rect::from_min_max(
                     Pos2::new(rect.left() + 18.0, rect.bottom() - 34.0),
@@ -275,7 +279,7 @@ impl App {
                     Align2::LEFT_CENTER,
                     format!("Rustgramm  v{} · Обновления", env!("CARGO_PKG_VERSION")),
                     FontId::proportional(12.0),
-                    if fresp.hovered() { ORANGE } else { SUBTEXT },
+                    if fresp.hovered() { c_orange() } else { SUBTEXT },
                 );
                 if fresp.on_hover_text("Проверить новую версию на GitHub").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     act = Some("check_updates");

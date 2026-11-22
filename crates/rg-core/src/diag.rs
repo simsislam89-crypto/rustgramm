@@ -1,0 +1,194 @@
+//! Максимально подробное локальное диагностическое логирование Rustgramm.
+//! Пишет в `<RG_HOME>/logs/rustgramm.log` с авторотацией (4 МБ) и держит кольцевой
+//! буфер последних записей в памяти для быстрого просмотра и копирования из Настроек.
+//! Секреты (пароли, коды входа, api_hash, токены) никогда не записываются.
+
+use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+const RING_CAP: usize = 200;
+
+struct LoggerState {
+    path: PathBuf,
+    ring: VecDeque<String>,
+}
+
+static ENABLED: AtomicBool = AtomicBool::new(true);
+static STATE: OnceLock<Mutex<LoggerState>> = OnceLock::new();
+
+/// Включить или выключить запись диагностического лога.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// Инициализирует путь лога `<dir>/logs/rustgramm.log` и выполняет ротацию при превышении лимита.
+pub fn init(home_dir: &Path) {
+    let logs_dir = home_dir.join("logs");
+    let _ = fs::create_dir_all(&logs_dir);
+    let path = logs_dir.join("rustgramm.log");
+    if let Ok(meta) = fs::metadata(&path)
+        && meta.len() > MAX_LOG_BYTES
+    {
+        let backup = logs_dir.join("rustgramm.log.1");
+        let _ = fs::remove_file(&backup);
+        let _ = fs::rename(&path, &backup);
+    }
+    let state = STATE.get_or_init(|| {
+        Mutex::new(LoggerState {
+            path: path.clone(),
+            ring: VecDeque::with_capacity(RING_CAP),
+        })
+    });
+    if let Ok(mut g) = state.lock() {
+        g.path = path;
+    }
+    info(
+        "BOOT",
+        &format!(
+            "=== Rustgramm v{} ({}/{}) старт диагностики ===",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ),
+    );
+}
+
+/// Возвращает путь к текущему файлу лога, если инициализирован.
+pub fn log_path() -> Option<PathBuf> {
+    STATE.get()?.lock().ok().map(|g| g.path.clone())
+}
+
+/// Возвращает последние строки диагностического лога из памяти (для UI и копирования).
+pub fn recent_lines() -> Vec<String> {
+    STATE
+        .get()
+        .and_then(|s| s.lock().ok())
+        .map(|g| g.ring.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Очищает файл лога и буфер в памяти.
+pub fn clear() {
+    if let Some(st) = STATE.get()
+        && let Ok(mut g) = st.lock()
+    {
+        g.ring.clear();
+        let _ = fs::write(&g.path, b"");
+    }
+}
+
+fn timestamp_now() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs();
+    let ms = dur.subsec_millis();
+    let days = (total_secs / 86_400) as i64;
+    let sod = total_secs % 86_400;
+    let h = sod / 3600;
+    let m = (sod % 3600) / 60;
+    let s = sod % 60;
+    // Алгоритм Hinnant (civil_from_days) без внешних зависимостей.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = y + i64::from(mo <= 2);
+    format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+/// Простая защита от случайной утечки токенов/ключей в строку лога.
+pub fn sanitize_line(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for word in raw.split_inclusive(char::is_whitespace) {
+        let trimmed = word.trim();
+        let is_hex32 = trimmed.len() == 32 && trimmed.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_hex32 || trimmed.to_ascii_lowercase().starts_with("password=") {
+            out.push_str("[REDACTED]");
+            if let Some(ws) = word.chars().last().filter(|c| c.is_whitespace()) {
+                out.push(ws);
+            }
+        } else {
+            out.push_str(word);
+        }
+    }
+    out.replace(['\r', '\n'], " ")
+}
+
+fn write_entry(level: &str, scope: &str, msg: &str) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let clean = sanitize_line(msg);
+    let line = format!("[{}] [{}] [{}] {}", timestamp_now(), level, scope, clean);
+    let Some(st) = STATE.get() else {
+        return;
+    };
+    let Ok(mut g) = st.lock() else {
+        return;
+    };
+    if g.ring.len() >= RING_CAP {
+        g.ring.pop_front();
+    }
+    g.ring.push_back(line.clone());
+    if let Ok(meta) = fs::metadata(&g.path)
+        && meta.len() > MAX_LOG_BYTES
+    {
+        let backup = g.path.with_extension("log.1");
+        let _ = fs::remove_file(&backup);
+        let _ = fs::rename(&g.path, &backup);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&g.path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+pub fn info(scope: &str, msg: &str) {
+    write_entry("INFO", scope, msg);
+}
+
+pub fn warn(scope: &str, msg: &str) {
+    write_entry("WARN", scope, msg);
+}
+
+pub fn error(scope: &str, msg: &str) {
+    write_entry("ERR ", scope, msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_redacts_hex32_and_newlines() {
+        let s = sanitize_line("hash 0123456789abcdef0123456789abcdef\nnext");
+        assert!(s.contains("[REDACTED]"));
+        assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn logger_writes_and_reads_ring() {
+        let dir = std::env::temp_dir().join("rg-diag-test");
+        let _ = fs::remove_dir_all(&dir);
+        init(&dir);
+        info("TEST", "diag hello");
+        let lines = recent_lines();
+        assert!(lines.iter().any(|l| l.contains("diag hello")));
+        assert!(log_path().is_some_and(|p| p.exists()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

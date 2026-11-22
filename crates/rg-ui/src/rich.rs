@@ -23,6 +23,8 @@ pub struct Run {
     pub spoiler: bool,
     /// Куда ведёт ссылка (только http/https).
     pub url: Option<String>,
+    /// Хэштег (`#rust` -> глобальный поиск по публичным каналам).
+    pub hashtag: Option<String>,
     /// Пользовательский Premium-эмодзи (идентификатор документа Telegram).
     pub custom_emoji: Option<i64>,
 }
@@ -259,7 +261,13 @@ pub fn build_runs(text: &str, ents: &[Entity]) -> Vec<Run> {
                         r.url = Some(format!("https://t.me/{name}"));
                     }
                 }
-                EntityKind::Hashtag | EntityKind::Command => {}
+                EntityKind::Hashtag => {
+                    let tag = slice.trim_start_matches('#').trim();
+                    if !tag.is_empty() {
+                        r.hashtag = Some(tag.to_owned());
+                    }
+                }
+                EntityKind::Command => {}
                 EntityKind::CustomEmoji(id) => r.custom_emoji = Some(id),
             }
         }
@@ -268,10 +276,11 @@ pub fn build_runs(text: &str, ents: &[Entity]) -> Vec<Run> {
     runs
 }
 
-/// Нажимаемая область текста: ссылка или спойлер (номер куска).
+/// Нажимаемая область текста: ссылка, хэштег или спойлер (номер куска).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
     Link(String),
+    Hashtag(String),
     Spoiler(usize),
 }
 
@@ -345,6 +354,8 @@ pub fn render(
                         }
                         if run.url.is_some() {
                             rt = rt.color(link).underline();
+                        } else if run.hashtag.is_some() {
+                            rt = rt.color(link);
                         }
                         if !shown {
                             // Скрытый спойлер: текст сливается с плашкой.
@@ -356,6 +367,8 @@ pub fn render(
                             hot.push((resp.rect, Hit::Spoiler(idx)));
                         } else if let Some(u) = &run.url {
                             hot.push((resp.rect, Hit::Link(u.clone())));
+                        } else if let Some(tag) = &run.hashtag {
+                            hot.push((resp.rect, Hit::Hashtag(tag.clone())));
                         } else if run.spoiler {
                             // раскрытый спойлер: клик снова скрывает
                             hot.push((resp.rect, Hit::Spoiler(idx)));

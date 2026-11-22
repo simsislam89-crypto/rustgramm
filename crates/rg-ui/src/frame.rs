@@ -15,10 +15,10 @@ enum Glyph {
     Restore,
 }
 
-/// Рисует значок кнопки окна линиями.
-fn paint_glyph(p: &egui::Painter, c: Pos2, g: Glyph, color: Color32) {
+/// Рисует значок кнопки окна линиями с учётом пружинного масштаба.
+fn paint_glyph(p: &egui::Painter, c: Pos2, g: Glyph, color: Color32, scale: f32) {
     let s = Stroke::new(1.4, color);
-    let h = 5.5;
+    let h = 5.5 * scale;
     match g {
         Glyph::Close => {
             p.line_segment([c + Vec2::new(-h, -h), c + Vec2::new(h, h)], s);
@@ -55,6 +55,7 @@ impl App {
     /// Шапка окна: перетаскивание, двойной клик — развернуть, кнопки справа.
     pub(crate) fn titlebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        ui.set_clip_rect(rect);
         let cy = rect.center().y;
         let ctx = ui.ctx().clone();
 
@@ -115,7 +116,8 @@ impl App {
         } else {
             lerp_color(DIALOG_DATE, WHITE, hover)
         };
-        paint_glyph(ui.painter(), rect.center(), g, color);
+        let active = tween(ui.ctx(), ("wba", g as u8), f32::from(u8::from(resp.is_pointer_button_down_on())), 0.08);
+        paint_glyph(ui.painter(), rect.center(), g, color, spring_scale(hover, active));
         if resp.clicked() {
             let ctx = ui.ctx();
             match g {

@@ -378,8 +378,12 @@ pub struct Settings {
     pub language: LanguageSettings,
     /// Локальная безопасность (код-пароль, частые контакты).
     pub security: SecuritySettings,
-    /// Непрозрачность окна, проценты (15..=100); по умолчанию 100 (непрозрачное на старте).
+    /// Непрозрачность окна, проценты (15..=100); по умолчанию 70 (матовое стекло на старте).
     pub window_opacity: u8,
+    /// Одноразовая миграция стартовой прозрачности к 70% в v0.19.0.
+    pub opacity_v19_migrated: bool,
+    /// Подробные локальные диагностические логи (`<RG_HOME>/logs/rustgramm.log`, без секретов).
+    pub diag_logging: bool,
     /// Размытие стекла (Windows 11 Acrylic при прозрачности < 100% и блюр-анимации в стиле iOS).
     pub blur_enabled: bool,
     /// Стиль фона чата: 0 — тёмный, 1 — мягкий градиент, 2 — тонкий узор.
@@ -476,7 +480,9 @@ impl Default for Settings {
             notify: NotifySettings::default(),
             language: LanguageSettings::default(),
             security: SecuritySettings::default(),
-            window_opacity: 100,
+            window_opacity: 70,
+            opacity_v19_migrated: true,
+            diag_logging: true,
             blur_enabled: true,
             chat_bg_style: 0,
             auto_play_gifs: true,
@@ -507,7 +513,14 @@ impl Settings {
     }
 
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
+        let mut cfg: Self = serde_json::from_str(s)?;
+        if !cfg.opacity_v19_migrated {
+            if cfg.window_opacity == 100 {
+                cfg.window_opacity = 70;
+            }
+            cfg.opacity_v19_migrated = true;
+        }
+        Ok(cfg)
     }
 
     pub fn to_json(&self) -> String {
@@ -584,16 +597,20 @@ mod tests {
     }
 
     #[test]
-    fn opacity_defaults_to_100_and_survives_old_files() {
+    fn opacity_defaults_to_70_and_survives_old_files() {
         let def = Settings::default();
-        assert_eq!(def.window_opacity, 100);
+        assert_eq!(def.window_opacity, 70);
         assert!(def.blur_enabled);
         assert!(def.auto_play_gifs);
+        assert!(def.diag_logging);
         assert_eq!(def.chat_bg_style, 0);
         let from_empty = Settings::from_json("{}").unwrap();
-        assert_eq!(from_empty.window_opacity, 100);
+        assert_eq!(from_empty.window_opacity, 70);
         assert!(from_empty.blur_enabled);
         assert_eq!(Settings::from_json(r#"{"window_opacity":40}"#).unwrap().window_opacity, 40);
+        // Явно сохранённые 100% после миграции сохраняются.
+        let explicit_100 = Settings::from_json(r#"{"window_opacity":100,"opacity_v19_migrated":true}"#).unwrap();
+        assert_eq!(explicit_100.window_opacity, 100);
     }
 
     #[test]

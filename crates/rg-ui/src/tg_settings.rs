@@ -180,6 +180,13 @@ struct Actions {
     switch_account: Option<u32>,
     remove_account: Option<u32>,
     open_wipe_modal: bool,
+    open_stars: bool,
+    open_gifts: bool,
+    open_business: bool,
+    open_themes: bool,
+    update_color: Option<(bool, Option<i32>)>,
+    open_logs_dir: bool,
+    copy_logs: bool,
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -653,6 +660,51 @@ impl App {
             self.wipe_confirm_step = false;
             act.close = true;
         }
+        if act.open_stars {
+            self.stars_modal_open = true;
+            self.stars_tab = 0;
+            self.send(Cmd::LoadStarsStatus);
+            self.send(Cmd::LoadSavedGifts(None));
+            self.send(Cmd::LoadStarGiftsCatalog);
+            act.close = true;
+        }
+        if act.open_gifts {
+            self.stars_modal_open = true;
+            self.stars_tab = 1;
+            self.send(Cmd::LoadStarsStatus);
+            self.send(Cmd::LoadSavedGifts(None));
+            self.send(Cmd::LoadStarGiftsCatalog);
+            act.close = true;
+        }
+        if act.open_business {
+            self.business_open = true;
+            self.send(Cmd::LoadQuickReplies);
+            act.close = true;
+        }
+        if act.open_themes {
+            self.themes_open = true;
+            act.close = true;
+        }
+        if let Some((for_prof, col_id)) = act.update_color {
+            if for_prof {
+                self.profile_accent_color = col_id;
+            } else {
+                self.replies_accent_color = col_id;
+            }
+            self.send(Cmd::UpdateProfileColor(for_prof, col_id));
+        }
+        if act.open_logs_dir {
+            let dir = worker::home().join("logs");
+            let _ = std::fs::create_dir_all(&dir);
+            rg_core::media::open_downloaded(&dir);
+        }
+        if act.copy_logs {
+            let all = rg_core::diag::recent_lines();
+            let start = all.len().saturating_sub(80);
+            let txt = all[start..].join("\n");
+            ctx.copy_text(txt);
+            self.status = "Последние 80 строк диагностического лога скопированы".to_owned();
+        }
         if act.logout {
             self.logout_confirm = true;
             act.close = true;
@@ -829,6 +881,7 @@ fn main_page(
         s.default_scale = s.ui_scale == 100;
     }
     divider(ui);
+    // Официальный блок Telegram в Настройках (как на скрине 7: Premium, Звёзды, Бизнес, Подарки + Темы).
     let prem_val = match st.account.as_ref() {
         Some(a) if a.me.premium => "Активна",
         Some(_) => "Нет",
@@ -837,6 +890,19 @@ fn main_page(
     if nav_row(ui, "menu/star", "Telegram Premium", prem_val) {
         go = Some(pg::RUSTGRAMM);
     }
+    if nav_row(ui, "settings/favorite", "Мои звёзды", "") {
+        act.open_stars = true;
+    }
+    if nav_row(ui, "settings/folders", "Telegram Бизнес", "") {
+        act.open_business = true;
+    }
+    if nav_row(ui, "menu/gift", "Отправить подарок", "") {
+        act.open_gifts = true;
+    }
+    if nav_row(ui, "menu/customize", "Темы и иконки AyuGram", "") {
+        act.open_themes = true;
+    }
+    divider(ui);
     if nav_row(ui, "heart", "О Rustgramm", env!("CARGO_PKG_VERSION")) {
         go = Some(pg::RUSTGRAMM);
     }
@@ -854,35 +920,20 @@ fn qr_profile_page(ui: &mut egui::Ui, st: &State, me: &str, streamer: bool) {
     } else {
         "https://t.me/".to_owned()
     };
+    let pop_k = tween(ui.ctx(), "prof-qr-pop", 1.0, 0.25);
     ui.add_space(18.0);
     ui.vertical_centered(|ui| {
-        if let Ok(code) = qrcode::QrCode::new(url.as_bytes()) {
-            let side = code.width();
-            let dark: Vec<bool> = code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect();
-            let sz = 210.0;
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(sz), Sense::hover());
-            ui.painter().rect_filled(rect, CornerRadius::same(14), Color32::WHITE);
-            let inner = rect.shrink(14.0);
-            let cell = inner.width() / side as f32;
-            for y in 0..side {
-                for x in 0..side {
-                    if dark[y * side + x] {
-                        let r = Rect::from_min_size(inner.min + Vec2::new(x as f32, y as f32) * cell, Vec2::splat(cell + 0.4));
-                        ui.painter().rect_filled(r, 0.0, Color32::BLACK);
-                    }
-                }
-            }
-        }
-        ui.add_space(12.0);
-        ui.label(RichText::new(me).size(16.0).strong().color(WHITE));
+        let _ = draw_styled_qr(ui, &url, 224.0, c_orange(), pop_k);
+        ui.add_space(14.0);
+        ui.label(RichText::new(me).size(17.0).strong().color(WHITE));
         let link_text = if user.is_empty() {
             "Задайте @имя в разделе «Мой аккаунт»".to_owned()
         } else {
             mask_streamer(&format!("@{user}"), streamer)
         };
-        ui.label(RichText::new(link_text).size(13.5).color(ORANGE));
-        ui.add_space(12.0);
-        if !user.is_empty() && orange_button(ui, "Скопировать ссылку", Vec2::new(190.0, 34.0)).clicked() {
+        ui.label(RichText::new(link_text).size(13.5).color(c_orange()));
+        ui.add_space(14.0);
+        if !user.is_empty() && orange_button(ui, "Скопировать ссылку", Vec2::new(200.0, 36.0)).clicked() {
             ui.ctx().copy_text(url);
         }
         ui.add_space(18.0);
@@ -975,6 +1026,33 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, act: &mut Actions, streamer: 
     if nav_row(ui, "menu/qr_code", "Показать QR-код профиля", "") {
         st.qr_open = true;
     }
+    divider(ui);
+    section(ui, "Цвет профиля и ответов");
+    desc(ui, "Выберите фирменный акцентный цвет вашего профиля Telegram (account.updateColor).");
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(kit::PAD);
+        const SWATCHES: [(i32, Color32, &str); 7] = [
+            (0, Color32::from_rgb(225, 86, 86), "Красный"),
+            (1, Color32::from_rgb(235, 138, 52), "Оранжевый"),
+            (2, Color32::from_rgb(148, 108, 228), "Фиолетовый"),
+            (3, Color32::from_rgb(76, 186, 108), "Зелёный"),
+            (4, Color32::from_rgb(64, 178, 198), "Бирюзовый"),
+            (5, Color32::from_rgb(66, 146, 232), "Синий"),
+            (6, Color32::from_rgb(224, 96, 152), "Розовый"),
+        ];
+        for (cid, col, name) in SWATCHES {
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+            let hk = tween(ui.ctx(), ("acc-col", cid), f32::from(u8::from(resp.hovered())), 0.12);
+            ui.painter().circle_filled(r.center(), 10.5 + 1.5 * hk, col);
+            if resp.on_hover_text(format!("Цвет профиля: {name}")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                act.update_color = Some((true, Some(cid)));
+            }
+        }
+        if ui.small_button("Сбросить").clicked() {
+            act.update_color = Some((true, None));
+        }
+    });
+    ui.add_space(8.0);
 }
 
 fn notify_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act: &mut Actions) {
@@ -1491,6 +1569,54 @@ fn data_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act: 
     toggle(ui, "Автозапуск GIF в ленте", &mut s.auto_play_gifs);
     let atlas_path = worker::home().join("emoji-apple.png");
     info_row(ui, "Атлас эмодзи", if atlas && atlas_path.exists() { "Apple (локально)" } else { "Twemoji" });
+    divider(ui);
+    section(ui, "Диагностические логи (только локально)");
+    toggle(ui, "Подробная запись логов ошибок и RPC", &mut s.diag_logging);
+    let log_path_s = rg_core::diag::log_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "logs/rustgramm.log".to_owned());
+    desc(ui, &format!("Секреты и пароли автоматически скрываются. Файл: {log_path_s}"));
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        if ui.button("Открыть папку логов").clicked() {
+            act.open_logs_dir = true;
+        }
+        if orange_button(ui, "Скопировать лог", Vec2::new(146.0, 28.0)).clicked() {
+            act.copy_logs = true;
+        }
+    });
+    ui.add_space(6.0);
+    let all_recent = rg_core::diag::recent_lines();
+    let recent_start = all_recent.len().saturating_sub(18);
+    let recent = &all_recent[recent_start..];
+    if !recent.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            egui::Frame::new()
+                .fill(Color32::from_black_alpha(120))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width((ui.available_width() - kit::PAD).max(200.0));
+                    egui::ScrollArea::vertical()
+                        .id_salt("diag-log-preview")
+                        .max_height(130.0)
+                        .show(ui, |ui| {
+                            for line in recent {
+                                let col = if line.contains(" ERR ") {
+                                    DANGER
+                                } else if line.contains(" WRN ") {
+                                    c_orange()
+                                } else {
+                                    SUBTEXT
+                                };
+                                ui.label(RichText::new(line).monospace().size(10.5).color(col));
+                            }
+                        });
+                });
+        });
+        ui.add_space(8.0);
+    }
 }
 
 fn folders_page(

@@ -232,6 +232,15 @@ mod imp {
         fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
         fn BringWindowToTop(hwnd: *mut c_void) -> i32;
         fn SendMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            insert_after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
         fn CreateIconIndirect(piconinfo: *const IconInfo) -> *mut c_void;
         pub(crate) fn DestroyIcon(hicon: *mut c_void) -> i32;
     }
@@ -297,6 +306,11 @@ mod imp {
     const SW_HIDE: i32 = 0;
     const SW_SHOW: i32 = 5;
     const SW_RESTORE: i32 = 9;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
     const WM_SETICON: u32 = 0x0080;
     const ICON_SMALL: usize = 0;
     const ICON_BIG: usize = 1;
@@ -356,12 +370,29 @@ mod imp {
         if hwnd.is_null() {
             return;
         }
-        let m = Margins { left: -1, right: -1, top: -1, bottom: -1 };
+        let m = if blur {
+            Margins { left: -1, right: -1, top: -1, bottom: -1 }
+        } else {
+            Margins { left: 0, right: 0, top: 0, bottom: 0 }
+        };
         // SAFETY: структура `Margins` живёт до конца вызова.
         let _ = unsafe { DwmExtendFrameIntoClientArea(hwnd, &raw const m) };
         let backdrop: i32 = if blur { 3 } else { 1 };
         // SAFETY: указатель на i32 живёт до конца вызова, размер 4 байта.
         let _ = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&raw const backdrop).cast(), 4) };
+        // Уведомляем DWM о смене клиентской рамки — предотвращает двоение и артефакты прозрачности.
+        // SAFETY: валидный HWND, без изменения позиции и размера.
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+        };
         APPLIED_BLUR.store(blur, Ordering::Relaxed);
     }
 

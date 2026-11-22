@@ -31,6 +31,10 @@ pub(crate) enum StickerAct {
     InsertCustom(String, i64),
     /// Загрузить сохранённые GIF.
     Gifs,
+    /// Принудительно перезагрузить стикеры.
+    ReloadSets,
+    /// Принудительно перезагрузить GIF.
+    ReloadGifs,
 }
 
 impl App {
@@ -49,20 +53,35 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    // Кнопка публикации своей истории («+ Моя история»).
+                    // Кнопка публикации своей истории («+ Моя история») — чёткий векторный «+» ровно по центру.
                     {
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 62.0), Sense::click());
-                        let center = Pos2::new(rect.center().x, rect.top() + 23.0);
-                        let hk = tween(ui.ctx(), "story-add-h", f32::from(u8::from(resp.hovered())), 0.12);
-                        ui.painter().circle_stroke(center, 20.5, Stroke::new(2.0, lerp_color(ORANGE.gamma_multiply(0.75), ORANGE, hk)));
-                        ui.painter().circle_filled(center, 18.0, t(WINDOW_OVER));
-                        ui.painter().text(center, Align2::CENTER_CENTER, "+", FontId::proportional(20.0), ORANGE);
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 72.0), Sense::click());
+                        let center = Pos2::new(rect.center().x, rect.top() + 26.0);
+                        let hk = tween(ui.ctx(), "story-add-h", f32::from(u8::from(resp.hovered())), 0.14);
+                        let sc = 1.0 + 0.08 * ios_spring_bounce(hk);
+                        let accent = c_orange();
+                        ui.painter().circle_stroke(
+                            center,
+                            21.0 * sc,
+                            Stroke::new(2.0, lerp_color(accent.gamma_multiply(0.75), accent, hk)),
+                        );
+                        ui.painter().circle_filled(center, 18.0 * sc, t(WINDOW_OVER));
+                        let arm = 6.5 * sc;
+                        let ps = Stroke::new(2.2, accent);
+                        ui.painter().line_segment(
+                            [Pos2::new(center.x - arm, center.y), Pos2::new(center.x + arm, center.y)],
+                            ps,
+                        );
+                        ui.painter().line_segment(
+                            [Pos2::new(center.x, center.y - arm), Pos2::new(center.x, center.y + arm)],
+                            ps,
+                        );
                         ui.painter().text(
-                            Pos2::new(rect.center().x, rect.bottom() - 8.0),
+                            Pos2::new(rect.center().x, rect.bottom() - 10.0),
                             Align2::CENTER_CENTER,
                             "Моя",
-                            FontId::proportional(11.0),
-                            if resp.hovered() { ORANGE } else { WHITE },
+                            FontId::proportional(11.5),
+                            if resp.hovered() { accent } else { WHITE },
                         );
                         if resp.on_hover_text("Опубликовать свою историю").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             open_composer = true;
@@ -72,25 +91,27 @@ impl App {
                         if !self.avatars.contains_key(&st.peer_id) && self.avatar_req.insert(st.peer_id) {
                             need_avatar.push((st.peer, st.peer_id));
                         }
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(52.0, 62.0), Sense::click());
-                        let center = Pos2::new(rect.center().x, rect.top() + 23.0);
-                        let ring = if st.unread { ORANGE } else { SUBTEXT.gamma_multiply(0.5) };
-                        ui.painter().circle_stroke(center, 20.5, Stroke::new(2.0, ring));
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 72.0), Sense::click());
+                        let center = Pos2::new(rect.center().x, rect.top() + 26.0);
+                        let hk = tween(ui.ctx(), ("st-h", st.story_id), f32::from(u8::from(resp.hovered())), 0.14);
+                        let sc = 1.0 + 0.06 * ios_spring_bounce(hk);
+                        let ring = if st.unread { c_orange() } else { SUBTEXT.gamma_multiply(0.55) };
+                        ui.painter().circle_stroke(center, 21.0 * sc, Stroke::new(2.1, ring));
                         draw_avatar(
                             ui,
                             center,
                             &st.author,
                             st.peer_id,
-                            36.0,
+                            36.0 * sc,
                             self.avatars.get(&st.peer_id),
                             self.settings.ayu.avatar_corners,
                         );
                         let short: String = st.author.chars().take(7).collect();
                         ui.painter().text(
-                            Pos2::new(rect.center().x, rect.bottom() - 8.0),
+                            Pos2::new(rect.center().x, rect.bottom() - 10.0),
                             Align2::CENTER_CENTER,
                             short,
-                            FontId::proportional(11.0),
+                            FontId::proportional(11.5),
                             if st.unread { WHITE } else { SUBTEXT },
                         );
                         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -112,11 +133,12 @@ impl App {
             } else {
                 self.story_open = Some(idx);
                 self.story_opened_at = Some(std::time::Instant::now());
+                self.story_paused = false;
                 if let Some(st) = self.stories.get_mut(idx) {
                     st.unread = false;
                     let (peer, sid) = (st.peer, st.story_id);
                     self.send(Cmd::ReadStory(peer, sid));
-                    if self.story_media_req.insert(sid) {
+                    if !self.story_textures.contains_key(&sid) && self.story_media_req.insert(sid) {
                         self.send(Cmd::LoadStoryMedia(peer, sid));
                     }
                 }
@@ -445,9 +467,26 @@ impl App {
             acts.push(StickerAct::Gifs);
         }
         if self.gif_list.is_empty() {
-            ui.add_space(40.0);
+            ui.add_space(36.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(if self.gifs_requested { "Нет сохранённых GIF" } else { "Загрузка…" }).color(SUBTEXT));
+                if !self.gifs_loaded {
+                    ui.add(egui::Spinner::new().size(20.0).color(c_orange()));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Загрузка сохранённых GIF…").color(SUBTEXT));
+                } else {
+                    ui.label(egui::RichText::new("Нет сохранённых GIF").color(SUBTEXT));
+                    ui.add_space(8.0);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Обновить").size(12.5).color(WHITE))
+                                .fill(t_btn(BUTTON))
+                                .corner_radius(CornerRadius::same(10)),
+                        )
+                        .clicked()
+                    {
+                        acts.push(StickerAct::ReloadGifs);
+                    }
+                }
             });
             return;
         }
@@ -542,80 +581,137 @@ impl App {
             });
     }
 
-    /// Вкладка «Стикеры»: сетка выбранного набора и полоса наборов внизу.
+    /// Вкладка «Стикеры»: Избранные, Недавние и все установленные наборы пользователя + плавные TGS.
     pub(crate) fn sticker_tab(&self, ui: &mut egui::Ui, emoji: Option<&Emoji>, acts: &mut Vec<StickerAct>) {
         if !self.stickers_requested {
             acts.push(StickerAct::LoadSets);
         }
-        if self.sticker_sets.is_empty() {
-            ui.add_space(40.0);
+        let has_fav = !self.faved_stickers.is_empty();
+        let has_rec = !self.recent_stickers.is_empty();
+        let extra = usize::from(has_fav) + usize::from(has_rec);
+        let total_tabs = extra + self.sticker_sets.len();
+        if total_tabs == 0 {
+            ui.add_space(36.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(if self.stickers_requested { "Нет наборов стикеров" } else { "Загрузка…" }).color(SUBTEXT));
+                if !self.stickers_loaded {
+                    ui.add(egui::Spinner::new().size(20.0).color(c_orange()));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Загрузка стикеров…").color(SUBTEXT));
+                } else {
+                    ui.label(egui::RichText::new("Нет наборов стикеров").color(SUBTEXT));
+                    ui.add_space(8.0);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Обновить").size(12.5).color(WHITE))
+                                .fill(t_btn(BUTTON))
+                                .corner_radius(CornerRadius::same(10)),
+                        )
+                        .clicked()
+                    {
+                        acts.push(StickerAct::ReloadSets);
+                    }
+                }
             });
             return;
         }
-        let cur = self.sticker_cur.min(self.sticker_sets.len() - 1);
-        let set = &self.sticker_sets[cur];
-        let list = self.sticker_lists.get(&set.id);
-        if list.is_none() {
-            acts.push(StickerAct::LoadSet(cur));
-        }
+        let cur = self.sticker_cur.min(total_tabs - 1);
+        let (title, list): (&str, Option<&Vec<rg_core::engine::StickerRow>>) = if has_fav && cur == 0 {
+            ("★ Избранные стикеры", Some(&self.faved_stickers))
+        } else if has_rec && cur == usize::from(has_fav) {
+            ("Недавние стикеры", Some(&self.recent_stickers))
+        } else {
+            let set_idx = cur - extra;
+            let set = &self.sticker_sets[set_idx];
+            let l = self.sticker_lists.get(&set.id);
+            if l.is_none() {
+                acts.push(StickerAct::LoadSet(set_idx));
+            }
+            (&set.title, l)
+        };
         let cols = 4usize;
         let width = ui.available_width();
-        let cell = width / cols as f32;
+        let cell = (width / cols as f32).max(48.0);
         egui::ScrollArea::vertical()
-            .max_height(ui.available_height() - 44.0)
+            .id_salt(("stk-grid", cur))
+            .max_height((ui.available_height() - 44.0).max(80.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(&set.title).size(12.5).color(Color32::from_rgb(150, 150, 158)));
+                ui.label(egui::RichText::new(title).size(12.5).color(Color32::from_rgb(160, 160, 170)));
                 ui.add_space(4.0);
+                if list.is_none() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add(egui::Spinner::new().size(18.0).color(c_orange()));
+                    });
+                }
                 for row in list.map(|l| l.chunks(cols)).into_iter().flatten() {
                     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, cell), Sense::hover());
                     for (k, st) in row.iter().enumerate() {
                         let r = Rect::from_min_size(Pos2::new(rect.left() + k as f32 * cell, rect.top()), Vec2::splat(cell));
                         let resp = ui.interact(r, ui.make_persistent_id(("stk", st.id)), Sense::click());
-                        let h = tween(ui.ctx(), ("stkh", st.id), f32::from(u8::from(resp.hovered())), 0.1);
+                        let h = tween(ui.ctx(), ("stkh", st.id), f32::from(u8::from(resp.hovered())), 0.12);
                         if h > 0.01 {
                             ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(10), Color32::from_rgba_unmultiplied(255, 255, 255, (22.0 * h) as u8));
                         }
-                        let side = (cell - 14.0) * (1.0 + 0.06 * h);
+                        let side = (cell - 12.0) * (1.0 + 0.08 * ios_spring_bounce(h));
                         let area = Rect::from_center_size(r.center(), Vec2::splat(side));
                         if let Some(tex) = self.sticker_tex.get(&st.id) {
                             egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
-                        } else if st.has_preview() {
+                        } else if st.has_preview() || st.mime == "application/x-tgsticker" {
                             if ui.is_rect_visible(r) {
                                 acts.push(StickerAct::Thumb(st.id));
                             }
                             ui.painter().rect_filled(area.shrink(10.0), CornerRadius::same(12), Color32::from_rgba_unmultiplied(255, 255, 255, 10));
                         } else if let Some(img) = emoji.and_then(|e| st.emoji.chars().next().and_then(|c| e.image(c, 34.0))) {
-                            // Анимированные стикеры (TGS/WebM) пока не воспроизводятся: показываем эмодзи.
                             img.paint_at(ui, Rect::from_center_size(r.center(), Vec2::splat(34.0)));
                         }
-                        if resp.clicked() {
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             acts.push(StickerAct::Send(st.id));
                         }
                     }
                 }
             });
         ui.add_space(4.0);
-        let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::hover());
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::hover());
         ui.painter().line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)));
-        let n = self.sticker_sets.len().min(9);
-        for (i, s) in self.sticker_sets.iter().take(n).enumerate() {
-            let c = Pos2::new(bar.left() + bar.width() * (i as f32 + 0.5) / n as f32, bar.center().y);
-            let r = Rect::from_center_size(c, Vec2::splat(30.0));
-            let resp = ui.interact(r, ui.make_persistent_id(("stkset", i)), Sense::click());
-            let sel = tween(ui.ctx(), ("stkseth", i), f32::from(u8::from(i == cur || resp.hovered())), 0.12);
-            let p = ui.painter();
-            p.circle_filled(c, 13.0, lerp_color(Color32::from_rgb(52, 52, 58), Color32::from_rgb(88, 88, 96), sel));
-            let initial = s.title.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_default();
-            p.text(c, Align2::CENTER_CENTER, initial, FontId::proportional(13.0), WHITE);
-            if resp.clicked() {
-                acts.push(StickerAct::SelectSet(i));
-            }
-        }
+        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+        egui::ScrollArea::horizontal()
+            .id_salt("stk-set-bar")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(&mut inner, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                    ui.set_height(38.0);
+                    for tab_i in 0..total_tabs {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(34.0, 38.0), Sense::click());
+                        let sel = tween(ui.ctx(), ("stkseth", tab_i), f32::from(u8::from(tab_i == cur || resp.hovered())), 0.12);
+                        let p = ui.painter();
+                        let c = r.center();
+                        let bg = if tab_i == cur {
+                            t_btn(c_orange())
+                        } else {
+                            lerp_color(Color32::from_rgb(48, 48, 56), Color32::from_rgb(76, 76, 86), sel)
+                        };
+                        p.circle_filled(c, 13.5, bg);
+                        let (lbl, tip) = if has_fav && tab_i == 0 {
+                            ("★".to_owned(), "Избранные стикеры".to_owned())
+                        } else if has_rec && tab_i == usize::from(has_fav) {
+                            ("⏱".to_owned(), "Недавние стикеры".to_owned())
+                        } else {
+                            let s = &self.sticker_sets[tab_i - extra];
+                            let init = s.title.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "S".to_owned());
+                            (init, s.title.clone())
+                        };
+                        p.text(c, Align2::CENTER_CENTER, lbl, FontId::proportional(13.0), WHITE);
+                        if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            acts.push(StickerAct::SelectSet(tab_i));
+                        }
+                    }
+                });
+            });
+        ui.advance_cursor_after_rect(bar);
         let _ = icons::Ico::Sticker;
     }
 }

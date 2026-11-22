@@ -226,9 +226,11 @@ pub async fn connect(cfg: &Config) -> Result<grammers_client::Client, Box<dyn st
 
 pub mod call_media;
 pub mod calls;
+pub mod diag;
 pub mod engine;
 pub mod media;
 pub mod qr;
+pub mod rich_msg;
 pub mod secret;
 
 #[cfg(test)]

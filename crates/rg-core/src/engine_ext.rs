@@ -162,7 +162,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Скачивает картинку/миниатюру истории для отображения в просмотрщике (`stories.getStoriesByID`).
+    /// Скачивает картинку/миниатюру истории для отображения в просмотрщике (`stories.getStoriesByID`)
+    /// с автоматической поддержкой кросс-DC (`dc_id` / `FILE_MIGRATE_X` через `iter_download`).
     pub async fn story_media_path(&self, peer: PeerRef, story_id: i32) -> Result<Option<PathBuf>, String> {
         let dir = self.dirs.cache.join("stories");
         let _ = std::fs::create_dir_all(&dir);
@@ -170,18 +171,21 @@ impl Engine {
         if dest.exists() && std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) {
             return Ok(Some(dest));
         }
+        let t0 = std::time::Instant::now();
         let tl::enums::stories::Stories::Stories(st) = self
-            .client
-            .invoke(&tl::functions::stories::GetStoriesById {
-                peer: peer.into(),
-                id: vec![story_id],
-            })
+            .invoke_retry(
+                "stories.getStoriesById",
+                &tl::functions::stories::GetStoriesById {
+                    peer: peer.into(),
+                    id: vec![story_id],
+                },
+            )
             .await
             .map_err(|e| format!("Загрузка истории: {e}"))?;
         let Some(tl::enums::StoryItem::Item(item)) = st.stories.into_iter().next() else {
             return Ok(None);
         };
-        let loc = match item.media {
+        let loc_dc: Option<(tl::enums::InputFileLocation, Option<i32>)> = match item.media {
             tl::enums::MessageMedia::Photo(p) => {
                 if let Some(tl::enums::Photo::Photo(ph)) = p.photo {
                     let sz = ph
@@ -194,13 +198,14 @@ impl Engine {
                             _ => None,
                         })
                         .unwrap_or_else(|| "x".to_owned());
-                    Some(tl::enums::InputFileLocation::InputPhotoFileLocation(
-                        tl::types::InputPhotoFileLocation {
+                    Some((
+                        tl::enums::InputFileLocation::InputPhotoFileLocation(tl::types::InputPhotoFileLocation {
                             id: ph.id,
                             access_hash: ph.access_hash,
                             file_reference: ph.file_reference,
                             thumb_size: sz,
-                        },
+                        }),
+                        Some(ph.dc_id),
                     ))
                 } else {
                     None
@@ -214,17 +219,21 @@ impl Engine {
                         .and_then(|ts| {
                             ts.iter().rev().find_map(|s| match s {
                                 tl::enums::PhotoSize::Size(x) => Some(x.r#type.clone()),
+                                tl::enums::PhotoSize::Progressive(x) => Some(x.r#type.clone()),
                                 _ => None,
                             })
                         })
                         .unwrap_or_default();
-                    Some(tl::enums::InputFileLocation::InputDocumentFileLocation(
-                        tl::types::InputDocumentFileLocation {
-                            id: doc.id,
-                            access_hash: doc.access_hash,
-                            file_reference: doc.file_reference,
-                            thumb_size: thumb,
-                        },
+                    Some((
+                        tl::enums::InputFileLocation::InputDocumentFileLocation(
+                            tl::types::InputDocumentFileLocation {
+                                id: doc.id,
+                                access_hash: doc.access_hash,
+                                file_reference: doc.file_reference,
+                                thumb_size: thumb,
+                            },
+                        ),
+                        Some(doc.dc_id),
                     ))
                 } else {
                     None
@@ -232,37 +241,34 @@ impl Engine {
             }
             _ => None,
         };
-        let Some(location) = loc else {
+        let Some((loc, dc_id)) = loc_dc else {
             return Ok(None);
         };
+        let dl = super::RawLoc { loc, dc_id };
+        let mut it = self.client.iter_download(&dl);
         let mut out = Vec::new();
-        let mut offset = 0i64;
-        loop {
-            let res = self
-                .client
-                .invoke(&tl::functions::upload::GetFile {
-                    precise: false,
-                    cdn_supported: false,
-                    location: location.clone(),
-                    offset,
-                    limit: 512 * 1024,
-                })
-                .await
-                .map_err(|e| format!("Скачивание медиа истории: {e}"))?;
-            let chunk = match res {
-                tl::enums::upload::File::File(f) => f.bytes,
-                tl::enums::upload::File::CdnRedirect(_) => break,
-            };
-            let n = chunk.len();
+        while let Some(chunk) = it
+            .next()
+            .await
+            .map_err(|e| format!("Скачивание медиа истории: {e}"))?
+        {
             out.extend_from_slice(&chunk);
-            offset += n as i64;
-            if n < 512 * 1024 || out.len() > 8 * 1024 * 1024 {
+            if out.len() > 8 * 1024 * 1024 {
                 break;
             }
         }
         if out.is_empty() {
             return Ok(None);
         }
+        crate::diag::info(
+            "STORY",
+            &format!(
+                "История #{story_id} (dc={:?}) загружена: {} КБ за {} мс",
+                dc_id,
+                out.len() / 1024,
+                t0.elapsed().as_millis()
+            ),
+        );
         std::fs::write(&dest, &out).map_err(|e| e.to_string())?;
         Ok(Some(dest))
     }
@@ -1526,4 +1532,647 @@ fn input_saved_star_gift(
         ));
     }
     Err("Идентификатор подарка не задан".to_owned())
+}
+
+// =========================================================================
+// Новые функции v0.19.0: безлимитная расшифровка голосовых, отложенные/напоминания,
+// эффекты сообщений, интерактивные чеклисты (Todo), опросы/викторины, теги Избранного,
+// отправка от имени канала (Send-As), глобальный поиск хэштегов, цвет профиля, Slow Mode.
+// =========================================================================
+
+/// Тег-реакция в «Избранном» (`messages.getSavedReactionTags`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedTagItem {
+    pub emoji: String,
+    pub title: String,
+    pub count: i32,
+}
+
+/// Профиль/канал, от имени которого можно писать в группе/канале (`channels.getSendAs`).
+#[derive(Debug, Clone)]
+pub struct SendAsItem {
+    pub peer: PeerRef,
+    pub id: i64,
+    pub title: String,
+    pub premium_required: bool,
+}
+
+/// Доступный анимированный эффект сообщения (`messages.getAvailableEffects`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageEffectItem {
+    pub id: i64,
+    pub emoticon: String,
+    pub premium_required: bool,
+}
+
+impl Engine {
+    /// Расшифровка голосового/видеосообщения в текст (`messages.transcribeAudio`).
+    /// Если Telegram ограничивает аккаунт без Premium (`PREMIUM_ACCOUNT_REQUIRED` / лимит 2/нед),
+    /// автоматически переключается на безлимитную локальную офлайн-расшифровку (без сторонних серверов!).
+    pub async fn transcribe_voice(&self, peer: PeerRef, msg_id: i32) -> Result<String, String> {
+        let tg_res = self
+            .invoke_retry(
+                "messages.transcribeAudio",
+                &tl::functions::messages::TranscribeAudio {
+                    peer: peer.into(),
+                    msg_id,
+                },
+            )
+            .await;
+        match tg_res {
+            Ok(tl::enums::messages::TranscribedAudio::Audio(ta)) => {
+                if !ta.text.trim().is_empty() {
+                    crate::diag::info("VOICE", &format!("Расшифровка Telegram OK (#{msg_id})"));
+                    return Ok(ta.text);
+                }
+                if ta.pending {
+                    // Короткое ожидание завершения серверной расшифровки Telegram.
+                    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+                    if let Ok(tl::enums::messages::TranscribedAudio::Audio(ta2)) = self
+                        .invoke_retry(
+                            "messages.transcribeAudio(poll)",
+                            &tl::functions::messages::TranscribeAudio {
+                                peer: peer.into(),
+                                msg_id,
+                            },
+                        )
+                        .await
+                        && !ta2.text.trim().is_empty()
+                    {
+                        return Ok(ta2.text);
+                    }
+                }
+            }
+            Err(e) => {
+                crate::diag::warn("VOICE", &format!("Серверная расшифровка недоступна ({e}), переход на локальную"));
+            }
+        }
+        // Безлимитная локальная офлайн-расшифровка (0 сторонних хостов):
+        // скачиваем голосовое в кэш и прогоняем через локальный whisper-cli (если лежит в `whisper/`) или системный движок ОС.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let downloaded = self
+            .fetch_media(peer, msg_id, false, &cancel, |_, _| {})
+            .await
+            .map_err(|e| format!("Скачивание аудио для расшифровки: {e}"))?;
+        let super::Fetched::Ready(audio_path) = downloaded else {
+            return Err("Не удалось скачать голосовое для локальной расшифровки".to_owned());
+        };
+        let home_whisper = self.dirs.cache.parent().unwrap_or(&self.dirs.cache).join("whisper");
+        tokio::task::spawn_blocking(move || local_transcribe_audio(&audio_path, &home_whisper))
+            .await
+            .map_err(|e| format!("Поток расшифровки: {e}"))?
+    }
+
+    /// Отправка сообщения с отложенным временем / напоминанием (`schedule_date`), анимированным
+    /// эффектом (`effect`) и выбором отправителя (`send_as` — писать от имени канала).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_advanced(
+        &self,
+        peer: PeerRef,
+        text: &str,
+        entities: &[super::Entity],
+        reply_to: Option<i32>,
+        schedule_date: Option<i32>,
+        effect: Option<i64>,
+        send_as: Option<PeerRef>,
+        force_silent: bool,
+    ) -> Result<(), String> {
+        let cfg = self.settings();
+        let tl_ents = super::entities_to_tl(text, entities);
+        let reply_header = reply_to.map(|mid| {
+            tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                reply_to_msg_id: mid,
+                top_msg_id: None,
+                reply_to_peer_id: None,
+                quote_text: None,
+                quote_entities: None,
+                quote_offset: None,
+                monoforum_peer_id: None,
+                todo_item_id: None,
+                poll_option: None,
+                quote_rich: None,
+            })
+        });
+        let silent = force_silent || cfg.ghost.should_send_without_sound();
+        self.apply_traffic_jitter().await;
+        self.invoke_retry(
+            "messages.sendMessage(adv)",
+            &tl::functions::messages::SendMessage {
+                no_webpage: false,
+                silent,
+                background: false,
+                clear_draft: true,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.into(),
+                reply_to: reply_header,
+                message: text.to_owned(),
+                random_id: rand_i64(),
+                reply_markup: None,
+                entities: (!tl_ents.is_empty()).then_some(tl_ents),
+                schedule_date,
+                schedule_repeat_period: None,
+                send_as: send_as.map(Into::into),
+                quick_reply_shortcut: None,
+                effect,
+                allow_paid_stars: None,
+                suggested_post: None,
+                rich_message: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Отправка: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает очередь отложенных сообщений и напоминаний чата (`messages.getScheduledHistory`).
+    pub async fn scheduled_history(&self, peer: PeerRef) -> Result<Vec<super::MessageRow>, String> {
+        let res = self
+            .invoke_retry(
+                "messages.getScheduledHistory",
+                &tl::functions::messages::GetScheduledHistory {
+                    peer: peer.into(),
+                    hash: 0,
+                },
+            )
+            .await
+            .map_err(|e| format!("Отложенные: {e}"))?;
+        let mut rows = super::tl_messages_to_rows(&res);
+        rows.sort_by_key(|r| (r.date, r.id));
+        Ok(rows)
+    }
+
+    /// Немедленно отправить отложенные сообщения (`messages.sendScheduledMessages`).
+    pub async fn send_scheduled_now(&self, peer: PeerRef, ids: Vec<i32>) -> Result<(), String> {
+        self.invoke_retry(
+            "messages.sendScheduledMessages",
+            &tl::functions::messages::SendScheduledMessages {
+                peer: peer.into(),
+                id: ids,
+            },
+        )
+        .await
+        .map_err(|e| format!("Отправка отложенного: {e}"))?;
+        Ok(())
+    }
+
+    /// Удалить отложенные сообщения (`messages.deleteScheduledMessages`).
+    pub async fn delete_scheduled(&self, peer: PeerRef, ids: Vec<i32>) -> Result<(), String> {
+        self.invoke_retry(
+            "messages.deleteScheduledMessages",
+            &tl::functions::messages::DeleteScheduledMessages {
+                peer: peer.into(),
+                id: ids,
+            },
+        )
+        .await
+        .map_err(|e| format!("Удаление отложенного: {e}"))?;
+        Ok(())
+    }
+
+    /// Создать интерактивный чеклист задач в чате (`InputMedia::Todo`).
+    pub async fn send_todo_list(
+        &self,
+        peer: PeerRef,
+        title: &str,
+        items: &[String],
+        others_can_complete: bool,
+        others_can_append: bool,
+    ) -> Result<(), String> {
+        let list: Vec<tl::enums::TodoItem> = items
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .enumerate()
+            .map(|(idx, s)| {
+                tl::enums::TodoItem::Item(tl::types::TodoItem {
+                    id: (idx + 1) as i32,
+                    title: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                        text: s.trim().to_owned(),
+                        entities: Vec::new(),
+                    }),
+                })
+            })
+            .collect();
+        if list.is_empty() {
+            return Err("Добавьте хотя бы один пункт задачи".to_owned());
+        }
+        let media = tl::enums::InputMedia::Todo(tl::types::InputMediaTodo {
+            todo: tl::enums::TodoList::List(tl::types::TodoList {
+                others_can_append,
+                others_can_complete,
+                title: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                    text: title.trim().to_owned(),
+                    entities: Vec::new(),
+                }),
+                list,
+            }),
+        });
+        self.invoke_retry(
+            "messages.sendMedia(todo)",
+            &tl::functions::messages::SendMedia {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.into(),
+                reply_to: None,
+                media,
+                message: String::new(),
+                random_id: rand_i64(),
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Создание чеклиста: {e}"))?;
+        Ok(())
+    }
+
+    /// Отметить или снять галочку пункта чеклиста (`messages.toggleTodoCompleted`).
+    pub async fn toggle_todo_item(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        item_id: i32,
+        completed: bool,
+    ) -> Result<(), String> {
+        let (comp, incomp) = if completed { (vec![item_id], Vec::new()) } else { (Vec::new(), vec![item_id]) };
+        self.invoke_retry(
+            "messages.toggleTodoCompleted",
+            &tl::functions::messages::ToggleTodoCompleted {
+                peer: peer.into(),
+                msg_id,
+                completed: comp,
+                incompleted: incomp,
+            },
+        )
+        .await
+        .map_err(|e| format!("Чеклист: {e}"))?;
+        Ok(())
+    }
+
+    /// Создать опрос или викторину прямо в чате (`InputMedia::Poll`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_poll(
+        &self,
+        peer: PeerRef,
+        question: &str,
+        options: &[String],
+        anonymous: bool,
+        multiple_choice: bool,
+        quiz: bool,
+        correct_idx: Option<usize>,
+        explanation: &str,
+    ) -> Result<(), String> {
+        let answers: Vec<tl::enums::PollAnswer> = options
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .take(10)
+            .enumerate()
+            .map(|(idx, s)| {
+                tl::enums::PollAnswer::Answer(tl::types::PollAnswer {
+                    text: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                        text: s.trim().to_owned(),
+                        entities: Vec::new(),
+                    }),
+                    option: vec![idx as u8],
+                    media: None,
+                    added_by: None,
+                    date: None,
+                })
+            })
+            .collect();
+        if answers.len() < 2 {
+            return Err("Укажите минимум 2 варианта ответа".to_owned());
+        }
+        let poll = tl::enums::Poll::Poll(tl::types::Poll {
+            id: rand_i64(),
+            closed: false,
+            public_voters: !anonymous,
+            multiple_choice: multiple_choice && !quiz,
+            quiz,
+            open_answers: false,
+            revoting_disabled: false,
+            shuffle_answers: false,
+            hide_results_until_close: false,
+            creator: true,
+            subscribers_only: false,
+            question: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                text: question.trim().to_owned(),
+                entities: Vec::new(),
+            }),
+            answers,
+            close_period: None,
+            close_date: None,
+            countries_iso2: None,
+            hash: 0,
+        });
+        let correct_answers = if quiz {
+            Some(vec![correct_idx.unwrap_or(0) as i32])
+        } else {
+            None
+        };
+        let sol = explanation.trim();
+        let media = tl::enums::InputMedia::Poll(Box::new(tl::types::InputMediaPoll {
+            poll,
+            correct_answers,
+            attached_media: None,
+            solution: (quiz && !sol.is_empty()).then(|| sol.to_owned()),
+            solution_entities: None,
+            solution_media: None,
+        }));
+        self.invoke_retry(
+            "messages.sendMedia(poll)",
+            &tl::functions::messages::SendMedia {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.into(),
+                reply_to: None,
+                media,
+                message: String::new(),
+                random_id: rand_i64(),
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Создание опроса: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает теги-реакции в «Избранном» (`messages.getSavedReactionTags`).
+    pub async fn saved_reaction_tags(&self) -> Result<Vec<SavedTagItem>, String> {
+        let res = self
+            .invoke_retry(
+                "messages.getSavedReactionTags",
+                &tl::functions::messages::GetSavedReactionTags {
+                    peer: None,
+                    hash: 0,
+                },
+            )
+            .await
+            .map_err(|e| format!("Теги Избранного: {e}"))?;
+        let tl::enums::messages::SavedReactionTags::Tags(t) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(t.tags
+            .into_iter()
+            .filter_map(|tag| {
+                let tl::enums::SavedReactionTag::Tag(x) = tag;
+                let emoji = match x.reaction {
+                    tl::enums::Reaction::Emoji(e) => e.emoticon,
+                    tl::enums::Reaction::CustomEmoji(_) => "✨".to_owned(),
+                    _ => return None,
+                };
+                Some(SavedTagItem {
+                    emoji,
+                    title: x.title.unwrap_or_default(),
+                    count: x.count,
+                })
+            })
+            .collect())
+    }
+
+    /// Переименовывает тег в «Избранном» (`messages.updateSavedReactionTag`).
+    pub async fn update_saved_reaction_tag(&self, emoji: &str, title: &str) -> Result<(), String> {
+        let t = title.trim();
+        self.invoke_retry(
+            "messages.updateSavedReactionTag",
+            &tl::functions::messages::UpdateSavedReactionTag {
+                reaction: tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                    emoticon: emoji.to_owned(),
+                }),
+                title: (!t.is_empty()).then(|| t.to_owned()),
+            },
+        )
+        .await
+        .map_err(|e| format!("Обновление тега: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает список профилей/каналов «Писать от имени…» (`channels.getSendAs`).
+    pub async fn send_as_peers(&self, peer: PeerRef) -> Result<Vec<SendAsItem>, String> {
+        let tl::enums::channels::SendAsPeers::Peers(res) = self
+            .invoke_retry(
+                "channels.getSendAs",
+                &tl::functions::channels::GetSendAs {
+                    for_paid_reactions: false,
+                    for_live_stories: false,
+                    peer: peer.into(),
+                },
+            )
+            .await
+            .map_err(|e| format!("Писать от имени: {e}"))?;
+        let mut out = Vec::new();
+        for sp in res.peers {
+            let tl::enums::SendAsPeer::Peer(x) = sp;
+            match &x.peer {
+                tl::enums::Peer::User(u) => {
+                    if let Some(usr) = res.users.iter().find(|y| matches!(y, tl::enums::User::User(z) if z.id == u.user_id)) {
+                        let tl::enums::User::User(z) = usr else { continue };
+                        let title = format!("{} {}", z.first_name.as_deref().unwrap_or(""), z.last_name.as_deref().unwrap_or(""))
+                            .trim()
+                            .to_owned();
+                        out.push(SendAsItem {
+                            peer: PeerRef::from(usr),
+                            id: z.id,
+                            title: if title.is_empty() { "Личный профиль".to_owned() } else { title },
+                            premium_required: x.premium_required,
+                        });
+                    }
+                }
+                tl::enums::Peer::Channel(c) => {
+                    if let Some(ch) = res.chats.iter().find(|y| matches!(y, tl::enums::Chat::Channel(z) if z.id == c.channel_id)) {
+                        let tl::enums::Chat::Channel(z) = ch else { continue };
+                        out.push(SendAsItem {
+                            peer: PeerRef::from(ch),
+                            id: -1_000_000_000_000 - z.id,
+                            title: z.title.clone(),
+                            premium_required: x.premium_required,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Глобальный поиск постов по хэштегу по всем публичным каналам (`channels.searchPosts`).
+    pub async fn search_hashtag_posts(&self, hashtag: &str, limit: i32) -> Result<Vec<super::MessageRow>, String> {
+        let tag = hashtag.trim().trim_start_matches('#');
+        if tag.is_empty() {
+            return Ok(Vec::new());
+        }
+        let res = self
+            .invoke_retry(
+                "channels.searchPosts",
+                &tl::functions::channels::SearchPosts {
+                    hashtag: Some(tag.to_owned()),
+                    query: None,
+                    offset_rate: 0,
+                    offset_peer: tl::enums::InputPeer::Empty,
+                    offset_id: 0,
+                    limit: limit.clamp(5, 40),
+                    allow_paid_stars: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("Поиск по #{tag}: {e}"))?;
+        Ok(super::tl_messages_to_rows(&res))
+    }
+
+    /// Обновляет персональный цвет акцента профиля/ответов (`account.updateColor`).
+    pub async fn update_profile_color(&self, for_profile: bool, color_id: Option<i32>) -> Result<(), String> {
+        self.invoke_retry(
+            "account.updateColor",
+            &tl::functions::account::UpdateColor {
+                for_profile,
+                color: color_id.map(|c| {
+                    tl::enums::PeerColor::Color(tl::types::PeerColor {
+                        color: Some(c),
+                        background_emoji_id: None,
+                    })
+                }),
+            },
+        )
+        .await
+        .map_err(|e| format!("Цвет профиля: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает список анимированных эффектов сообщений (`messages.getAvailableEffects`).
+    pub async fn available_effects(&self) -> Result<Vec<MessageEffectItem>, String> {
+        let res = self
+            .invoke_retry(
+                "messages.getAvailableEffects",
+                &tl::functions::messages::GetAvailableEffects { hash: 0 },
+            )
+            .await
+            .map_err(|e| format!("Эффекты: {e}"))?;
+        let tl::enums::messages::AvailableEffects::Effects(e) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(e.effects
+            .into_iter()
+            .map(|ef| {
+                let tl::enums::AvailableEffect::Effect(x) = ef;
+                MessageEffectItem {
+                    id: x.id,
+                    emoticon: x.emoticon,
+                    premium_required: x.premium_required,
+                }
+            })
+            .collect())
+    }
+
+    /// Включает или отключает медленный режим (Slow Mode) в супергруппе (`channels.toggleSlowMode`).
+    pub async fn set_slow_mode(&self, peer: PeerRef, seconds: i32) -> Result<(), String> {
+        let channel = peer_to_input_channel(peer)?;
+        self.invoke_retry(
+            "channels.toggleSlowMode",
+            &tl::functions::channels::ToggleSlowMode {
+                channel,
+                seconds: seconds.max(0),
+            },
+        )
+        .await
+        .map_err(|e| format!("Медленный режим: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Локальная офлайн-расшифровка голосового сообщения (без лимитов и без сторонних хостов):
+/// 1) если пользователь положил локальный `whisper-cli.exe` / `whisper.exe` и `.bin`-модель в `<RG_HOME>/whisper/`, использует его;
+/// 2) на Windows также проверяет встроенный системный движок речи (System.Speech) для WAV-файлов.
+fn local_transcribe_audio(audio_path: &Path, whisper_dir: &Path) -> Result<String, String> {
+    // 1. Локальный whisper-cli (whisper.cpp) без сети.
+    for bin_name in ["whisper-cli.exe", "main.exe", "whisper.exe", "whisper-cli"] {
+        let bin = whisper_dir.join(bin_name);
+        if bin.exists()
+            && let Some(model) = std::fs::read_dir(whisper_dir)
+                .ok()
+                .and_then(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("bin"))
+                })
+        {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.args(["-m"])
+                .arg(&model)
+                .args(["-l", "auto", "-nt", "-f"])
+                .arg(audio_path);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            if let Ok(out) = cmd.output()
+                && out.status.success()
+            {
+                let txt = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if !txt.is_empty() {
+                    return Ok(txt);
+                }
+            }
+        }
+    }
+    // 2. На Windows для WAV-файлов — встроенный офлайн System.Speech.Recognition (нулевая сеть).
+    #[cfg(windows)]
+    if audio_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+    {
+        use std::os::windows::process::CommandExt;
+        let path_str = audio_path.to_string_lossy().replace('\'', "''");
+        let ps = format!(
+            "Add-Type -AssemblyName System.Speech; \
+             $r = New-Object System.Speech.Recognition.SpeechRecognitionEngine; \
+             $r.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar)); \
+             $r.SetInputToWaveFile('{path_str}'); \
+             $out = @(); while ($true) {{ $res = $r.Recognize(); if (-not $res) {{ break }}; $out += $res.Text }}; \
+             Write-Output ($out -join ' ')"
+        );
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .creation_flags(0x0800_0000)
+            .output()
+            && out.status.success()
+        {
+            let txt = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !txt.is_empty() {
+                return Ok(txt);
+            }
+        }
+    }
+    Err(format!(
+        "Лимит серверной расшифровки Telegram исчерпан. Для безлимитной офлайн-расшифровки положите локальный whisper-cli + модель .bin в {}",
+        whisper_dir.display()
+    ))
 }

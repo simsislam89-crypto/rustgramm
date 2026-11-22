@@ -84,7 +84,6 @@ struct App {
     key_hash: String,
     proxy: String,
     proxy_open: bool,
-    qr_cache: Option<(String, QrImage)>,
     now: i64,
     /// Когда показана текущая ошибка (unix); через 6 секунд она скрывается.
     error_at: i64,
@@ -400,6 +399,72 @@ struct App {
     /// Темы `.tdesktop-theme` / `.attheme`, живой конструктор палитры и обои чата.
     themes_open: bool,
     wallpaper_tex: Option<(String, egui::TextureHandle)>,
+    /// Флаги загрузки стикеров/GIF и сохранённые избранные/недавние стикеры.
+    stickers_loaded: bool,
+    gifs_loaded: bool,
+    faved_stickers: Vec<StickerRow>,
+    recent_stickers: Vec<StickerRow>,
+    /// Всплывающее мини-окно эмодзи/стикеров/GIF при наведении на смайл (на ПК).
+    emoji_hover_open: bool,
+    /// Архив загружен лениво (по клику на «Архив», не на старте).
+    archive_loaded: bool,
+    /// Состояние просмотрщика историй (пауза, звук, ошибки загрузки, лайки).
+    story_errors: HashMap<i32, String>,
+    story_paused: bool,
+    story_muted: bool,
+    story_liked: HashSet<i32>,
+    /// Показать/скрыть пароль 2FA (интерактивная обезьянка 🙈/🐵 как в Telegram).
+    login_show_password: bool,
+    /// Расшифровки голосовых / видеосообщений (Telegram API + локальный оффлайн-движок).
+    transcriptions: HashMap<i32, String>,
+    transcribing: HashSet<i32>,
+    /// 1. Интерактивные чек-листы (To-Do).
+    todo_modal_open: bool,
+    todo_title: String,
+    todo_items: Vec<String>,
+    todo_others_complete: bool,
+    todo_others_append: bool,
+    /// 2. Анимированные эффекты сообщений и меню кнопки отправки.
+    available_effects: Vec<rg_core::engine::MessageEffectItem>,
+    effects_requested: bool,
+    selected_effect: Option<i64>,
+    send_menu_open: bool,
+    effect_bursts: HashMap<i32, f64>,
+    /// 3. Отложенные сообщения и личные напоминания.
+    scheduled_open: bool,
+    scheduled_msgs: Vec<MessageRow>,
+    schedule_picker_open: bool,
+    schedule_delay_mins: i32,
+    /// 4. Теги «Избранного» (Saved Messages Tags).
+    saved_tags: Vec<rg_core::engine::SavedTagItem>,
+    saved_tag_filter: Option<String>,
+    saved_tags_req: bool,
+    saved_tag_edit: Option<(String, String)>,
+    /// 5. Отправка от имени канала / профиля (Send As).
+    send_as_map: HashMap<i64, Vec<rg_core::engine::SendAsItem>>,
+    send_as_req: HashSet<i64>,
+    selected_send_as: HashMap<i64, grammers_session::types::PeerRef>,
+    send_as_popup_open: bool,
+    /// 6. Встроенный конструктор опросов и викторин.
+    poll_modal_open: bool,
+    poll_question: String,
+    poll_options: Vec<String>,
+    poll_anonymous: bool,
+    poll_multiple: bool,
+    poll_quiz: bool,
+    poll_correct: usize,
+    poll_explanation: String,
+    /// 7. Акцентный цвет профиля и ответов (`account.updateColor`).
+    profile_accent_color: Option<i32>,
+    replies_accent_color: Option<i32>,
+    /// 8. Глобальный поиск по хэштегам в публичных каналах.
+    hashtag_modal: Option<(String, Vec<MessageRow>)>,
+    /// 9. Медленный режим (выбранная задержка в окне администрирования).
+    admin_slowmode_secs: i32,
+    /// 10. Палитра быстрого перехода `Ctrl+K` (Quick Switcher).
+    palette_open: bool,
+    palette_query: String,
+    palette_sel: usize,
 }
 
 pub(crate) struct ShotModal {
@@ -416,28 +481,6 @@ struct InAppToast {
     title: String,
     body: String,
     at: std::time::Instant,
-}
-
-/// Готовая сетка QR: размер стороны и тёмные модули.
-struct QrImage {
-    side: usize,
-    dark: Vec<bool>,
-}
-
-fn qr_image(url: &str) -> Option<QrImage> {
-    let code = qrcode::QrCode::new(url.as_bytes()).ok()?;
-    Some(QrImage {
-        side: code.width(),
-        dark: code
-            .to_colors()
-            .into_iter()
-            .map(|c| c == qrcode::Color::Dark)
-            .collect(),
-    })
-}
-
-fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    orange_button(ui, text, Vec2::new(280.0, 40.0))
 }
 
 fn link(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -479,7 +522,6 @@ impl App {
             key_hash: String::new(),
             proxy: String::new(),
             proxy_open: false,
-            qr_cache: None,
             now: 0,
             error_at: 0,
             reply: None,
@@ -720,6 +762,56 @@ impl App {
             quick_replies: Vec::new(),
             themes_open: false,
             wallpaper_tex: None,
+            stickers_loaded: false,
+            gifs_loaded: false,
+            faved_stickers: Vec::new(),
+            recent_stickers: Vec::new(),
+            emoji_hover_open: false,
+            archive_loaded: false,
+            story_errors: HashMap::new(),
+            story_paused: false,
+            story_muted: false,
+            story_liked: HashSet::new(),
+            login_show_password: false,
+            transcriptions: HashMap::new(),
+            transcribing: HashSet::new(),
+            todo_modal_open: false,
+            todo_title: String::new(),
+            todo_items: vec![String::new(), String::new()],
+            todo_others_complete: true,
+            todo_others_append: false,
+            available_effects: Vec::new(),
+            effects_requested: false,
+            selected_effect: None,
+            send_menu_open: false,
+            effect_bursts: HashMap::new(),
+            scheduled_open: false,
+            scheduled_msgs: Vec::new(),
+            schedule_picker_open: false,
+            schedule_delay_mins: 15,
+            saved_tags: Vec::new(),
+            saved_tag_filter: None,
+            saved_tags_req: false,
+            saved_tag_edit: None,
+            send_as_map: HashMap::new(),
+            send_as_req: HashSet::new(),
+            selected_send_as: HashMap::new(),
+            send_as_popup_open: false,
+            poll_modal_open: false,
+            poll_question: String::new(),
+            poll_options: vec![String::new(), String::new()],
+            poll_anonymous: true,
+            poll_multiple: false,
+            poll_quiz: false,
+            poll_correct: 0,
+            poll_explanation: String::new(),
+            profile_accent_color: None,
+            replies_accent_color: None,
+            hashtag_modal: None,
+            admin_slowmode_secs: 0,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_sel: 0,
         }
     }
 
@@ -729,32 +821,47 @@ impl App {
 
     /// Предпросмотры только для свежих вложений и по одному разу.
     /// Событие из потока обновлений: сообщения доходят сразу, без перезахода в чат.
-    /// Обновляет строку чата в списке по новому сообщению. Возвращает `true`, если нужен полный
-    /// перезапрос списка (чат не найден или должен сменить место).
+    /// Обновляет строку чата в списке по новому сообщению и поднимает чат наверх локально (0 мс,
+    /// без тяжёлого полного перезапроса списка!). Возвращает `true` только если чата вообще нет в списке.
     fn apply_live_to_list(&mut self, key: i64, row: &(i64, bool, String), is_open: bool) -> bool {
         let Some(pos) = self.dialogs.iter().position(|d| d.id == key) else {
             return true;
         };
+        let open_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
         let (date, outgoing, text) = row;
-        let old = self.dialogs[pos].clone();
-        let newer = *date > old.date;
+        let old_date = self.dialogs[pos].date;
+        let old_pinned = self.dialogs[pos].pinned;
+        let old_archived = self.dialogs[pos].archived;
+        let newer = *date >= old_date;
         let d = &mut self.dialogs[pos];
-        if newer || *date == old.date {
-            d.last.clone_from(text);
-        }
         if newer {
-            d.date = *date;
-            if !outgoing && !is_open {
-                d.unread += 1;
+            if !text.is_empty() {
+                d.last.clone_from(text);
+            }
+            if *date > old_date {
+                d.date = *date;
+                if !outgoing && !is_open {
+                    d.unread += 1;
+                }
             }
         }
-        if !newer || old.pinned {
-            return false;
+        // Мгновенно поднимаем чат наверх своей папки (после закреплённых), без лишнего RPC!
+        if *date > old_date && !old_pinned {
+            let target = self
+                .dialogs
+                .iter()
+                .position(|o| !o.pinned && o.archived == old_archived)
+                .unwrap_or(0);
+            if target < pos {
+                let item = self.dialogs.remove(pos);
+                self.dialogs.insert(target, item);
+                if let Some(oid) = open_id {
+                    self.selected = self.dialogs.iter().position(|x| x.id == oid);
+                }
+            }
         }
-        // Уже самый верхний среди незакреплённых той же папки (архив или основной список)?
-        self.dialogs
-            .iter()
-            .any(|o| o.id != key && !o.pinned && o.archived == old.archived && o.date >= old.date)
+        self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+        false
     }
 
     fn on_live(&mut self, ctx: &egui::Context, l: rg_core::engine::Live) {
@@ -1598,7 +1705,7 @@ impl App {
                     x.kind == rg_core::media::MediaKind::AnimatedSticker && x.mime == "application/x-tgsticker"
                 })
             })
-            .take(8)
+            .take(20)
             .map(|r| r.id)
             .collect();
         for id in tgs_want {
@@ -1619,17 +1726,20 @@ impl App {
         if !videos.is_empty() {
             let _ = self.cmd.send(Cmd::CachedMedia(videos));
         }
-        // Короткие GIF до 4 МБ подгружаются в фоне для мгновенного автозапуска в ленте.
+        // Короткие GIF и видео-стикеры WebM до 4 МБ подгружаются в фоне для плавного автозапуска в ленте.
         if self.settings.auto_play_gifs {
             let gifs: Vec<i32> = rows
                 .iter()
                 .rev()
                 .filter(|r| {
                     r.media.as_ref().is_some_and(|x| {
-                        x.kind == rg_core::media::MediaKind::Gif && x.size > 0 && x.size <= 4 * 1024 * 1024
+                        (x.kind == rg_core::media::MediaKind::Gif
+                            || (x.kind == rg_core::media::MediaKind::AnimatedSticker && x.mime == "video/webm"))
+                            && x.size > 0
+                            && x.size <= 4 * 1024 * 1024
                     })
                 })
-                .take(4)
+                .take(8)
                 .map(|r| r.id)
                 .collect();
             for id in gifs {
@@ -1638,7 +1748,7 @@ impl App {
                 }
             }
         }
-        // Загружаем текстуры всех пользовательских Premium-эмодзи из сообщений.
+        // Загружаем текстуры всех пользовательских Premium-эмодзи из сообщений и RichMessage-блоков.
         let mut custom_ids: Vec<i64> = Vec::new();
         for r in rows {
             for e in &r.entities {
@@ -1646,6 +1756,13 @@ impl App {
                     && !self.sticker_tex.contains_key(&doc_id)
                     && self.custom_emoji_req.insert(doc_id)
                 {
+                    custom_ids.push(doc_id);
+                }
+            }
+            let mut rich_ids = Vec::new();
+            rg_core::rich_msg::collect_rich_custom_emojis(&r.rich_blocks, &mut rich_ids);
+            for doc_id in rich_ids {
+                if !self.sticker_tex.contains_key(&doc_id) && self.custom_emoji_req.insert(doc_id) {
                     custom_ids.push(doc_id);
                 }
             }
@@ -1801,6 +1918,14 @@ impl App {
             }
         }
 
+        // Ctrl+K — Палитра быстрого перехода (Quick Switcher) по всем чатам и действиям.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.palette_open = !self.palette_open;
+            if self.palette_open {
+                self.palette_query.clear();
+                self.palette_sel = 0;
+            }
+        }
         // Ctrl+, — открыть Настройки Telegram.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
             self.open_tg_settings();
@@ -1984,35 +2109,36 @@ impl App {
         };
         let mut active = false;
 
-        // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`):
+        // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`) на плавных 30 FPS:
         // если панель эмодзи закрыта, рендерим только 0-й кадр один раз (0% нагрузки CPU в простое!).
+        let panel_visible = self.emoji_open || self.emoji_hover_open;
         for (&doc_id, anim) in &self.tgs_docs {
-            let bucket = if self.emoji_open && focused {
+            let bucket = if panel_visible && focused {
                 let f = anim.frame_at_time(t);
                 active = true;
-                (f.round() as usize / 4) * 4
+                (f.round() as usize / 2) * 2
             } else {
                 0
             };
-            if bucket == 0 && self.sticker_tex.contains_key(&doc_id) && !self.emoji_open {
+            if bucket == 0 && self.sticker_tex.contains_key(&doc_id) && !panel_visible {
                 continue;
             }
             let key = (doc_id, bucket);
             let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
-                let img = anim.render_frame(bucket as f32, 48);
+                let img = anim.render_frame(bucket as f32, 64);
                 ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
             });
             self.sticker_tex.insert(doc_id, tex.clone());
         }
 
-        // Обновляем анимированные TGS-стикеры в открытом чате (`tgs_msgs`, шаг 4 кадра ≈ 15 FPS).
+        // Обновляем анимированные TGS-стикеры в открытом чате (`tgs_msgs`, плавные 30 FPS).
         if focused {
             for (&msg_id, anim) in &self.tgs_msgs {
                 let f = anim.frame_at_time(t);
-                let bucket = (f.round() as usize / 4) * 4;
+                let bucket = (f.round() as usize / 2) * 2;
                 let key = (-i64::from(msg_id) - 1_000_000, bucket);
                 let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
-                    let img = anim.render_frame(bucket as f32, 128);
+                    let img = anim.render_frame(bucket as f32, 160);
                     ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
                 });
                 self.textures.insert(msg_id, tex.clone());
@@ -2021,7 +2147,7 @@ impl App {
         }
 
         if active && focused && speed > 0.01 {
-            ctx.request_repaint_after(std::time::Duration::from_millis(66));
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
 
@@ -2087,6 +2213,16 @@ impl App {
                 Ev::StickerSets(s) => {
                     self.sticker_sets = s;
                     self.sticker_cur = 0;
+                    self.stickers_loaded = true;
+                }
+                Ev::FavedStickers(list) => {
+                    self.faved_stickers = list;
+                }
+                Ev::RecentStickers(list) => {
+                    self.recent_stickers = list;
+                }
+                Ev::StickersLoaded => {
+                    self.stickers_loaded = true;
                 }
                 Ev::Live(l) => self.on_live(ctx, l),
                 Ev::PlayVideo(p) => {
@@ -2189,7 +2325,13 @@ impl App {
                         self.tgs_msgs.insert(msg_id, anim);
                     }
                 }
-                Ev::Gifs(g) => self.gif_list = g,
+                Ev::Gifs(g) => {
+                    self.gif_list = g;
+                    self.gifs_loaded = true;
+                }
+                Ev::GifsLoaded => {
+                    self.gifs_loaded = true;
+                }
                 Ev::PeerInfo(id, info) => {
                     if let Some(doc_id) = info.emoji_status
                         && !self.sticker_tex.contains_key(&doc_id)
@@ -2293,6 +2435,21 @@ impl App {
                     self.peer_saved_gifts.clear();
                     self.saved_gifts_req.clear();
                     self.history_cache.clear();
+                    self.archive_loaded = false;
+                    self.in_archive = false;
+                    self.stickers_requested = false;
+                    self.stickers_loaded = false;
+                    self.gifs_requested = false;
+                    self.gifs_loaded = false;
+                    self.faved_stickers.clear();
+                    self.recent_stickers.clear();
+                    self.sticker_sets.clear();
+                    self.gif_list.clear();
+                    self.story_textures.clear();
+                    self.story_media_req.clear();
+                    self.story_errors.clear();
+                    self.transcriptions.clear();
+                    self.transcribing.clear();
                     self.me.clear();
                     self.stage = Stage::Starting;
                     self.phone.clear();
@@ -2326,35 +2483,53 @@ impl App {
                     let tex = ctx.load_texture(format!("s{id}"), *img, egui::TextureOptions::LINEAR);
                     self.sticker_tex.insert(id, tex);
                 }
-                Ev::History(idx, m) if self.selected == Some(idx) => {
-                    // Плавная каскадная загрузка сообщений как на iPhone.
-                    let now_t = ctx.input(|i| i.time);
-                    if self.known.is_empty() {
-                        let tail = m.len().saturating_sub(12);
-                        for (k, r) in m[tail..].iter().enumerate() {
-                            self.arrived.insert(r.id, now_t + k as f64 * 0.016);
-                        }
-                    } else {
-                        for r in &m {
-                            if !self.known.contains(&r.id) {
+                Ev::History(dialog_id, m) => {
+                    // Сохраняем в ОЗУ-кэш даже при быстром переключении чатов (до 16 последних).
+                    if self.history_cache.len() >= 16
+                        && !self.history_cache.contains_key(&dialog_id)
+                        && let Some(&drop_key) = self.history_cache.keys().next()
+                    {
+                        self.history_cache.remove(&drop_key);
+                    }
+                    self.history_cache.insert(dialog_id, m.clone());
+                    // Сопоставляем по стабильному `dialog_id` — перестановки списка чатов больше не ломают загрузку!
+                    if let Some(idx) = self
+                        .selected
+                        .filter(|&i| self.dialogs.get(i).is_some_and(|d| d.id == dialog_id))
+                    {
+                        let now_t = ctx.input(|i| i.time);
+                        if self.known.is_empty() {
+                            for r in &m {
                                 self.arrived.insert(r.id, now_t);
                             }
+                        } else {
+                            for r in &m {
+                                if !self.known.contains(&r.id) {
+                                    self.arrived.insert(r.id, now_t);
+                                    if r.effect.is_some() {
+                                        self.effect_bursts.insert(r.id, now_t);
+                                    }
+                                }
+                            }
                         }
+                        self.known.extend(m.iter().map(|r| r.id));
+                        self.request_previews(idx, &m);
+                        self.messages = m;
+                        self.history_loading = false;
+                        self.older_pending = false;
                     }
-                    self.known.extend(m.iter().map(|r| r.id));
-                    self.request_previews(idx, &m);
-                    if let Some(id) = self.dialogs.get(idx).map(|d| d.id) {
-                        // Держим в ОЗУ кэш не более 16 последних чатов (остальное — на диске).
-                        if self.history_cache.len() >= 16 && !self.history_cache.contains_key(&id)
-                            && let Some(&drop_key) = self.history_cache.keys().next()
-                        {
-                            self.history_cache.remove(&drop_key);
-                        }
-                        self.history_cache.insert(id, m.clone());
+                }
+                Ev::HistoryError(dialog_id, err) => {
+                    if self
+                        .selected
+                        .and_then(|i| self.dialogs.get(i))
+                        .is_some_and(|d| d.id == dialog_id)
+                    {
+                        self.history_loading = false;
+                        self.older_pending = false;
                     }
-                    self.messages = m;
-                    self.history_loading = false;
-                    self.older_pending = false;
+                    self.error = err;
+                    self.error_at = self.now;
                 }
                 Ev::Older(idx, rows) if self.selected == Some(idx) => {
                     self.older_pending = false;
@@ -2381,7 +2556,6 @@ impl App {
                 }
                 Ev::Found(..) => {}
                 Ev::EditHistory(id, v) => self.edit_history = Some((id, v)),
-                Ev::History(..) => {}
                 Ev::Image(idx, id, img) if self.selected == Some(idx) => {
                     let tex = ctx.load_texture(format!("m{id}"), *img, egui::TextureOptions::LINEAR);
                     self.textures.insert(id, tex);
@@ -2426,6 +2600,35 @@ impl App {
                 Ev::StoryImage(sid, img) => {
                     let tex = ctx.load_texture(format!("story-{sid}"), *img, egui::TextureOptions::LINEAR);
                     self.story_textures.insert(sid, tex);
+                    self.story_errors.remove(&sid);
+                }
+                Ev::StoryError(sid, err) => {
+                    self.story_errors.insert(sid, err);
+                }
+                Ev::Transcribed(msg_id, text) => {
+                    self.transcribing.remove(&msg_id);
+                    self.transcriptions.insert(msg_id, text);
+                }
+                Ev::ScheduledHistory(did, rows) => {
+                    if self
+                        .selected
+                        .and_then(|i| self.dialogs.get(i))
+                        .is_some_and(|d| d.id == did)
+                    {
+                        self.scheduled_msgs = rows;
+                    }
+                }
+                Ev::SavedTags(tags) => {
+                    self.saved_tags = tags;
+                }
+                Ev::SendAsList(did, list) => {
+                    self.send_as_map.insert(did, list);
+                }
+                Ev::HashtagResults(tag, rows) => {
+                    self.hashtag_modal = Some((tag, rows));
+                }
+                Ev::AvailableEffects(eff) => {
+                    self.available_effects = eff;
                 }
                 Ev::AdminLog(rows) => self.admin_log = rows,
                 Ev::AdminInvites(rows) => self.admin_invites = rows,
@@ -2501,21 +2704,20 @@ impl App {
         }
     }
 
-    // ---------- вход ----------
+    // ---------- вход (в стиле официального Telegram + матовое стекло, 0 лагов на Android) ----------
 
     fn login_ui(&mut self, ui: &mut egui::Ui) {
-        // Верхняя полоса с кнопкой «НАСТРОЙКИ» (не перекрывает статус-бар Android и не уезжает за край).
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             if self.login_busy {
-                ui.add(egui::Spinner::new().size(15.0).color(ORANGE));
+                ui.add(egui::Spinner::new().size(15.0).color(c_orange()));
                 ui.label(RichText::new("Связь с Telegram…").size(12.5).color(SUBTEXT));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(16.0);
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("НАСТРОЙКИ").size(13.5).strong().color(ACCENT))
+                        egui::Button::new(RichText::new("Прокси / Сеть").size(13.0).strong().color(c_orange()))
                             .frame(false),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2527,24 +2729,56 @@ impl App {
         });
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.05).max(10.0));
-                match self.stage.clone() {
-                    Stage::Qr(url) => self.qr_screen(ui, &url),
-                    _ => self.form_screen(ui),
-                }
+                let top_gap = (ui.available_height() * 0.06).clamp(8.0, 48.0);
+                ui.add_space(top_gap);
+                let card_w = ui.available_width().clamp(296.0, 410.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 26, (185.0 * opacity_f32().max(0.55)) as u8))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
+                    .corner_radius(egui::CornerRadius::same(22))
+                    .inner_margin(egui::Margin::symmetric(24, 26))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w - 48.0);
+                        ui.vertical_centered(|ui| match self.stage.clone() {
+                            Stage::Qr(url) => self.qr_screen(ui, &url),
+                            _ => self.form_screen(ui),
+                        });
+                    });
                 if !self.error.is_empty() {
                     ui.add_space(12.0);
                     egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(220, 68, 68, 36))
-                        .stroke(egui::Stroke::new(1.0, DANGER.gamma_multiply(0.6)))
-                        .corner_radius(egui::CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .fill(Color32::from_rgba_unmultiplied(220, 68, 68, 42))
+                        .stroke(egui::Stroke::new(1.0, DANGER.gamma_multiply(0.65)))
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .inner_margin(egui::Margin::symmetric(14, 10))
                         .show(ui, |ui| {
-                            ui.set_max_width(300.0);
-                            ui.label(RichText::new(&self.error).size(12.5).color(Color32::from_rgb(255, 165, 165)));
+                            ui.set_max_width(340.0);
+                            ui.label(RichText::new(&self.error).size(12.5).color(Color32::from_rgb(255, 175, 175)));
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("Повторить подключение").size(12.0).color(WHITE))
+                                            .fill(t_btn(BUTTON))
+                                            .corner_radius(egui::CornerRadius::same(8)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.error.clear();
+                                    self.send(Cmd::RetryConnect);
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("Прокси").size(12.0).color(c_orange()))
+                                            .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    self.proxy_open = true;
+                                }
+                            });
                         });
                 }
-                // Если уже есть другой авторизованный аккаунт, можно отменить вход и вернуться обратно.
                 if let Some(prev) = self
                     .settings
                     .accounts
@@ -2562,11 +2796,11 @@ impl App {
                         }
                     }
                 }
-                ui.add_space(20.0);
+                ui.add_space(18.0);
                 ui.label(
-                    RichText::new(format!("Rustgramm v{}", env!("CARGO_PKG_VERSION")))
+                    RichText::new(format!("Rustgramm v{} · Zero Telemetry", env!("CARGO_PKG_VERSION")))
                         .color(SUBTEXT)
-                        .size(12.5),
+                        .size(12.0),
                 );
                 ui.add_space(18.0);
             });
@@ -2574,85 +2808,135 @@ impl App {
         self.proxy_window(ui.ctx());
     }
 
-    fn qr_screen(&mut self, ui: &mut egui::Ui, url: &str) {
-        let size = 188.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(12), Color32::WHITE);
-        if url.is_empty() {
-            ui.put(rect, egui::Spinner::new().color(ACCENT));
-        } else {
-            if self.qr_cache.as_ref().is_none_or(|(u, _)| u != url) {
-                self.qr_cache = qr_image(url).map(|q| (url.to_owned(), q));
-            }
-            if let Some((_, q)) = &self.qr_cache {
-                let inner = rect.shrink(12.0);
-                let cell = inner.width() / q.side as f32;
-                for y in 0..q.side {
-                    for x in 0..q.side {
-                        if q.dark[y * q.side + x] {
-                            let r = egui::Rect::from_min_size(
-                                inner.min + Vec2::new(x as f32, y as f32) * cell,
-                                Vec2::splat(cell + 0.5),
-                            );
-                            ui.painter().rect_filled(r, 0.0, Color32::BLACK);
-                        }
-                    }
-                }
-                let c = rect.center();
-                ui.painter().circle_filled(c, 24.0, Color32::WHITE);
-                icons::logo(ui.painter(), c, 20.0, BUTTON);
-            }
+    /// Фирменный интерактивный смайл-талисман входа Telegram (как на экране авторизации Telegram).
+    fn paint_login_mascot(ui: &mut egui::Ui, emoji_char: &str, ring_accent: Color32, emoji_atlas: Option<&emoji::Emoji>) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(104.0), Sense::hover());
+        let c = rect.center();
+        let p = ui.painter();
+        // Мягкое матовое свечение вокруг медальона.
+        p.circle_filled(
+            c,
+            50.0,
+            Color32::from_rgba_unmultiplied(ring_accent.r(), ring_accent.g(), ring_accent.b(), 26),
+        );
+        p.circle_filled(
+            c,
+            42.0,
+            Color32::from_rgba_unmultiplied(ring_accent.r(), ring_accent.g(), ring_accent.b(), 44),
+        );
+        p.circle_stroke(
+            c,
+            42.0,
+            egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(ring_accent.r(), ring_accent.g(), ring_accent.b(), 150)),
+        );
+        let mut drew_atlas = false;
+        if let Some(atlas) = emoji_atlas
+            && let Some(ch) = emoji_char.chars().next()
+            && let Some(img) = atlas.image(ch, 54.0)
+        {
+            let er = egui::Rect::from_center_size(c, Vec2::splat(54.0));
+            img.paint_at(ui, er);
+            drew_atlas = true;
         }
-        ui.add_space(22.0);
+        if !drew_atlas {
+            p.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                emoji_char,
+                FontId::proportional(46.0),
+                WHITE,
+            );
+        }
+    }
+
+    fn qr_screen(&mut self, ui: &mut egui::Ui, url: &str) {
+        let pop_k = theme::tween(ui.ctx(), "login-qr-pop", if url.is_empty() { 0.0 } else { 1.0 }, 0.28);
+        if url.is_empty() {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(214.0), Sense::hover());
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(22), Color32::from_white_alpha(18));
+            ui.put(rect, egui::Spinner::new().size(28.0).color(c_orange()));
+        } else {
+            let _ = theme::draw_styled_qr(ui, url, 214.0, c_orange(), pop_k);
+        }
+        ui.add_space(18.0);
         ui.label(
-            RichText::new("Сканируйте QR-код в Telegram")
-                .size(20.0)
+            RichText::new("Вход по QR-коду")
+                .size(21.0)
                 .strong()
                 .color(WHITE),
         );
-        ui.add_space(14.0);
-        for step in [
-            "1.  Откройте Telegram на телефоне",
-            "2.  Перейдите в Настройки > Устройства > Подключить устройство",
-            "3.  Наведите камеру на этот QR-код",
+        ui.add_space(12.0);
+        for (num, text) in [
+            ("1", "Откройте Telegram на телефоне"),
+            ("2", "Настройки → Устройства → Подключить устройство"),
+            ("3", "Наведите камеру на этот экран"),
         ] {
-            ui.label(RichText::new(step).size(14.0).color(WHITE));
+            ui.horizontal(|ui| {
+                let (br, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                ui.painter().circle_filled(br.center(), 9.5, c_orange());
+                ui.painter().text(
+                    br.center(),
+                    egui::Align2::CENTER_CENTER,
+                    num,
+                    FontId::proportional(11.5),
+                    Color32::WHITE,
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new(text).size(13.5).color(WHITE));
+            });
+            ui.add_space(4.0);
         }
-        ui.add_space(46.0);
-        if link(ui, "Войти по номеру телефона").clicked() {
+        ui.add_space(20.0);
+        if ui
+            .add_sized(
+                [296.0, 40.0],
+                egui::Button::new(RichText::new("Войти по номеру телефона").size(14.0).strong().color(c_orange()))
+                    .fill(Color32::from_rgba_unmultiplied(c_orange().r(), c_orange().g(), c_orange().b(), 26))
+                    .stroke(egui::Stroke::new(1.0, c_orange().gamma_multiply(0.5)))
+                    .corner_radius(egui::CornerRadius::same(12)),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.error.clear();
             self.send(Cmd::UsePhone);
         }
     }
 
     fn form_screen(&mut self, ui: &mut egui::Ui) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
-        icons::logo(ui.painter(), rect.center(), 46.0, BUTTON);
-        ui.add_space(14.0);
-        ui.label(RichText::new("Rustgramm").size(30.0).strong().color(WHITE));
-        ui.add_space(18.0);
-        ui.set_max_width(320.0);
+        let form_w = ui.available_width().min(316.0);
         match self.stage.clone() {
             Stage::Starting => {
-                ui.label(RichText::new("Подключение к Telegram…").color(SUBTEXT));
-                ui.add(egui::Spinner::new().color(ACCENT));
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(92.0), Sense::hover());
+                icons::logo(ui.painter(), rect.center(), 44.0, c_orange());
+                ui.add_space(12.0);
+                ui.label(RichText::new("Rustgramm").size(26.0).strong().color(WHITE));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Подключение к серверам Telegram…").size(13.5).color(SUBTEXT));
+                ui.add_space(10.0);
+                ui.add(egui::Spinner::new().size(22.0).color(c_orange()));
             }
             Stage::NeedKeys => {
+                Self::paint_login_mascot(ui, "🔑", c_orange(), self.emoji.as_ref());
+                ui.add_space(10.0);
+                ui.label(RichText::new("Ключи API Telegram").size(20.0).strong().color(WHITE));
                 ui.label(
-                    RichText::new(
-                        "Нужны ключи приложения с my.telegram.org (API development tools). Они хранятся только на этом устройстве.",
-                    )
-                    .color(SUBTEXT),
+                    RichText::new("my.telegram.org → API development tools (хранятся только на устройстве)")
+                        .size(12.5)
+                        .color(SUBTEXT),
                 );
-                ui.label("api_id");
-                ui.add(egui::TextEdit::singleline(&mut self.key_id).desired_width(280.0));
-                ui.label("api_hash");
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::singleline(&mut self.key_id).hint_text("api_id").desired_width(form_w));
+                ui.add_space(6.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.key_hash)
                         .password(true)
-                        .desired_width(280.0),
+                        .hint_text("api_hash")
+                        .desired_width(form_w),
                 );
-                if primary_button(ui, "Сохранить и продолжить").clicked() {
+                ui.add_space(10.0);
+                if orange_button(ui, "Сохранить и продолжить", Vec2::new(form_w, 42.0)).clicked() {
                     let hash = std::mem::take(&mut self.key_hash);
                     self.send(Cmd::Keys(self.key_id.clone(), hash));
                 }
@@ -2662,24 +2946,27 @@ impl App {
                     .get(self.login_country_idx)
                     .copied()
                     .unwrap_or(countries::COUNTRIES[0]);
-                ui.label(RichText::new("Ваш номер телефона").size(19.0).strong().color(WHITE));
+                Self::paint_login_mascot(ui, "👋", c_orange(), self.emoji.as_ref());
+                ui.add_space(12.0);
+                ui.label(RichText::new("Вход в Telegram").size(22.0).strong().color(WHITE));
+                ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Выберите страну и введите номер телефона")
+                    RichText::new("Выберите страну и введите ваш номер телефона")
                         .size(13.0)
                         .color(SUBTEXT),
                 );
-                ui.add_space(12.0);
-                // Кнопка выбора страны (с поиском по названию/коду).
+                ui.add_space(14.0);
+                // Кнопка выбора страны (с виртуализированным списком — 0 лагов на Android!).
                 let cbtn = egui::Button::new(
-                    RichText::new(format!("{}  {} ({})  ▼", country.iso, country.name, country.dial))
+                    RichText::new(format!("{}  {} ({})  ▾", country.iso, country.name, country.dial))
                         .size(14.0)
                         .color(WHITE),
                 )
                 .fill(t(SIDEBAR_BG))
-                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(28)))
-                .corner_radius(egui::CornerRadius::same(10));
+                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(30)))
+                .corner_radius(egui::CornerRadius::same(12));
                 if ui
-                    .add_sized([296.0, 38.0], cbtn)
+                    .add_sized([form_w, 42.0], cbtn)
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
@@ -2687,26 +2974,27 @@ impl App {
                     self.login_country_query.clear();
                 }
                 if self.login_country_open {
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                     egui::Frame::new()
                         .fill(t2(WINDOW_BG))
                         .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(30)))
-                        .corner_radius(egui::CornerRadius::same(10))
+                        .corner_radius(egui::CornerRadius::same(12))
                         .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
-                            ui.set_width(280.0);
+                            ui.set_width(form_w - 16.0);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.login_country_query)
-                                    .hint_text("Поиск страны или кода (+7, +1, США)…")
-                                    .desired_width(276.0),
+                                    .hint_text("Поиск страны или кода (+7, +1)…")
+                                    .desired_width(form_w - 20.0),
                             );
                             ui.add_space(4.0);
                             let matches = countries::filter_countries(&self.login_country_query);
                             egui::ScrollArea::vertical()
-                                .max_height(175.0)
+                                .max_height(168.0)
                                 .id_salt("country-picker")
-                                .show(ui, |ui| {
-                                    for idx in matches {
+                                .show_rows(ui, 28.0, matches.len(), |ui, range| {
+                                    for row_i in range {
+                                        let idx = matches[row_i];
                                         let c = countries::COUNTRIES[idx];
                                         let sel = idx == self.login_country_idx;
                                         let lbl = format!("{}  {}  {}", c.iso, c.name, c.dial);
@@ -2714,8 +3002,8 @@ impl App {
                                             .selectable_label(
                                                 sel,
                                                 RichText::new(lbl)
-                                                    .size(13.0)
-                                                    .color(if sel { ORANGE } else { WHITE }),
+                                                    .size(13.5)
+                                                    .color(if sel { c_orange() } else { WHITE }),
                                             )
                                             .clicked()
                                         {
@@ -2728,18 +3016,17 @@ impl App {
                         });
                 }
                 ui.add_space(8.0);
-                // Два синхронизированных поля: [Код страны] + [Номер телефона].
                 let mut enter_pressed = false;
                 ui.allocate_ui_with_layout(
-                    Vec2::new(296.0, 40.0),
+                    Vec2::new(form_w, 42.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         let dr = ui.add_sized(
-                            [76.0, 38.0],
+                            [78.0, 42.0],
                             egui::TextEdit::singleline(&mut self.login_dial)
                                 .hint_text("+7")
-                                .margin(Vec2::new(10.0, 9.0)),
+                                .margin(Vec2::new(10.0, 10.0)),
                         );
                         if dr.changed() {
                             if !self.login_dial.starts_with('+') && !self.login_dial.is_empty() {
@@ -2751,10 +3038,10 @@ impl App {
                             }
                         }
                         let pr = ui.add_sized(
-                            [212.0, 38.0],
+                            [(form_w - 86.0).max(160.0), 42.0],
                             egui::TextEdit::singleline(&mut self.phone)
                                 .hint_text(country.hint)
-                                .margin(Vec2::new(10.0, 9.0)),
+                                .margin(Vec2::new(10.0, 10.0)),
                         );
                         if pr.changed()
                             && let Some((idx, dial, local)) = countries::split_full_phone(&self.phone)
@@ -2770,10 +3057,10 @@ impl App {
                         }
                     },
                 );
-                ui.add_space(12.0);
-                let btn_lbl = if self.login_busy { "ОТПРАВКА КОДА…" } else { "ДАЛЕЕ" };
+                ui.add_space(14.0);
+                let btn_lbl = if self.login_busy { "ОТПРАВКА КОДА…" } else { "ПРОДОЛЖИТЬ" };
                 let clicked = ui
-                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(296.0, 42.0)))
+                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(form_w, 44.0)))
                     .inner
                     .clicked();
                 if (clicked || enter_pressed) && !self.login_busy {
@@ -2798,26 +3085,35 @@ impl App {
                 }
             }
             Stage::NeedCode => {
-                ui.label(RichText::new("Введите код подтверждения").size(18.0).strong().color(WHITE));
-                if !self.login_last_phone.is_empty() {
-                    ui.label(RichText::new(&self.login_last_phone).size(14.0).color(ORANGE));
-                }
+                Self::paint_login_mascot(ui, "📩", c_orange(), self.emoji.as_ref());
+                ui.add_space(12.0);
                 ui.label(
-                    RichText::new("Код отправлен в приложение Telegram (или по SMS)")
+                    RichText::new(if self.login_last_phone.is_empty() {
+                        "Код подтверждения"
+                    } else {
+                        &self.login_last_phone
+                    })
+                    .size(20.0)
+                    .strong()
+                    .color(WHITE),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Мы отправили код в приложение Telegram на другом устройстве или по SMS")
                         .size(12.5)
                         .color(SUBTEXT),
                 );
-                ui.add_space(10.0);
+                ui.add_space(14.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.code)
                         .hint_text("5 цифр кода")
-                        .desired_width(296.0)
-                        .margin(Vec2::new(10.0, 9.0)),
+                        .desired_width(form_w)
+                        .margin(Vec2::new(12.0, 11.0)),
                 );
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ВОЙТИ" };
                 let go = ui
-                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(296.0, 42.0)))
+                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(form_w, 44.0)))
                     .inner
                     .clicked()
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
@@ -2828,14 +3124,14 @@ impl App {
                     self.send(Cmd::Code(if clean.is_empty() { self.code.trim().to_owned() } else { clean }));
                     self.code.clear();
                 }
-                ui.add_space(12.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     if link(ui, "← Изменить номер").clicked() {
                         self.error.clear();
                         self.code.clear();
                         self.send(Cmd::BackToPhone);
                     }
-                    ui.add_space(18.0);
+                    ui.add_space(16.0);
                     let wait_left = self
                         .login_code_sent_at
                         .map_or(0, |t| 30u64.saturating_sub(t.elapsed().as_secs()));
@@ -2851,30 +3147,56 @@ impl App {
                 });
             }
             Stage::NeedPassword(hint) => {
-                ui.label(RichText::new("Облачный пароль (2FA)").size(18.0).strong().color(WHITE));
-                ui.label(RichText::new(format!("Подсказка: {hint}")).color(SUBTEXT));
-                ui.add_space(10.0);
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.password)
-                        .password(true)
-                        .hint_text("Введите пароль")
-                        .desired_width(296.0)
-                        .margin(Vec2::new(10.0, 9.0)),
+                // Классическая интерактивная обезьянка Telegram 2FA: закрывает глаза при скрытом пароле и подглядывает при показе!
+                let mascot = if self.login_show_password { "🐵" } else { "🙈" };
+                Self::paint_login_mascot(ui, mascot, c_orange(), self.emoji.as_ref());
+                ui.add_space(12.0);
+                ui.label(RichText::new("Введите облачный пароль").size(20.0).strong().color(WHITE));
+                if !hint.is_empty() && hint != "нет" {
+                    ui.label(RichText::new(format!("Подсказка: {hint}")).size(13.0).color(SUBTEXT));
+                }
+                ui.add_space(14.0);
+                let mut enter_pw = false;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(form_w, 42.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let r = ui.add_sized(
+                            [(form_w - 48.0).max(180.0), 42.0],
+                            egui::TextEdit::singleline(&mut self.password)
+                                .password(!self.login_show_password)
+                                .hint_text("Облачный пароль")
+                                .margin(Vec2::new(12.0, 10.0)),
+                        );
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            enter_pw = true;
+                        }
+                        let eye = egui::Button::new(
+                            RichText::new(if self.login_show_password { "Скр." } else { "Пок." })
+                                .size(11.5)
+                                .color(SUBTEXT),
+                        )
+                        .fill(t(SIDEBAR_BG))
+                        .corner_radius(egui::CornerRadius::same(10));
+                        if ui.add_sized([40.0, 42.0], eye).clicked() {
+                            self.login_show_password = !self.login_show_password;
+                        }
+                    },
                 );
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ПРОДОЛЖИТЬ" };
                 let go = ui
-                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(296.0, 42.0)))
+                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(form_w, 44.0)))
                     .inner
                     .clicked()
-                    || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    || enter_pw;
                 if go && !self.password.is_empty() && !self.login_busy {
                     self.error.clear();
                     self.login_busy = true;
                     let pw = std::mem::take(&mut self.password);
                     self.send(Cmd::Password(pw));
                 }
-                ui.add_space(12.0);
+                ui.add_space(14.0);
                 if link(ui, "← Назад к номеру").clicked() {
                     self.error.clear();
                     self.password.clear();
@@ -2914,30 +3236,40 @@ impl App {
     // ---------- главное окно ----------
 
     fn dialogs_ui(&mut self, ui: &mut egui::Ui) {
-        // Верхняя строка: меню и поле поиска.
+        // Верхняя строка: меню и поле поиска — идеальное выравнивание по центру (Y).
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
-            if resp.hovered() {
-                ui.painter().circle_filled(rect.center(), 20.0, t(WINDOW_OVER));
+        ui.horizontal_centered(|ui| {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(38.0, 36.0), Sense::click());
+            let m_hov = theme::tween(ui.ctx(), "burger-h", f32::from(u8::from(resp.hovered())), 0.12);
+            if m_hov > 0.01 {
+                ui.painter().circle_filled(
+                    rect.center(),
+                    17.0 * (0.9 + 0.1 * ios_spring_bounce(m_hov)),
+                    t(WINDOW_OVER),
+                );
             }
-            icons::menu(ui.painter(), rect.center(), DIALOG_DATE);
-            if resp.clicked() {
+            icons::menu(ui.painter(), rect.center(), lerp_color(DIALOG_DATE, WHITE, m_hov));
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.drawer_open = true;
             }
             let has_lock = !self.settings.security.passcode_hash.is_empty();
-            let w = ui.available_width() - 8.0 - if has_lock { 38.0 } else { 0.0 };
+            let w = (ui.available_width() - 10.0 - if has_lock { 38.0 } else { 0.0 }).max(80.0);
             let (srect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
             ui.painter()
                 .rect_filled(srect, egui::CornerRadius::same(18), t(FILTER_INPUT));
+            // Точное вертикальное центрирование текста «Поиск» в пилюле 36 px.
+            let text_h = 22.0;
             let inner = egui::Rect::from_min_max(
-                srect.min + Vec2::new(14.0, 4.0),
-                srect.max - Vec2::new(if self.search.is_empty() { 14.0 } else { 32.0 }, 4.0),
+                egui::pos2(srect.left() + 14.0, srect.center().y - text_h * 0.5),
+                egui::pos2(
+                    srect.right() - if self.search.is_empty() { 14.0 } else { 32.0 },
+                    srect.center().y + text_h * 0.5,
+                ),
             );
             ui.put(
                 inner,
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Поиск")
+                    .hint_text("Поиск  (Ctrl+K)")
                     .frame(egui::Frame::NONE)
                     .desired_width(inner.width()),
             );
@@ -3017,7 +3349,11 @@ impl App {
             if archive_header(ui) {
                 toggle_archive = true;
             }
-        } else if archived_total > 0 && needle.is_empty() && active_folder.is_none() && archive_row(ui, &self.dialogs) {
+        } else if (archived_total > 0 || !self.archive_loaded)
+            && needle.is_empty()
+            && active_folder.is_none()
+            && archive_row(ui, &self.dialogs, self.archive_loaded)
+        {
             toggle_archive = true;
         }
         let show_global = !needle.is_empty() && !self.global_results.is_empty();
@@ -3258,6 +3594,10 @@ impl App {
         );
         if toggle_archive {
             self.in_archive = !self.in_archive;
+            if self.in_archive && !self.archive_loaded {
+                self.archive_loaded = true;
+                self.send(Cmd::LoadArchive);
+            }
         }
         if let Some((peer, id, name)) = open_global {
             self.search.clear();
@@ -3331,8 +3671,8 @@ fn paint_archive_icon(p: &egui::Painter, c: egui::Pos2, size: f32) {
     icons::tg(p, "archive_userpic", c, Color32::WHITE);
 }
 
-/// Строка «Архив» в начале списка; `true` — нажата.
-fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow]) -> bool {
+/// Строка «Архив» в начале списка; `true` — нажата. Архив грузится лениво по клику.
+fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow], loaded: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT),
         Sense::click(),
@@ -3354,6 +3694,13 @@ fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow]) -> bool {
         .take(3)
         .map(|d| d.name.as_str())
         .collect();
+    let sub = if !names.is_empty() {
+        names.join(", ")
+    } else if loaded {
+        "Архив пуст".to_owned()
+    } else {
+        "Нажмите, чтобы загрузить архивные чаты".to_owned()
+    };
     p.with_clip_rect(egui::Rect::from_min_max(
         rect.min,
         egui::pos2(rect.right() - 60.0, rect.max.y),
@@ -3361,8 +3708,8 @@ fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow]) -> bool {
     .text(
         rect.left_top() + Vec2::new(68.0, 35.0),
         egui::Align2::LEFT_TOP,
-        names.join(", "),
-        FontId::proportional(14.0),
+        sub,
+        FontId::proportional(13.5),
         DIALOG_TEXT,
     );
     let unread: i32 = dialogs.iter().filter(|d| d.archived && !d.muted).map(|d| d.unread).sum();
@@ -3442,8 +3789,12 @@ impl eframe::App for App {
         if (ctx.zoom_factor() - zoom).abs() > 0.001 {
             ctx.set_zoom_factor(zoom);
         }
-        ui.painter()
-            .rect_filled(ctx.content_rect(), egui::CornerRadius::ZERO, t(BACKDROP));
+        // Единая фоновая подложка на фоновом слое (без двоения краёв и швов при прозрачности).
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.content_rect().expand(2.0),
+            egui::CornerRadius::ZERO,
+            t(BACKDROP),
+        );
         if !self.emoji_tried {
             self.emoji_tried = true;
             self.emoji = emoji::Emoji::load(&ctx);
@@ -3511,26 +3862,36 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
         }
-        // Панель эмодзи/стикеров/GIF в широком окне стоит справа, как в AyuGram, и занимает место панели сведений.
-        let emoji_k = theme::tween(&ctx, "emoji-side", f32::from(u8::from(self.emoji_open && self.selected.is_some() && !narrow)), 0.2);
-        if emoji_k > 0.01 && self.selected.is_some() {
+        // Панель эмодзи/стикеров/GIF в широком окне стоит справа, как в AyuGram (жёсткий clip,
+        // без min_width(300) при сворачивании — устраняет «двоение» и вылезание текста за правый край!).
+        let emoji_k = theme::tween(&ctx, "emoji-side", f32::from(u8::from(self.emoji_open && self.selected.is_some() && !narrow)), 0.18);
+        if emoji_k > 0.02 && self.selected.is_some() {
+            let panel_w = (320.0 * ios_spring(emoji_k)).max(2.0);
             egui::Panel::right("emoji-side")
-                .exact_size(320.0 * ease_out(emoji_k))
+                .exact_size(panel_w)
                 .frame(egui::Frame::new().fill(tint_panel()).inner_margin(egui::Margin::symmetric(4, 0)))
                 .show(ui, |ui| {
-                    ui.set_min_width(300.0);
-                    self.emoji_panel_body(ui);
+                    ui.set_clip_rect(ui.max_rect());
+                    if panel_w >= 120.0 {
+                        self.emoji_panel_body(ui);
+                    }
                 });
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.emoji_pinned {
                 self.emoji_open = false;
             }
         }
-        let info_k = theme::tween(&ctx, "info-panel", f32::from(u8::from(self.info_open && !self.emoji_open && self.selected.is_some() && !narrow)), 0.2);
-        if info_k > 0.01 && self.selected.is_some() && emoji_k < 0.01 {
+        let info_k = theme::tween(&ctx, "info-panel", f32::from(u8::from(self.info_open && !self.emoji_open && self.selected.is_some() && !narrow)), 0.18);
+        if info_k > 0.02 && self.selected.is_some() && emoji_k <= 0.02 {
+            let panel_w = (320.0 * ios_spring(info_k)).max(2.0);
             egui::Panel::right("info")
-                .exact_size(320.0 * ease_out(info_k))
+                .exact_size(panel_w)
                 .frame(egui::Frame::new().fill(tint_panel()))
-                .show(ui, |ui| self.info_ui(ui));
+                .show(ui, |ui| {
+                    ui.set_clip_rect(ui.max_rect());
+                    if panel_w >= 120.0 {
+                        self.info_ui(ui);
+                    }
+                });
         }
         egui::Panel::top("header")
             .exact_size(TOP_BAR_HEIGHT)
@@ -3578,12 +3939,8 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| self.composer_ui(ui));
         }
-        // Лента мягко подъезжает при открытии чата (200 мс, кривая iOS без перелёта).
-        let push = (self.chat_opened.elapsed().as_secs_f32() / 0.2).clamp(0.0, 1.0);
-        if push < 1.0 && self.selected.is_some() {
-            ctx.request_repaint();
-        }
-        let slide = if self.selected.is_some() { (1.0 - ios_spring(push)) * 14.0 } else { 0.0 };
+        // Стабильные отступы ленты при входе в чат (без покадрового смещения inner_margin.left,
+        // которое переносило строки и вызывало дёргание сообщений при открытии чата!).
         let bg_style = if self.settings.ayu.disable_custom_backgrounds {
             0
         } else {
@@ -3594,7 +3951,7 @@ impl eframe::App for App {
                 egui::Frame::new()
                     .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin {
-                        left: (8.0 + slide.max(0.0)) as i8,
+                        left: 8,
                         right: 8,
                         top: 0,
                         bottom: 0,
@@ -3627,7 +3984,8 @@ impl eframe::App for App {
                 );
                 self.messages_ui(ui);
             });
-        if narrow {
+        // Плавающее мини-окно эмодзи/стикеров/GIF работает и на узком экране, и при наведении на ПК!
+        if narrow || (self.emoji_hover_open && !self.emoji_open) {
             self.emoji_window(&ctx);
         }
         self.render_modals(&ctx, frame);
@@ -3665,6 +4023,11 @@ impl App {
         self.paid_reaction_modal(ctx);
         self.business_window(ctx);
         self.themes_window(ctx);
+        self.scheduled_window(ctx);
+        self.todo_creator_window(ctx);
+        self.poll_creator_window(ctx);
+        self.hashtag_search_window(ctx);
+        self.quick_switcher_window(ctx);
         if let Some((path, caption, reply_to, opts)) =
             media_editor::media_editor_window(ctx, &mut self.media_editor, &worker::home().join("cache"))
         {

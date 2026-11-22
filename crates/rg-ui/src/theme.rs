@@ -79,8 +79,8 @@ pub const COLUMN_LEFT_NORMAL: f32 = 380.0;
 pub const NARROW_WIDTH: f32 = 720.0;
 
 // ---- прозрачность окна и блюр
-/// Непрозрачность фонов и кнопок, 0..=255 (100% = 255, непрозрачное на старте).
-static ALPHA: AtomicU8 = AtomicU8::new(255);
+/// Непрозрачность фонов и кнопок, 0..=255 (70% = 178 по умолчанию, матовое стекло на старте).
+static ALPHA: AtomicU8 = AtomicU8::new(178);
 /// Последняя альфа, применённая к глобальному стилю egui (кнопки, окна, поля).
 static VISUAL_ALPHA: AtomicU8 = AtomicU8::new(0);
 /// Включён ли блюр-эффект в стиле iOS.
@@ -257,8 +257,8 @@ pub fn set_blur(on: bool) {
 pub fn blur_on() -> bool {
     BLUR.load(Ordering::Relaxed)
 }
-/// Процент непрозрачности по умолчанию (100% — непрозрачное на старте).
-pub const DEFAULT_OPACITY_PCT: u8 = 100;
+/// Процент непрозрачности по умолчанию (70% — мягкое матовое стекло на старте).
+pub const DEFAULT_OPACITY_PCT: u8 = 70;
 
 /// Задать непрозрачность фонов и кнопок в процентах (15..=100).
 pub fn set_opacity(pct: u8) {
@@ -322,6 +322,197 @@ fn with_alpha(c: Color32, a: u8) -> Color32 {
 pub fn ios_spring(k: f32) -> f32 {
     let k = k.clamp(0.0, 1.0);
     1.0 - (1.0 - k).powi(4)
+}
+
+/// Упругая пружинная кривая iOS с мягким перелётом (~5%) для кнопок, попапов и иконок.
+pub fn ios_spring_bounce(k: f32) -> f32 {
+    let t = k.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let decay = (-6.2 * t).exp();
+    let osc = (t * std::f32::consts::PI * 1.65).cos();
+    (1.0 - decay * osc).clamp(0.0, 1.08)
+}
+
+/// Пружинный масштаб интерактивных иконок/кнопок (наведение + нажатие).
+pub fn spring_scale(hover: f32, active: f32) -> f32 {
+    let h = ios_spring_bounce(hover);
+    let a = ios_spring(active);
+    (1.0 + 0.14 * h - 0.08 * a).clamp(0.88, 1.22)
+}
+
+/// Многослойное матовое стекло для левой шторки, всплывающих окон и модальных карточек.
+pub fn paint_frosted_glass_panel(p: &egui::Painter, rect: Rect, radius: f32, raw: f32) {
+    let k = ios_spring(raw.clamp(0.0, 1.0));
+    let cr = CornerRadius::same(radius.clamp(0.0, 32.0) as u8);
+    let op = opacity_f32();
+    let base = resolve_theme_color(WINDOW_BG);
+    // Плотность стекла: достаточно прозрачное для эффекта матовости, но текст читается идеально.
+    let glass_a = ((150.0 + 82.0 * op) * k).clamp(0.0, 242.0) as u8;
+    p.rect_filled(
+        rect,
+        cr,
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), glass_a),
+    );
+    if blur_on() {
+        // Верхняя морозная дымка (эффект преломления матового стекла).
+        let top_h = (rect.height() * 0.42).clamp(24.0, 180.0);
+        let top_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), top_h));
+        let frost_a = (16.0 * k * (0.55 + 0.45 * op)) as u8;
+        p.rect_filled(
+            top_rect,
+            CornerRadius {
+                nw: cr.nw,
+                ne: cr.ne,
+                sw: 0,
+                se: 0,
+            },
+            Color32::from_rgba_unmultiplied(215, 224, 240, frost_a),
+        );
+        // Нижняя глубина для объёма.
+        let bot_h = (rect.height() * 0.25).clamp(16.0, 100.0);
+        let bot_rect = Rect::from_min_max(
+            Pos2::new(rect.left(), rect.bottom() - bot_h),
+            rect.right_bottom(),
+        );
+        p.rect_filled(
+            bot_rect,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: cr.sw,
+                se: cr.se,
+            },
+            Color32::from_black_alpha((26.0 * k) as u8),
+        );
+    }
+    paint_modal_subblur(p, rect, radius, raw);
+}
+
+/// Стильный QR-код в фирменном стиле Rustgramm (матовая стеклянная подложка, жидкие скруглённые
+/// модули, мягкие рамки поисковых узоров, градиентный акцент и эмблема в центре).
+pub fn draw_styled_qr(ui: &mut egui::Ui, url: &str, size: f32, accent: Color32, pop_k: f32) -> bool {
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M) else {
+        return false;
+    };
+    let n = code.width();
+    if n == 0 {
+        return false;
+    }
+    let scale = 0.92 + 0.08 * ios_spring_bounce(pop_k);
+    let (outer, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let card = Rect::from_center_size(outer.center(), Vec2::splat(size * scale));
+    let p = ui.painter();
+
+    // Матовое мягкое свечение вокруг карточки QR.
+    p.rect_filled(
+        card.expand(5.0),
+        CornerRadius::same(26),
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (24.0 * pop_k) as u8),
+    );
+    // Контрастная светло-жемчужная стеклянная подложка — сканируется камерой с 0.1 секунды.
+    p.rect_filled(
+        card,
+        CornerRadius::same(22),
+        Color32::from_rgba_unmultiplied(248, 249, 252, (248.0 * pop_k.clamp(0.2, 1.0)) as u8),
+    );
+    p.rect_stroke(
+        card,
+        CornerRadius::same(22),
+        Stroke::new(1.5, Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 120)),
+        egui::StrokeKind::Inside,
+    );
+
+    let quiet = 16.0 * scale;
+    let inner = card.shrink(quiet);
+    let cell = inner.width() / n as f32;
+    let center_clear_r = (n as f32 * 0.145).max(3.2);
+    let mid = (n as f32 - 1.0) * 0.5;
+
+    let is_finder = |x: usize, y: usize| -> bool {
+        (x < 7 && y < 7) || (x + 7 >= n && y < 7) || (x < 7 && y + 7 >= n)
+    };
+
+    // Жидкие точки данных с лёгким градиентом к акцентному цвету по диагонали.
+    let dark_base = Color32::from_rgb(18, 20, 26);
+    for y in 0..n {
+        for x in 0..n {
+            if is_finder(x, y) || code[(x, y)] != qrcode::Color::Dark {
+                continue;
+            }
+            let dx = x as f32 - mid;
+            let dy = y as f32 - mid;
+            if (dx * dx + dy * dy).sqrt() < center_clear_r {
+                continue;
+            }
+            let diag = ((x + y) as f32 / (2.0 * n as f32)).clamp(0.0, 1.0);
+            let dot_col = lerp_color(dark_base, lerp_color(dark_base, accent, 0.28), diag);
+            let cx = inner.left() + (x as f32 + 0.5) * cell;
+            let cy = inner.top() + (y as f32 + 0.5) * cell;
+            let r = (cell * 0.44).max(1.2);
+            p.circle_filled(Pos2::new(cx, cy), r, dot_col);
+            // Мягкое слияние соседних тёмных точек для «жидкого» силуэта.
+            if x + 1 < n && !is_finder(x + 1, y) && code[(x + 1, y)] == qrcode::Color::Dark {
+                let dx2 = (x + 1) as f32 - mid;
+                if (dx2 * dx2 + dy * dy).sqrt() >= center_clear_r {
+                    let bridge = Rect::from_center_size(
+                        Pos2::new(cx + cell * 0.5, cy),
+                        Vec2::new(cell * 0.6, r * 1.45),
+                    );
+                    p.rect_filled(bridge, CornerRadius::same(1), dot_col);
+                }
+            }
+            if y + 1 < n && !is_finder(x, y + 1) && code[(x, y + 1)] == qrcode::Color::Dark {
+                let dy2 = (y + 1) as f32 - mid;
+                if (dx * dx + dy2 * dy2).sqrt() >= center_clear_r {
+                    let bridge = Rect::from_center_size(
+                        Pos2::new(cx, cy + cell * 0.5),
+                        Vec2::new(r * 1.45, cell * 0.6),
+                    );
+                    p.rect_filled(bridge, CornerRadius::same(1), dot_col);
+                }
+            }
+        }
+    }
+
+    // 3 скруглённых поисковых узора (finder eyes) с акцентным центром.
+    for (fx, fy) in [(0usize, 0usize), (n - 7, 0), (0, n - 7)] {
+        let fr = Rect::from_min_size(
+            Pos2::new(inner.left() + fx as f32 * cell, inner.top() + fy as f32 * cell),
+            Vec2::splat(7.0 * cell),
+        );
+        let outer_cr = CornerRadius::same((cell * 2.1).clamp(4.0, 18.0) as u8);
+        let inner_cr = CornerRadius::same((cell * 1.2).clamp(2.0, 12.0) as u8);
+        p.rect_stroke(
+            fr.shrink(cell * 0.5),
+            outer_cr,
+            Stroke::new(cell * 1.02, dark_base),
+            egui::StrokeKind::Middle,
+        );
+        p.rect_filled(fr.shrink(cell * 2.0), inner_cr, accent);
+    }
+
+    // Центральный значок-медальон (бумажный самолётик Rustgramm).
+    let badge_r = (center_clear_r * cell * 0.92).clamp(16.0, 26.0);
+    p.circle_filled(inner.center(), badge_r + 2.5, Color32::from_rgb(248, 249, 252));
+    p.circle_filled(inner.center(), badge_r, accent);
+    let c = inner.center();
+    let s = badge_r * 0.52;
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            c + Vec2::new(-s * 1.05, 0.0),
+            c + Vec2::new(s * 0.95, -s * 0.78),
+            c + Vec2::new(s * 0.45, s * 0.9),
+            c + Vec2::new(-s * 0.12, s * 0.22),
+        ],
+        Color32::WHITE,
+        Stroke::NONE,
+    ));
+    true
 }
 
 /// Полупрозрачная вуаль под модальными окнами в стиле AyuGram (лёгкое затемнение фона без пятен).
@@ -645,8 +836,8 @@ fn read_face(path: &str) -> Option<Arc<FontData>> {
         .map(|b| Arc::new(FontData::from_owned(b).tweak(tweak)))
 }
 
-/// Системные шрифты Windows (Segoe UI, Consolas, Symbols) без тяжёлых встроенных шрифтов и seguiemj.ttf
-/// (цветные эмодзи рисуются нашим атласом `Emoji`, поэтому не тратим ~25 МБ ОЗУ на лишние шрифты).
+/// Системные шрифты Windows/Android с полным покрытием символов и эмодзи во всех семействах
+/// (убирает квадраты `□` в именах контактов, секретных чатах, кнопках и заголовках).
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let has_segoe = if let Some(f) = read_face("C:\\Windows\\Fonts\\segoeui.ttf") {
@@ -688,15 +879,26 @@ fn install_fonts(ctx: &egui::Context) {
             .or_default()
             .push("segoe".into());
     }
-    for (name, path) in [
+    // Фоллбэки Unicode/символов/эмодзи во ВСЕ три семейства — гарантирует отсутствие квадратов `[]`.
+    let fallback_paths = [
         ("segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
+        ("segoe-emoji", "C:\\Windows\\Fonts\\seguiemj.ttf"),
+        ("arial-uni", "C:\\Windows\\Fonts\\arial.ttf"),
+        ("noto-symbols2", "/system/fonts/NotoSansSymbols2-Regular.ttf"),
         ("noto-symbols", "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf"),
-    ] {
+        ("noto-emoji", "/system/fonts/NotoColorEmoji.ttf"),
+        ("dejavu-sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ];
+    for (name, path) in fallback_paths {
         if let Ok(bytes) = std::fs::read(path) {
             fonts
                 .font_data
                 .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
-            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            for family in [
+                FontFamily::Proportional,
+                FontFamily::Monospace,
+                FontFamily::Name(FAM_DISPLAY.into()),
+            ] {
                 fonts
                     .families
                     .entry(family)
@@ -899,6 +1101,7 @@ mod tests {
 
     #[test]
     fn custom_theme_palette_updates_live_colors_and_resets() {
+        set_opacity(100);
         let custom = rg_settings::CustomThemeSettings {
             accent_hex: "#3390EC".to_owned(),
             window_bg_hex: "#17212B".to_owned(),
@@ -910,5 +1113,16 @@ mod tests {
         sync_custom_theme(&rg_settings::CustomThemeSettings::default());
         assert_eq!(c_orange(), ORANGE);
         assert_eq!(t(WINDOW_BG), WINDOW_BG);
+        set_opacity(DEFAULT_OPACITY_PCT);
+    }
+
+    #[test]
+    fn default_opacity_is_70_and_spring_curves_behave() {
+        assert_eq!(DEFAULT_OPACITY_PCT, 70);
+        assert_eq!(ios_spring_bounce(0.0), 0.0);
+        assert_eq!(ios_spring_bounce(1.0), 1.0);
+        assert!(ios_spring_bounce(0.5) > 0.9);
+        assert!(spring_scale(1.0, 0.0) > 1.05);
+        assert!(spring_scale(0.0, 1.0) < 1.0);
     }
 }

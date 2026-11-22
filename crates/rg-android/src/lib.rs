@@ -15,7 +15,8 @@ fn android_main(app: android_activity::AndroidApp) {
     if let Some(dir) = app.internal_data_path() {
         let _ = rg_ui::worker::DATA_DIR.set(dir);
     }
-    rg_ui::android_jni::ensure_runtime_permissions();
+    // Не блокируем старт приложения запросом разрешений до появления экрана входа —
+    // права запрашиваются лениво при записи голоса, выборе файлов и показе уведомлений.
     let options = eframe::NativeOptions {
         android_app: Some(app),
         ..Default::default()

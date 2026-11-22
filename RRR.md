@@ -915,3 +915,60 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --features plugins` и `--no-default-features` — **OK**; кросс-проверка `cargo check -p rg-android --target aarch64-linux-android` (Full и Lite, NDK 27) — **OK** (0 ошибок, 0 предупреждений в `android_jni.rs` и `rg-android`).
 - `cargo test --workspace` — **2130 тестов пройдено, 0 провалено, 0 пропущено** (включая `no_foreign_hosts`, тесты `call_media`, `theme_pack`, `media_editor`, `CustomThemeSettings`, `LivePalette` и `set_icon_pack`).
 - `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` собран (**13 702 656 байт**), smoke-запуск `RG_DEMO=1` — **OK** (`smoke_alive=True`).
+
+## Этап 30 (2026-11-22, v0.19.0)
+
+Масштабная стабилизация по всем 11 пользовательским скриншотам: устранены двоение окна, квадраты `□`, дёргание ленты, бесконечная загрузка, ошибки `RPC 500 RPC_MCGET_FAIL`, задержки live-сообщений, пустые сообщения современных ботов (`eroot`), лаги входа на Android, непрозрачный фон стикеров, неработающий скролл левого меню, отсутствие наборов стикеров/GIF и историй; добавлены 70% матовое стекло на старте, пружинные микроанимации (`⋮` и др.), жидкие QR-коды, безлимитная расшифровка голоса, подробный локальный диагностический лог и 10 новых функций Telegram.
+
+### Причины найденных багов и решения
+
+1. **Раздвоение окна и вылезание текста справа (`lib.rs`, `win.rs`, `frame.rs`)**:
+   - Причина: `Panel::right("emoji-side")` задавал `ui.set_min_width(300.0)` во время анимации сворачивания, фон рисовался в `ui.painter()` вместо `LayerId::background()`, а `DwmExtendFrameIntoClientArea` не вызывал `SetWindowPos(SWP_FRAMECHANGED)`.
+   - Решение: подложка перенесена на `LayerId::background()`, добавлен строгий `set_clip_rect` в `titlebar` / `emoji-side` / `info` без `min_width(300)` при сворачивании, и `SetWindowPos(SWP_FRAMECHANGED)` в `win.rs::apply_blur`.
+
+2. **Квадраты `□` и обрезка окна секретных чатов (`theme.rs`, `features_ui.rs`)**:
+   - Причина: `install_fonts` пропускал `seguiemj.ttf` и не добавлял символьные шрифты в `FAM_DISPLAY`; окно секретных чатов использовало полупрозрачный дефолтный фрейм и обычные `ui.button(&d.name)` без эмодзи-атласа.
+   - Решение: `seguisym.ttf`, `seguiemj.ttf`, `arial.ttf` и Android Noto fallbacks добавлены во все 3 семейства шрифтов (`Proportional`, `Monospace`, `FAM_DISPLAY`); `secret_chats_window` получил плотный матовый фрейм `246/255` и эмодзи-безопасные строки контактов.
+
+3. **Дёргание сообщений при входе в чат (`lib.rs`, `chat.rs`)**:
+   - Причина: `CentralPanel` анимировал `inner_margin.left` (`22 → 8` px) каждый кадр (пересчитывая переносы текста во всех пузырях), а `bubble()` добавлял сжимающийся `ui.add_space(16 → 0)` над каждым сообщением.
+   - Решение: убраны обе layout-анимации, оставлено только плавное проявление прозрачности (`opacity`) с постоянными отступами.
+
+4. **Медленный старт, `RPC 500: RPC_MCGET_FAIL`, бесконечная загрузка, пропадание live-сообщений и 96 потоков (`engine.rs`, `worker.rs`, `lib.rs`)**:
+   - Причина: `grammers-client` `AutoSleep` не повторял HTTP 500; `enter()` одновременно запрашивал 60 диалогов и архив до запуска `run_updates`; `Ev::History(idx)` терял ответ при перестановке списка чатов; `on_live` делал полный перезапрос 300 чатов + архива.
+   - Решение: добавлен `Engine::invoke_retry` с экспоненциальным ретраем для RPC 500/502/503 (`RPC_MCGET_FAIL`, `RPC_CALL_FAIL`, `TIMEOUT`, `INTERNAL`); `run_updates` стартует **первым** (с `updates.getState` и авто-восстановлением); `dialogs_stream(5, 5000)` грузит сначала 5 основных чатов (`folder_id: Some(0)`) **без загрузки архива** (архив грузится лениво через `Cmd::LoadArchive`); `Ev::History` и `Ev::HistoryError` привязаны к стабильному `dialog_id`; `apply_live_to_list` поднимает чат локально за 0 мс; конкурентность Tokio увеличена до `8..=32` worker-потоков, `max_blocking_threads(96)`, `avatar_limit = 96`, `limit = 24`.
+
+5. **Современные боты `RichMessage` (`eroot`, `VOID ACCESS`) (`rich_msg.rs`, `engine.rs`, `chat.rs`)**:
+   - Причина: бот `eroot` отправляет Layer 233 `Message.rich_message: Some(RichMessage)` (`PageBlockTable`, `PageBlockBlockquote`, `PageBlockVideo`, `TextCustomEmoji`), где `m.text()` пустой.
+   - Решение: создан парсер `crates/rg-core/src/rich_msg.rs` (`RichBlock`, `RichTableCell`, `RichListItem`, `collect_rich_custom_emojis`), поддержка скачивания встроенных превью `RichMessage` в `preview_path` (`RawLoc` + `dc_id`), и полноценный рендер `render_rich_blocks` (таблицы с зеброй, цитаты с акцентной полосой, заголовки, списки с кастомными эмодзи, разделители). Кнопка Mini App `app` в поле ввода сжата до компактной авто-ширины (`54..=88 × 30` px).
+
+6. **Стикеры, GIF и мини-окно эмодзи по наведению на ПК (`panels.rs`, `chat.rs`, `worker.rs`, `video.rs`, `lib.rs`)**:
+   - Стикеры без текста рисуются на **100% прозрачном фоне** без хвостика пузыря и с аккуратной пилюлей времени; TGS-анимации ускорены до плавных 30 FPS (до 20 стикеров в ленте), WebM видео-стикеры воспроизводятся в ленте с прозрачным фоном (`with_transparent(true)`).
+   - `Cmd::Stickers` и `Cmd::Gifs` выполняются асинхронно (`tokio::spawn`), добавлены `faved_stickers()` (`★ Избранные`) и `recent_stickers()` (`⏱ Недавние`), флаги `stickers_loaded`/`gifs_loaded` со спиннером и кнопкой «Обновить».
+   - Наведение на кнопку смайла на ПК открывает плавающее матовое мини-окно (`emoji_hover_open`), а клик закрепляет боковую панель.
+
+7. **Истории 9:16 с мгновенной загрузкой (`engine_ext.rs`, `worker.rs`, `panels.rs`, `chat.rs`)**:
+   - Исправлена кросс-DC загрузка медиа историй (`RawLoc` + `dc_id` + `iter_download` вместо `upload.getFile` на домашнем DC, падавшего с `FILE_MIGRATE_X`); первые 6 историй предзагружаются в фоне сразу после входа (`preload_stories`).
+   - Просмотрщик перерисован 1-в-1 в вертикальную 9:16 карточку (верхние полоски прогресса, аватар/время, Пауза/Звук/Закрыть, полноразмерное фото, просмотры `👁`, быстрый ответ и сердце `♥` с пружинным откликом); в полосе историй векторный `+` выровнен ровно по центру, высота увеличена до 72 px.
+
+8. **Вход в стиле официального Telegram без лагов на Android, 70% матовое стекло, выравнивание и навигация (`rg-android`, `theme.rs`, `settings_ui.rs`, `tg_settings.rs`, `lib.rs`, `chat.rs`)**:
+   - Убран блокирующий `ensure_runtime_permissions()` на старте Android; рабочий поток не завершается при сетевом сбое (ожидает прокси/повтор); список стран виртуализирован через `show_rows`.
+   - Экран входа переделан под официальный Telegram: матовая карточка, маскот-эмодзи (`👋`, `📩`, интерактивная обезьянка `🙈`/`🐵` при показе пароля 2FA), жидкий стильный QR-код `draw_styled_qr` (также в профиле).
+   - Прозрачность по умолчанию на старте — **70%** (`DEFAULT_OPACITY_PCT = 70`, однократная миграция `opacity_v19_migrated`).
+   - Выровнены все иконки поля ввода (`34..38×40` слоты, 19 px визуальный размер, единая ось Y), текст «Поиск» центрирован по вертикали на уровне `≡`.
+   - Левое меню получило многослойное матовое стекло (`paint_frosted_glass_panel`) и полноценный вертикальный скролл (`ScrollArea`); `Telegram Premium`, `Мои звёзды`, `Telegram Бизнес`, `Отправить подарок` и `Темы` перенесены в «Настройки».
+   - Звёздные реакции показываются в меню **только в каналах**, где автор включил `ChannelFull.paid_reactions_available`.
+   - Ускорена смена аккаунтов (пауза разрыва пула `180 → 15` мс + мгновенный кэш с диска), лимита в 3 аккаунта нет; добавлен локальный диагностический лог `crates/rg-core/src/diag.rs` (`<RG_HOME>/logs/rustgramm.log`, без секретов) с просмотром и копированием в Настройках → Продвинутые настройки.
+   - Добавлена безлимитная расшифровка голосовых/кружков (`Engine::transcribe_voice`: Telegram API + локальный оффлайн-фоллбэк без чужих серверов, кнопка `→A Расшифровать` прямо в пузыре).
+
+9. **10 новых функций Telegram + пружинные микроанимации (`engine_ext.rs`, `worker.rs`, `chat.rs`, `rich.rs`, `tg_settings.rs`, `features_ui.rs`)**:
+   - Пружинные микроанимации (`ios_spring_bounce`, `spring_scale`): кнопка `⋮` в шапке плавно увеличивается и раздвигает точки при наведении/открытии, а также иконки шапки, поля ввода, реакций и кнопок окна.
+   - Новые функции: (1) Интерактивные чек-листы (To-Do); (2) Анимированные эффекты сообщений (`Message.effect` + вспышка частиц + меню ПКМ на Отправить); (3) Отложенные сообщения и личные напоминания; (4) Теги «Избранного» (фильтр и переименование); (5) Отправка от имени канала/профиля (`Send As`); (6) Конструктор опросов и викторин; (7) Акцентный цвет профиля (`account.updateColor`); (8) Глобальный поиск по `#хэштегам` в публичных каналах; (9) Медленный режим (Slow Mode: таймер над полем ввода + выбор задержки в админке); (10) Палитра быстрого перехода `Ctrl+K` (Quick Switcher) по всем чатам и действиям.
+
+### Проверки (v0.19.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) — **0 предупреждений**.
+- `cargo clippy -p rg-ui -p rg-desktop -p rg-android --no-default-features --all-targets -- -D warnings` (Lite) — **0 предупреждений**.
+- `cargo check -p rg-android --target aarch64-linux-android` (`--features plugins` и `--no-default-features`, NDK 27) — **OK**.
+- `cargo test --workspace` — **2134 теста пройдено, 0 провалено, 0 пропущено** (включая `no_foreign_hosts`, `diag`, `rich_msg`, `opacity_v19_migrated`, `default_opacity_is_70_and_spring_curves_behave`, `ui_suite`).
+- `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` собран (**14 106 624 байта**), smoke-запуск `RG_DEMO=1` и `RG_DEMO=qr` — **OK** (`smoke_main=True smoke_qr=True`).

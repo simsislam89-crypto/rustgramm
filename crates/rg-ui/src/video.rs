@@ -157,8 +157,8 @@ impl InlineGifView {
         let src = file_url(video);
         let html = format!(
             "<!doctype html><html><head><meta charset=utf-8><style>\
-            html,body{{margin:0;height:100%;background:#141418;overflow:hidden;cursor:pointer}}\
-            video{{width:100%;height:100%;object-fit:cover;display:block}}\
+            html,body{{margin:0;height:100%;background:transparent;overflow:hidden;cursor:pointer}}\
+            video{{width:100%;height:100%;object-fit:contain;display:block;background:transparent}}\
             </style></head><body><video id=v src=\"{src}\" autoplay loop muted playsinline></video>\
             <script>var n=0;document.onclick=function(){{document.title='rg'+(++n)+'|open'}}</script>\
             </body></html>"
@@ -170,7 +170,8 @@ impl InlineGifView {
         let webview = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(file_url(&html_path))
             .with_autoplay(true)
-            .with_background_color((20, 20, 24, 255))
+            .with_transparent(true)
+            .with_background_color((0, 0, 0, 0))
             .with_devtools(false)
             .with_bounds(Rect {
                 position: PhysicalPosition::new(0, 0).into(),

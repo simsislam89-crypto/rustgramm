@@ -134,6 +134,14 @@ pub struct PeerInfo {
     pub bot_menu_webapp: Option<(String, String)>,
     /// Описание бота из `BotInfo.description` (показывается на стартовом экране бота).
     pub bot_description: String,
+    /// Включены ли платные звёздные реакции в этом канале (`ChannelFull.paid_reactions_available`).
+    pub paid_reactions_available: bool,
+    /// Интервал медленного режима (Slow Mode), секунды (0 — выключен).
+    pub slowmode_seconds: i32,
+    /// Unix-время, когда можно отправить следующее сообщение при Slow Mode.
+    pub slowmode_next_send_date: i32,
+    /// Есть ли приветственные сообщения для новых участников канала/группы.
+    pub has_welcome_messages: bool,
 }
 
 /// Действие кнопки бота (инлайн под сообщением или реплай-клавиатуры под полем ввода).
@@ -374,6 +382,10 @@ pub struct StoryRow {
     pub caption: String,
     pub date: i32,
     pub unread: bool,
+    pub views: i32,
+    pub reactions: i32,
+    pub is_video: bool,
+    pub count_in_peer: usize,
 }
 
 /// Ветка комментариев к посту канала (`messages.getDiscussionMessage` + `messages.getReplies`).
@@ -680,6 +692,23 @@ pub fn utf16_range(text: &str, char_start: usize, char_len: usize) -> (i32, i32)
     (off as i32, len as i32)
 }
 
+/// Пункт интерактивного чеклиста (`TodoItem` + статус выполнения).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TodoItemRow {
+    pub id: i32,
+    pub text: String,
+    pub done: bool,
+}
+
+/// Интерактивный чеклист задач в сообщении (`MessageMedia::ToDo`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TodoListInfo {
+    pub title: String,
+    pub others_can_complete: bool,
+    pub others_can_append: bool,
+    pub items: Vec<TodoItemRow>,
+}
+
 /// Сообщение для интерфейса.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MessageRow {
@@ -717,6 +746,15 @@ pub struct MessageRow {
     /// Реплай-клавиатура бота под полем ввода (`ReplyKeyboardMarkup`).
     #[serde(default)]
     pub reply_keyboard: Vec<Vec<BotButton>>,
+    /// Блоки Telegram Layer 233 `RichMessage` (таблицы, цитаты, заголовки, списки современных ботов).
+    #[serde(default)]
+    pub rich_blocks: Vec<crate::rich_msg::RichBlock>,
+    /// Идентификатор анимированного эффекта сообщения (`Message.effect`).
+    #[serde(default)]
+    pub effect: Option<i64>,
+    /// Интерактивный чеклист (`MessageMedia::ToDo`).
+    #[serde(default)]
+    pub todo: Option<TodoListInfo>,
 }
 
 impl MessageRow {
@@ -743,6 +781,9 @@ impl MessageRow {
             grouped: None,
             inline_buttons: Vec::new(),
             reply_keyboard: Vec::new(),
+            rich_blocks: Vec::new(),
+            effect: None,
+            todo: None,
         }
     }
 }
@@ -1037,30 +1078,82 @@ impl Engine {
         ok_count
     }
 
-    /// Чаты из папки «Архив» (folder_id = 1).
-    pub async fn archived(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
+    /// Вызывает любой MTProto RPC с автоматическими повторами при временных ошибках сервера
+    /// (500 `RPC_MCGET_FAIL` / `RPC_CALL_FAIL` / `INTERNAL` / `TIMEOUT`, 502/503, короткий `FLOOD_WAIT` и сбои сокета).
+    pub async fn invoke_retry<R>(
+        &self,
+        tag: &str,
+        req: &R,
+    ) -> Result<R::Return, grammers_client::InvocationError>
+    where
+        R: grammers_client::tl::RemoteCall + Send + Sync,
+    {
+        use grammers_client::InvocationError;
+        let delays = [250u64, 600, 1300, 2400];
+        let mut attempt = 0usize;
+        loop {
+            match self.client.invoke(req).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let retry_ms = match &e {
+                        InvocationError::Rpc(r)
+                            if r.code == 500
+                                || r.code == 502
+                                || r.code == 503
+                                || r.code == -503
+                                || r.name.contains("MCGET")
+                                || r.name.contains("CALL_FAIL")
+                                || r.name.contains("TIMEOUT")
+                                || r.name.contains("INTERNAL") =>
+                        {
+                            delays.get(attempt).copied()
+                        }
+                        InvocationError::Rpc(r) if r.code == 420 => {
+                            let secs = r.value.unwrap_or(0);
+                            if secs <= 12 && attempt < 2 {
+                                Some(u64::from(secs) * 1000 + 250)
+                            } else {
+                                None
+                            }
+                        }
+                        InvocationError::Io(_) => delays.get(attempt).copied(),
+                        _ => None,
+                    };
+                    if let Some(ms) = retry_ms {
+                        crate::diag::warn(
+                            "RPC",
+                            &format!("{tag}: попытка {} не удалась ({e}), повтор через {ms} мс", attempt + 1),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        attempt += 1;
+                    } else {
+                        crate::diag::error("RPC", &format!("{tag}: ошибка {e}"));
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Разбирает сырую страницу ответа `messages.getDialogs` (основную или архивную) в `DialogRow`.
+    fn parse_raw_dialogs(
+        res: grammers_client::tl::enums::messages::Dialogs,
+        archived_flag: bool,
+        my_id: Option<i64>,
+    ) -> (Vec<DialogRow>, bool, (i32, i32, grammers_client::tl::enums::InputPeer)) {
         use grammers_client::tl;
-        let res = self
-            .client
-            .invoke(&tl::functions::messages::GetDialogs {
-                exclude_pinned: false,
-                folder_id: Some(1),
-                offset_date: 0,
-                offset_id: 0,
-                offset_peer: tl::enums::InputPeer::Empty,
-                limit: limit.min(100) as i32,
-                hash: 0,
-            })
-            .await?;
-        let (dialogs, messages, chats, users) = match res {
-            tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users),
-            tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users),
-            tl::enums::messages::Dialogs::NotModified(_) => return Ok(Vec::new()),
+        let (dialogs, messages, chats, users, more_hint) = match res {
+            tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users, false),
+            tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users, true),
+            tl::enums::messages::Dialogs::NotModified(_) => {
+                return (Vec::new(), false, (0, 0, tl::enums::InputPeer::Empty));
+            }
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(dialogs.len());
+        let mut last_off = (0i32, 0i32, tl::enums::InputPeer::Empty);
         for d in dialogs {
             let tl::enums::Dialog::Dialog(d) = d else { continue };
             let pid = grammers_session::types::PeerId::from(&d.peer);
@@ -1069,6 +1162,7 @@ impl Engine {
             let mut emoji_status = None;
             let mut verified = false;
             let mut premium = false;
+            let mut is_self = false;
             let (name, peer) = match &d.peer {
                 tl::enums::Peer::User(u) => {
                     let Some(user) = users.iter().find(|x| matches!(x, tl::enums::User::User(y) if y.id == u.user_id)) else { continue };
@@ -1076,6 +1170,7 @@ impl Engine {
                         tl::enums::User::User(y) => {
                             kind = if y.bot { DialogKind::Bot } else { DialogKind::User };
                             contact = y.contact;
+                            is_self = y.is_self || my_id == Some(y.id);
                             emoji_status = emoji_status_id(y.emoji_status.as_ref());
                             verified = y.verified;
                             premium = y.premium;
@@ -1111,34 +1206,57 @@ impl Engine {
                     (name, grammers_session::types::PeerRef::from(chat))
                 }
             };
-            let (last, date) = messages
+            let (last, date, msg_id_raw) = messages
                 .iter()
                 .find_map(|m| match m {
                     tl::enums::Message::Message(m)
                         if m.id == d.top_message && grammers_session::types::PeerId::from(&m.peer_id) == pid =>
                     {
-                        let preview = if m.message.trim().is_empty() {
-                            raw_media_label(m.media.as_ref())
-                        } else {
+                        let preview = if !m.message.trim().is_empty() {
                             m.message.chars().take(80).collect()
+                        } else if let Some(rm) = m.rich_message.as_ref() {
+                            let (_, sum) = crate::rich_msg::parse_rich_message(rm);
+                            sum.lines().next().unwrap_or("Сообщение").chars().take(80).collect()
+                        } else {
+                            raw_media_label(m.media.as_ref())
                         };
-                        Some((preview, i64::from(m.date)))
+                        Some((preview, i64::from(m.date), m.id))
+                    }
+                    tl::enums::Message::Service(s)
+                        if s.id == d.top_message && grammers_session::types::PeerId::from(&s.peer_id) == pid =>
+                    {
+                        let txt = format_service_action(&s.action).unwrap_or_else(|| "Событие".to_owned());
+                        Some((txt, i64::from(s.date), s.id))
                     }
                     _ => None,
                 })
                 .unwrap_or_default();
-            let muted = matches!(&d.notify_settings, tl::enums::PeerNotifySettings::Settings(s) if s.mute_until.is_some_and(|t| i64::from(t) > now));
+            if date > 0 {
+                last_off = (date as i32, msg_id_raw, tl::enums::InputPeer::from(peer));
+            }
+            let muted = matches!(
+                &d.notify_settings,
+                tl::enums::PeerNotifySettings::Settings(s)
+                    if s.mute_until.is_some_and(|t| i64::from(t) > now)
+            );
+            let is_archived = archived_flag || d.folder_id == Some(1);
             out.push(DialogRow {
                 peer,
                 id: pid.bot_api_dialog_id_unchecked(),
-                name: if name.is_empty() { "Без имени".to_owned() } else { name },
+                name: if is_self {
+                    "Избранное".to_owned()
+                } else if name.is_empty() {
+                    "Без имени".to_owned()
+                } else {
+                    name
+                },
                 last,
                 date,
                 unread: d.unread_count.max(i32::from(d.unread_mark)),
                 pinned: d.pinned,
                 muted,
-                saved: false,
-                archived: true,
+                saved: is_self,
+                archived: is_archived,
                 kind,
                 contact,
                 read_out: d.read_outbox_max_id,
@@ -1147,7 +1265,29 @@ impl Engine {
                 premium,
             });
         }
-        Ok(out)
+        (out, more_hint, last_off)
+    }
+
+    /// Чаты из папки «Архив» (folder_id = 1) — загружаются лениво только при открытии архива.
+    pub async fn archived(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .invoke_retry(
+                "getDialogs(archive)",
+                &tl::functions::messages::GetDialogs {
+                    exclude_pinned: false,
+                    folder_id: Some(1),
+                    offset_date: 0,
+                    offset_id: 0,
+                    offset_peer: tl::enums::InputPeer::Empty,
+                    limit: limit.min(100) as i32,
+                    hash: 0,
+                },
+            )
+            .await?;
+        let (rows, _, _) = Self::parse_raw_dialogs(res, true, None);
+        crate::diag::info("DLG", &format!("Загружен архив: {} чатов", rows.len()));
+        Ok(rows)
     }
 
     /// Переместить чат в архив или вернуть из него.
@@ -1197,49 +1337,135 @@ impl Engine {
     }
 
     pub async fn dialogs(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
-        let mut it = self.client.iter_dialogs();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        use grammers_client::tl;
         let mut out = Vec::new();
+        let mut off_date = 0i32;
+        let mut off_id = 0i32;
+        let mut off_peer = tl::enums::InputPeer::Empty;
+        let mut exclude_pinned = false;
         while out.len() < limit {
-            let Some(d) = it.next().await? else { break };
-            out.push(dialog_row_from(&d, now));
+            let chunk_lim = (limit - out.len()).min(60) as i32;
+            let res = self
+                .invoke_retry(
+                    "getDialogs(main)",
+                    &tl::functions::messages::GetDialogs {
+                        exclude_pinned,
+                        folder_id: Some(0),
+                        offset_date: off_date,
+                        offset_id: off_id,
+                        offset_peer: off_peer.clone(),
+                        limit: chunk_lim,
+                        hash: 0,
+                    },
+                )
+                .await?;
+            let (rows, more, (nd, ni, np)) = Self::parse_raw_dialogs(res, false, None);
+            let got = rows.len();
+            for r in rows {
+                if !out.iter().any(|x: &DialogRow| x.id == r.id) {
+                    out.push(r);
+                }
+            }
+            if !more || got == 0 || nd == 0 || (nd == off_date && ni == off_id) {
+                break;
+            }
+            off_date = nd;
+            off_id = ni;
+            off_peer = np;
+            exclude_pinned = true;
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
         Ok(out)
     }
 
-    /// Потоковая загрузка большого числа чатов (до 5000+) без тормозов:
-    /// сначала отдаёт первую быструю порцию `first_batch` (видимый экран), затем догружает остальные чанками по 150.
+    /// Умная потоковая загрузка ТОЛЬКО основного списка чатов (`folder_id = Some(0)`, архив НЕ трогается!).
+    /// Первые `first_batch` (например 5) чатов приходят мгновенно одним маленьким запросом,
+    /// далее остальные (до `max_total`) догружаются мягкими порциями с автоповтором при RPC 500 (`RPC_MCGET_FAIL`).
     pub async fn dialogs_stream(
         &self,
         first_batch: usize,
         max_total: usize,
         tx: mpsc::Sender<(Vec<DialogRow>, bool)>,
     ) -> Result<(), grammers_client::InvocationError> {
-        let mut it = self.client.iter_dialogs();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let mut batch = Vec::with_capacity(first_batch.max(64));
+        use grammers_client::tl;
+        let t0 = std::time::Instant::now();
+        let mut seen = std::collections::HashSet::<i64>::new();
+        let mut off_date = 0i32;
+        let mut off_id = 0i32;
+        let mut off_peer = tl::enums::InputPeer::Empty;
+        let mut exclude_pinned = false;
         let mut total = 0usize;
-        let mut first_sent = false;
+        let mut first = true;
+
         while total < max_total {
-            let Some(d) = it.next().await? else { break };
-            batch.push(dialog_row_from(&d, now));
-            total += 1;
-            let threshold = if !first_sent { first_batch.max(20) } else { 150 };
-            if batch.len() >= threshold {
-                first_sent = true;
-                let send_vec = std::mem::replace(&mut batch, Vec::with_capacity(150));
-                if tx.send((send_vec, false)).await.is_err() {
-                    return Ok(());
-                }
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(12)).await;
+            let page_limit = if first {
+                first_batch.clamp(5, 25)
+            } else if total < 80 {
+                30
+            } else {
+                50
             }
+            .min(max_total - total) as i32;
+
+            let res = match self
+                .invoke_retry(
+                    if first { "getDialogs(first5)" } else { "getDialogs(stream)" },
+                    &tl::functions::messages::GetDialogs {
+                        exclude_pinned,
+                        folder_id: Some(0),
+                        offset_date: off_date,
+                        offset_id: off_id,
+                        offset_peer: off_peer.clone(),
+                        limit: page_limit,
+                        hash: 0,
+                    },
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::diag::error("DLG", &format!("Остановка потока чатов после {total} шт.: {e}"));
+                    if total == 0 {
+                        let _ = tx.send((Vec::new(), true)).await;
+                        return Err(e);
+                    }
+                    break;
+                }
+            };
+            let (rows, more, (nd, ni, np)) = Self::parse_raw_dialogs(res, false, None);
+            let got = rows.len();
+            let mut fresh = Vec::with_capacity(got);
+            for r in rows {
+                if seen.insert(r.id) {
+                    fresh.push(r);
+                }
+            }
+            total += fresh.len();
+            if first {
+                crate::diag::info(
+                    "DLG",
+                    &format!("Первые {} чатов загружены за {} мс (без архива)", fresh.len(), t0.elapsed().as_millis()),
+                );
+            }
+            first = false;
+            let done_now = !more || got == 0 || nd == 0 || (nd == off_date && ni == off_id) || total >= max_total;
+            if tx.send((fresh, done_now)).await.is_err() || done_now {
+                if done_now {
+                    crate::diag::info(
+                        "DLG",
+                        &format!("Поток чатов завершён: всего {total} шт. за {} мс", t0.elapsed().as_millis()),
+                    );
+                }
+                return Ok(());
+            }
+            off_date = nd;
+            off_id = ni;
+            off_peer = np;
+            exclude_pinned = true;
+            // Бережная пауза между фоновыми страницами защищает от 500 RPC_MCGET_FAIL и FLOOD_WAIT.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         }
-        let _ = tx.send((batch, true)).await;
+        let _ = tx.send((Vec::new(), true)).await;
         Ok(())
     }
 
@@ -1350,6 +1576,10 @@ impl Engine {
                     info.linked_chat_id = full.linked_chat_id;
                     info.pinned_msg_id = full.pinned_msg_id;
                     info.ttl_period = full.ttl_period;
+                    info.paid_reactions_available = full.paid_reactions_available;
+                    info.slowmode_seconds = full.slowmode_seconds.unwrap_or(0);
+                    info.slowmode_next_send_date = full.slowmode_next_send_date.unwrap_or(0);
+                    info.has_welcome_messages = full.has_welcome_messages;
                     if let Some(tl::enums::ExportedChatInvite::ChatInviteExported(inv)) = full.exported_invite {
                         info.invite_link = inv.link;
                     }
@@ -1525,23 +1755,59 @@ impl Engine {
                 .or(h.post_author)
                 .unwrap_or_else(|| "скрытый отправитель".to_owned())
         });
-        let (inline_buttons, reply_keyboard, paid_reactions, service_text) = match &m.raw {
+        let (inline_buttons, reply_keyboard, paid_reactions, service_text, rich_blocks, rich_summary, rich_media, effect, todo) = match &m.raw {
             grammers_client::tl::enums::Message::Message(x) => {
                 let (ib, rk) = extract_reply_markup(x.reply_markup.as_ref());
-                (ib, rk, extract_paid_reactions(x.reactions.as_ref()), None)
+                let (rblocks, rsum) = x
+                    .rich_message
+                    .as_ref()
+                    .map(crate::rich_msg::parse_rich_message)
+                    .unwrap_or_default();
+                let rmedia = x.rich_message.as_ref().and_then(extract_rich_primary_media);
+                let todo = extract_todo_media(x.media.as_ref());
+                (
+                    ib,
+                    rk,
+                    extract_paid_reactions(x.reactions.as_ref()),
+                    None,
+                    rblocks,
+                    rsum,
+                    rmedia,
+                    x.effect,
+                    todo,
+                )
             }
-            grammers_client::tl::enums::Message::Service(s) => {
-                (Vec::new(), Vec::new(), 0, format_service_action(&s.action))
-            }
-            _ => (Vec::new(), Vec::new(), 0, None),
+            grammers_client::tl::enums::Message::Service(s) => (
+                Vec::new(),
+                Vec::new(),
+                0,
+                format_service_action(&s.action),
+                Vec::new(),
+                String::new(),
+                None,
+                None,
+                None,
+            ),
+            _ => (
+                Vec::new(),
+                Vec::new(),
+                0,
+                None,
+                Vec::new(),
+                String::new(),
+                None,
+                None,
+                None,
+            ),
         };
-        let text = if m.text().is_empty()
-            && let Some(st) = service_text
-        {
-            st
-        } else {
+        let text = if !m.text().is_empty() {
             m.text().to_owned()
+        } else if !rich_summary.is_empty() {
+            rich_summary
+        } else {
+            service_text.unwrap_or_default()
         };
+        let media = m.media().as_ref().map(media::describe).or(rich_media);
         MessageRow {
             id: m.id(),
             text,
@@ -1549,7 +1815,7 @@ impl Engine {
             date: m.date().as_second(),
             deleted: false,
             edits,
-            media: m.media().as_ref().map(media::describe),
+            media,
             sender: m
                 .sender()
                 .and_then(|p| p.name())
@@ -1572,6 +1838,9 @@ impl Engine {
             grouped: m.grouped_id(),
             inline_buttons,
             reply_keyboard,
+            rich_blocks,
+            effect,
+            todo,
         }
     }
 
@@ -1896,39 +2165,124 @@ impl Engine {
         let Some(m) = self.message_by_id(peer, msg_id).await? else {
             return Ok(None);
         };
-        let Some(media) = m.media() else { return Ok(None) };
-        let info = media::describe(&media);
-        let is_thumb = matches!(
-            info.kind,
-            MediaKind::AnimatedSticker | MediaKind::Video | MediaKind::Gif | MediaKind::Round
-        );
-        if !info.has_preview() || (!is_thumb && info.size > PREVIEW_LIMIT) {
+        if let Some(media) = m.media() {
+            let info = media::describe(&media);
+            let is_thumb = matches!(
+                info.kind,
+                MediaKind::AnimatedSticker | MediaKind::Video | MediaKind::Gif | MediaKind::Round
+            );
+            if !info.has_preview() || (!is_thumb && info.size > PREVIEW_LIMIT) {
+                return Ok(None);
+            }
+            match &media {
+                // У видео, GIF, кружков и анимированных стикеров берём самую большую скачиваемую миниатюру.
+                grammers_client::media::Media::Document(d) if is_thumb => {
+                    use grammers_client::media::Downloadable;
+                    let thumbs = d.thumbs();
+                    let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
+                        return Ok(None);
+                    };
+                    self.client.download_media(th, &file).await?;
+                }
+                grammers_client::media::Media::Sticker(s) if is_thumb => {
+                    use grammers_client::media::Downloadable;
+                    let thumbs = s.document.thumbs();
+                    let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
+                        return Ok(None);
+                    };
+                    self.client.download_media(th, &file).await?;
+                }
+                _ => {
+                    self.client.download_media(&media, &file).await?;
+                }
+            }
+            media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
+            return Ok(Some(file));
+        }
+        // Layer 233 RichMessage: встроенные фото/GIF/видео-превью ботов (например eroot).
+        if let Some(rm) = m.rich_message() {
+            let grammers_client::tl::enums::RichMessage::Message(rm) = rm;
+            if let Some(bytes) = self.download_rich_preview_bytes(rm).await? {
+                let _ = std::fs::create_dir_all(&self.dirs.cache);
+                std::fs::write(&file, bytes)?;
+                media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
+                return Ok(Some(file));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Скачивает превью (фото или обложку GIF/видео) первого встроенного медиа из `RichMessage`.
+    async fn download_rich_preview_bytes(
+        &self,
+        rm: &grammers_client::tl::types::RichMessage,
+    ) -> Result<Option<Vec<u8>>, BoxErr> {
+        use grammers_client::tl;
+        let loc_dc: Option<(tl::enums::InputFileLocation, Option<i32>)> = rm
+            .photos
+            .iter()
+            .find_map(|p| {
+                let tl::enums::Photo::Photo(ph) = p else { return None };
+                let sz = ph
+                    .sizes
+                    .iter()
+                    .rev()
+                    .find_map(|s| match s {
+                        tl::enums::PhotoSize::Size(x) => Some(x.r#type.clone()),
+                        tl::enums::PhotoSize::Progressive(x) => Some(x.r#type.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "x".to_owned());
+                Some((
+                    tl::enums::InputFileLocation::InputPhotoFileLocation(tl::types::InputPhotoFileLocation {
+                        id: ph.id,
+                        access_hash: ph.access_hash,
+                        file_reference: ph.file_reference.clone(),
+                        thumb_size: sz,
+                    }),
+                    Some(ph.dc_id),
+                ))
+            })
+            .or_else(|| {
+                rm.documents.iter().find_map(|d| {
+                    let tl::enums::Document::Document(doc) = d else { return None };
+                    let thumb = doc
+                        .thumbs
+                        .as_ref()
+                        .and_then(|ts| {
+                            ts.iter().rev().find_map(|s| match s {
+                                tl::enums::PhotoSize::Size(x) => Some(x.r#type.clone()),
+                                tl::enums::PhotoSize::Progressive(x) => Some(x.r#type.clone()),
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or_default();
+                    Some((
+                        tl::enums::InputFileLocation::InputDocumentFileLocation(
+                            tl::types::InputDocumentFileLocation {
+                                id: doc.id,
+                                access_hash: doc.access_hash,
+                                file_reference: doc.file_reference.clone(),
+                                thumb_size: thumb,
+                            },
+                        ),
+                        Some(doc.dc_id),
+                    ))
+                })
+            });
+        let Some((loc, dc_id)) = loc_dc else {
             return Ok(None);
-        }
-        match &media {
-            // У видео, GIF, кружков и анимированных стикеров берём самую большую скачиваемую миниатюру.
-            grammers_client::media::Media::Document(d) if is_thumb => {
-                use grammers_client::media::Downloadable;
-                let thumbs = d.thumbs();
-                let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
-                    return Ok(None);
-                };
-                self.client.download_media(th, &file).await?;
-            }
-            grammers_client::media::Media::Sticker(s) if is_thumb => {
-                use grammers_client::media::Downloadable;
-                let thumbs = s.document.thumbs();
-                let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
-                    return Ok(None);
-                };
-                self.client.download_media(th, &file).await?;
-            }
-            _ => {
-                self.client.download_media(&media, &file).await?;
+        };
+        let dl = RawLoc { loc, dc_id };
+        let mut it = self.client.iter_download(&dl);
+        let mut out = Vec::new();
+        while let Some(chunk) = it.next().await? {
+            out.extend_from_slice(&chunk);
+            if out.len() > 6 * 1024 * 1024 {
+                break;
             }
         }
-        media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
-        Ok(Some(file))
+        Ok((!out.is_empty()).then_some(out))
     }
 
     /// Скачать вложение в каталог загрузок под безопасным именем; существующие файлы не затираются.
@@ -2129,21 +2483,52 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Поток обновлений: сохраняет новые, изменённые и удалённые сообщения.
-    /// Возвращается, когда поток закончился. Для каждого события зовёт `on_event`.
+    /// Поток обновлений в реальном времени:
+    /// 1) явно вызывает `updates.getState` (иначе Telegram не шлёт живые пуши по сокету!),
+    /// 2) никогда не умирает на временных RPC 500 / сетевых сбоях,
+    /// 3) подробно логирует события и восстановление в диагностический журнал.
     pub async fn run_updates(
         &self,
         updates: mpsc::Receiver<UpdatesLike>,
         mut on_event: impl FnMut(&Update) + Send,
     ) -> Result<(), BoxErr> {
+        // Обязательный вызов updates.getState, чтобы Telegram начал слать live-обновления немедленно.
+        match self.invoke_retry("updates.getState", &grammers_client::tl::functions::updates::GetState {}).await {
+            Ok(grammers_client::tl::enums::updates::State::State(st)) => {
+                crate::diag::info(
+                    "UPD",
+                    &format!("updates.getState OK: pts={} qts={} seq={} date={}", st.pts, st.qts, st.seq, st.date),
+                );
+            }
+            Err(e) => {
+                crate::diag::warn("UPD", &format!("updates.getState не удался: {e}"));
+            }
+        }
         let mut stream = self
             .client
             .stream_updates(updates, UpdatesConfiguration { catch_up: false })
             .await?;
+        crate::diag::info("UPD", "Поток live-обновлений запущен");
+        let mut consecutive_err = 0u32;
         loop {
-            let upd = stream.next().await?;
-            self.apply(&upd).await;
-            on_event(&upd);
+            match stream.next().await {
+                Ok(upd) => {
+                    consecutive_err = 0;
+                    self.apply(&upd).await;
+                    on_event(&upd);
+                }
+                Err(e) => {
+                    consecutive_err += 1;
+                    let es = e.to_string();
+                    crate::diag::warn("UPD", &format!("Сбой потока обновлений (#{consecutive_err}): {es}"));
+                    if es.contains("Dropped") || es.contains("closed") || consecutive_err > 20 {
+                        crate::diag::error("UPD", "Канал обновлений закрыт — выход из цикла");
+                        return Err(Box::new(e));
+                    }
+                    let wait_ms = (400u64 * u64::from(consecutive_err)).min(4000);
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                }
+            }
         }
     }
 
@@ -2677,35 +3062,90 @@ impl Engine {
     pub async fn sticker_sets(&self) -> Result<Vec<StickerSetRow>, grammers_client::InvocationError> {
         use grammers_client::tl;
         let res = self
-            .client
-            .invoke(&tl::functions::messages::GetAllStickers { hash: 0 })
+            .invoke_retry("messages.getAllStickers", &tl::functions::messages::GetAllStickers { hash: 0 })
             .await?;
         let tl::enums::messages::AllStickers::Stickers(s) = res else {
             return Ok(Vec::new());
         };
-        Ok(s.sets
+        let out: Vec<StickerSetRow> = s
+            .sets
             .iter()
             .filter_map(|x| {
                 let tl::enums::StickerSet::Set(x) = x;
                 (!x.masks && !x.emojis && !x.archived).then(|| set_row_of(x, true))
             })
-            .collect())
+            .collect();
+        crate::diag::info("STICKER", &format!("Загружено наборов стикеров: {}", out.len()));
+        Ok(out)
     }
 
-    /// Сохранённые GIF пользователя (документы с миниатюрами).
-    pub async fn saved_gifs(&self) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
+    /// Избранные стикеры аккаунта (`messages.getFavedStickers`).
+    pub async fn faved_stickers(&self) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
         use grammers_client::tl;
-        let res = self.client.invoke(&tl::functions::messages::GetSavedGifs { hash: 0 }).await?;
-        let tl::enums::messages::SavedGifs::Gifs(g) = res else {
+        let res = self
+            .invoke_retry("messages.getFavedStickers", &tl::functions::messages::GetFavedStickers { hash: 0 })
+            .await?;
+        let tl::enums::messages::FavedStickers::Stickers(f) = res else {
             return Ok(Vec::new());
         };
-        Ok(g.gifs
+        let out: Vec<StickerRow> = f
+            .stickers
             .iter()
             .filter_map(|d| match d {
                 tl::enums::Document::Document(d) => Some(sticker_row_of(d)),
                 _ => None,
             })
-            .collect())
+            .collect();
+        crate::diag::info("STICKER", &format!("Избранных стикеров: {}", out.len()));
+        Ok(out)
+    }
+
+    /// Недавние стикеры аккаунта (`messages.getRecentStickers`).
+    pub async fn recent_stickers(&self) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .invoke_retry(
+                "messages.getRecentStickers",
+                &tl::functions::messages::GetRecentStickers {
+                    attached: false,
+                    hash: 0,
+                },
+            )
+            .await?;
+        let tl::enums::messages::RecentStickers::Stickers(r) = res else {
+            return Ok(Vec::new());
+        };
+        let out: Vec<StickerRow> = r
+            .stickers
+            .iter()
+            .filter_map(|d| match d {
+                tl::enums::Document::Document(d) => Some(sticker_row_of(d)),
+                _ => None,
+            })
+            .collect();
+        crate::diag::info("STICKER", &format!("Недавних стикеров: {}", out.len()));
+        Ok(out)
+    }
+
+    /// Сохранённые GIF пользователя (документы с миниатюрами).
+    pub async fn saved_gifs(&self) -> Result<Vec<StickerRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .invoke_retry("messages.getSavedGifs", &tl::functions::messages::GetSavedGifs { hash: 0 })
+            .await?;
+        let tl::enums::messages::SavedGifs::Gifs(g) = res else {
+            return Ok(Vec::new());
+        };
+        let out: Vec<StickerRow> = g
+            .gifs
+            .iter()
+            .filter_map(|d| match d {
+                tl::enums::Document::Document(d) => Some(sticker_row_of(d)),
+                _ => None,
+            })
+            .collect();
+        crate::diag::info("GIF", &format!("Сохранённых GIF: {}", out.len()));
+        Ok(out)
     }
 
     /// Отправка сообщения с необязательным ответом, форматированием и пользовательскими Premium-эмодзи.
@@ -2736,7 +3176,6 @@ impl Engine {
         entities: &[Entity],
         reply_to: Option<i32>,
     ) -> Result<(), grammers_client::InvocationError> {
-        use grammers_client::tl;
         let ghost_mode = self.settings().ghost;
         let silent = ghost_mode.should_send_without_sound();
         let mut msg = grammers_client::message::InputMessage::new()
@@ -2747,49 +3186,7 @@ impl Engine {
             msg = msg.reply_to(Some(id));
         }
         if !entities.is_empty() {
-            let tl_ents: Vec<tl::enums::MessageEntity> = entities
-                .iter()
-                .filter_map(|e| {
-                    let (offset, length) = utf16_range(text, e.start, e.end.saturating_sub(e.start));
-                    if length <= 0 {
-                        return None;
-                    }
-                    Some(match e.kind {
-                        EntityKind::Bold => tl::types::MessageEntityBold { offset, length }.into(),
-                        EntityKind::Italic => tl::types::MessageEntityItalic { offset, length }.into(),
-                        EntityKind::Underline => tl::types::MessageEntityUnderline { offset, length }.into(),
-                        EntityKind::Strike => tl::types::MessageEntityStrike { offset, length }.into(),
-                        EntityKind::Code => tl::types::MessageEntityCode { offset, length }.into(),
-                        EntityKind::Pre => tl::types::MessageEntityPre {
-                            offset,
-                            length,
-                            language: e.url.clone().unwrap_or_default(),
-                        }
-                        .into(),
-                        EntityKind::Spoiler => tl::types::MessageEntitySpoiler { offset, length }.into(),
-                        EntityKind::Quote => tl::types::MessageEntityBlockquote {
-                            offset,
-                            length,
-                            collapsed: false,
-                        }
-                        .into(),
-                        EntityKind::Link => {
-                            if let Some(url) = &e.url {
-                                tl::types::MessageEntityTextUrl { offset, length, url: url.clone() }.into()
-                            } else {
-                                tl::types::MessageEntityUrl { offset, length }.into()
-                            }
-                        }
-                        EntityKind::CustomEmoji(doc_id) => tl::types::MessageEntityCustomEmoji {
-                            offset,
-                            length,
-                            document_id: doc_id,
-                        }
-                        .into(),
-                        _ => return None,
-                    })
-                })
-                .collect();
+            let tl_ents = entities_to_tl(text, entities);
             if !tl_ents.is_empty() {
                 msg = msg.fmt_entities(tl_ents);
             }
@@ -4010,16 +4407,18 @@ impl Engine {
         }))
     }
 
-    /// Лента активных историй (`stories.getAllStories`).
+    /// Лента активных историй (`stories.getAllStories`) с просмотрами, реакциями и числом историй автора.
     pub async fn stories(&self) -> Result<Vec<StoryRow>, grammers_client::InvocationError> {
         use grammers_client::tl;
         let tl::enums::stories::AllStories::Stories(st) = self
-            .client
-            .invoke(&tl::functions::stories::GetAllStories {
-                next: false,
-                hidden: false,
-                state: None,
-            })
+            .invoke_retry(
+                "stories.getAllStories",
+                &tl::functions::stories::GetAllStories {
+                    next: false,
+                    hidden: false,
+                    state: None,
+                },
+            )
             .await?
         else {
             return Ok(Vec::new());
@@ -4027,6 +4426,11 @@ impl Engine {
         let mut out = Vec::new();
         for ps in st.peer_stories {
             let tl::enums::PeerStories::Stories(ps) = ps;
+            let total_in_peer = ps
+                .stories
+                .iter()
+                .filter(|s| matches!(s, tl::enums::StoryItem::Item(_)))
+                .count();
             let Some(last) = ps.stories.iter().rfind(|s| matches!(s, tl::enums::StoryItem::Item(_))) else {
                 continue;
             };
@@ -4050,6 +4454,11 @@ impl Engine {
                 _ => continue,
             };
             let unread = ps.max_read_id.is_none_or(|m| item.id > m);
+            let (views, reactions) = match item.views.as_ref() {
+                Some(tl::enums::StoryViews::Views(v)) => (v.views_count, v.reactions_count.unwrap_or(0)),
+                None => (0, 0),
+            };
+            let is_video = matches!(item.media, tl::enums::MessageMedia::Document(_));
             out.push(StoryRow {
                 peer,
                 peer_id,
@@ -4058,8 +4467,13 @@ impl Engine {
                 caption: item.caption.clone().unwrap_or_default(),
                 date: item.date,
                 unread,
+                views,
+                reactions,
+                is_video,
+                count_in_peer: total_in_peer.max(1),
             });
         }
+        crate::diag::info("STORY", &format!("Загружено активных историй: {}", out.len()));
         Ok(out)
     }
 
@@ -4615,6 +5029,150 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
         .collect()
 }
 
+/// Конвертирует список `Entity` в TL-сущности Telegram (`Vec<tl::enums::MessageEntity>`).
+pub(crate) fn entities_to_tl(text: &str, entities: &[Entity]) -> Vec<grammers_client::tl::enums::MessageEntity> {
+    use grammers_client::tl;
+    entities
+        .iter()
+        .filter_map(|e| {
+            let (offset, length) = utf16_range(text, e.start, e.end.saturating_sub(e.start));
+            if length <= 0 {
+                return None;
+            }
+            Some(match e.kind {
+                EntityKind::Bold => tl::types::MessageEntityBold { offset, length }.into(),
+                EntityKind::Italic => tl::types::MessageEntityItalic { offset, length }.into(),
+                EntityKind::Underline => tl::types::MessageEntityUnderline { offset, length }.into(),
+                EntityKind::Strike => tl::types::MessageEntityStrike { offset, length }.into(),
+                EntityKind::Code => tl::types::MessageEntityCode { offset, length }.into(),
+                EntityKind::Pre => tl::types::MessageEntityPre {
+                    offset,
+                    length,
+                    language: e.url.clone().unwrap_or_default(),
+                }
+                .into(),
+                EntityKind::Spoiler => tl::types::MessageEntitySpoiler { offset, length }.into(),
+                EntityKind::Quote => tl::types::MessageEntityBlockquote {
+                    offset,
+                    length,
+                    collapsed: false,
+                }
+                .into(),
+                EntityKind::Link => {
+                    if let Some(url) = &e.url {
+                        tl::types::MessageEntityTextUrl { offset, length, url: url.clone() }.into()
+                    } else {
+                        tl::types::MessageEntityUrl { offset, length }.into()
+                    }
+                }
+                EntityKind::CustomEmoji(doc_id) => tl::types::MessageEntityCustomEmoji {
+                    offset,
+                    length,
+                    document_id: doc_id,
+                }
+                .into(),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+/// Обёртка `Downloadable` для любого `InputFileLocation` с указанием DC — автоматически
+/// переносит авторизацию между дата-центрами (`FILE_MIGRATE_X`).
+pub(crate) struct RawLoc {
+    pub loc: grammers_client::tl::enums::InputFileLocation,
+    pub dc_id: Option<i32>,
+}
+
+impl grammers_client::media::Downloadable for RawLoc {
+    fn to_raw_input_location(&self) -> Option<grammers_client::tl::enums::InputFileLocation> {
+        Some(self.loc.clone())
+    }
+    fn dc_id(&self) -> Option<i32> {
+        self.dc_id
+    }
+}
+
+fn extract_rich_primary_media(rm: &grammers_client::tl::enums::RichMessage) -> Option<MediaInfo> {
+    use grammers_client::tl;
+    let tl::enums::RichMessage::Message(rm) = rm;
+    if !rm.photos.is_empty() {
+        let mut mi = MediaInfo::basic(MediaKind::Photo, "Фото", 0);
+        mi.has_thumb = true;
+        return Some(mi);
+    }
+    if let Some(tl::enums::Document::Document(doc)) = rm.documents.first() {
+        let mut is_gif = false;
+        let mut is_vid = false;
+        let mut dims = (0, 0);
+        let mut dur = 0u32;
+        for a in &doc.attributes {
+            match a {
+                tl::enums::DocumentAttribute::Animated => is_gif = true,
+                tl::enums::DocumentAttribute::Video(v) => {
+                    is_vid = true;
+                    dims = (v.w, v.h);
+                    dur = v.duration.max(0.0) as u32;
+                }
+                _ => {}
+            }
+        }
+        let kind = if is_gif || doc.mime_type == "image/gif" {
+            MediaKind::Gif
+        } else if is_vid || doc.mime_type.starts_with("video/") {
+            MediaKind::Video
+        } else {
+            MediaKind::Photo
+        };
+        let mut mi = MediaInfo::basic(kind, "Медиа", doc.size.max(0) as u64);
+        mi.dims = dims;
+        mi.duration = dur;
+        mi.mime = doc.mime_type.clone();
+        mi.has_thumb = doc.thumbs.as_ref().is_some_and(|t| !t.is_empty()) || !is_vid;
+        return Some(mi);
+    }
+    None
+}
+
+fn extract_todo_media(media: Option<&grammers_client::tl::enums::MessageMedia>) -> Option<TodoListInfo> {
+    use grammers_client::tl::enums::{MessageMedia, TextWithEntities, TodoCompletion, TodoItem, TodoList};
+    let Some(MessageMedia::ToDo(td)) = media else {
+        return None;
+    };
+    let TodoList::List(list) = &td.todo;
+    let TextWithEntities::Entities(title_e) = &list.title;
+    let completed_ids: std::collections::HashSet<i32> = td
+        .completions
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|c| {
+            let TodoCompletion::Completion(x) = c;
+            x.id
+        })
+        .collect();
+    let items = list
+        .list
+        .iter()
+        .map(|it| {
+            let TodoItem::Item(x) = it;
+            let TextWithEntities::Entities(t) = &x.title;
+            TodoItemRow {
+                id: x.id,
+                text: t.text.clone(),
+                done: completed_ids.contains(&x.id),
+            }
+        })
+        .collect();
+    Some(TodoListInfo {
+        title: title_e.text.clone(),
+        others_can_complete: list.others_can_complete,
+        others_can_append: list.others_can_append,
+        items,
+    })
+}
+
+#[allow(dead_code)]
 fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
     let archived = matches!(
         &d.raw,
