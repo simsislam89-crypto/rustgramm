@@ -30,12 +30,14 @@ export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$(cat "$PASS_FILE")"
 mkdir -p dist
 
 # 1. Полная версия для телефона (с плагинами)
+rm -f target/release/apk/*.apk
 cargo apk build -p rg-android --release --features plugins
 APK_FULL="$(ls target/release/apk/*.apk | head -n 1)"
 cp -f "$APK_FULL" dist/Rustgramm-Android-Full.apk
 cp -f "$APK_FULL" dist/Rustgramm.apk
 
 # 2. Облегчённая версия для телефона (без плагинов)
+rm -f target/release/apk/*.apk
 cargo apk build -p rg-android --release --no-default-features
 APK_LITE="$(ls target/release/apk/*.apk | head -n 1)"
 cp -f "$APK_LITE" dist/Rustgramm-Android-Lite.apk
