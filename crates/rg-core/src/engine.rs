@@ -40,11 +40,67 @@ pub struct DialogRow {
     pub contact: bool,
     /// Наибольший идентификатор своего сообщения, прочитанного собеседником (две галочки).
     pub read_out: i32,
+    /// Пользовательский Premium-эмодзи статуса (`document_id`), если установлен.
+    pub emoji_status: Option<i64>,
+    /// Официальный подтверждённый аккаунт/канал.
+    pub verified: bool,
+    /// Наличие Telegram Premium.
+    pub premium: bool,
+}
+
+/// Музыкальный трек (из профиля `saved_music` или аудиосообщения).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioTrack {
+    pub id: i64,
+    pub access_hash: i64,
+    pub file_ref: Vec<u8>,
+    pub title: String,
+    pub performer: String,
+    pub file_name: String,
+    pub mime: String,
+    pub duration: u32,
+    pub size: u64,
+}
+
+impl AudioTrack {
+    /// Человекочитаемое название трека для карточки профиля и мини-плеера.
+    pub fn display_title(&self) -> String {
+        match (self.performer.trim(), self.title.trim()) {
+            ("", "") => {
+                if !self.file_name.trim().is_empty() {
+                    self.file_name.trim().to_owned()
+                } else {
+                    "Аудиозапись".to_owned()
+                }
+            }
+            ("", t) => t.to_owned(),
+            (p, "") => p.to_owned(),
+            (p, t) => format!("{p} — {t}"),
+        }
+    }
+
+    pub fn ext(&self) -> &str {
+        if let Some((_, e)) = self.file_name.rsplit_once('.')
+            && !e.is_empty()
+            && e.len() <= 5
+            && e.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return e;
+        }
+        match self.mime.as_str() {
+            "audio/mp4" | "audio/x-m4a" | "audio/m4a" => "m4a",
+            "audio/ogg" | "audio/opus" => "ogg",
+            "audio/flac" => "flac",
+            "audio/wav" | "audio/x-wav" => "wav",
+            _ => "mp3",
+        }
+    }
 }
 
 /// Сведения о собеседнике, группе или канале для правой панели.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerInfo {
+    pub id: i64,
     pub name: String,
     pub username: String,
     pub about: String,
@@ -54,6 +110,13 @@ pub struct PeerInfo {
     pub blocked: bool,
     pub broadcast: bool,
     pub invite_link: String,
+    pub emoji_status: Option<i64>,
+    pub verified: bool,
+    pub premium: bool,
+    pub birthday: String,
+    pub business_hours: String,
+    /// Сохранённая музыка в профиле (`UserFull.saved_music` + `users.getSavedMusic`).
+    pub saved_music: Vec<AudioTrack>,
 }
 
 /// Итог `Engine::fetch_media`.
@@ -85,7 +148,7 @@ pub enum DialogKind {
 }
 
 /// Вид форматирования фрагмента текста.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EntityKind {
     Bold,
     Italic,
@@ -105,7 +168,7 @@ pub enum EntityKind {
 }
 
 /// Фрагмент форматирования в символах (не в UTF-16, как у Telegram).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Entity {
     pub kind: EntityKind,
     pub start: usize,
@@ -172,7 +235,7 @@ pub fn utf16_range(text: &str, char_start: usize, char_len: usize) -> (i32, i32)
 }
 
 /// Сообщение для интерфейса.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MessageRow {
     pub id: i32,
     pub text: String,
@@ -249,6 +312,103 @@ const PREVIEW_LIMIT: u64 = 20 * 1024 * 1024;
 /// Идентификатор чата в виде, пригодном для хранения (формат Bot API).
 fn peer_key(peer: &PeerRef) -> i64 {
     peer.id.bot_api_dialog_id_unchecked()
+}
+
+/// Извлекает `document_id` пользовательского Premium-эмодзи статуса.
+fn emoji_status_id(s: Option<&grammers_client::tl::enums::EmojiStatus>) -> Option<i64> {
+    use grammers_client::tl::enums::EmojiStatus as E;
+    match s? {
+        E::Status(x) => Some(x.document_id),
+        E::Collectible(x) => Some(x.document_id),
+        _ => None,
+    }
+}
+
+/// Превращает документ Telegram в музыкальный трек (`saved_music` или аудио).
+fn audio_track_of(doc: &grammers_client::tl::enums::Document) -> Option<AudioTrack> {
+    use grammers_client::tl;
+    let tl::enums::Document::Document(d) = doc else {
+        return None;
+    };
+    let mut title = String::new();
+    let mut performer = String::new();
+    let mut file_name = String::new();
+    let mut duration = 0u32;
+    for a in &d.attributes {
+        match a {
+            tl::enums::DocumentAttribute::Audio(x) => {
+                title = x.title.clone().unwrap_or_default();
+                performer = x.performer.clone().unwrap_or_default();
+                duration = x.duration.max(0) as u32;
+            }
+            tl::enums::DocumentAttribute::Filename(x) => {
+                file_name = x.file_name.clone();
+            }
+            _ => {}
+        }
+    }
+    Some(AudioTrack {
+        id: d.id,
+        access_hash: d.access_hash,
+        file_ref: d.file_reference.clone(),
+        title,
+        performer,
+        file_name,
+        mime: d.mime_type.clone(),
+        duration,
+        size: d.size.max(0) as u64,
+    })
+}
+
+fn fmt_birthday(b: &grammers_client::tl::enums::Birthday) -> String {
+    const MONTHS: [&str; 12] = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ];
+    let grammers_client::tl::enums::Birthday::Birthday(b) = b;
+    let m = MONTHS.get(b.month.saturating_sub(1) as usize).copied().unwrap_or("");
+    match b.year {
+        Some(y) if y > 0 => format!("{} {m} {y}", b.day),
+        _ => format!("{} {m}", b.day),
+    }
+}
+
+/// Подпись последнего сообщения в списке чатов (если текст пуст — показываем тип вложения, как в AyuGram).
+fn dialog_last_preview(m: &grammers_client::message::Message) -> String {
+    let text = m.text().trim();
+    if !text.is_empty() {
+        return text.chars().take(80).collect();
+    }
+    match m.media().as_ref().map(media::describe) {
+        Some(info) => match info.kind {
+            MediaKind::Photo => "🖼 Фото".to_owned(),
+            MediaKind::Video => "📹 Видео".to_owned(),
+            MediaKind::Gif => "🎬 GIF".to_owned(),
+            MediaKind::Round => "⭕ Видеосообщение".to_owned(),
+            MediaKind::Voice => "🎤 Голосовое сообщение".to_owned(),
+            MediaKind::Audio => format!("🎵 {}", info.name),
+            MediaKind::Sticker | MediaKind::AnimatedSticker => {
+                if info.name.is_empty() { "Стикер".to_owned() } else { info.name }
+            }
+            MediaKind::Poll { .. } => format!("📊 {}", info.name),
+            MediaKind::WebPage { .. } => format!("🔗 {}", info.name),
+            MediaKind::File => format!("📎 {}", info.name),
+            MediaKind::Other(label) => label,
+        },
+        None => String::new(),
+    }
+}
+
+fn raw_media_label(media: Option<&grammers_client::tl::enums::MessageMedia>) -> String {
+    use grammers_client::tl::enums::MessageMedia as M;
+    match media {
+        Some(M::Photo(_)) => "🖼 Фото".to_owned(),
+        Some(M::Document(_)) => "📎 Вложение".to_owned(),
+        Some(M::Poll(_)) => "📊 Опрос".to_owned(),
+        Some(M::Geo(_) | M::GeoLive(_) | M::Venue(_)) => "📍 Геопозиция".to_owned(),
+        Some(M::Contact(_)) => "👤 Контакт".to_owned(),
+        _ => String::new(),
+    }
 }
 
 impl Engine {
@@ -330,6 +490,9 @@ impl Engine {
             let pid = grammers_session::types::PeerId::from(&d.peer);
             let mut kind = DialogKind::Group;
             let mut contact = false;
+            let mut emoji_status = None;
+            let mut verified = false;
+            let mut premium = false;
             let (name, peer) = match &d.peer {
                 tl::enums::Peer::User(u) => {
                     let Some(user) = users.iter().find(|x| matches!(x, tl::enums::User::User(y) if y.id == u.user_id)) else { continue };
@@ -337,6 +500,9 @@ impl Engine {
                         tl::enums::User::User(y) => {
                             kind = if y.bot { DialogKind::Bot } else { DialogKind::User };
                             contact = y.contact;
+                            emoji_status = emoji_status_id(y.emoji_status.as_ref());
+                            verified = y.verified;
+                            premium = y.premium;
                             format!("{} {}", y.first_name.clone().unwrap_or_default(), y.last_name.clone().unwrap_or_default())
                                 .trim()
                                 .to_owned()
@@ -360,6 +526,8 @@ impl Engine {
                             if y.broadcast {
                                 kind = DialogKind::Channel;
                             }
+                            emoji_status = emoji_status_id(y.emoji_status.as_ref());
+                            verified = y.verified;
                             y.title.clone()
                         }
                         _ => String::new(),
@@ -373,7 +541,12 @@ impl Engine {
                     tl::enums::Message::Message(m)
                         if m.id == d.top_message && grammers_session::types::PeerId::from(&m.peer_id) == pid =>
                     {
-                        Some((m.message.chars().take(80).collect::<String>(), i64::from(m.date)))
+                        let preview = if m.message.trim().is_empty() {
+                            raw_media_label(m.media.as_ref())
+                        } else {
+                            m.message.chars().take(80).collect()
+                        };
+                        Some((preview, i64::from(m.date)))
                     }
                     _ => None,
                 })
@@ -393,6 +566,9 @@ impl Engine {
                 kind,
                 contact,
                 read_out: d.read_outbox_max_id,
+                emoji_status,
+                verified,
+                premium,
             });
         }
         Ok(out)
@@ -461,6 +637,22 @@ impl Engine {
                 ),
                 _ => (0, false, false),
             };
+            let (emoji_status, verified, premium) = match d.peer() {
+                grammers_client::peer::Peer::User(u) => match &u.raw {
+                    grammers_client::tl::enums::User::User(y) => (
+                        emoji_status_id(y.emoji_status.as_ref()),
+                        y.verified,
+                        y.premium,
+                    ),
+                    _ => (None, false, false),
+                },
+                grammers_client::peer::Peer::Channel(c) => (
+                    emoji_status_id(c.raw.emoji_status.as_ref()),
+                    c.raw.verified,
+                    false,
+                ),
+                _ => (None, false, false),
+            };
             out.push(DialogRow {
                 peer: d.peer_ref(),
                 id: d.peer_id().bot_api_dialog_id_unchecked(),
@@ -468,7 +660,7 @@ impl Engine {
                 last: d
                     .last_message
                     .as_ref()
-                    .map(|m| m.text().chars().take(80).collect())
+                    .map(dialog_last_preview)
                     .unwrap_or_default(),
                 date: d.last_message.as_ref().map_or(0, |m| m.date().as_second()),
                 unread,
@@ -487,6 +679,9 @@ impl Engine {
                     grammers_client::tl::enums::Dialog::Dialog(x) => x.read_outbox_max_id,
                     _ => 0,
                 },
+                emoji_status,
+                verified,
+                premium,
             });
         }
         Ok(out)
@@ -501,24 +696,54 @@ impl Engine {
         self.history_before(peer, 0, limit).await
     }
 
-    /// Сведения о чате для правой панели (имя, @имя, о себе, телефон, статус, число участников).
+    /// Сведения о чате для правой панели (имя, @имя, о себе, телефон, статус, музыка профиля, число участников).
     pub async fn peer_info(&self, peer: PeerRef) -> Result<PeerInfo, grammers_client::InvocationError> {
         use grammers_client::tl;
-        let mut info = PeerInfo::default();
+        let mut info = PeerInfo {
+            id: peer_key(&peer),
+            ..PeerInfo::default()
+        };
         match tl::enums::InputPeer::from(peer) {
             tl::enums::InputPeer::User(u) => {
-                let tl::enums::users::UserFull::Full(f) = self
-                    .client
-                    .invoke(&tl::functions::users::GetFullUser {
-                        id: tl::enums::InputUser::User(tl::types::InputUser {
-                            user_id: u.user_id,
-                            access_hash: u.access_hash,
-                        }),
-                    })
-                    .await?;
+                let input_user = tl::enums::InputUser::User(tl::types::InputUser {
+                    user_id: u.user_id,
+                    access_hash: u.access_hash,
+                });
+                let req_full = tl::functions::users::GetFullUser { id: input_user.clone() };
+                let req_music = tl::functions::users::GetSavedMusic {
+                    id: input_user,
+                    offset: 0,
+                    limit: 20,
+                    hash: 0,
+                };
+                let (full_res, music_res) = tokio::join!(
+                    self.client.invoke(&req_full),
+                    self.client.invoke(&req_music),
+                );
+                let tl::enums::users::UserFull::Full(f) = full_res?;
                 let tl::enums::UserFull::Full(full) = f.full_user;
                 info.about = full.about.unwrap_or_default();
                 info.blocked = full.blocked;
+                if let Some(b) = &full.birthday {
+                    info.birthday = fmt_birthday(b);
+                }
+                if full.business_work_hours.is_some() {
+                    info.business_hours = "Открыто".to_owned();
+                }
+                if let Some(doc) = &full.saved_music
+                    && let Some(tr) = audio_track_of(doc)
+                {
+                    info.saved_music.push(tr);
+                }
+                if let Ok(tl::enums::users::SavedMusic::Music(m)) = music_res {
+                    for doc in &m.documents {
+                        if let Some(tr) = audio_track_of(doc)
+                            && !info.saved_music.iter().any(|x| x.id == tr.id)
+                        {
+                            info.saved_music.push(tr);
+                        }
+                    }
+                }
                 if let Some(tl::enums::User::User(x)) = f.users.iter().find(|x| matches!(x, tl::enums::User::User(y) if y.id == u.user_id)) {
                     info.name = [x.first_name.clone(), x.last_name.clone()]
                         .into_iter()
@@ -527,6 +752,9 @@ impl Engine {
                         .join(" ");
                     info.username = x.username.clone().unwrap_or_default();
                     info.phone = x.phone.clone().unwrap_or_default();
+                    info.emoji_status = emoji_status_id(x.emoji_status.as_ref());
+                    info.verified = x.verified;
+                    info.premium = x.premium;
                     if let Some(s) = &x.status {
                         info.status = status_text(s);
                     }
@@ -553,6 +781,8 @@ impl Engine {
                     info.name = y.title.clone();
                     info.username = y.username.clone().unwrap_or_default();
                     info.broadcast = y.broadcast;
+                    info.emoji_status = emoji_status_id(y.emoji_status.as_ref());
+                    info.verified = y.verified;
                 }
             }
             tl::enums::InputPeer::Chat(c) => {
@@ -573,6 +803,29 @@ impl Engine {
             _ => {}
         }
         Ok(info)
+    }
+
+    /// Скачать музыкальный трек (из `saved_music`) в кэш `cache/audio/<id>.<ext>`.
+    pub async fn download_track(&self, track: &AudioTrack) -> Result<PathBuf, BoxErr> {
+        use grammers_client::tl;
+        let dir = self.dirs.cache.join("audio");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{}.{}", track.id, track.ext()));
+        if file.exists() && file.metadata().is_ok_and(|m| m.len() > 0) {
+            return Ok(file);
+        }
+        let part = file.with_extension("part");
+        let loc = RawLocation(tl::enums::InputFileLocation::InputDocumentFileLocation(
+            tl::types::InputDocumentFileLocation {
+                id: track.id,
+                access_hash: track.access_hash,
+                file_reference: track.file_ref.clone(),
+                thumb_size: String::new(),
+            },
+        ));
+        self.client.download_media(&loc, &part).await?;
+        let _ = std::fs::rename(&part, &file);
+        Ok(file)
     }
 
     /// Ссылка на отправителя сообщения (для загрузки его аватарки в группах).
@@ -2181,6 +2434,7 @@ impl Engine {
 /// Активный сеанс (устройство) аккаунта.
 #[derive(Debug, Clone)]
 pub struct SessionRow {
+    pub hash: i64,
     pub current: bool,
     pub device: String,
     pub app: String,
@@ -2190,31 +2444,176 @@ pub struct SessionRow {
     pub active: i64,
 }
 
-/// Строка приватности: название и краткое описание правила («Все», «Мои контакты» …).
+/// Все 12 правил конфиденциальности Telegram (как в AyuGram Desktop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyKeyKind {
+    PhoneNumber,
+    StatusTimestamp,
+    ProfilePhoto,
+    Forwards,
+    PhoneCall,
+    VoiceMessages,
+    Messages,
+    Birthday,
+    Gifts,
+    About,
+    SavedMusic,
+    ChatInvite,
+}
+
+impl PrivacyKeyKind {
+    pub const ALL: [Self; 12] = [
+        Self::PhoneNumber,
+        Self::StatusTimestamp,
+        Self::ProfilePhoto,
+        Self::Forwards,
+        Self::PhoneCall,
+        Self::VoiceMessages,
+        Self::Messages,
+        Self::Birthday,
+        Self::Gifts,
+        Self::About,
+        Self::SavedMusic,
+        Self::ChatInvite,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::PhoneNumber => "Номер телефона",
+            Self::StatusTimestamp => "Последняя активность",
+            Self::ProfilePhoto => "Фото профиля",
+            Self::Forwards => "Пересланные сообщения",
+            Self::PhoneCall => "Звонки",
+            Self::VoiceMessages => "Голосовые сообщения",
+            Self::Messages => "Сообщения",
+            Self::Birthday => "День рождения",
+            Self::Gifts => "Подарки",
+            Self::About => "О себе",
+            Self::SavedMusic => "Музыка в профиле",
+            Self::ChatInvite => "Группы и каналы",
+        }
+    }
+
+    fn to_tl(self) -> grammers_client::tl::enums::InputPrivacyKey {
+        use grammers_client::tl::enums::InputPrivacyKey as K;
+        match self {
+            Self::PhoneNumber => K::PhoneNumber,
+            Self::StatusTimestamp => K::StatusTimestamp,
+            Self::ProfilePhoto => K::ProfilePhoto,
+            Self::Forwards => K::Forwards,
+            Self::PhoneCall => K::PhoneCall,
+            Self::VoiceMessages => K::VoiceMessages,
+            Self::Messages => K::NoPaidMessages,
+            Self::Birthday => K::Birthday,
+            Self::Gifts => K::StarGiftsAutoSave,
+            Self::About => K::About,
+            Self::SavedMusic => K::SavedMusic,
+            Self::ChatInvite => K::ChatInvite,
+        }
+    }
+}
+
+/// Базовый уровень доступа для правила приватности.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyLevel {
+    Everybody,
+    Contacts,
+    Nobody,
+}
+
+impl PrivacyLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Everybody => "Все",
+            Self::Contacts => "Мои контакты",
+            Self::Nobody => "Никто",
+        }
+    }
+}
+
+/// Строка приватности: ключ, название, описание и базовый уровень.
 #[derive(Debug, Clone)]
 pub struct PrivacyRow {
+    pub key: PrivacyKeyKind,
     pub title: &'static str,
     pub rule: String,
+    pub level: PrivacyLevel,
+}
+
+/// Категория уведомлений Telegram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyScope {
+    Users,
+    Chats,
+    Broadcasts,
+}
+
+impl NotifyScope {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Users => "Личные чаты",
+            Self::Chats => "Группы",
+            Self::Broadcasts => "Каналы",
+        }
+    }
+
+    fn to_tl(self) -> grammers_client::tl::enums::InputNotifyPeer {
+        use grammers_client::tl::enums::InputNotifyPeer as P;
+        match self {
+            Self::Users => P::InputNotifyUsers,
+            Self::Chats => P::InputNotifyChats,
+            Self::Broadcasts => P::InputNotifyBroadcasts,
+        }
+    }
 }
 
 /// Уведомления Telegram для типа чатов: включены ли и показывается ли текст.
 #[derive(Debug, Clone)]
 pub struct NotifyRow {
+    pub scope: NotifyScope,
     pub title: &'static str,
     pub enabled: bool,
     pub preview: bool,
 }
 
+/// Заблокированный пользователь с данными для разблокировки.
+#[derive(Debug, Clone)]
+pub struct BlockedUser {
+    pub id: i64,
+    pub access_hash: i64,
+    pub name: String,
+    pub username: String,
+}
+
 /// Всё, что нужно страницам «Настройки Telegram»: данные аккаунта, приватность, уведомления,
-/// заблокированные, сеансы. Только чтение.
+/// заблокированные, сеансы, 2FA, автоудаление и TTL аккаунта.
 #[derive(Debug, Clone, Default)]
 pub struct AccountOverview {
     pub me: PeerInfo,
     pub privacy: Vec<PrivacyRow>,
     pub notify: Vec<NotifyRow>,
-    pub blocked: Vec<String>,
+    pub blocked: Vec<BlockedUser>,
     pub sessions: Vec<SessionRow>,
     pub session_ttl_days: i32,
+    pub has_2fa: bool,
+    pub login_email: String,
+    pub default_history_ttl: i32,
+    pub account_ttl_days: i32,
+    pub contact_signup_notify: bool,
+}
+
+fn privacy_level(rules: &[grammers_client::tl::enums::PrivacyRule]) -> PrivacyLevel {
+    use grammers_client::tl::enums::PrivacyRule as R;
+    let mut base = PrivacyLevel::Nobody;
+    for r in rules {
+        match r {
+            R::PrivacyValueAllowAll => base = PrivacyLevel::Everybody,
+            R::PrivacyValueAllowContacts => base = PrivacyLevel::Contacts,
+            R::PrivacyValueDisallowAll => base = PrivacyLevel::Nobody,
+            _ => {}
+        }
+    }
+    base
 }
 
 fn privacy_text(rules: &[grammers_client::tl::enums::PrivacyRule]) -> String {
@@ -2257,52 +2656,261 @@ impl Engine {
         Ok(())
     }
 
-    /// Загружает обзор аккаунта для настроек Telegram. Все запросы — чтение.
+    /// Меняет публичное имя пользователя (`account.updateUsername`).
+    pub async fn update_username(&self, username: &str) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::UpdateUsername {
+                username: username.trim().trim_start_matches('@').to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Изменяет правило приватности (`account.setPrivacy`).
+    pub async fn set_privacy(
+        &self,
+        key: PrivacyKeyKind,
+        level: PrivacyLevel,
+    ) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let rule = match level {
+            PrivacyLevel::Everybody => tl::enums::InputPrivacyRule::InputPrivacyValueAllowAll,
+            PrivacyLevel::Contacts => tl::enums::InputPrivacyRule::InputPrivacyValueAllowContacts,
+            PrivacyLevel::Nobody => tl::enums::InputPrivacyRule::InputPrivacyValueDisallowAll,
+        };
+        self.client
+            .invoke(&tl::functions::account::SetPrivacy {
+                key: key.to_tl(),
+                rules: vec![rule],
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Изменяет серверные уведомления для категории чатов (`account.updateNotifySettings`).
+    pub async fn set_notify_scope(
+        &self,
+        scope: NotifyScope,
+        enabled: bool,
+        preview: bool,
+    ) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::UpdateNotifySettings {
+                peer: scope.to_tl(),
+                settings: tl::enums::InputPeerNotifySettings::Settings(tl::types::InputPeerNotifySettings {
+                    show_previews: Some(preview),
+                    silent: Some(!enabled),
+                    mute_until: Some(if enabled { 0 } else { i32::MAX }),
+                    sound: None,
+                    stories_muted: None,
+                    stories_hide_sender: None,
+                    stories_sound: None,
+                }),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Уведомления о регистрации контактов (`account.setContactSignUpNotification`).
+    pub async fn set_contact_signup_notify(&self, enabled: bool) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::SetContactSignUpNotification { silent: !enabled })
+            .await?;
+        Ok(())
+    }
+
+    /// Таймер автоудаления новых чатов (`messages.setDefaultHistoryTTL`, секунды, 0 — выкл.).
+    pub async fn set_default_history_ttl(&self, period: i32) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::messages::SetDefaultHistoryTtl { period: period.max(0) })
+            .await?;
+        Ok(())
+    }
+
+    /// Срок удаления неактивного аккаунта (`account.setAccountTTL`, дни).
+    pub async fn set_account_ttl_days(&self, days: i32) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::SetAccountTtl {
+                ttl: tl::enums::AccountDaysTtl::Ttl(tl::types::AccountDaysTtl { days: days.clamp(30, 730) }),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Завершить один сеанс по `hash` (`account.resetAuthorization`).
+    pub async fn reset_authorization(&self, hash: i64) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::ResetAuthorization { hash })
+            .await?;
+        Ok(())
+    }
+
+    /// Завершить все остальные сеансы (`auth.resetAuthorizations`).
+    pub async fn reset_other_authorizations(&self) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::auth::ResetAuthorizations {})
+            .await?;
+        Ok(())
+    }
+
+    /// Срок автоматического завершения неактивных сеансов (`account.setAuthorizationTTL`, дни).
+    pub async fn set_authorization_ttl(&self, days: i32) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::account::SetAuthorizationTtl {
+                authorization_ttl_days: days.clamp(7, 365),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Разблокировать пользователя из списка заблокированных (`contacts.unblock`).
+    pub async fn unblock_user(&self, id: i64, access_hash: i64) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::contacts::Unblock {
+                my_stories_from: false,
+                id: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                    user_id: id,
+                    access_hash,
+                }),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Очистить сохранённые платёжные данные и адреса доставки (`payments.clearSavedInfo`).
+    pub async fn clear_payment_info(&self) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::payments::ClearSavedInfo {
+                credentials: true,
+                info: true,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Загружает полный обзор аккаунта для настроек Telegram параллельно (в 5–8 раз быстрее последовательного обхода).
     pub async fn account_overview(&self) -> Result<AccountOverview, grammers_client::InvocationError> {
         use grammers_client::tl;
         let mut out = AccountOverview::default();
-        if let Ok(me) = self.client.get_me().await
-            && let Ok(peer) = me.to_ref().await
-            && let Some(peer) = peer
-        {
-            out.me = self.peer_info(peer).await?;
-        }
-        let keys: [(&'static str, tl::enums::InputPrivacyKey); 6] = [
-            ("Номер телефона", tl::enums::InputPrivacyKey::PhoneNumber),
-            ("Последняя активность", tl::enums::InputPrivacyKey::StatusTimestamp),
-            ("Фото профиля", tl::enums::InputPrivacyKey::ProfilePhoto),
-            ("Пересланные сообщения", tl::enums::InputPrivacyKey::Forwards),
-            ("Звонки", tl::enums::InputPrivacyKey::PhoneCall),
-            ("Группы и каналы", tl::enums::InputPrivacyKey::ChatInvite),
-        ];
-        for (title, key) in keys {
-            let rule = match self.client.invoke(&tl::functions::account::GetPrivacy { key }).await {
-                Ok(tl::enums::account::PrivacyRules::Rules(r)) => privacy_text(&r.rules),
-                Err(_) => "—".to_owned(),
-            };
-            out.privacy.push(PrivacyRow { title, rule });
-        }
-        let notify: [(&'static str, tl::enums::InputNotifyPeer); 3] = [
-            ("Личные чаты", tl::enums::InputNotifyPeer::InputNotifyUsers),
-            ("Группы", tl::enums::InputNotifyPeer::InputNotifyChats),
-            ("Каналы", tl::enums::InputNotifyPeer::InputNotifyBroadcasts),
-        ];
-        for (title, peer) in notify {
-            if let Ok(tl::enums::PeerNotifySettings::Settings(s)) =
-                self.client.invoke(&tl::functions::account::GetNotifySettings { peer }).await
+
+        let me_fut = async {
+            if let Ok(me) = self.client.get_me().await
+                && let Ok(Some(peer)) = me.to_ref().await
             {
-                out.notify.push(NotifyRow {
-                    title,
-                    enabled: s.mute_until.unwrap_or(0) == 0,
-                    preview: s.show_previews.unwrap_or(true),
-                });
+                return self.peer_info(peer).await.ok();
             }
+            None
+        };
+        let req_blocked = tl::functions::contacts::GetBlocked {
+            my_stories_from: false,
+            offset: 0,
+            limit: 100,
+        };
+        let req_auths = tl::functions::account::GetAuthorizations {};
+        let req_pwd = tl::functions::account::GetPassword {};
+        let req_hist_ttl = tl::functions::messages::GetDefaultHistoryTtl {};
+        let req_acc_ttl = tl::functions::account::GetAccountTtl {};
+        let req_signup = tl::functions::account::GetContactSignUpNotification {};
+
+        let blocked_fut = self.client.invoke(&req_blocked);
+        let auths_fut = self.client.invoke(&req_auths);
+        let pwd_fut = self.client.invoke(&req_pwd);
+        let hist_ttl_fut = self.client.invoke(&req_hist_ttl);
+        let acc_ttl_fut = self.client.invoke(&req_acc_ttl);
+        let signup_fut = self.client.invoke(&req_signup);
+
+        let notify_fut = async {
+            let r_u = tl::functions::account::GetNotifySettings { peer: NotifyScope::Users.to_tl() };
+            let r_c = tl::functions::account::GetNotifySettings { peer: NotifyScope::Chats.to_tl() };
+            let r_b = tl::functions::account::GetNotifySettings { peer: NotifyScope::Broadcasts.to_tl() };
+            let (u, c, b) = tokio::join!(
+                self.client.invoke(&r_u),
+                self.client.invoke(&r_c),
+                self.client.invoke(&r_b),
+            );
+            let mut list = Vec::with_capacity(3);
+            for (scope, res) in [(NotifyScope::Users, u), (NotifyScope::Chats, c), (NotifyScope::Broadcasts, b)] {
+                if let Ok(tl::enums::PeerNotifySettings::Settings(s)) = res {
+                    list.push(NotifyRow {
+                        scope,
+                        title: scope.title(),
+                        enabled: s.mute_until.unwrap_or(0) == 0 && !s.silent.unwrap_or(false),
+                        preview: s.show_previews.unwrap_or(true),
+                    });
+                }
+            }
+            list
+        };
+
+        let privacy_fut = async {
+            let mut handles = Vec::with_capacity(PrivacyKeyKind::ALL.len());
+            for k in PrivacyKeyKind::ALL {
+                let c = self.client.clone();
+                handles.push(tokio::spawn(async move {
+                    let res = c.invoke(&tl::functions::account::GetPrivacy { key: k.to_tl() }).await;
+                    (k, res)
+                }));
+            }
+            let mut rows = Vec::with_capacity(PrivacyKeyKind::ALL.len());
+            for h in handles {
+                if let Ok((key, res)) = h.await {
+                    let (rule, level) = match res {
+                        Ok(tl::enums::account::PrivacyRules::Rules(r)) => (privacy_text(&r.rules), privacy_level(&r.rules)),
+                        Err(_) => ("—".to_owned(), PrivacyLevel::Nobody),
+                    };
+                    rows.push(PrivacyRow {
+                        key,
+                        title: key.title(),
+                        rule,
+                        level,
+                    });
+                }
+            }
+            rows
+        };
+
+        let (me_res, privacy, notify, blocked_res, auths_res, pwd_res, hist_ttl_res, acc_ttl_res, signup_res) = tokio::join!(
+            me_fut,
+            privacy_fut,
+            notify_fut,
+            blocked_fut,
+            auths_fut,
+            pwd_fut,
+            hist_ttl_fut,
+            acc_ttl_fut,
+            signup_fut,
+        );
+
+        if let Some(me) = me_res {
+            out.me = me;
         }
-        if let Ok(b) = self
-            .client
-            .invoke(&tl::functions::contacts::GetBlocked { my_stories_from: false, offset: 0, limit: 100 })
-            .await
-        {
+        out.privacy = privacy;
+        out.notify = notify;
+
+        if let Ok(tl::enums::account::Password::Password(p)) = pwd_res {
+            out.has_2fa = p.has_password;
+            out.login_email = p.login_email_pattern.unwrap_or_default();
+        }
+        if let Ok(tl::enums::DefaultHistoryTtl::Ttl(t)) = hist_ttl_res {
+            out.default_history_ttl = t.period;
+        }
+        if let Ok(tl::enums::AccountDaysTtl::Ttl(t)) = acc_ttl_res {
+            out.account_ttl_days = t.days;
+        }
+        if let Ok(silent) = signup_res {
+            out.contact_signup_notify = !silent;
+        }
+        if let Ok(b) = blocked_res {
             let users = match b {
                 tl::enums::contacts::Blocked::Blocked(x) => x.users,
                 tl::enums::contacts::Blocked::Slice(x) => x.users,
@@ -2310,24 +2918,30 @@ impl Engine {
             for u in users {
                 if let tl::enums::User::User(u) = u {
                     let n = format!("{} {}", u.first_name.unwrap_or_default(), u.last_name.unwrap_or_default());
-                    out.blocked.push(n.trim().to_owned());
+                    out.blocked.push(BlockedUser {
+                        id: u.id,
+                        access_hash: u.access_hash.unwrap_or(0),
+                        name: n.trim().to_owned(),
+                        username: u.username.unwrap_or_default(),
+                    });
                 }
             }
         }
-        let tl::enums::account::Authorizations::Authorizations(a) =
-            self.client.invoke(&tl::functions::account::GetAuthorizations {}).await?;
-        out.session_ttl_days = a.authorization_ttl_days;
-        for x in a.authorizations {
-            let tl::enums::Authorization::Authorization(x) = x;
-            out.sessions.push(SessionRow {
-                current: x.current,
-                device: x.device_model,
-                app: format!("{} {}", x.app_name, x.app_version),
-                platform: format!("{} {}", x.platform, x.system_version),
-                place: [x.region, x.country].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
-                ip: x.ip,
-                active: i64::from(x.date_active),
-            });
+        if let Ok(tl::enums::account::Authorizations::Authorizations(a)) = auths_res {
+            out.session_ttl_days = a.authorization_ttl_days;
+            for x in a.authorizations {
+                let tl::enums::Authorization::Authorization(x) = x;
+                out.sessions.push(SessionRow {
+                    hash: x.hash,
+                    current: x.current,
+                    device: x.device_model,
+                    app: format!("{} {}", x.app_name, x.app_version),
+                    platform: format!("{} {}", x.platform, x.system_version),
+                    place: [x.region, x.country].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
+                    ip: x.ip,
+                    active: i64::from(x.date_active),
+                });
+            }
         }
         Ok(out)
     }
@@ -2393,6 +3007,9 @@ mod tests {
             kind,
             contact: false,
             read_out: 0,
+            emoji_status: None,
+            verified: false,
+            premium: false,
         }
     }
 

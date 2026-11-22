@@ -6,10 +6,12 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, RichText, Sense, Vec2, load::SizedTexture};
 
-const ATLAS_PNG: &[u8] = include_bytes!("../assets/emoji.png");
+const ATLAS_BYTES: &[u8] = include_bytes!("../assets/emoji.webp");
 const ATLAS_IDX: &str = include_str!("../assets/emoji.idx");
 const CELL: f32 = 36.0;
 const COLS: usize = 32;
+const ATLAS_W: u32 = 1152;
+const ATLAS_H: u32 = 1548;
 
 /// Кусок текста: обычные символы или один эмодзи.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,17 +108,16 @@ fn intra(c: char) -> u8 {
 
 impl Emoji {
     /// Распаковывает атлас в текстуру; `None`, если встроенная картинка повреждена.
+    /// При наличии валидного локального `emoji-apple.png` встроенный атлас не декодируется вовсе (экономия ОЗУ и старта).
     pub fn load(ctx: &egui::Context) -> Option<Self> {
-        // Локальный атлас Apple-эмодзи (из кэша AyuGram у владельца) в раскладке встроенного.
-        // Он не входит ни в программу, ни в репозиторий: права на Apple-эмодзи не наши.
         let local = std::fs::read(crate::worker::home().join("emoji-apple.png"))
             .ok()
             .and_then(|b| image::load_from_memory(&b).ok())
-            .map(|i| i.to_rgba8());
-        let builtin = image::load_from_memory(ATLAS_PNG).ok()?.to_rgba8();
+            .map(|i| i.to_rgba8())
+            .filter(|i| i.dimensions() == (ATLAS_W, ATLAS_H));
         let img = match local {
-            Some(l) if l.dimensions() == builtin.dimensions() => l,
-            _ => builtin,
+            Some(l) => l,
+            None => image::load_from_memory(ATLAS_BYTES).ok()?.to_rgba8(),
         };
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
@@ -418,7 +419,7 @@ mod tests {
 
     #[test]
     fn atlas_png_decodes_and_fits_index() {
-        let img = image::load_from_memory(ATLAS_PNG).unwrap();
+        let img = image::load_from_memory(ATLAS_BYTES).unwrap();
         let rows = ATLAS_IDX.lines().count().div_ceil(COLS);
         assert_eq!(img.width() as usize, COLS * CELL as usize);
         assert_eq!(img.height() as usize, rows * CELL as usize);

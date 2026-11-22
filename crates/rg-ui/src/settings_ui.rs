@@ -151,7 +151,7 @@ impl App {
                 if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
                     act = Some("saved");
                 }
-                if a.drawer_l_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
+                if a.drawer_s_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
                     act = Some("read");
                 }
                 if item(ui, icons::Ico::Settings, "Настройки") {

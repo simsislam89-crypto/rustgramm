@@ -411,17 +411,21 @@ fn read_face(path: &str) -> Option<Arc<FontData>> {
         .map(|b| Arc::new(FontData::from_owned(b).tweak(tweak)))
 }
 
-/// Системные шрифты Windows (Segoe UI, Consolas) плюс запасные символьные для значков.
+/// Системные шрифты Windows (Segoe UI, Consolas, Symbols) без тяжёлых встроенных шрифтов и seguiemj.ttf
+/// (цветные эмодзи рисуются нашим атласом `Emoji`, поэтому не тратим ~25 МБ ОЗУ на лишние шрифты).
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    if let Some(f) = read_face("C:\\Windows\\Fonts\\segoeui.ttf") {
+    let has_segoe = if let Some(f) = read_face("C:\\Windows\\Fonts\\segoeui.ttf") {
         fonts.font_data.insert("segoe".into(), f);
         fonts
             .families
             .entry(FontFamily::Proportional)
             .or_default()
             .insert(0, "segoe".into());
-    }
+        true
+    } else {
+        false
+    };
     let bold = read_face("C:\\Windows\\Fonts\\segoeuib.ttf");
     let display = fonts
         .families
@@ -431,7 +435,11 @@ fn install_fonts(ctx: &egui::Context) {
         fonts.font_data.insert("segoe-bold".into(), f);
         display.push("segoe-bold".into());
     }
-    display.push("Ubuntu-Light".into());
+    if has_segoe {
+        display.push("segoe".into());
+    } else {
+        display.push("Ubuntu-Light".into());
+    }
     if let Some(f) = read_face("C:\\Windows\\Fonts\\consola.ttf") {
         fonts.font_data.insert("consola".into(), f);
         fonts
@@ -439,9 +447,14 @@ fn install_fonts(ctx: &egui::Context) {
             .entry(FontFamily::Monospace)
             .or_default()
             .insert(0, "consola".into());
+    } else if has_segoe {
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push("segoe".into());
     }
     for (name, path) in [
-        ("segoe-emoji", "C:\\Windows\\Fonts\\seguiemj.ttf"),
         ("segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
         ("noto-symbols", "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf"),
     ] {

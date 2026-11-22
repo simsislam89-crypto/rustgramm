@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use grammers_client::media::Media;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MediaKind {
     Photo,
     /// Статичный стикер WebP, который можно показать.
@@ -40,7 +40,7 @@ pub enum MediaKind {
     Other(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MediaInfo {
     pub kind: MediaKind,
     pub name: String,

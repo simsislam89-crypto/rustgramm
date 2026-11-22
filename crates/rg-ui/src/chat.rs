@@ -72,6 +72,8 @@ struct Env<'a> {
     translated: &'a HashMap<i32, String>,
     /// Текстуры пользовательских Premium-эмодзи (`document_id` -> текстура).
     custom_tex: &'a HashMap<i64, egui::TextureHandle>,
+    /// Показывать кнопку «Перевести» в контекстном меню (из настроек языка).
+    show_translate: bool,
     /// Видимая область ленты (для аккуратного размещения встроенного GIF).
     clip_rect: Rect,
 }
@@ -135,24 +137,60 @@ impl App {
                     (true, true) => String::new(),
                 };
                 let online = subtitle.starts_with("в сети");
-                let hresp = ui
-                    .horizontal(|ui| {
-                        avatar(ui, &d.name, d.id, 40.0, self.avatars.get(&d.id), self.settings.ayu.avatar_corners);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.add_space(if subtitle.is_empty() { 11.0 } else { 5.0 });
-                            ui.label(RichText::new(if d.saved { "Избранное" } else { &d.name }).strong().size(15.5).color(WHITE));
-                            if !subtitle.is_empty() {
-                                ui.label(RichText::new(subtitle).size(12.5).color(if online { GREEN } else { SUBTEXT }));
-                            }
-                        });
-                    })
-                    .response;
-                if ui
-                    .interact(hresp.rect, ui.make_persistent_id("hdr-profile"), Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
+                let title_str = if d.saved { "Избранное" } else { d.name.as_str() };
+                let emoji_id = d.emoji_status.or_else(|| info.and_then(|x| x.emoji_status));
+                let verified = d.verified || info.is_some_and(|x| x.verified);
+                let premium = d.premium || info.is_some_and(|x| x.premium);
+                let hdr_w = (ui.available_width() - 150.0).max(160.0);
+                let (hrect, hresp) = ui.allocate_exact_size(Vec2::new(hdr_w, TOP_BAR_HEIGHT - 4.0), Sense::click());
+                draw_avatar(
+                    ui,
+                    Pos2::new(hrect.left() + 20.0, hrect.center().y),
+                    title_str,
+                    d.id,
+                    40.0,
+                    self.avatars.get(&d.id),
+                    self.settings.ayu.avatar_corners,
+                );
+                let text_x = hrect.left() + 50.0;
+                let title_y = if subtitle.is_empty() { hrect.center().y } else { hrect.center().y - 9.0 };
+                let p = ui.painter();
+                let title_galley = p.layout_no_wrap(title_str.to_owned(), FontId::proportional(15.5), WHITE);
+                let title_w = title_galley.size().x.min((hrect.right() - text_x - 24.0).max(40.0));
+                let clip_t = Rect::from_min_max(Pos2::new(text_x, hrect.top()), Pos2::new(text_x + title_w, hrect.bottom()));
+                p.with_clip_rect(clip_t).text(
+                    Pos2::new(text_x, title_y),
+                    egui::Align2::LEFT_CENTER,
+                    title_str,
+                    FontId::proportional(15.5),
+                    WHITE,
+                );
+                // Значок Premium-эмодзи статуса / галочки / Premium прямо рядом с именем (как в AyuGram!).
+                let badge_c = Pos2::new(text_x + title_w + 11.0, title_y);
+                if let Some(doc_id) = emoji_id {
+                    if let Some(tex) = self.sticker_tex.get(&doc_id) {
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(Vec2::splat(16.0))
+                            .paint_at(ui, Rect::from_center_size(badge_c, Vec2::splat(16.0)));
+                    } else {
+                        icons::tg(ui.painter(), "dialogs/dialogs_premium", badge_c, ORANGE);
+                    }
+                } else if verified {
+                    icons::tg(ui.painter(), "dialogs/dialogs_verified_star", badge_c, ORANGE);
+                } else if premium {
+                    icons::tg(ui.painter(), "dialogs/dialogs_premium", badge_c, ORANGE);
+                }
+                if !subtitle.is_empty() {
+                    let clip_s = Rect::from_min_max(Pos2::new(text_x, hrect.top()), Pos2::new(hrect.right(), hrect.bottom()));
+                    ui.painter().with_clip_rect(clip_s).text(
+                        Pos2::new(text_x, hrect.center().y + 10.0),
+                        egui::Align2::LEFT_CENTER,
+                        subtitle,
+                        FontId::proportional(12.5),
+                        if online { GREEN } else { SUBTEXT },
+                    );
+                }
+                if hresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.info_open = !self.info_open;
                 }
             }
@@ -272,9 +310,13 @@ impl App {
         let mut open_save: Option<i32> = None;
         let mut open_url: Option<String> = None;
         let mut cmd_after: Option<Cmd> = None;
+        let mut play_track: Option<rg_core::engine::AudioTrack> = None;
+        let mut toggle_audio = false;
         let mut start_invite = false;
         let mut start_search = false;
         let mut info_tab = self.info_tab;
+        let cur_audio_title = self.audio_title.clone();
+        let cur_audio_playing = self.audio_is_playing();
 
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -296,13 +338,36 @@ impl App {
                     );
                 }
             }
+            let pname = if d.saved { "Избранное" } else { d.name.as_str() };
+            let name_galley = ui.painter().layout_no_wrap(pname.to_owned(), FontId::proportional(17.5), WHITE);
+            let emoji_id = info.as_ref().and_then(|x| x.emoji_status).or(d.emoji_status);
+            let verified = info.as_ref().is_some_and(|x| x.verified) || d.verified;
+            let premium = info.as_ref().is_some_and(|x| x.premium) || d.premium;
+            let has_badge = emoji_id.is_some() || verified || premium;
+            let name_x = top.center().x - if has_badge { 10.0 } else { 0.0 };
             ui.painter().text(
-                Pos2::new(top.center().x, top.top() + 114.0),
+                Pos2::new(name_x, top.top() + 114.0),
                 egui::Align2::CENTER_CENTER,
-                if d.saved { "Избранное" } else { &d.name },
+                pname,
                 FontId::proportional(17.5),
                 WHITE,
             );
+            if has_badge {
+                let bc = Pos2::new(name_x + name_galley.size().x * 0.5 + 12.0, top.top() + 114.0);
+                if let Some(doc_id) = emoji_id {
+                    if let Some(tex) = self.sticker_tex.get(&doc_id) {
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(Vec2::splat(17.0))
+                            .paint_at(ui, Rect::from_center_size(bc, Vec2::splat(17.0)));
+                    } else {
+                        icons::tg(ui.painter(), "dialogs/dialogs_premium", bc, ORANGE);
+                    }
+                } else if verified {
+                    icons::tg(ui.painter(), "dialogs/dialogs_verified_star", bc, ORANGE);
+                } else if premium {
+                    icons::tg(ui.painter(), "dialogs/dialogs_premium", bc, ORANGE);
+                }
+            }
             let sub = info
                 .as_ref()
                 .map(|x| {
@@ -365,6 +430,59 @@ impl App {
                 }
             });
             ui.add_space(10.0);
+            // Музыка в профиле (Saved Music, 1 в 1 как на скринах 10–12 AyuGram под быстрыми кнопками!).
+            if let Some(info) = &info
+                && !info.saved_music.is_empty()
+            {
+                for track in info.saved_music.iter().take(4) {
+                    let title = track.display_title();
+                    let is_cur = cur_audio_title == title && !title.is_empty();
+                    let (mr, mresp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
+                    let card = Rect::from_min_max(mr.min + Vec2::new(10.0, 2.0), mr.max - Vec2::new(10.0, 2.0));
+                    let fill = if is_cur {
+                        t_btn(ORANGE).gamma_multiply(0.28)
+                    } else if mresp.hovered() {
+                        t(WINDOW_OVER)
+                    } else {
+                        Color32::from_white_alpha((12.0 * opacity_f32()) as u8)
+                    };
+                    let p = ui.painter();
+                    p.rect_filled(card, egui::CornerRadius::same(10), fill);
+                    let ic_r = Rect::from_min_size(card.min + Vec2::new(6.0, 6.0), Vec2::splat(30.0));
+                    p.rect_filled(ic_r, egui::CornerRadius::same(7), if is_cur { t_btn(ORANGE) } else { t(BUTTON) });
+                    let ico_name = if is_cur && cur_audio_playing {
+                        "media_pause"
+                    } else {
+                        "media_play"
+                    };
+                    icons::tg_sized(p, ico_name, ic_r.center(), Vec2::splat(14.0), Color32::WHITE);
+                    let clip = Rect::from_min_max(Pos2::new(ic_r.right() + 8.0, card.top()), Pos2::new(card.right() - 8.0, card.bottom()));
+                    p.with_clip_rect(clip).text(
+                        Pos2::new(ic_r.right() + 8.0, card.center().y - if track.duration > 0 { 6.0 } else { 0.0 }),
+                        egui::Align2::LEFT_CENTER,
+                        &title,
+                        FontId::proportional(13.0),
+                        if is_cur { ORANGE } else { WHITE },
+                    );
+                    if track.duration > 0 {
+                        p.with_clip_rect(clip).text(
+                            Pos2::new(ic_r.right() + 8.0, card.center().y + 9.0),
+                            egui::Align2::LEFT_CENTER,
+                            super::media_ui::mmss(track.duration),
+                            FontId::proportional(11.0),
+                            SUBTEXT,
+                        );
+                    }
+                    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        if is_cur {
+                            toggle_audio = true;
+                        } else {
+                            play_track = Some(track.clone());
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+            }
             kit::divider(ui);
 
             if let Some(info) = &info {
@@ -395,6 +513,12 @@ impl App {
                 row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { mask_streamer(&format!("+{}", info.phone), streamer) }, "Телефон", !streamer);
                 row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { mask_streamer(&format!("@{}", info.username), streamer) }, "Имя пользователя", !streamer);
                 row(ui, "menu/info", &info.about, if is_group { "Описание" } else { "О себе" }, true);
+                if !info.birthday.is_empty() {
+                    row(ui, "settings/gift", &info.birthday, "День рождения", true);
+                }
+                if !info.business_hours.is_empty() {
+                    row(ui, "settings/timer", &info.business_hours, "Часы работы", false);
+                }
                 if !info.invite_link.is_empty() {
                     row(ui, "menu/link", &info.invite_link, "Ссылка-приглашение", true);
                 }
@@ -547,6 +671,12 @@ impl App {
         });
 
         self.info_tab = info_tab;
+        if let Some(track) = play_track {
+            self.send(Cmd::PlayTrack(track));
+        }
+        if toggle_audio {
+            self.toggle_audio_playback();
+        }
         if let Some(cmd) = cmd_after {
             self.send(cmd);
         }
@@ -598,6 +728,51 @@ impl App {
                 self.chat_search.clear();
                 self.found = None;
                 self.send(Cmd::Search(String::new()));
+            }
+        });
+    }
+
+    /// Полоса перевода всего чата (появляется под шапкой, когда включено «Переводить чаты целиком»).
+    pub(crate) fn translate_chat_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            ui.add_space(14.0);
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+            icons::tg(ui.painter(), "settings/language", ir.center(), ORANGE);
+            ui.add_space(4.0);
+            let lang = self.settings.language.translate_to.clone();
+            let all_tr = !self.messages.is_empty()
+                && self
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|m| !m.text.trim().is_empty())
+                    .take(10)
+                    .all(|m| self.translated.contains_key(&m.id));
+            let lbl = if all_tr {
+                "Показать оригинал".to_owned()
+            } else {
+                format!("Перевести чат ({})", lang.to_uppercase())
+            };
+            if ui
+                .add(egui::Label::new(RichText::new(lbl).color(ORANGE).size(13.0)).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                if all_tr {
+                    self.translated.clear();
+                } else {
+                    let items: Vec<(i32, String)> = self
+                        .messages
+                        .iter()
+                        .rev()
+                        .filter(|m| !m.text.trim().is_empty() && !self.translated.contains_key(&m.id))
+                        .take(25)
+                        .map(|m| (m.id, m.text.clone()))
+                        .collect();
+                    if !items.is_empty() {
+                        self.send(Cmd::TranslateBatch(items, lang));
+                    }
+                }
             }
         });
     }
@@ -1007,6 +1182,7 @@ impl App {
                 gif_paths: &self.gif_paths,
                 translated: &self.translated,
                 custom_tex: &self.sticker_tex,
+                show_translate: self.settings.language.show_translate_button,
                 clip_rect,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
@@ -1727,7 +1903,9 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     }
     if !m.text.is_empty() {
         item(ui, "menu/copy", "Копировать текст", Act::Copy(m.text.clone()));
-        item(ui, "settings/language", "Перевести", Act::Translate(m.id, m.text.clone()));
+        if env.show_translate {
+            item(ui, "settings/language", "Перевести", Act::Translate(m.id, m.text.clone()));
+        }
     }
     if s.show_message_shot && (!m.text.is_empty() || m.media.is_some()) {
         item(ui, "menu/photo", "Снимок сообщения", Act::Shot(m.id));

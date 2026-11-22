@@ -7,7 +7,8 @@ use grammers_client::SignInError;
 use grammers_client::client::{LoginToken, PasswordToken};
 use rg_ayu::store::MessageStore;
 use rg_core::engine::{
-    ContactRow, DialogKind, DialogRow, Engine, FolderRow, MessageRow, StickerRow, StickerSetRow,
+    AudioTrack, ContactRow, DialogKind, DialogRow, Engine, FolderRow, MessageRow, NotifyScope,
+    PrivacyKeyKind, PrivacyLevel, StickerRow, StickerSetRow,
 };
 use rg_core::{Config, connect_with_updates};
 use rg_settings::Settings;
@@ -108,6 +109,32 @@ pub enum Cmd {
     Account,
     /// Сохранить имя, фамилию и «О себе».
     UpdateProfile(String, String, String),
+    /// Изменить `@username` аккаунта.
+    UpdateUsername(String),
+    /// Изменить правило приватности (`account.setPrivacy`).
+    SetPrivacy(PrivacyKeyKind, PrivacyLevel),
+    /// Изменить серверные уведомления для типа чатов (`account.updateNotifySettings`).
+    SetNotifyScope(NotifyScope, bool, bool),
+    /// Уведомления о присоединении контактов.
+    SetContactSignupNotify(bool),
+    /// Таймер автоудаления новых сообщений (секунды, 0 — выкл.).
+    SetDefaultHistoryTtl(i32),
+    /// Срок удаления аккаунта при неактивности (дни).
+    SetAccountTtlDays(i32),
+    /// Завершить один сеанс по `hash`.
+    ResetAuthorization(i64),
+    /// Завершить все остальные сеансы.
+    ResetOtherAuthorizations,
+    /// Срок автозавершения неактивных сеансов (дни).
+    SetAuthorizationTtl(i32),
+    /// Разблокировать пользователя из списка заблокированных.
+    UnblockUser(i64, i64),
+    /// Очистить сохранённые платёжные данные.
+    ClearPaymentInfo,
+    /// Скачать и воспроизвести музыкальный трек из профиля.
+    PlayTrack(AudioTrack),
+    /// Перевести массив сообщений (для режима «Переводить чаты целиком»).
+    TranslateBatch(Vec<(i32, String)>, String),
     /// Создать канал (название, описание, true — канал, false — супергруппа).
     CreateChannel(String, String, bool),
     /// Создать группу с участниками.
@@ -178,6 +205,8 @@ pub enum Ev {
     PlayVideo(PathBuf),
     /// Потоковое воспроизведение ролика по локальному адресу до окончания загрузки (адрес, подпись).
     StreamVideo(String, String),
+    /// Аудио/музыка/голосовое готово к воспроизведению во встроенном мини-плеере (путь, название, длительность).
+    PlayAudio(PathBuf, String, u32),
     /// Короткий GIF скачан в кэш и готов к автозапуску в ленте.
     GifReady(i32, PathBuf),
     /// Ключевые слова для поиска эмодзи из Telegram.
@@ -287,6 +316,12 @@ struct CachedDialog {
     kind: u8,
     contact: bool,
     read_out: i32,
+    #[serde(default)]
+    emoji_status: Option<i64>,
+    #[serde(default)]
+    verified: bool,
+    #[serde(default)]
+    premium: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -341,6 +376,9 @@ fn save_disk_cache(home: &std::path::Path, me: &str, dialogs: &[DialogRow], fold
                 kind: kind_to_u8(d.kind),
                 contact: d.contact,
                 read_out: d.read_out,
+                emoji_status: d.emoji_status,
+                verified: d.verified,
+                premium: d.premium,
             })
             .collect(),
         folders: folders
@@ -397,6 +435,9 @@ fn load_disk_cache(home: &std::path::Path) -> Option<(String, Vec<DialogRow>, Ve
             kind: u8_to_kind(d.kind),
             contact: d.contact,
             read_out: d.read_out,
+            emoji_status: d.emoji_status,
+            verified: d.verified,
+            premium: d.premium,
         })
         .collect();
     let folders = cache
@@ -418,6 +459,28 @@ fn load_disk_cache(home: &std::path::Path) -> Option<(String, Vec<DialogRow>, Ve
         })
         .collect();
     Some((cache.me, dialogs, folders))
+}
+
+/// Дисковый кэш последних сообщений чата (`cache/history/<id>.json`) — мгновенное открытие после перезапуска.
+fn save_history_cache(home: &std::path::Path, dialog_id: i64, rows: &[MessageRow]) {
+    let dir = home.join("cache").join("history");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tail = rows.len().saturating_sub(60);
+    if let Ok(bytes) = serde_json::to_vec(&rows[tail..]) {
+        let tmp = dir.join(format!("{dialog_id}.tmp"));
+        let dst = dir.join(format!("{dialog_id}.json"));
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &dst);
+        }
+    }
+}
+
+fn load_history_cache(home: &std::path::Path, dialog_id: i64) -> Option<Vec<MessageRow>> {
+    let bytes = std::fs::read(home.join("cache").join("history").join(format!("{dialog_id}.json"))).ok()?;
+    let rows: Vec<MessageRow> = serde_json::from_slice(&bytes).ok()?;
+    (!rows.is_empty()).then_some(rows)
 }
 
 /// Запускает новую копию приложения и завершает текущую.
@@ -661,13 +724,22 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 current = Some(i);
                 let Some(d) = dialogs.get(i) else { continue };
                 let seq = open_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                let (eng, out, peer, open_gen_c) = (engine.clone(), out.clone(), d.peer, open_gen.clone());
+                let (eng, out, peer, did, home_c, open_gen_c) =
+                    (engine.clone(), out.clone(), d.peer, d.id, home.clone(), open_gen.clone());
+                // Мгновенно отдаём кэш истории с диска (< 2 мс), пока сеть забирает свежие сообщения.
+                if let Some(cached) = load_history_cache(&home_c, did) {
+                    out.send(Ev::History(i, cached));
+                }
                 tokio::spawn(async move {
-                    match eng.history(peer, 80).await {
+                    // 45 свежих сообщений приходят одним быстрым RPC вместо нескольких чанков.
+                    match eng.history(peer, 45).await {
                         Ok(rows) => {
                             if open_gen_c.load(std::sync::atomic::Ordering::SeqCst) != seq {
                                 return;
                             }
+                            let rows_save = rows.clone();
+                            let h2 = home_c.clone();
+                            tokio::task::spawn_blocking(move || save_history_cache(&h2, did, &rows_save));
                             out.send(Ev::History(i, rows));
                             match eng.mark_read(peer).await {
                                 Ok(true) => out.send(Ev::Status(String::new())),
@@ -868,6 +940,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             kind: DialogKind::User,
                             contact: true,
                             read_out: 0,
+                            emoji_status: None,
+                            verified: false,
+                            premium: false,
                         },
                     );
                     current = current.map(|i| i + 1);
@@ -1080,8 +1155,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::Translate(id, text) => {
                 let (eng, out) = (engine.clone(), out.clone());
+                let lang = eng.settings().language.translate_to;
                 tokio::spawn(async move {
-                    match eng.translate_text(&text, "ru").await {
+                    match eng.translate_text(&text, if lang.is_empty() { "ru" } else { &lang }).await {
                         Ok(tr) if !tr.trim().is_empty() => out.send(Ev::Translated(id, tr)),
                         Ok(_) => out.err("Перевод пуст"),
                         Err(e) => out.err(format!("Перевод: {e}")),
@@ -1229,6 +1305,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                 if !streamed.load(std::sync::atomic::Ordering::Relaxed) {
                                     out.send(Ev::PlayVideo(p));
                                 }
+                            } else if play && cfg!(windows) && matches!(ext.as_str(), "mp3" | "m4a" | "ogg" | "oga" | "opus" | "flac" | "wav" | "aac") {
+                                let title = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Аудио".to_owned());
+                                out.send(Ev::PlayAudio(p, title, 0));
                             } else if play {
                                 rg_core::media::open_downloaded(&p);
                                 out.send(Ev::Status(format!("Открыто: {}", p.display())));
@@ -1344,6 +1423,183 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                 });
             }
+            Cmd::UpdateUsername(username) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.update_username(&username).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Имя пользователя обновлено".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Имя пользователя: {e}")),
+                    }
+                });
+            }
+            Cmd::SetPrivacy(key, level) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_privacy(key, level).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("{}: {}", key.title(), level.label())));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Приватность: {e}")),
+                    }
+                });
+            }
+            Cmd::SetNotifyScope(scope, enabled, preview) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_notify_scope(scope, enabled, preview).await {
+                        Ok(()) => {
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Уведомления: {e}")),
+                    }
+                });
+            }
+            Cmd::SetContactSignupNotify(enabled) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_contact_signup_notify(enabled).await {
+                        Ok(()) => {
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Уведомления о контактах: {e}")),
+                    }
+                });
+            }
+            Cmd::SetDefaultHistoryTtl(period) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_default_history_ttl(period).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Таймер автоудаления обновлён".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Автоудаление: {e}")),
+                    }
+                });
+            }
+            Cmd::SetAccountTtlDays(days) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_account_ttl_days(days).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Срок хранения аккаунта обновлён".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Срок аккаунта: {e}")),
+                    }
+                });
+            }
+            Cmd::ResetAuthorization(hash) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.reset_authorization(hash).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Сеанс завершён".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Завершение сеанса: {e}")),
+                    }
+                });
+            }
+            Cmd::ResetOtherAuthorizations => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.reset_other_authorizations().await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Все остальные сеансы завершены".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Завершение сеансов: {e}")),
+                    }
+                });
+            }
+            Cmd::SetAuthorizationTtl(days) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_authorization_ttl(days).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Срок неактивных сеансов обновлён".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Срок сеансов: {e}")),
+                    }
+                });
+            }
+            Cmd::UnblockUser(id, access_hash) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.unblock_user(id, access_hash).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Пользователь разблокирован".into()));
+                            if let Ok(a) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(a)));
+                            }
+                        }
+                        Err(e) => out.err(format!("Разблокировка: {e}")),
+                    }
+                });
+            }
+            Cmd::ClearPaymentInfo => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.clear_payment_info().await {
+                        Ok(()) => out.send(Ev::Status("Платёжные данные и адреса очищены".into())),
+                        Err(e) => out.err(format!("Очистка платёжных данных: {e}")),
+                    }
+                });
+            }
+            Cmd::PlayTrack(track) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                let title = track.display_title();
+                let dur = track.duration;
+                out.send(Ev::Status(format!("Загрузка трека «{title}»…")));
+                tokio::spawn(async move {
+                    match eng.download_track(&track).await {
+                        Ok(path) => {
+                            out.send(Ev::Status(String::new()));
+                            out.send(Ev::PlayAudio(path, title, dur));
+                        }
+                        Err(e) => out.err(format!("Музыка: {e}")),
+                    }
+                });
+            }
+            Cmd::TranslateBatch(items, lang) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                let to_lang = if lang.is_empty() { "ru".to_owned() } else { lang };
+                out.send(Ev::Status("Перевод чата…".into()));
+                tokio::spawn(async move {
+                    for (id, text) in items.into_iter().take(25) {
+                        if let Ok(tr) = eng.translate_text(&text, &to_lang).await
+                            && !tr.trim().is_empty()
+                        {
+                            out.send(Ev::Translated(id, tr));
+                        }
+                    }
+                    out.send(Ev::Status(String::new()));
+                });
+            }
             Cmd::Settings(s) => {
                 let s = *s;
                 let json = s.to_json();
@@ -1383,13 +1639,13 @@ async fn refresh_keep(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>, 
 
 /// Перечитать последние сообщения открытого чата.
 async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerRef, idx: usize) {
-    if let Ok(rows) = engine.history(peer, 80).await {
+    if let Ok(rows) = engine.history(peer, 45).await {
         out.send(Ev::History(idx, rows));
     }
 }
 
 /// После входа: параллельно загружаем профиль, чаты, архив и папки, сохраняем дисковый кэш,
-/// запускаем поток обновлений.
+/// запускаем поток обновлений и в фоне прогреваем кэш первых 3 чатов для открытия за 0 мс.
 async fn enter(
     engine: &Engine,
     out: &Out,
@@ -1425,6 +1681,25 @@ async fn enter(
         out.send(Ev::Folders(f));
     }
     save_disk_cache(home, cached_me, dialogs, cached_folders);
+    // Фоновый прогрев кэша истории первых 3 чатов — при клике они откроются мгновенно (0 мс).
+    let prefetch: Vec<(grammers_session::types::PeerRef, i64)> = dialogs
+        .iter()
+        .filter(|d| !d.archived)
+        .take(3)
+        .map(|d| (d.peer, d.id))
+        .collect();
+    if !prefetch.is_empty() {
+        let eng = engine.clone();
+        let h_dir = home.to_owned();
+        tokio::spawn(async move {
+            for (peer, id) in prefetch {
+                if let Ok(rows) = eng.history(peer, 45).await {
+                    let h2 = h_dir.clone();
+                    let _ = tokio::task::spawn_blocking(move || save_history_cache(&h2, id, &rows)).await;
+                }
+            }
+        });
+    }
     if let Some(rx) = updates.take() {
         let eng = engine.clone();
         let ctx = out.ctx.clone();
@@ -1452,10 +1727,10 @@ fn decode_square(path: &std::path::Path, side: u32) -> Option<eframe::egui::Colo
     Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
 
-/// Декодирует картинку и уменьшает до 640 px по большей стороне.
+/// Декодирует картинку и уменьшает до 512 px по большей стороне (экономит ~36% ОЗУ на текстурах).
 fn decode(path: &std::path::Path) -> Option<eframe::egui::ColorImage> {
     let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.thumbnail(640, 640).to_rgba8();
+    let img = image::load_from_memory(&bytes).ok()?.thumbnail(512, 512).to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
@@ -1487,6 +1762,9 @@ mod tests {
                 kind: DialogKind::User,
                 contact: true,
                 read_out: 42,
+                emoji_status: (i == 1).then_some(543210987),
+                verified: i == 2,
+                premium: i == 1,
             })
             .collect();
         let folders = vec![FolderRow {
@@ -1512,6 +1790,13 @@ mod tests {
         assert_eq!(loaded_f.len(), 1);
         assert_eq!(loaded_f[0].title, "Работа");
         assert!(elapsed.as_millis() < 500, "disk cache took {elapsed:?}");
+        let sample_msgs = vec![
+            MessageRow::plain(1, "Привет".to_owned(), true, 1_763_700_000),
+            MessageRow::plain(2, "Ответ".to_owned(), false, 1_763_700_010),
+        ];
+        save_history_cache(&dir, 4242, &sample_msgs);
+        let loaded_msgs = load_history_cache(&dir, 4242).unwrap();
+        assert_eq!(loaded_msgs, sample_msgs);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

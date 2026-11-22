@@ -18,9 +18,20 @@ mod imp {
         bottom: i32,
     }
 
+    #[repr(C)]
+    struct FlashWInfo {
+        cb_size: u32,
+        hwnd: *mut c_void,
+        flags: u32,
+        count: u32,
+        timeout: u32,
+    }
+
     #[link(name = "user32")]
     unsafe extern "system" {
         fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
+        fn FlashWindowEx(pfwi: *const FlashWInfo) -> i32;
+        fn MessageBeep(utype: u32) -> i32;
     }
     #[link(name = "dwmapi")]
     unsafe extern "system" {
@@ -78,13 +89,44 @@ mod imp {
             apply_blur(raw as *mut c_void, enabled);
         }
     }
+
+    /// Мигает значком окна на панели задач Windows до активации окна.
+    pub fn flash_taskbar() {
+        let raw = HWND_VAL.load(Ordering::Acquire);
+        if raw == 0 {
+            return;
+        }
+        // FLASHW_TRAY (2) | FLASHW_TIMERNOFG (12) = 14
+        let info = FlashWInfo {
+            cb_size: std::mem::size_of::<FlashWInfo>() as u32,
+            hwnd: raw as *mut c_void,
+            flags: 2 | 12,
+            count: 3,
+            timeout: 0,
+        };
+        // SAFETY: структура валидна на время вызова.
+        let _ = unsafe { FlashWindowEx(&raw const info) };
+    }
+
+    /// Проигрывает короткий системный звук уведомления Windows.
+    pub fn play_notify_sound() {
+        // MB_ICONASTERISK (0x40) — мягкий звук уведомления.
+        // SAFETY: системный вызов не принимает указателей.
+        let _ = unsafe { MessageBeep(0x0000_0040) };
+    }
 }
 
 #[cfg(windows)]
-pub use imp::{dress_window, set_window_blur};
+pub use imp::{dress_window, flash_taskbar, play_notify_sound, set_window_blur};
 
 #[cfg(not(windows))]
 pub fn dress_window(_title: &str) {}
 
 #[cfg(not(windows))]
 pub fn set_window_blur(_enabled: bool) {}
+
+#[cfg(not(windows))]
+pub fn flash_taskbar() {}
+
+#[cfg(not(windows))]
+pub fn play_notify_sound() {}

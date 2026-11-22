@@ -168,6 +168,20 @@ struct App {
     input_custom_emojis: Vec<(usize, usize, i64)>,
     custom_emoji_req: HashSet<i64>,
     last_toast: Option<std::time::Instant>,
+    /// Встроенные карточки уведомлений Rustgramm (когда выключены системные уведомления Windows).
+    toasts: Vec<InAppToast>,
+    /// Локальная блокировка по код-паролю.
+    app_locked: bool,
+    lock_input: String,
+    lock_err: String,
+    passcode_checked: bool,
+    /// Встроенный аудиоплеер (музыка профиля, голосовые, аудиофайлы).
+    audio_path: Option<std::path::PathBuf>,
+    audio_title: String,
+    audio_dur: u32,
+    audio_vol: f32,
+    #[cfg(windows)]
+    audio_view: Option<video::AudioView>,
     #[cfg(windows)]
     player: Option<video::VideoView>,
     refresh_at: Option<std::time::Instant>,
@@ -187,6 +201,13 @@ struct App {
     older_pending: bool,
     history_end: bool,
     scroll_to: Option<i32>,
+}
+
+/// Карточка встроенного уведомления Rustgramm (позиционируется в выбранном углу экрана).
+struct InAppToast {
+    title: String,
+    body: String,
+    at: std::time::Instant,
 }
 
 /// Готовая сетка QR: размер стороны и тёмные модули.
@@ -328,6 +349,17 @@ impl App {
             input_custom_emojis: Vec::new(),
             custom_emoji_req: HashSet::new(),
             last_toast: None,
+            toasts: Vec::new(),
+            app_locked: false,
+            lock_input: String::new(),
+            lock_err: String::new(),
+            passcode_checked: false,
+            audio_path: None,
+            audio_title: String::new(),
+            audio_dur: 0,
+            audio_vol: 1.0,
+            #[cfg(windows)]
+            audio_view: None,
             #[cfg(windows)]
             player: None,
             refresh_at: None,
@@ -419,22 +451,20 @@ impl App {
                 if self.apply_live_to_list(key, &row_snapshot, open_id == Some(key)) {
                     self.refresh_at.get_or_insert(std::time::Instant::now());
                 }
-                // Системное уведомление Windows, когда пришло входящее, чат не заглушён и окно не в фокусе.
+                // Уведомление по настройкам (Windows Toast или встроенные карточки + мигание + звук).
                 if !row_snapshot.1 && !ctx.input(|i| i.focused) {
                     let dialog = self.dialogs.iter().find(|d| d.id == key);
                     let muted = dialog.is_some_and(|d| d.muted);
-                    let cooldown_ok = self.last_toast.is_none_or(|t| t.elapsed().as_secs() >= 3);
+                    let cooldown_ok = self.last_toast.is_none_or(|t| t.elapsed().as_secs() >= 2);
                     if !muted && cooldown_ok {
                         self.last_toast = Some(std::time::Instant::now());
-                        let title = dialog.map_or("Rustgramm", |d| d.name.as_str());
-                        let body = if self.settings.ayu.streamer_mode {
-                            "Новое сообщение"
-                        } else if row_snapshot.2.is_empty() {
-                            "Вложение"
+                        let title = dialog.map_or("Rustgramm".to_owned(), |d| d.name.clone());
+                        let body = if row_snapshot.2.is_empty() {
+                            "Вложение".to_owned()
                         } else {
-                            row_snapshot.2.as_str()
+                            row_snapshot.2.clone()
                         };
-                        notify_toast(title, body);
+                        self.push_notification(ctx, &title, &body);
                     }
                 }
             }
@@ -456,6 +486,339 @@ impl App {
                 if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key) {
                     d.read_out = d.read_out.max(max);
                 }
+            }
+        }
+    }
+
+    /// Отправляет уведомление с учётом всех настроек (Windows Toast или встроенные карточки, звук, мигание).
+    pub(crate) fn push_notification(&mut self, ctx: &egui::Context, raw_title: &str, raw_body: &str) {
+        let cfg = &self.settings.notify;
+        if !cfg.desktop_notifications {
+            return;
+        }
+        let streamer = self.settings.ayu.streamer_mode;
+        let title = if cfg.show_name && !streamer { raw_title } else { "Rustgramm" };
+        let body = if cfg.show_text && !streamer { raw_body } else { "Новое сообщение" };
+        if cfg.flash_taskbar {
+            win::flash_taskbar();
+        }
+        if cfg.allow_sound && cfg.volume > 0 {
+            win::play_notify_sound();
+        }
+        if cfg.use_windows_notifications {
+            notify_toast(title, body);
+        } else {
+            let max_n = usize::from(cfg.max_count.clamp(1, 5));
+            self.toasts.push(InAppToast {
+                title: title.to_owned(),
+                body: body.to_owned(),
+                at: std::time::Instant::now(),
+            });
+            while self.toasts.len() > max_n {
+                self.toasts.remove(0);
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Встроенные всплывающие карточки уведомлений в выбранном углу окна (0..=3).
+    #[allow(deprecated)]
+    fn toasts_overlay(&mut self, ctx: &egui::Context) {
+        self.toasts.retain(|t| t.at.elapsed().as_secs_f32() < 4.5);
+        if self.toasts.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        let screen = ctx.content_rect();
+        let corner = self.settings.notify.corner;
+        let card_w = 290.0_f32.min(screen.width() - 28.0);
+        let card_h = 62.0;
+        let gap = 8.0;
+        let mut dismiss: Option<usize> = None;
+        for (idx, toast) in self.toasts.iter().enumerate() {
+            let age = toast.at.elapsed().as_secs_f32();
+            let alpha = if age < 0.2 {
+                ios_spring(age / 0.2)
+            } else if age > 4.0 {
+                ((4.5 - age) / 0.5).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let offset_y = idx as f32 * (card_h + gap);
+            let x = match corner {
+                0 | 2 => screen.left() + 14.0,
+                _ => screen.right() - card_w - 14.0,
+            };
+            let y = match corner {
+                0 | 1 => screen.top() + 44.0 + offset_y,
+                _ => screen.bottom() - card_h - 14.0 - offset_y,
+            };
+            egui::Area::new(egui::Id::new(("rg-toast", idx)))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(egui::pos2(x, y))
+                .show(ctx, |ui| {
+                    ui.set_opacity(alpha);
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
+                    let p = ui.painter();
+                    p.rect_filled(rect, egui::CornerRadius::same(12), t2(WINDOW_BG));
+                    p.rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(12),
+                        egui::Stroke::new(1.0, Color32::from_white_alpha(38)),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.circle_filled(egui::pos2(rect.left() + 26.0, rect.center().y), 16.0, t_btn(ORANGE));
+                    p.text(
+                        egui::pos2(rect.left() + 26.0, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        "R",
+                        FontId::proportional(14.0),
+                        Color32::WHITE,
+                    );
+                    let clip = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 50.0, rect.top()),
+                        egui::pos2(rect.right() - 10.0, rect.bottom()),
+                    );
+                    p.with_clip_rect(clip).text(
+                        egui::pos2(rect.left() + 50.0, rect.center().y - 9.0),
+                        egui::Align2::LEFT_CENTER,
+                        &toast.title,
+                        FontId::proportional(13.5),
+                        WHITE,
+                    );
+                    p.with_clip_rect(clip).text(
+                        egui::pos2(rect.left() + 50.0, rect.center().y + 10.0),
+                        egui::Align2::LEFT_CENTER,
+                        &toast.body,
+                        FontId::proportional(12.5),
+                        SUBTEXT,
+                    );
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        dismiss = Some(idx);
+                    }
+                });
+        }
+        if let Some(i) = dismiss {
+            self.toasts.remove(i);
+        }
+    }
+
+    pub(crate) fn audio_is_playing(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.audio_view.as_ref().is_some_and(video::AudioView::is_playing)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn toggle_audio_playback(&mut self) {
+        #[cfg(windows)]
+        if let Some(v) = self.audio_view.as_ref() {
+            v.set_playing(!v.is_playing());
+        }
+    }
+
+    fn stop_audio(&mut self) {
+        #[cfg(windows)]
+        if let Some(v) = self.audio_view.take() {
+            v.stop();
+        }
+        self.audio_path = None;
+        self.audio_title.clear();
+        self.audio_dur = 0;
+    }
+
+    /// Мини-плеер музыки/аудио сверху чата (как в Telegram/AyuGram).
+    fn audio_bar(&mut self, ui: &mut egui::Ui) {
+        let playing = self.audio_is_playing();
+        #[cfg(windows)]
+        let (pos_s, dur_s) = self
+            .audio_view
+            .as_ref()
+            .map(|v| (v.pos_secs(), v.dur_secs().max(self.audio_dur as f32)))
+            .unwrap_or((0.0, self.audio_dur as f32));
+        #[cfg(not(windows))]
+        let (pos_s, dur_s) = (0.0f32, self.audio_dur as f32);
+        let mut toggle = false;
+        let mut seek_to: Option<f32> = None;
+        let mut vol_changed = false;
+        let mut close = false;
+        ui.horizontal_centered(|ui| {
+            ui.add_space(10.0);
+            let (pr, presp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+            ui.painter().circle_filled(pr.center(), 14.0, t_btn(ORANGE));
+            icons::tg_sized(
+                ui.painter(),
+                if playing { "media_pause" } else { "media_play" },
+                pr.center(),
+                Vec2::splat(13.0),
+                Color32::WHITE,
+            );
+            if presp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                toggle = true;
+            }
+            ui.add_space(6.0);
+            // Название трека + полоса перемотки.
+            let bar_w = (ui.available_width() - 180.0).max(90.0);
+            let (tr, tresp) = ui.allocate_exact_size(Vec2::new(bar_w, 34.0), Sense::click_and_drag());
+            let p = ui.painter();
+            let clip = egui::Rect::from_min_max(tr.min, egui::pos2(tr.right(), tr.top() + 20.0));
+            p.with_clip_rect(clip).text(
+                egui::pos2(tr.left(), tr.top() + 9.0),
+                egui::Align2::LEFT_CENTER,
+                &self.audio_title,
+                FontId::proportional(13.0),
+                WHITE,
+            );
+            let track = egui::Rect::from_min_max(egui::pos2(tr.left(), tr.bottom() - 7.0), egui::pos2(tr.right(), tr.bottom() - 3.0));
+            let frac = if dur_s > 0.1 { (pos_s / dur_s).clamp(0.0, 1.0) } else { 0.0 };
+            p.rect_filled(track, egui::CornerRadius::same(2), Color32::from_white_alpha(32));
+            p.rect_filled(
+                egui::Rect::from_min_max(track.min, egui::pos2(track.left() + track.width() * frac, track.max.y)),
+                egui::CornerRadius::same(2),
+                t_btn(ORANGE),
+            );
+            if (tresp.clicked() || tresp.dragged())
+                && dur_s > 0.1
+                && let Some(pt) = tresp.interact_pointer_pos()
+            {
+                let f = ((pt.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+                seek_to = Some(f * dur_s);
+            }
+            ui.add_space(8.0);
+            let time_s = format!(
+                "{} / {}",
+                media_ui::mmss(pos_s as u32),
+                media_ui::mmss(dur_s as u32)
+            );
+            ui.label(RichText::new(time_s).size(11.5).color(SUBTEXT));
+            // Ползунок громкости.
+            let (vr, vresp) = ui.allocate_exact_size(Vec2::new(52.0, 20.0), Sense::click_and_drag());
+            let vtrack = egui::Rect::from_min_max(egui::pos2(vr.left(), vr.center().y - 1.5), egui::pos2(vr.right(), vr.center().y + 1.5));
+            ui.painter().rect_filled(vtrack, egui::CornerRadius::same(2), Color32::from_white_alpha(32));
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(vtrack.min, egui::pos2(vtrack.left() + vtrack.width() * self.audio_vol, vtrack.max.y)),
+                egui::CornerRadius::same(2),
+                t_btn(ORANGE),
+            );
+            if (vresp.clicked() || vresp.dragged())
+                && let Some(pt) = vresp.interact_pointer_pos()
+            {
+                self.audio_vol = ((pt.x - vtrack.left()) / vtrack.width().max(1.0)).clamp(0.0, 1.0);
+                vol_changed = true;
+            }
+            let (xr, xresp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+            icons::tg(ui.painter(), "info/info_close", xr.center(), if xresp.hovered() { WHITE } else { SUBTEXT });
+            if xresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                close = true;
+            }
+        });
+        if toggle {
+            self.toggle_audio_playback();
+        }
+        #[cfg(windows)]
+        if let Some(s) = seek_to
+            && let Some(v) = self.audio_view.as_ref()
+        {
+            v.seek_secs(s);
+        }
+        #[cfg(windows)]
+        if vol_changed
+            && let Some(v) = self.audio_view.as_ref()
+        {
+            v.set_volume(self.audio_vol);
+        }
+        #[cfg(not(windows))]
+        let _ = (seek_to, vol_changed);
+        if close {
+            self.stop_audio();
+        }
+    }
+
+    /// Синхронизирует скрытый WebView2 аудиоплеер с текущим треком (создаётся только при проигрывании).
+    #[cfg(windows)]
+    fn audio_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(path) = self.audio_path.clone() else {
+            if let Some(v) = self.audio_view.take() {
+                v.stop();
+            }
+            return;
+        };
+        if self.audio_view.is_none() {
+            let dir = worker::home().join("audio_player");
+            match video::AudioView::new(frame, &path, &dir, self.audio_vol) {
+                Ok(v) => self.audio_view = Some(v),
+                Err(e) => {
+                    self.error = e;
+                    self.error_at = self.now;
+                    self.audio_path = None;
+                    return;
+                }
+            }
+        }
+        if let Some(v) = self.audio_view.as_ref() {
+            if v.is_playing() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            let _ = v.take_ended();
+        }
+    }
+
+    /// Экран локальной блокировки по код-паролю (из «Конфиденциальность → Локальный код-пароль»).
+    fn lock_screen_ui(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.24).max(40.0));
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+            ui.painter().circle_filled(ir.center(), 30.0, t_btn(ORANGE));
+            icons::tg(ui.painter(), "settings/lock", ir.center(), Color32::WHITE);
+            ui.add_space(14.0);
+            ui.label(RichText::new("Rustgramm заблокирован").size(20.0).strong().color(WHITE));
+            ui.label(RichText::new("Введите локальный код-пароль").size(13.5).color(SUBTEXT));
+            ui.add_space(16.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.lock_input)
+                    .password(true)
+                    .hint_text("Код-пароль")
+                    .desired_width(240.0)
+                    .margin(Vec2::new(10.0, 9.0)),
+            );
+            if !self.lock_err.is_empty() {
+                ui.add_space(6.0);
+                ui.colored_label(DANGER, &self.lock_err);
+            }
+            ui.add_space(12.0);
+            let submit = orange_button(ui, "Разблокировать", Vec2::new(240.0, 38.0)).clicked()
+                || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if submit {
+                if rg_settings::hash_passcode(&self.lock_input) == self.settings.security.passcode_hash {
+                    self.app_locked = false;
+                    self.lock_input.clear();
+                    self.lock_err.clear();
+                } else {
+                    self.lock_err = "Неверный код-пароль".to_owned();
+                    self.lock_input.clear();
+                }
+            }
+        });
+    }
+
+    /// Пакетно запрашивает текстуры всех пользовательских Premium-эмодзи статусов из списка чатов.
+    fn request_emoji_statuses(&mut self) {
+        let mut ids: Vec<i64> = Vec::new();
+        for d in &self.dialogs {
+            if let Some(doc_id) = d.emoji_status
+                && !self.sticker_tex.contains_key(&doc_id)
+                && self.custom_emoji_req.insert(doc_id)
+            {
+                ids.push(doc_id);
+            }
+        }
+        if !ids.is_empty() {
+            for chunk in ids.chunks(90) {
+                self.send(Cmd::CustomEmojiDocs(chunk.to_vec()));
             }
         }
     }
@@ -766,6 +1129,7 @@ impl App {
                     if let Some(id) = keep {
                         self.selected = self.dialogs.iter().position(|x| x.id == id);
                     }
+                    self.request_emoji_statuses();
                 }
                 Ev::Folders(f) => {
                     if self.folder.is_some_and(|id| !f.iter().any(|x| x.id == id)) {
@@ -792,6 +1156,15 @@ impl App {
                 Ev::StreamVideo(url, name) => {
                     self.player_path = None;
                     self.player_stream = Some((url, name));
+                }
+                Ev::PlayAudio(path, title, dur) => {
+                    #[cfg(windows)]
+                    if let Some(v) = self.audio_view.take() {
+                        v.stop();
+                    }
+                    self.audio_path = Some(path);
+                    self.audio_title = title;
+                    self.audio_dur = dur;
                 }
                 Ev::GifReady(id, p) => {
                     self.gif_paths.insert(id, p);
@@ -832,6 +1205,12 @@ impl App {
                 }
                 Ev::Gifs(g) => self.gif_list = g,
                 Ev::PeerInfo(id, info) => {
+                    if let Some(doc_id) = info.emoji_status
+                        && !self.sticker_tex.contains_key(&doc_id)
+                        && self.custom_emoji_req.insert(doc_id)
+                    {
+                        self.send(Cmd::CustomEmojiDocs(vec![doc_id]));
+                    }
                     self.peer_infos.insert(id, info);
                 }
                 Ev::EmojiSets(s) => {
@@ -845,6 +1224,13 @@ impl App {
                     self.sticker_lists.insert(id, l);
                 }
                 Ev::StickerImg(id, img) => {
+                    // Ограничение кэша текстур стикеров/эмодзи в ОЗУ (до 260 шт.).
+                    if self.sticker_tex.len() > 260 {
+                        let keep: HashSet<i64> = self.dialogs.iter().filter_map(|d| d.emoji_status).collect();
+                        self.sticker_tex.retain(|k, _| keep.contains(k));
+                        self.sticker_req.retain(|k| self.sticker_tex.contains_key(k));
+                        self.custom_emoji_req.retain(|k| self.sticker_tex.contains_key(k));
+                    }
                     let tex = ctx.load_texture(format!("s{id}"), *img, egui::TextureOptions::LINEAR);
                     self.sticker_tex.insert(id, tex);
                 }
@@ -866,6 +1252,12 @@ impl App {
                     self.known.extend(m.iter().map(|r| r.id));
                     self.request_previews(idx, &m);
                     if let Some(id) = self.dialogs.get(idx).map(|d| d.id) {
+                        // Держим в ОЗУ кэш не более 16 последних чатов (остальное — на диске).
+                        if self.history_cache.len() >= 16 && !self.history_cache.contains_key(&id)
+                            && let Some(&drop_key) = self.history_cache.keys().next()
+                        {
+                            self.history_cache.remove(&drop_key);
+                        }
                         self.history_cache.insert(id, m.clone());
                     }
                     self.messages = m;
@@ -905,10 +1297,23 @@ impl App {
                 }
                 Ev::Image(..) => {}
                 Ev::Avatar(id, img) => {
+                    if self.avatars.len() > 160 && !self.avatars.contains_key(&id) {
+                        let keep: HashSet<i64> = self.dialogs.iter().take(40).map(|d| d.id).collect();
+                        self.avatars.retain(|k, _| keep.contains(k));
+                        self.avatar_req.retain(|k| self.avatars.contains_key(k));
+                    }
                     let tex = ctx.load_texture(format!("a{id}"), *img, egui::TextureOptions::LINEAR);
                     self.avatars.insert(id, tex);
                 }
-                Ev::Settings(s) => self.settings = *s,
+                Ev::Settings(s) => {
+                    self.settings = *s;
+                    if !self.passcode_checked {
+                        self.passcode_checked = true;
+                        if !self.settings.security.passcode_hash.is_empty() {
+                            self.app_locked = true;
+                        }
+                    }
+                }
                 Ev::Status(s) => self.status = s,
                 Ev::Error(e) => {
                     self.error = e;
@@ -1140,7 +1545,8 @@ impl App {
             if resp.clicked() {
                 self.drawer_open = true;
             }
-            let w = ui.available_width() - 8.0;
+            let has_lock = !self.settings.security.passcode_hash.is_empty();
+            let w = ui.available_width() - 8.0 - if has_lock { 38.0 } else { 0.0 };
             let (srect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
             ui.painter()
                 .rect_filled(srect, egui::CornerRadius::same(18), t(FILTER_INPUT));
@@ -1162,6 +1568,16 @@ impl App {
                 if xresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.search.clear();
                     self.global_results.clear();
+                }
+            }
+            if has_lock {
+                let (lr, lresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+                if lresp.hovered() {
+                    ui.painter().circle_filled(lr.center(), 16.0, t(WINDOW_OVER));
+                }
+                icons::tg(ui.painter(), "dialogs/dialogs_lock_off", lr.center(), if lresp.hovered() { ORANGE } else { DIALOG_DATE });
+                if lresp.on_hover_text("Заблокировать Rustgramm").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.app_locked = true;
                 }
             }
         });
@@ -1342,27 +1758,40 @@ impl App {
                         rect.min,
                         egui::pos2(right.max(rect.left() + 70.0), rect.max.y),
                     );
+                    let title_str = if d.saved { "Избранное" } else { d.name.as_str() };
+                    let title_w = p
+                        .layout_no_wrap(title_str.to_owned(), FontId::proportional(15.0), name_c)
+                        .size()
+                        .x;
                     p.with_clip_rect(name_clip).text(
                         rect.left_top() + Vec2::new(68.0, 12.0),
                         egui::Align2::LEFT_TOP,
-                        if d.saved { "Избранное" } else { &d.name },
+                        title_str,
                         FontId::proportional(15.0),
                         name_c,
                     );
-                    if d.muted {
-                        // Перечёркнутый динамик после имени, если звук отключён.
-                        let w = p
-                            .layout_no_wrap(
-                                (if d.saved { "Избранное" } else { d.name.as_str() }).to_owned(),
-                                FontId::proportional(15.0),
-                                name_c,
-                            )
-                            .size()
-                            .x;
-                        let x = rect.left() + 68.0 + w + 14.0;
-                        if x < clip_right - 8.0 {
-                            icons::tg(p, "dialogs/dialogs_mute", egui::pos2(x - 4.0, rect.top() + 21.0), date_c);
+                    // Значки после имени: Premium-эмодзи статус / галочка / Premium / без звука (как в AyuGram!).
+                    let mut badge_x = rect.left() + 68.0 + title_w + 11.0;
+                    let badge_y = rect.top() + 21.0;
+                    if let Some(doc_id) = d.emoji_status
+                        && badge_x < clip_right - 8.0
+                    {
+                        if let Some(tex) = self.sticker_tex.get(&doc_id) {
+                            let area = egui::Rect::from_center_size(egui::pos2(badge_x, badge_y), Vec2::splat(16.0));
+                            egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
+                        } else {
+                            icons::tg(ui.painter(), "dialogs/dialogs_premium", egui::pos2(badge_x, badge_y), ORANGE);
                         }
+                        badge_x += 18.0;
+                    } else if d.verified && badge_x < clip_right - 8.0 {
+                        icons::tg(ui.painter(), "dialogs/dialogs_verified_star", egui::pos2(badge_x, badge_y), ORANGE);
+                        badge_x += 18.0;
+                    } else if d.premium && badge_x < clip_right - 8.0 {
+                        icons::tg(ui.painter(), "dialogs/dialogs_premium", egui::pos2(badge_x, badge_y), ORANGE);
+                        badge_x += 18.0;
+                    }
+                    if d.muted && badge_x < clip_right - 8.0 {
+                        icons::tg(ui.painter(), "dialogs/dialogs_mute", egui::pos2(badge_x - 2.0, badge_y), date_c);
                     }
                     match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
                         Some(e) => e.paint_line(
@@ -1568,7 +1997,12 @@ impl eframe::App for App {
         theme::sync_visuals(&ctx);
         win::set_window_blur(self.settings.blur_enabled && self.settings.window_opacity < 100);
         theme::set_anim_speed(self.settings.anim_speed);
-        let zoom = f32::from(self.settings.ui_scale.clamp(80, 150)) / 100.0;
+        let scale_pct = if self.settings.default_scale {
+            100
+        } else {
+            self.settings.ui_scale.clamp(75, 200)
+        };
+        let zoom = f32::from(scale_pct) / 100.0;
         if (ctx.zoom_factor() - zoom).abs() > 0.001 {
             ctx.set_zoom_factor(zoom);
         }
@@ -1596,6 +2030,12 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(tint_title()))
                 .show(ui, |ui| self.titlebar(ui));
             self.resize_edges(ui);
+        }
+        if self.app_locked && !self.settings.security.passcode_hash.is_empty() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(tint_panel()))
+                .show(ui, |ui| self.lock_screen_ui(ui));
+            return;
         }
         if self.stage != Stage::Ready {
             egui::CentralPanel::default()
@@ -1643,6 +2083,18 @@ impl eframe::App for App {
             .exact_size(TOP_BAR_HEIGHT)
             .frame(egui::Frame::new().fill(tint_panel()))
             .show(ui, |ui| self.header_ui(ui, narrow));
+        if self.audio_path.is_some() {
+            egui::Panel::top("audio-bar")
+                .exact_size(40.0)
+                .frame(egui::Frame::new().fill(t(WINDOW_BG)))
+                .show(ui, |ui| self.audio_bar(ui));
+        }
+        if self.settings.language.translate_entire_chats && self.selected.is_some() {
+            egui::Panel::top("translate-bar")
+                .exact_size(34.0)
+                .frame(egui::Frame::new().fill(tint_panel()))
+                .show(ui, |ui| self.translate_chat_bar(ui));
+        }
         if !self.status.is_empty() || !self.error.is_empty() {
             egui::Panel::bottom("status")
                 .frame(
@@ -1705,10 +2157,13 @@ impl eframe::App for App {
         self.create_window(&ctx);
         self.settings_window(&ctx);
         self.tg_settings_window(&ctx);
+        self.proxy_window(&ctx);
+        self.toasts_overlay(&ctx);
         #[cfg(windows)]
         {
             self.inline_gif_overlay(&ctx, frame);
             self.player_overlay(&ctx, frame);
+            self.audio_overlay(&ctx, frame);
         }
         #[cfg(not(windows))]
         let _ = frame;
@@ -1800,6 +2255,9 @@ fn demo_app(mode: &str) -> App {
             kind: rg_core::engine::DialogKind::User,
             contact: true,
             read_out: 0,
+            emoji_status: None,
+            verified: i == 0,
+            premium: i == 1,
         });
     }
     for (i, (n, l)) in [("Старый чат", "Давно не писали"), ("Рассылка", "Скидки на всё")].iter().enumerate() {
@@ -1821,6 +2279,9 @@ fn demo_app(mode: &str) -> App {
             kind: rg_core::engine::DialogKind::User,
             contact: false,
             read_out: 0,
+            emoji_status: None,
+            verified: false,
+            premium: false,
         });
     }
     app.selected = Some(0);

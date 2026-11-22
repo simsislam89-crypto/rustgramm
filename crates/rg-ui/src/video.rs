@@ -214,6 +214,129 @@ impl InlineGifView {
     }
 }
 
+/// Встроенный скрытый аудиоплеер для музыки в профиле и голосовых/аудио в чатах
+/// (поддерживает M4A/AAC, MP3, OGG/Opus, FLAC, WAV; создаётся только во время воспроизведения).
+pub struct AudioView {
+    webview: WebView,
+    /// Текущая позиция (мс).
+    pos_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Длительность (мс).
+    dur_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Идёт ли воспроизведение прямо сейчас.
+    playing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Закончился ли трек.
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AudioView {
+    pub fn new(window: &impl HasWindowHandle, audio: &Path, dir: &Path, volume: f32) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let html_path = dir.join("audio.html");
+        let src = file_url(audio);
+        let vol = volume.clamp(0.0, 1.0);
+        let html = format!(
+            "<!doctype html><html><head><meta charset=utf-8></head><body>\
+            <audio id=a src=\"{src}\" autoplay></audio>\
+            <script>\
+            var a=document.getElementById('a'),n=0;a.volume={vol:.3};\
+            function rep(ev){{\
+              var p=Math.round((a.currentTime||0)*1000);\
+              var d=Math.round((isFinite(a.duration)?a.duration:0)*1000);\
+              var pl=a.paused?0:1;\
+              document.title='rga'+(++n)+'|'+ev+'|'+p+'|'+d+'|'+pl;\
+            }}\
+            a.onplay=function(){{rep('p')}};\
+            a.onpause=function(){{rep('p')}};\
+            a.onended=function(){{rep('e')}};\
+            a.onloadedmetadata=function(){{rep('m')}};\
+            setInterval(function(){{if(!a.paused)rep('t')}},250);\
+            </script></body></html>"
+        );
+        std::fs::write(&html_path, html).map_err(|e| e.to_string())?;
+        let pos_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dur_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let playing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pw, dw, plw, ew) = (pos_ms.clone(), dur_ms.clone(), playing.clone(), ended.clone());
+        let mut context = wry::WebContext::new(Some(dir.join("webview")));
+        let webview = WebViewBuilder::new_with_web_context(&mut context)
+            .with_url(file_url(&html_path))
+            .with_autoplay(true)
+            .with_visible(false)
+            .with_devtools(false)
+            .with_bounds(Rect {
+                position: PhysicalPosition::new(-100, -100).into(),
+                size: PhysicalSize::new(1u32, 1u32).into(),
+            })
+            .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+            .with_document_title_changed_handler(move |title| {
+                use std::sync::atomic::Ordering::Relaxed;
+                let Some(rest) = title.strip_prefix("rga").and_then(|t| t.split_once('|')).map(|(_, b)| b) else {
+                    return;
+                };
+                let mut parts = rest.split('|');
+                let ev = parts.next().unwrap_or("");
+                if let Some(p) = parts.next().and_then(|s| s.parse::<u64>().ok()) {
+                    pw.store(p, Relaxed);
+                }
+                if let Some(d) = parts.next().and_then(|s| s.parse::<u64>().ok())
+                    && d > 0
+                {
+                    dw.store(d, Relaxed);
+                }
+                if let Some(pl) = parts.next() {
+                    plw.store(pl == "1", Relaxed);
+                }
+                if ev == "e" {
+                    ew.store(true, Relaxed);
+                    plw.store(false, Relaxed);
+                }
+            })
+            .build_as_child(window)
+            .map_err(|e| format!("Аудиоплеер: {e}"))?;
+        let _ = webview.focus_parent();
+        Ok(Self { webview, pos_ms, dur_ms, playing, ended })
+    }
+
+    pub fn set_playing(&self, play: bool) {
+        let js = if play { "document.getElementById('a').play()" } else { "document.getElementById('a').pause()" };
+        let _ = self.webview.evaluate_script(js);
+        self.playing.store(play, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn seek_secs(&self, secs: f32) {
+        let s = secs.max(0.0);
+        let _ = self.webview.evaluate_script(&format!("document.getElementById('a').currentTime={s:.2}"));
+        self.pos_ms.store((s * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_volume(&self, vol: f32) {
+        let v = vol.clamp(0.0, 1.0);
+        let _ = self.webview.evaluate_script(&format!("document.getElementById('a').volume={v:.3}"));
+    }
+
+    pub fn pos_secs(&self) -> f32 {
+        self.pos_ms.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn dur_secs(&self) -> f32 {
+        self.dur_ms.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn take_ended(&self) -> bool {
+        self.ended.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn stop(&self) {
+        let _ = self.webview.evaluate_script("document.getElementById('a').pause()");
+        let _ = self.webview.focus_parent();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,19 +43,25 @@ impl App {
         if hide_all && self.folder.is_none() {
             self.folder = self.folders.first().map(|f| f.id);
         }
-        // (идентификатор папки, подпись, непрочитанные без заглушённых)
+        let inc_muted = self.settings.notify.badge_include_muted;
+        let count_msgs = self.settings.notify.badge_count_messages;
+        let tally = |d: &rg_core::engine::DialogRow| -> i32 {
+            if d.unread <= 0 || (!inc_muted && d.muted) {
+                0
+            } else if count_msgs {
+                d.unread
+            } else {
+                1
+            }
+        };
+        // (идентификатор папки, подпись, непрочитанные с учётом настроек счётчика)
         let mut tabs: Vec<(Option<i32>, String, i32)> = Vec::new();
         if !hide_all {
-            let n = self.dialogs.iter().filter(|d| !d.archived && !d.muted).map(|d| d.unread).sum();
+            let n = self.dialogs.iter().filter(|d| !d.archived).map(tally).sum();
             tabs.push((None, "Все чаты".to_owned(), n));
         }
         for f in &self.folders {
-            let n = self
-                .dialogs
-                .iter()
-                .filter(|d| folder_matches(f, d) && !d.muted)
-                .map(|d| d.unread)
-                .sum();
+            let n = self.dialogs.iter().filter(|d| folder_matches(f, d)).map(tally).sum();
             tabs.push((Some(f.id), f.title.clone(), n));
         }
         let mut chosen = None;

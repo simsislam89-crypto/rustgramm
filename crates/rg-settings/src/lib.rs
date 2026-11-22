@@ -110,6 +110,126 @@ impl GhostMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct NotifySettings {
+    /// Показывать уведомления на рабочем столе.
+    pub desktop_notifications: bool,
+    /// Мигать иконкой на панели задач при новом сообщении.
+    pub flash_taskbar: bool,
+    /// Воспроизводить звук уведомления.
+    pub allow_sound: bool,
+    /// Громкость звука (0..=100).
+    pub volume: u8,
+    /// Показывать имя отправителя в уведомлении.
+    pub show_name: bool,
+    /// Показывать текст сообщения в уведомлении.
+    pub show_text: bool,
+    /// Уведомления о закреплённых сообщениях.
+    pub pinned_messages: bool,
+    /// Принимать звонки на этом устройстве.
+    pub accept_calls: bool,
+    /// Учитывать чаты без звука в счётчике непрочитанных.
+    pub badge_include_muted: bool,
+    /// Считать непрочитанные сообщения (иначе — количество чатов).
+    pub badge_count_messages: bool,
+    /// Использовать системные toast-уведомления Windows (иначе — встроенные карточки Rustgramm).
+    pub use_windows_notifications: bool,
+    /// Учитывать системный режим «Не беспокоить».
+    pub respect_focus_mode: bool,
+    /// Угол экрана для уведомлений: 0 — верх-лево, 1 — верх-право, 2 — низ-лево, 3 — низ-право.
+    pub corner: u8,
+    /// Максимум одновременных уведомлений на экране (1..=5).
+    pub max_count: u8,
+}
+
+impl Default for NotifySettings {
+    fn default() -> Self {
+        Self {
+            desktop_notifications: true,
+            flash_taskbar: true,
+            allow_sound: true,
+            volume: 100,
+            show_name: true,
+            show_text: true,
+            pinned_messages: true,
+            accept_calls: true,
+            badge_include_muted: false,
+            badge_count_messages: true,
+            use_windows_notifications: false,
+            respect_focus_mode: true,
+            corner: 3,
+            max_count: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageSettings {
+    /// Код языка интерфейса (`"ru"`, `"en"`, …).
+    pub interface_lang: String,
+    /// Показывать пункт «Перевести» в контекстном меню сообщений.
+    pub show_translate_button: bool,
+    /// Показывать кнопку перевода всего чата в шапке.
+    pub translate_entire_chats: bool,
+    /// Языки, которые не нужно переводить (ISO 639-1).
+    pub do_not_translate: Vec<String>,
+    /// Целевой язык встроенного переводчика Telegram.
+    pub translate_to: String,
+}
+
+impl Default for LanguageSettings {
+    fn default() -> Self {
+        Self {
+            interface_lang: "ru".to_owned(),
+            show_translate_button: true,
+            translate_entire_chats: false,
+            do_not_translate: vec!["ru".to_owned()],
+            translate_to: "ru".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecuritySettings {
+    /// Хеш локального код-пароля (пусто — код-пароль отключён).
+    pub passcode_hash: String,
+    /// Автоблокировка при бездействии, минут (0 — только вручную).
+    pub auto_lock_mins: u16,
+    /// Показывать частые контакты вверху поиска.
+    pub suggest_frequent_contacts: bool,
+}
+
+impl Default for SecuritySettings {
+    fn default() -> Self {
+        Self {
+            passcode_hash: String::new(),
+            auto_lock_mins: 0,
+            suggest_frequent_contacts: true,
+        }
+    }
+}
+
+/// Устойчивый солёный 128-битный хеш локального код-пароля (без внешних крейтов).
+pub fn hash_passcode(pin: &str) -> String {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x8422_2325_cbf2_9ce4;
+    for round in 0u64..1024 {
+        for &b in b"rustgramm-local-passcode-v1:" {
+            h1 ^= u64::from(b) ^ round;
+            h1 = h1.wrapping_mul(0x0100_0000_01b3);
+        }
+        for &b in pin.as_bytes() {
+            h1 ^= u64::from(b);
+            h1 = h1.wrapping_mul(0x0100_0000_01b3);
+            h2 = h2.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (u64::from(b) + round);
+        }
+    }
+    format!("{h1:016x}{h2:016x}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub ghost: GhostMode,
     pub translation: TranslationProvider,
@@ -121,6 +241,12 @@ pub struct Settings {
     pub extera: ExteraSettings,
     /// Фильтры сообщений.
     pub filters: Vec<Filter>,
+    /// Настройки уведомлений и звуков.
+    pub notify: NotifySettings,
+    /// Настройки языка и встроенного переводчика.
+    pub language: LanguageSettings,
+    /// Локальная безопасность (код-пароль, частые контакты).
+    pub security: SecuritySettings,
     /// Непрозрачность окна, проценты (15..=100); по умолчанию 100 (непрозрачное на старте).
     pub window_opacity: u8,
     /// Размытие стекла (Windows 11 Acrylic при прозрачности < 100% и блюр-анимации в стиле iOS).
@@ -133,7 +259,9 @@ pub struct Settings {
     pub recent_emoji: String,
     /// Скорость анимаций, проценты (0 — без анимаций, 100 — как в Telegram, до 200).
     pub anim_speed: u8,
-    /// Масштаб интерфейса, проценты (80..=150).
+    /// Масштаб интерфейса по умолчанию (100%).
+    pub default_scale: bool,
+    /// Масштаб интерфейса, проценты (75..=200).
     pub ui_scale: u8,
 }
 
@@ -146,12 +274,16 @@ impl Default for Settings {
             ayu: AyuSettings::default(),
             extera: ExteraSettings::default(),
             filters: Vec::new(),
+            notify: NotifySettings::default(),
+            language: LanguageSettings::default(),
+            security: SecuritySettings::default(),
             window_opacity: 100,
             blur_enabled: true,
             chat_bg_style: 0,
             auto_play_gifs: true,
             recent_emoji: String::new(),
             anim_speed: 100,
+            default_scale: true,
             ui_scale: 100,
         }
     }
@@ -263,6 +395,17 @@ mod tests {
         let mut s = Settings::default();
         s.ghost.set_active(true);
         s.ayu.save_deleted_messages = false;
+        s.notify.corner = 1;
+        s.notify.max_count = 4;
+        s.language.translate_entire_chats = true;
+        s.security.passcode_hash = hash_passcode("1234");
         assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+    }
+
+    #[test]
+    fn passcode_hash_is_stable_and_distinct() {
+        assert_eq!(hash_passcode("4242"), hash_passcode("4242"));
+        assert_ne!(hash_passcode("4242"), hash_passcode("4243"));
+        assert_eq!(hash_passcode("0000").len(), 32);
     }
 }
