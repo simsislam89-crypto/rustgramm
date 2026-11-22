@@ -25,7 +25,30 @@ if [ ! -f "$KS" ]; then
     -alias rustgramm -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Rustgramm"
 fi
 export CARGO_APK_RELEASE_KEYSTORE="$PWD/$KS"
-export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$(cat "$PASS_FILE")"
+KS_PASS="$(cat "$PASS_FILE")"
+export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$KS_PASS"
+
+BUILD_TOOLS="$(ls -d "${ANDROID_HOME}"/build-tools/* | sort -V | tail -n 1)"
+ZIPALIGN="${BUILD_TOOLS}/zipalign"
+APKSIGNER="${BUILD_TOOLS}/apksigner"
+
+align_and_sign() {
+  local src="$1"
+  local dst="$2"
+  local tmp="${dst}.aligned.apk"
+  "$ZIPALIGN" -f -p 4 "$src" "$tmp"
+  "$APKSIGNER" sign \
+    --ks "$KS" \
+    --ks-pass "pass:${KS_PASS}" \
+    --ks-key-alias rustgramm \
+    --v1-signing-enabled true \
+    --v2-signing-enabled true \
+    --v3-signing-enabled true \
+    --out "$dst" \
+    "$tmp"
+  rm -f "$tmp"
+  "$APKSIGNER" verify --verbose "$dst"
+}
 
 mkdir -p dist
 
@@ -33,13 +56,13 @@ mkdir -p dist
 rm -f target/release/apk/*.apk
 cargo apk build -p rg-android --release --features plugins
 APK_FULL="$(ls target/release/apk/*.apk | head -n 1)"
-cp -f "$APK_FULL" dist/Rustgramm-Android-Full.apk
-cp -f "$APK_FULL" dist/Rustgramm.apk
+align_and_sign "$APK_FULL" dist/Rustgramm-Android-Full.apk
+cp -f dist/Rustgramm-Android-Full.apk dist/Rustgramm.apk
 
 # 2. Облегчённая версия для телефона (без плагинов)
 rm -f target/release/apk/*.apk
 cargo apk build -p rg-android --release --no-default-features
 APK_LITE="$(ls target/release/apk/*.apk | head -n 1)"
-cp -f "$APK_LITE" dist/Rustgramm-Android-Lite.apk
+align_and_sign "$APK_LITE" dist/Rustgramm-Android-Lite.apk
 
 ls -la dist/Rustgramm-Android-Full.apk dist/Rustgramm-Android-Lite.apk dist/Rustgramm.apk
