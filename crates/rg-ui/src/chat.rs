@@ -51,6 +51,8 @@ pub(crate) enum Act {
     Discuss(i32),
     /// Фильтровать ленту по конкретному отправителю.
     FilterUser(i64, String),
+    /// Нажатие инлайн- или реплай-кнопки бота (`(msg_id, текст, действие)`).
+    BotBtn(i32, String, rg_core::engine::BotBtnKind),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -913,6 +915,19 @@ impl App {
             .and_then(|i| self.dialogs.get(i))
             .and_then(|d| self.peer_infos.get(&d.id))
             .and_then(|x| x.ttl_period);
+        let bot_webapp = self
+            .selected
+            .and_then(|i| self.dialogs.get(i))
+            .and_then(|d| self.peer_infos.get(&d.id))
+            .and_then(|x| x.bot_menu_webapp.clone());
+        let reply_kb: Option<Vec<Vec<rg_core::engine::BotButton>>> = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.reply_keyboard.is_empty())
+            .map(|m| m.reply_keyboard.clone());
+        let has_reply_kb = reply_kb.is_some();
+        let mut bot_act: Option<Act> = None;
         // Необязательная полоса форматирования над строкой ввода (`[Aa]`).
         if self.format_bar_open {
             ui.horizontal(|ui| {
@@ -1005,9 +1020,27 @@ impl App {
                     self.ttl_popup_open = false;
                 }
             }
+            if let Some((w_lbl, w_url)) = &bot_webapp {
+                let btn_t = format!("🌐 {}", short(w_lbl, 12));
+                if orange_button(ui, &btn_t, Vec2::new(112.0, 32.0))
+                    .on_hover_text(format!("Открыть Mini App: {w_lbl}"))
+                    .clicked()
+                    && let Some(idx) = self.selected
+                {
+                    self.send(Cmd::OpenMiniApp {
+                        idx,
+                        msg_id: None,
+                        title: w_lbl.clone(),
+                        url: Some(w_url.clone()),
+                        start_param: None,
+                        simple: false,
+                    });
+                }
+            }
             // Точный расчёт правой части (без лишнего пустого зазора в строке ввода).
             let right_w = 44.0
                 + 34.0
+                + if has_reply_kb { 34.0 } else { 0.0 }
                 + if s.field_emoji_button { 46.0 } else { 0.0 }
                 + if s.field_auto_delete_button { 36.0 } else { 0.0 };
             let width = (ui.available_width() - right_w).max(80.0);
@@ -1103,6 +1136,19 @@ impl App {
                     self.format_bar_open = !self.format_bar_open;
                 }
             }
+            if has_reply_kb {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 44.0), Sense::click());
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "⌨",
+                    FontId::proportional(15.0),
+                    if self.bot_keyboard_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE },
+                );
+                if resp.on_hover_text("Клавиатура бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.bot_keyboard_open = !self.bot_keyboard_open;
+                }
+            }
             if s.field_auto_delete_button {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 44.0), Sense::click());
                 let active_ttl = cur_ttl.is_some_and(|v| v > 0);
@@ -1188,6 +1234,54 @@ impl App {
                 r.request_focus();
             }
         });
+        // Реплай-клавиатура бота под строкой ввода (`ReplyKeyboardMarkup`).
+        if self.bot_keyboard_open
+            && let Some(rows) = reply_kb
+        {
+            ui.add_space(4.0);
+            let avail_w = (ui.available_width() - 8.0).max(120.0);
+            for row in &rows {
+                if row.is_empty() {
+                    continue;
+                }
+                let cols = row.len() as f32;
+                let gap = 6.0;
+                let bw = ((avail_w - gap * (cols - 1.0).max(0.0)) / cols).max(48.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for btn in row {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(bw, 34.0), Sense::click());
+                        let fill = match btn.style {
+                            1 => t_btn(ORANGE),
+                            2 => DANGER.gamma_multiply(0.75),
+                            3 => GREEN.gamma_multiply(0.7),
+                            _ if resp.hovered() => t(WINDOW_OVER),
+                            _ => t(SERVICE_BG),
+                        };
+                        ui.painter().rect_filled(rect, egui::CornerRadius::same(8), fill);
+                        let icon = match &btn.kind {
+                            rg_core::engine::BotBtnKind::WebView { .. } => "🌐 ",
+                            _ => "",
+                        };
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{icon}{}", short(&btn.text, 28)),
+                            FontId::proportional(13.5),
+                            WHITE,
+                        );
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            bot_act = Some(Act::BotBtn(0, btn.text.clone(), btn.kind.clone()));
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        }
+        if let Some(a) = bot_act {
+            let ctx = ui.ctx().clone();
+            self.apply(&ctx, a);
+        }
         #[cfg(not(target_os = "android"))]
         if attach
             && self.selected.is_some()
@@ -1608,6 +1702,22 @@ impl App {
             return;
         }
         let pad = (viewport_h - self.msgs_h).max(0.0);
+        let cur_avail = ui.available_width();
+        if (cur_avail - self.msg_last_avail).abs() > 2.0 {
+            self.msg_heights.clear();
+            self.msg_last_avail = cur_avail;
+        }
+        let is_bot = self
+            .selected
+            .and_then(|i| self.dialogs.get(i))
+            .is_some_and(|d| d.kind == rg_core::engine::DialogKind::Bot);
+        let bot_desc = self
+            .selected
+            .and_then(|i| self.dialogs.get(i))
+            .and_then(|d| self.peer_infos.get(&d.id))
+            .map(|x| x.bot_description.clone())
+            .unwrap_or_default();
+        let mut measured_heights: Vec<(i32, f32)> = Vec::new();
         let out = {
             let topic_slice = self.active_topic.and_then(|tid| {
                 self.topic_msgs
@@ -1632,7 +1742,7 @@ impl App {
                 show_translate: self.settings.language.show_translate_button,
                 clip_rect,
                 selected_msgs: &self.selected_msgs,
-                avail: ui.available_width(),
+                avail: cur_avail,
                 s: &self.settings.ayu,
                 tex: &self.textures,
                 shift,
@@ -1652,13 +1762,15 @@ impl App {
             let hide_blocked = self.settings.ayu.hide_from_blocked;
             let blocked_ids = &self.blocked_ids;
             let user_filter = self.user_filter.as_ref().map(|(id, _)| *id);
+            let heights = &self.msg_heights;
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .stick_to_bottom(!searching && self.autoscroll_anchor.is_none() && self.active_topic.is_none())
-                .show(ui, |ui| {
+                .show_viewport(ui, |ui, viewport| {
                     if (fast_wheel_delta + autoscroll_dy).abs() > 0.1 {
                         ui.scroll_with_delta(Vec2::new(0.0, fast_wheel_delta + autoscroll_dy));
                     }
+                    let origin_y = ui.cursor().min.y;
                     let mut prev_date: Option<i64> = None;
                     // Короткая переписка прижата к низу, как в Telegram.
                     ui.add_space(8.0 + pad);
@@ -1673,6 +1785,30 @@ impl App {
                                 && user_filter.is_none_or(|uid| m.sender_id == uid)
                         })
                         .collect();
+                    if visible.is_empty() && is_bot && !searching {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(16.0);
+                            egui::Frame::new()
+                                .fill(t2(WINDOW_BG))
+                                .corner_radius(egui::CornerRadius::same(14))
+                                .inner_margin(egui::Margin::same(16))
+                                .show(ui, |ui| {
+                                    ui.set_max_width(340.0);
+                                    ui.label(RichText::new("Что умеет этот бот?").strong().size(15.0).color(ORANGE));
+                                    ui.add_space(6.0);
+                                    let desc_txt = if bot_desc.trim().is_empty() {
+                                        "Нажмите «СТАРТ», чтобы запустить бота и загрузить его меню и кнопки."
+                                    } else {
+                                        bot_desc.trim()
+                                    };
+                                    ui.label(RichText::new(desc_txt).size(13.5).color(WHITE));
+                                    ui.add_space(10.0);
+                                    if orange_button(ui, "СТАРТ (/start)", Vec2::new(220.0, 36.0)).clicked() {
+                                        acts.push(Act::Repeat("/start".to_owned()));
+                                    }
+                                });
+                        });
+                    }
                     let mut i = 0;
                     while i < visible.len() {
                         let m = visible[i];
@@ -1687,15 +1823,36 @@ impl App {
                         let show_avatar = group
                             && !m.outgoing
                             && visible.get(j).is_none_or(|n| n.outgoing || n.sender_id != m.sender_id);
-                        if prev_date.is_none_or(|p| !same_day(p, m.date)) {
+                        let new_day = prev_date.is_none_or(|p| !same_day(p, m.date));
+                        prev_date = Some(m.date);
+                        // Виртуализация для больших чатов: сообщения далеко за пределами видимого окна
+                        // с известной высотой не пересчитывают верстку текста/карточек и не грузят CPU.
+                        let cur_rel_y = ui.cursor().min.y - origin_y;
+                        if album.len() == 1
+                            && env.scroll_to != Some(m.id)
+                            && let Some(&cached_h) = heights.get(&m.id)
+                            && (cur_rel_y + cached_h + 36.0 < viewport.min.y - 360.0
+                                || cur_rel_y > viewport.max.y + 360.0)
+                        {
+                            if new_day {
+                                ui.allocate_exact_size(Vec2::new(env.avail, 34.0), Sense::hover());
+                            }
+                            ui.allocate_exact_size(Vec2::new(env.avail, cached_h), Sense::hover());
+                            ui.add_space(4.0);
+                            i = j;
+                            continue;
+                        }
+                        if new_day {
                             day_pill(ui, env.avail, day_label(m.date, now));
                         }
-                        prev_date = Some(m.date);
+                        let y_before = ui.cursor().min.y;
                         if album.len() > 1 {
                             let caption = album.iter().find(|x| !x.text.is_empty()).copied().unwrap_or(album[album.len() - 1]);
                             bubble(ui, caption, album, show_avatar, &env, &mut acts, &mut gif_candidate);
                         } else {
                             bubble(ui, m, &[], show_avatar, &env, &mut acts, &mut gif_candidate);
+                            let h = (ui.cursor().min.y - y_before).max(20.0);
+                            measured_heights.push((m.id, h));
                         }
                         ui.add_space(4.0);
                         i = j;
@@ -1703,6 +1860,12 @@ impl App {
                     ui.add_space(8.0);
                 })
         };
+        if self.msg_heights.len() > 2400 {
+            self.msg_heights.clear();
+        }
+        for (mid, h) in measured_heights {
+            self.msg_heights.insert(mid, h);
+        }
         self.inline_gif_rect = gif_candidate;
         self.msgs_h = (out.content_size.y - pad).max(0.0);
         self.scrolled_up = out.content_size.y > out.inner_rect.height() + 20.0
@@ -1965,6 +2128,10 @@ impl App {
             }
             Act::Goto(id) => self.scroll_to = Some(id),
             Act::OpenUrl(url) => {
+                // Внутренняя маршрутизация ссылок Telegram (`tg://`, `https://t.me/...`, `@username`) внутри клиента.
+                if self.handle_tg_uri(&url) {
+                    return;
+                }
                 if self.settings.ayu.disable_open_link_warning {
                     super::rich::open_url(&url);
                 } else {
@@ -2004,6 +2171,44 @@ impl App {
                     uid,
                     if uname.is_empty() { format!("ID {uid}") } else { uname },
                 ));
+            }
+            Act::BotBtn(msg_id, label, kind) => {
+                use rg_core::engine::BotBtnKind as K;
+                match kind {
+                    K::Text => {
+                        self.send(Cmd::Send(label, None));
+                    }
+                    K::Callback(data) => {
+                        if let Some(idx) = self.selected {
+                            self.send(Cmd::BotCallback(idx, msg_id, data));
+                        }
+                    }
+                    K::Url(u) => {
+                        self.apply(ctx, Act::OpenUrl(u));
+                    }
+                    K::WebView { url, simple } => {
+                        if let Some(idx) = self.selected {
+                            self.send(Cmd::OpenMiniApp {
+                                idx,
+                                msg_id: (msg_id > 0).then_some(msg_id),
+                                title: label,
+                                url: Some(url),
+                                start_param: None,
+                                simple,
+                            });
+                        }
+                    }
+                    K::Copy(txt) => {
+                        ctx.copy_text(txt);
+                        self.status = "Скопировано в буфер обмена".to_owned();
+                    }
+                    K::SwitchInline { query, .. } => {
+                        self.input = query;
+                    }
+                    K::UserProfile(uid) => {
+                        self.send(Cmd::OpenTgLink(rg_core::engine::TgLink::UserId(uid)));
+                    }
+                }
             }
         }
     }
@@ -2585,6 +2790,26 @@ impl App {
                 self.pending_confirm_media = None;
             }
         }
+        // Всплывающее уведомление (`alert = true`) от инлайн-кнопки бота.
+        if let Some(msg) = self.bot_alert.clone() {
+            let mut open = true;
+            egui::Window::new("Уведомление бота")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(340.0)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(&msg).size(14.0).color(WHITE));
+                    ui.add_space(10.0);
+                    if orange_button(ui, "ОК", Vec2::new(100.0, 32.0)).clicked() {
+                        self.bot_alert = None;
+                    }
+                });
+            if !open {
+                self.bot_alert = None;
+            }
+        }
     }
 }
 
@@ -2782,6 +3007,7 @@ fn bubble(
         }
     }
     let ease_in = ios_spring(k_in);
+    let mut bubble_w = 210.0_f32;
     ui.with_layout(layout, |ui| {
         ui.set_opacity(ease_in.powf(0.75).clamp(0.0, 1.0));
         ui.add_space(6.0);
@@ -2838,6 +3064,7 @@ fn bubble(
             w = max_inner.min(310.0);
         }
         let w = w.min(max_inner);
+        bubble_w = w;
         let radius = egui::CornerRadius::same(s.bubble_radius());
         let bid = ui.make_persistent_id(("m", m.id));
         let mut cards: Vec<(Rect, Act)> = Vec::new();
@@ -3087,6 +3314,57 @@ fn bubble(
         }
         egui::Popup::context_menu(&resp).show(|ui| menu(ui, m, env, acts));
     });
+    // Инлайн-кнопки бота прямо под пузырём сообщения (`ReplyInlineMarkup`).
+    if !m.inline_buttons.is_empty() && !m.deleted {
+        let total_w = (bubble_w + 2.0 * MSG_PAD_X).max(210.0).min(env.avail * 0.82);
+        let left_pad = if env.group && !m.outgoing { 46.0 } else { 6.0 };
+        for (r_idx, row) in m.inline_buttons.iter().enumerate() {
+            if row.is_empty() {
+                continue;
+            }
+            ui.add_space(3.0);
+            ui.with_layout(layout, |ui| {
+                ui.add_space(left_pad);
+                let cols = row.len() as f32;
+                let gap = 4.0;
+                let bw = ((total_w - gap * (cols - 1.0).max(0.0)) / cols).max(44.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (c_idx, btn) in row.iter().enumerate() {
+                        let (brect, bresp) = ui.allocate_exact_size(Vec2::new(bw, 32.0), Sense::click());
+                        let bfill = match btn.style {
+                            1 => t_btn(ORANGE),
+                            2 => DANGER.gamma_multiply(0.75),
+                            3 => GREEN.gamma_multiply(0.7),
+                            _ if bresp.hovered() => t(WINDOW_OVER),
+                            _ => t(SERVICE_BG),
+                        };
+                        ui.painter().rect_filled(brect, egui::CornerRadius::same(8), bfill);
+                        let badge = match &btn.kind {
+                            rg_core::engine::BotBtnKind::Url(_) => " ↗",
+                            rg_core::engine::BotBtnKind::WebView { .. } => " 🌐",
+                            rg_core::engine::BotBtnKind::Copy(_) => " 📋",
+                            rg_core::engine::BotBtnKind::SwitchInline { .. } => " ↪",
+                            _ => "",
+                        };
+                        let max_chars = ((bw / 7.5) as usize).clamp(4, 34);
+                        let lbl = format!("{}{badge}", short(&btn.text, max_chars));
+                        ui.painter().text(
+                            brect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            lbl,
+                            FontId::proportional(13.0),
+                            Color32::WHITE,
+                        );
+                        let _ = (r_idx, c_idx);
+                        if bresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            acts.push(Act::BotBtn(m.id, btn.text.clone(), btn.kind.clone()));
+                        }
+                    }
+                });
+            });
+        }
+    }
 }
 
 /// Показывать ли счётчик реакций у сообщений.

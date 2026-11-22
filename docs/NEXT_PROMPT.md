@@ -1,4 +1,4 @@
-/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 23 (v0.12.0)», «Этап 24 (v0.13.0)», «Этап 25 (v0.14.0)») и docs/PARITY.md. Версия сейчас 0.14.0.
+/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 24 (v0.13.0)», «Этап 25 (v0.14.0)», «Этап 26 (v0.15.0)») и docs/PARITY.md. Версия сейчас 0.15.0.
 
 СУТЬ: интерфейс и поведение 1 в 1 как в настоящем AyuGram, с оранжевыми основными кнопками, непрозрачным стартом (100%) + регулируемой прозрачностью окна и кнопок с iOS/Acrylic-блюром. Эталон — запущенный D:\download WIN\AyuGram\AyuGram.exe.
 Единственный релизный файл — `dist\Rustgramm.exe` (`scripts/make-dist.sh` обновляет его на месте, не создавая `-new`).
@@ -25,8 +25,11 @@
 - Система плагинов (`rg-ayu::plugins`) для телефона и ПК + сборки Full (`--features plugins`) и Lite (`--no-default-features`), `scripts/make-apk.sh`, `.github/workflows/release.yml`, и **2097 модульных и характеристических тестов** (`cargo test --workspace`).
 - Полноценный системный трей Windows (`tray.rs::TrayManager` на `Shell_NotifyIconW`, динамическая иконка с бейджем непрочитанных `render_app_icon_rgba`, режимы `WorkMode`, меню, автозапуск через HKCU Run, URL-протокол `tg://`, `WDA_EXCLUDEFROMCAPTURE` для режима стримера) — v0.14.0.
 - Живая векторная Lottie-анимация `.tgs` на чистом Rust (`lottie.rs::TgsAnim`, ключевые кадры/Безье, 24 FPS в стикерах/эмодзи), интерактивный Message Shot (`shot.rs`: GDI ClearType, 5 тем, буфер `arboard` и PNG), отложенная отправка в Ghost Mode (`schedule_date` + `offline = true`) и замки `locked_*`, просмотр журнала удалённых/правок (`audit_peer`), пакетная пересылка (`forward_batch`), импорт/экспорт фильтров JSON + пер-диалоговые фильтры, полоса/просмотрщик историй, форумы и темы, комментарии каналов, закреплённый баннер, форматирование при отправке (`parse_formatted`, `[Aa]`, `Ctrl+B/I/Shift+X/M/P`), галерея просмотрщика (`←`/`→`), Drag & Drop и переключатели exteraGram (`pg::EXTERA`).
+- Исправлено затемнение модальных окон (`paint_modal_subblur` + осветлённый `paint_frosted_scrim`), добавлена виртуализация ленты сообщений (`show_viewport` + `msg_heights`) и 0% нагрузка CPU от `.tgs` в простое (`tick_tgs`) — v0.15.0.
+- Полный функционал ботов (инлайн/реплай-клавиатуры, `/start`, `getBotCallbackAnswer`, меню WebApp и встроенные Mini Apps через `MiniAppView`) и внутренняя система ссылок (`parse_tg_link`: `t.me/...`, `t.me/+HASH`, `tg://...`, `@username`) без браузера.
+- Полный щит приватности трафика (`PrivacyShieldSettings`: блокировка телеметрии, джиттер таймингов 0–300 мс, кэш только в ОЗУ `ephemeral_local_cache`, обезличивание имён файлов), тотальная очистка всех следов у других людей и на серверах без потери аккаунта (`WipeScope` / `wipe_external_data`), а также изолированные аккаунты с разными аппаратными отпечатками `initConnection` и раздельными слотами/прокси (`AccountProfile::isolated`).
+- Репозиторий сделан публичным (`simsislam89-crypto/rustgramm`), настроены 3 релиза GitHub (Windows PC x64 + Android Full с плагинами + Android Lite без плагинов).
 
 ЧТО ДЕЛАТЬ ДАЛЬШЕ:
-1. Живая визуальная сверка v0.14.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.
-2. Закачка Android NDK (`aarch64-linux-android-clang`) или релиз через GitHub Actions `.github/workflows/release.yml` для сборки `Rustgramm-Android-Full.apk` и `Rustgramm-Android-Lite.apk`.
-3. Несколько аккаунтов, секретные чаты и звонки (`tgcalls`, по плану в `ROADMAP.md`).
+1. Живая визуальная сверка v0.15.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.
+2. Секретные чаты и звонки (`tgcalls`, по плану в `ROADMAP.md`).

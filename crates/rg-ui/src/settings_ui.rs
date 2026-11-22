@@ -56,9 +56,11 @@ fn next_menu(v: MenuVisibility) -> MenuVisibility {
 }
 
 impl App {
-    /// Левая выдвижная панель: профиль, разделы, переключатели ночной темы и призрака.
+    /// Левая выдвижная панель: профиль, аккаунты, разделы, переключатели ночной темы и призрака.
     #[allow(deprecated)] // Area::new требует Id, а замена Id::new ещё не даёт стабильного id
     pub(crate) fn drawer(&mut self, ctx: &egui::Context) {
+        self.add_account_window(ctx);
+        self.wipe_data_window(ctx);
         let open = ease_out(tween(ctx, "drawer", f32::from(u8::from(self.drawer_open)), 0.22));
         if open < 0.005 && !self.drawer_open {
             return;
@@ -82,6 +84,7 @@ impl App {
         let me_tex = self.dialogs.iter().find(|d| d.saved).and_then(|d| self.avatars.get(&d.id));
         let corners = s.ayu.avatar_corners;
         let mut act: Option<&str> = None;
+        let mut switch_slot: Option<u32> = None;
         egui::Area::new(egui::Id::new("drawer"))
             .order(egui::Order::Tooltip)
             .fixed_pos(Pos2::new(-(1.0 - open) * w, 0.0))
@@ -132,6 +135,57 @@ impl App {
                     );
                     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 };
+                // Список изолированных аккаунтов и кнопка добавления второго/нового аккаунта без корреляции.
+                for acc in &s.accounts {
+                    let is_cur = acc.slot == s.active_account;
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 38.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
+                    }
+                    let badge_c = if is_cur { ORANGE } else { SUBTEXT };
+                    ui.painter().circle_filled(Pos2::new(r.left() + 30.0, r.center().y), 11.0, badge_c.gamma_multiply(0.28));
+                    ui.painter().text(
+                        Pos2::new(r.left() + 30.0, r.center().y),
+                        Align2::CENTER_CENTER,
+                        format!("{}", acc.slot + 1),
+                        FontId::proportional(11.5),
+                        if is_cur { ORANGE } else { WHITE },
+                    );
+                    let title = if is_cur && !me.is_empty() {
+                        format!("{} · {}", acc.label, me)
+                    } else {
+                        acc.label.clone()
+                    };
+                    ui.painter().text(
+                        Pos2::new(r.left() + 56.0, r.center().y - 7.0),
+                        Align2::LEFT_CENTER,
+                        title.chars().take(24).collect::<String>(),
+                        FontId::proportional(13.0),
+                        if is_cur { ORANGE } else { WHITE },
+                    );
+                    ui.painter().text(
+                        Pos2::new(r.left() + 56.0, r.center().y + 8.0),
+                        Align2::LEFT_CENTER,
+                        format!("🔒 {}", acc.device_model),
+                        FontId::proportional(10.5),
+                        SUBTEXT,
+                    );
+                    if is_cur {
+                        ui.painter().text(
+                            Pos2::new(r.right() - 18.0, r.center().y),
+                            Align2::RIGHT_CENTER,
+                            "✓",
+                            FontId::proportional(13.0),
+                            ORANGE,
+                        );
+                    } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        switch_slot = Some(acc.slot);
+                    }
+                }
+                if item(ui, icons::Ico::Profile, "+ Добавить аккаунт (изолированный)") {
+                    act = Some("add_account");
+                }
+                kit::divider(ui);
                 if a.drawer_my_profile && item(ui, icons::Ico::Profile, "Мой профиль") {
                     act = Some("profile");
                 }
@@ -243,6 +297,12 @@ impl App {
                 self.create_member_map.clear();
                 self.send(Cmd::Contacts);
             }
+            Some("add_account") => {
+                self.drawer_open = false;
+                self.add_account_open = true;
+                self.new_acc_label.clear();
+                self.new_acc_proxy.clear();
+            }
             Some(other) => {
                 self.drawer_open = false;
                 let name = match other {
@@ -255,6 +315,10 @@ impl App {
                 self.status = format!("{name}: этот раздел будет в следующем этапе");
             }
             None => {}
+        }
+        if let Some(slot) = switch_slot {
+            self.drawer_open = false;
+            self.send(Cmd::SwitchAccount(slot));
         }
         if s != self.settings {
             self.settings = s.clone();
@@ -450,6 +514,152 @@ impl App {
             self.logout_confirm = false;
         }
     }
+
+    /// Модальное окно добавления изолированного аккаунта (анти-корреляция отпечатков и сети).
+    #[allow(deprecated)]
+    pub(crate) fn add_account_window(&mut self, ctx: &egui::Context) {
+        if !self.add_account_open {
+            return;
+        }
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut submit = false;
+        egui::Window::new("Добавить изолированный аккаунт")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(370.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                ui.label(
+                    RichText::new(
+                        "Новый аккаунт получит отдельную изолированную директорию сессии, собственную БД, уникальный аппаратный отпечаток устройства (device_model / system_version в MTProto initConnection) и разрыв сетевого соединения при переключении, чтобы Telegram не мог связать два ваших аккаунта.",
+                    )
+                    .size(12.0)
+                    .color(SUBTEXT),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Название профиля").size(12.5).color(WHITE));
+                ui.add_sized(
+                    [340.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.new_acc_label)
+                        .hint_text("Например: Личный / Рабочий / Анонимный")
+                        .margin(Vec2::new(8.0, 6.0)),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Отдельный SOCKS5 прокси (необязательно)").size(12.5).color(WHITE));
+                ui.add_sized(
+                    [340.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.new_acc_proxy)
+                        .hint_text("socks5://127.0.0.1:9050 или пусто")
+                        .margin(Vec2::new(8.0, 6.0)),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if orange_button(ui, "Создать и войти", Vec2::new(165.0, 34.0)).clicked() {
+                        submit = true;
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if submit {
+            let label = self.new_acc_label.trim().to_owned();
+            let proxy_url = self.new_acc_proxy.trim().to_owned();
+            self.add_account_open = false;
+            self.send(Cmd::AddIsolatedAccount { label, proxy_url });
+        } else if close {
+            self.add_account_open = false;
+        }
+    }
+
+    /// Модальное окно тотальной очистки данных у других людей и на серверах Telegram без потери аккаунта.
+    #[allow(deprecated)]
+    pub(crate) fn wipe_data_window(&mut self, ctx: &egui::Context) {
+        if !self.wipe_modal_open {
+            return;
+        }
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut run_wipe = false;
+        egui::Window::new("Тотальная очистка данных у других людей")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(390.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label(
+                    RichText::new(
+                        "Стирает все ваши следы и переписки у собеседников и на серверах Telegram БЕЗ удаления самого аккаунта:",
+                    )
+                    .size(12.5)
+                    .color(SUBTEXT),
+                );
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut self.wipe_scope.revoke_private_chats,
+                    "Удалить все личные переписки и чаты с ботами У ОБОИХ собеседников (revoke)",
+                );
+                ui.checkbox(
+                    &mut self.wipe_scope.delete_my_group_messages,
+                    "Найти и удалить все мои сообщения в группах для всех участников",
+                );
+                ui.checkbox(
+                    &mut self.wipe_scope.clear_contacts_and_top_peers,
+                    "Удалить синхронизированные контакты и рейтинг частых собеседников",
+                );
+                ui.checkbox(
+                    &mut self.wipe_scope.clear_drafts_stickers_payments,
+                    "Стереть облачные черновики, недавние стикеры и платёжные данные",
+                );
+                ui.checkbox(
+                    &mut self.wipe_scope.wipe_local_storage,
+                    "Очистить локальный кэш медиа, истории и БД сообщений на устройстве",
+                );
+                ui.add_space(10.0);
+                if !self.wipe_confirm_step {
+                    ui.horizontal(|ui| {
+                        if orange_button(ui, "Далее — к подтверждению", Vec2::new(200.0, 34.0)).clicked() {
+                            self.wipe_confirm_step = true;
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Отмена").clicked() {
+                            close = true;
+                        }
+                    });
+                } else {
+                    ui.colored_label(
+                        DANGER,
+                        "Внимание: удалённые у собеседников переписки и ваши сообщения в группах невозможно восстановить. Выполнить очистку сейчас?",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Да, стереть мои данные везде").color(DANGER).strong())
+                            .clicked()
+                        {
+                            run_wipe = true;
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Назад").clicked() {
+                            self.wipe_confirm_step = false;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            });
+        if run_wipe {
+            self.wipe_modal_open = false;
+            self.wipe_confirm_step = false;
+            self.send(Cmd::WipeExternalData(self.wipe_scope));
+        } else if close {
+            self.wipe_modal_open = false;
+            self.wipe_confirm_step = false;
+        }
+    }
 }
 
 /// Категории и ссылки (верхний уровень).
@@ -593,6 +803,39 @@ fn ayu_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     section(ui, "Прочее");
     toggle(ui, "Локальный Telegram Premium", &mut s.ayu.local_premium);
     toggle(ui, "Отключить рекламу", &mut s.ayu.disable_ads);
+    divider(ui);
+    section(ui, "Щит приватности трафика и метаданных");
+    toggle(
+        ui,
+        "Блокировать телеметрию активности и времени захода",
+        &mut s.privacy_shield.block_activity_telemetry,
+    );
+    toggle(
+        ui,
+        "Только ОЗУ (не сохранять кэш чатов и истории на диск)",
+        &mut s.privacy_shield.ephemeral_local_cache,
+    );
+    toggle(
+        ui,
+        "Обезличивать имена отправляемых файлов (file.ext)",
+        &mut s.privacy_shield.anonymize_filenames,
+    );
+    toggle(
+        ui,
+        "Изоляция отпечатков между аккаунтами (анти-корреляция)",
+        &mut s.privacy_shield.anti_correlation_accounts,
+    );
+    toggle(
+        ui,
+        "Маскировать Mini Apps под Telegram Android",
+        &mut s.ayu.spoof_webview_as_android,
+    );
+    let mut jit = i32::from(s.privacy_shield.traffic_jitter_ms);
+    let shown = if jit == 0 { "выкл.".to_owned() } else { format!("0..{jit} мс") };
+    if slider(ui, "Шум таймингов пакетов (джиттер)", &mut jit, (0, 300), shown) {
+        s.privacy_shield.traffic_jitter_ms = jit.clamp(0, 300) as u16;
+    }
+    desc(ui, "Защищает от корреляции трафика по времени пакетов и не оставляет на серверах и диске следов того, в каких чатах вы были и когда заходили.");
     ui.add_space(8.0);
 }
 

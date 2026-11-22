@@ -196,6 +196,30 @@ pub enum Cmd {
     DeleteFolder(i32),
     /// Глобальный поиск пользователей, групп и каналов.
     GlobalSearch(String),
+    /// Нажать callback-кнопку бота (`(индекс_чата, msg_id, data)`).
+    BotCallback(usize, i32, Vec<u8>),
+    /// Запустить Mini App / WebApp бота (`messages.requestWebView` / `messages.requestSimpleWebView`).
+    OpenMiniApp {
+        idx: usize,
+        msg_id: Option<i32>,
+        title: String,
+        url: Option<String>,
+        start_param: Option<String>,
+        simple: bool,
+    },
+    /// Открыть внутреннюю ссылку Telegram (`tg://`, `t.me/...`, `@username`) внутри клиента.
+    OpenTgLink(rg_core::engine::TgLink),
+    /// Тотальная очистка данных у других людей и на сервере без потери аккаунта.
+    WipeExternalData(rg_core::engine::WipeScope),
+    /// Переключиться на изолированный слот аккаунта (с разрывом старого соединения и сменой отпечатка).
+    SwitchAccount(u32),
+    /// Добавить новый изолированный аккаунт с уникальным отпечатком устройства и опциональным SOCKS5-прокси.
+    AddIsolatedAccount {
+        label: String,
+        proxy_url: String,
+    },
+    /// Удалить дополнительный изолированный слот аккаунта (`slot > 0`).
+    RemoveAccountSlot(u32),
     Settings(Box<Settings>),
 }
 
@@ -272,6 +296,18 @@ pub enum Ev {
     Stories(Vec<StoryRow>),
     /// Закреплённое сообщение чата.
     PinnedMsg(i64, MessageRow),
+    /// Готовый URL для открытия встроенного окна Mini App / WebApp бота.
+    MiniAppReady {
+        title: String,
+        url: String,
+    },
+    /// Всплывающее окно-уведомление от callback-кнопки бота (`alert = true`).
+    BotAlert(String),
+    /// Переход к чату и конкретному сообщению по внутренней ссылке.
+    NavigateTo {
+        id: i64,
+        post: Option<i32>,
+    },
     Status(String),
     Error(String),
 }
@@ -301,6 +337,17 @@ pub(crate) fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".rg"));
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Изолированный каталог для слота аккаунта (`0` — корень для обратной совместимости, `1..N` — `accounts/slot_N`).
+pub(crate) fn account_home(root: &std::path::Path, slot: u32) -> PathBuf {
+    if slot == 0 {
+        root.to_path_buf()
+    } else {
+        let dir = root.join("accounts").join(format!("slot_{slot}"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
 }
 
 fn keys_from_file(home: &std::path::Path) -> Option<Config> {
@@ -575,13 +622,23 @@ impl Out {
 
 async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui::Context) {
     let out = Out { ev, ctx };
-    let home = home();
+    let root_home = home();
+    let settings_path = root_home.join("settings.json");
+    let mut settings = load_settings(&settings_path);
+    if settings.accounts.is_empty() {
+        settings.accounts.push(rg_settings::AccountProfile::default());
+    }
+    let home = account_home(&root_home, settings.active_account);
     wipe_if_logged_out(&home);
+    if settings.privacy_shield.ephemeral_local_cache {
+        let _ = std::fs::remove_file(home.join("dialogs_cache.json"));
+        let _ = std::fs::remove_dir_all(home.join("cache").join("history"));
+    }
     // Ключи: переменные окружения или файл `api.keys` (две строки: api_id, api_hash).
     let mut cfg = loop {
         if let Some(c) = Config::from_env()
             .ok()
-            .or_else(|| keys_from_file(&home))
+            .or_else(|| keys_from_file(&root_home))
             .or_else(builtin_keys) {
             break c;
         }
@@ -589,9 +646,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         match cmds.recv().await {
             Some(Cmd::Keys(id, hash)) => match id.trim().parse::<i32>() {
                 Ok(n) if n > 0 && !hash.trim().is_empty() => {
-                    let _ = std::fs::write(home.join("api.keys"), format!("{n}
-{}
-", hash.trim()));
+                    let _ = std::fs::write(root_home.join("api.keys"), format!("{n}\n{}\n", hash.trim()));
                 }
                 _ => out.err("api_id — число, api_hash — строка из 32 символов"),
             },
@@ -602,21 +657,31 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     cfg.session_path = home.join("main.session").to_string_lossy().into_owned();
     if cfg.proxy_url.is_none() {
         cfg.proxy_url = std::fs::read_to_string(home.join("proxy.txt"))
+            .or_else(|_| std::fs::read_to_string(root_home.join("proxy.txt")))
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| s.starts_with("socks5://"));
     }
+    if settings.privacy_shield.anti_correlation_accounts
+        && let Some(prof) = settings.accounts.iter().find(|a| a.slot == settings.active_account)
+    {
+        cfg.device_model = Some(prof.device_model.clone());
+        cfg.system_version = Some(prof.system_version.clone());
+        cfg.app_version = Some(prof.app_version.clone());
+        cfg.lang_code = Some(prof.lang_code.clone());
+        if !prof.proxy_url.is_empty() && prof.proxy_url.starts_with("socks5://") {
+            cfg.proxy_url = Some(prof.proxy_url.clone());
+        }
+    }
 
-    let settings_path = home.join("settings.json");
-    let settings = load_settings(&settings_path);
     out.send(Ev::Settings(Box::new(settings.clone())));
 
-    // Мгновенный старт из локального кэша (если сессия уже есть): показываем чаты и аватарки
-    // ещё до завершения сетевого подключения к Telegram.
+    // Мгновенный старт из локального кэша (если сессия уже есть и не включён RAM-only режим).
     let mut cached_me = String::new();
     let mut cached_folders: Vec<FolderRow> = Vec::new();
     let mut dialogs: Vec<DialogRow> = Vec::new();
-    if home.join("main.session").exists()
+    if !settings.privacy_shield.ephemeral_local_cache
+        && home.join("main.session").exists()
         && let Some((me, dlgs, flds)) = load_disk_cache(&home)
     {
         cached_me = me.clone();
@@ -652,7 +717,12 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             return;
         }
     };
-    let store = match MessageStore::open(&home.join("messages.db").to_string_lossy()).await {
+    let store_res = if settings.privacy_shield.ephemeral_local_cache {
+        MessageStore::in_memory().await
+    } else {
+        MessageStore::open(&home.join("messages.db").to_string_lossy()).await
+    };
+    let store = match store_res {
         Ok(s) => s,
         Err(e) => {
             out.err(format!("Хранилище сообщений: {e}"));
@@ -769,10 +839,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 current = Some(i);
                 let Some(d) = dialogs.get(i) else { continue };
                 let seq = open_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let ephemeral = engine.settings().privacy_shield.ephemeral_local_cache;
                 let (eng, out, peer, did, home_c, open_gen_c) =
                     (engine.clone(), out.clone(), d.peer, d.id, home.clone(), open_gen.clone());
                 // Мгновенно отдаём кэш истории с диска (< 2 мс), пока сеть забирает свежие сообщения.
-                if let Some(cached) = load_history_cache(&home_c, did) {
+                if !ephemeral && let Some(cached) = load_history_cache(&home_c, did) {
                     out.send(Ev::History(i, cached));
                 }
                 tokio::spawn(async move {
@@ -782,9 +853,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             if open_gen_c.load(std::sync::atomic::Ordering::SeqCst) != seq {
                                 return;
                             }
-                            let rows_save = rows.clone();
-                            let h2 = home_c.clone();
-                            tokio::task::spawn_blocking(move || save_history_cache(&h2, did, &rows_save));
+                            if !ephemeral {
+                                let rows_save = rows.clone();
+                                let h2 = home_c.clone();
+                                tokio::task::spawn_blocking(move || save_history_cache(&h2, did, &rows_save));
+                            }
                             out.send(Ev::History(i, rows));
                             match eng.mark_read(peer).await {
                                 Ok(true) => out.send(Ev::Status(String::new())),
@@ -1873,8 +1946,254 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     out.send(Ev::Status(String::new()));
                 });
             }
+            Cmd::BotCallback(idx, msg_id, data) => {
+                let Some(d) = dialogs.get(idx) else { continue };
+                let (eng, out, peer, title) = (engine.clone(), out.clone(), d.peer, d.name.clone());
+                out.send(Ev::Status("Выполнение команды кнопки…".into()));
+                tokio::spawn(async move {
+                    match eng.press_bot_callback(peer, msg_id, data).await {
+                        Ok((msg, url, alert)) => {
+                            if let Some(m) = msg {
+                                if alert {
+                                    out.send(Ev::BotAlert(m));
+                                    out.send(Ev::Status(String::new()));
+                                } else {
+                                    out.send(Ev::Status(m));
+                                }
+                            } else {
+                                out.send(Ev::Status(String::new()));
+                            }
+                            if let Some(u) = url {
+                                out.send(Ev::MiniAppReady { title, url: u });
+                            }
+                            reload(&eng, &out, peer, idx).await;
+                        }
+                        Err(e) => out.err(format!("Кнопка бота: {e}")),
+                    }
+                });
+            }
+            Cmd::OpenMiniApp {
+                idx,
+                msg_id,
+                title,
+                url,
+                start_param,
+                simple,
+            } => {
+                let Some(d) = dialogs.get(idx) else { continue };
+                let spoof = engine.settings().ayu.spoof_webview_as_android;
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                out.send(Ev::Status(format!("Запуск Mini App «{title}»…")));
+                tokio::spawn(async move {
+                    match eng
+                        .request_webview_url(peer, msg_id, url, start_param, simple, spoof)
+                        .await
+                    {
+                        Ok(final_url) => {
+                            out.send(Ev::Status(String::new()));
+                            out.send(Ev::MiniAppReady {
+                                title,
+                                url: final_url,
+                            });
+                        }
+                        Err(e) => out.err(format!("Mini App: {e}")),
+                    }
+                });
+            }
+            Cmd::OpenTgLink(link) => {
+                use rg_core::engine::TgLink as L;
+                match link {
+                    L::Settings => {}
+                    L::Proxy(url) => {
+                        let _ = std::fs::write(home.join("proxy.txt"), &url);
+                        out.send(Ev::Status(format!("Прокси сохранён: {url} (перезапустите для применения)")));
+                    }
+                    L::PrivatePost { channel_id, msg_id } => {
+                        let bot_id = -1_000_000_000_000 - channel_id;
+                        out.send(Ev::NavigateTo {
+                            id: bot_id,
+                            post: msg_id,
+                        });
+                    }
+                    L::UserId(uid) => {
+                        out.send(Ev::NavigateTo {
+                            id: uid,
+                            post: None,
+                        });
+                    }
+                    L::Invite(hash) => {
+                        out.send(Ev::Status("Проверка приглашения…".into()));
+                        match engine.open_or_import_invite(&hash).await {
+                            Ok((peer, id, name)) => {
+                                if !dialogs.iter().any(|d| d.id == id) {
+                                    dialogs.insert(
+                                        0,
+                                        DialogRow {
+                                            peer,
+                                            id,
+                                            name,
+                                            last: String::new(),
+                                            date: 0,
+                                            unread: 0,
+                                            pinned: false,
+                                            muted: false,
+                                            saved: false,
+                                            archived: false,
+                                            kind: if id < -1_000_000_000_000 {
+                                                DialogKind::Channel
+                                            } else {
+                                                DialogKind::Group
+                                            },
+                                            contact: false,
+                                            read_out: 0,
+                                            emoji_status: None,
+                                            verified: false,
+                                            premium: false,
+                                        },
+                                    );
+                                    out.send(Ev::Dialogs(dialogs.clone()));
+                                }
+                                out.send(Ev::Status(String::new()));
+                                out.send(Ev::NavigateTo { id, post: None });
+                            }
+                            Err(e) => out.err(format!("Приглашение: {e}")),
+                        }
+                    }
+                    L::Resolve {
+                        domain,
+                        post,
+                        start,
+                        startapp,
+                    } => {
+                        out.send(Ev::Status(format!("Переход к @{domain}…")));
+                        match engine.resolve_username(&domain).await {
+                            Ok((peer, id, name)) => {
+                                if !dialogs.iter().any(|d| d.id == id) {
+                                    dialogs.insert(
+                                        0,
+                                        DialogRow {
+                                            peer,
+                                            id,
+                                            name: name.clone(),
+                                            last: String::new(),
+                                            date: 0,
+                                            unread: 0,
+                                            pinned: false,
+                                            muted: false,
+                                            saved: false,
+                                            archived: false,
+                                            kind: if id < -1_000_000_000_000 {
+                                                DialogKind::Channel
+                                            } else if id < 0 {
+                                                DialogKind::Group
+                                            } else if domain.to_ascii_lowercase().ends_with("bot") {
+                                                DialogKind::Bot
+                                            } else {
+                                                DialogKind::User
+                                            },
+                                            contact: false,
+                                            read_out: 0,
+                                            emoji_status: None,
+                                            verified: false,
+                                            premium: false,
+                                        },
+                                    );
+                                    out.send(Ev::Dialogs(dialogs.clone()));
+                                }
+                                out.send(Ev::Status(String::new()));
+                                out.send(Ev::NavigateTo { id, post });
+                                if let Some(param) = start {
+                                    let cmd_txt = if param.is_empty() {
+                                        "/start".to_owned()
+                                    } else {
+                                        format!("/start {param}")
+                                    };
+                                    let _ = engine.send_reply(peer, &cmd_txt, None).await;
+                                    if let Some(pos) = dialogs.iter().position(|d| d.id == id) {
+                                        reload(&engine, &out, peer, pos).await;
+                                    }
+                                }
+                                if let Some(app_param) = startapp {
+                                    let spoof = engine.settings().ayu.spoof_webview_as_android;
+                                    if let Ok(u) = engine
+                                        .request_webview_url(peer, None, None, Some(app_param), true, spoof)
+                                        .await
+                                    {
+                                        out.send(Ev::MiniAppReady { title: name, url: u });
+                                    }
+                                }
+                            }
+                            Err(e) => out.err(format!("Ссылка @{domain}: {e}")),
+                        }
+                    }
+                }
+            }
+            Cmd::WipeExternalData(scope) => {
+                let (eng, out, home_c) = (engine.clone(), out.clone(), home.clone());
+                out.send(Ev::Status("Выполняется тотальная очистка переписок и следов…".into()));
+                tokio::spawn(async move {
+                    if scope.wipe_local_storage {
+                        let _ = std::fs::remove_file(home_c.join("dialogs_cache.json"));
+                        let _ = std::fs::remove_dir_all(home_c.join("cache"));
+                    }
+                    match eng.wipe_external_data(scope).await {
+                        Ok(report) => out.send(Ev::Status(report)),
+                        Err(e) => out.err(format!("Очистка: {e}")),
+                    }
+                });
+            }
+            Cmd::SwitchAccount(slot) => {
+                let mut s = engine.settings();
+                if s.active_account == slot {
+                    continue;
+                }
+                s.active_account = slot;
+                let _ = std::fs::write(&settings_path, s.to_json());
+                connected.pool_handle.quit();
+                tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+                restart_app();
+            }
+            Cmd::AddIsolatedAccount { label, proxy_url } => {
+                let mut s = engine.settings();
+                let next_slot = s.accounts.iter().map(|a| a.slot).max().unwrap_or(0) + 1;
+                let entropy = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                let prof = rg_settings::AccountProfile::isolated(next_slot, label, proxy_url, entropy);
+                s.accounts.push(prof);
+                s.active_account = next_slot;
+                let _ = std::fs::write(&settings_path, s.to_json());
+                connected.pool_handle.quit();
+                tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+                restart_app();
+            }
+            Cmd::RemoveAccountSlot(slot) => {
+                if slot == 0 {
+                    continue;
+                }
+                let mut s = engine.settings();
+                s.accounts.retain(|a| a.slot != slot);
+                let _ = std::fs::remove_dir_all(root_home.join("accounts").join(format!("slot_{slot}")));
+                let need_restart = s.active_account == slot;
+                if need_restart {
+                    s.active_account = 0;
+                }
+                let json = s.to_json();
+                engine.update_settings(|cur| *cur = s.clone());
+                let _ = std::fs::write(&settings_path, json);
+                out.send(Ev::Settings(Box::new(s)));
+                if need_restart {
+                    connected.pool_handle.quit();
+                    tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+                    restart_app();
+                }
+            }
             Cmd::Settings(s) => {
                 let s = *s;
+                if s.privacy_shield.ephemeral_local_cache {
+                    let _ = std::fs::remove_file(home.join("dialogs_cache.json"));
+                    let _ = std::fs::remove_dir_all(home.join("cache").join("history"));
+                }
                 let json = s.to_json();
                 engine.update_settings(|cur| *cur = s);
                 let _ = std::fs::write(&settings_path, json);
@@ -1953,7 +2272,9 @@ async fn enter(
         *cached_folders = f.clone();
         out.send(Ev::Folders(f));
     }
-    save_disk_cache(home, cached_me, dialogs, cached_folders);
+    if !engine.settings().privacy_shield.ephemeral_local_cache {
+        save_disk_cache(home, cached_me, dialogs, cached_folders);
+    }
     // Подгружаем обзор аккаунта (заблокированные для `hide_from_blocked`, приватность) и истории в фоне.
     {
         let eng = engine.clone();
@@ -1975,7 +2296,7 @@ async fn enter(
         .take(3)
         .map(|d| (d.peer, d.id))
         .collect();
-    if !prefetch.is_empty() {
+    if !prefetch.is_empty() && !engine.settings().privacy_shield.ephemeral_local_cache {
         let eng = engine.clone();
         let h_dir = home.to_owned();
         tokio::spawn(async move {

@@ -176,6 +176,10 @@ struct Actions {
     set_session_ttl: Option<i32>,
     unblock: Option<(i64, i64)>,
     clear_payments: bool,
+    open_add_account: bool,
+    switch_account: Option<u32>,
+    remove_account: Option<u32>,
+    open_wipe_modal: bool,
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -632,6 +636,24 @@ impl App {
         }
         if act.open_proxy {
             self.proxy_open = true;
+        }
+        if act.open_add_account {
+            self.add_account_open = true;
+            self.new_acc_label.clear();
+            self.new_acc_proxy.clear();
+            act.close = true;
+        }
+        if let Some(slot) = act.switch_account {
+            self.send(Cmd::SwitchAccount(slot));
+            act.close = true;
+        }
+        if let Some(slot) = act.remove_account {
+            self.send(Cmd::RemoveAccountSlot(slot));
+        }
+        if act.open_wipe_modal {
+            self.wipe_modal_open = true;
+            self.wipe_confirm_step = false;
+            act.close = true;
         }
         if act.logout {
             self.logout_confirm = true;
@@ -1360,6 +1382,50 @@ fn privacy_page(
     desc(ui, "Отображать людей, с которыми вы часто общаетесь, в верхней части поиска.");
 
     divider(ui);
+    section(ui, "Щит приватности трафика и метаданных");
+    toggle(
+        ui,
+        "Блокировать телеметрию активности и времени захода",
+        &mut s.privacy_shield.block_activity_telemetry,
+    );
+    toggle(
+        ui,
+        "Только ОЗУ (не сохранять кэш чатов и истории на диск)",
+        &mut s.privacy_shield.ephemeral_local_cache,
+    );
+    toggle(
+        ui,
+        "Обезличивать имена отправляемых файлов (file.ext)",
+        &mut s.privacy_shield.anonymize_filenames,
+    );
+    toggle(
+        ui,
+        "Изоляция отпечатков между аккаунтами (анти-корреляция)",
+        &mut s.privacy_shield.anti_correlation_accounts,
+    );
+    toggle(
+        ui,
+        "Маскировать Mini Apps под Telegram Android",
+        &mut s.ayu.spoof_webview_as_android,
+    );
+    let mut jit = i32::from(s.privacy_shield.traffic_jitter_ms);
+    let shown = if jit == 0 { "выкл.".to_owned() } else { format!("0..{jit} мс") };
+    if slider(ui, "Шум таймингов пакетов (джиттер)", &mut jit, (0, 300), shown) {
+        s.privacy_shield.traffic_jitter_ms = jit.clamp(0, 300) as u16;
+    }
+    desc(ui, "Усложняет анализ трафика и не сохраняет сведения о просматриваемых сообщениях, чатах и времени входа.");
+
+    divider(ui);
+    section(ui, "Тотальная очистка данных у других людей");
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        if orange_button(ui, "Стереть мои данные у других людей…", Vec2::new(280.0, 34.0)).clicked() {
+            act.open_wipe_modal = true;
+        }
+    });
+    desc(ui, "Удаляет все личные переписки у обоих собеседников (revoke), стирает ваши сообщения в группах, синхронизированные контакты, черновики и кэш БЕЗ потери самого аккаунта.");
+
+    divider(ui);
     section(ui, "Удаление аккаунта");
     if value_row(ui, "Если я не захожу", &days_months_label(a.account_ttl_days), false) {
         st.account_ttl_open = true;
@@ -1745,6 +1811,74 @@ fn power_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
 }
 
 fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Actions, atlas: bool) {
+    section(ui, "Изолированные аккаунты (анти-корреляция)");
+    let w = ui.available_width();
+    for acc in &s.accounts {
+        let is_cur = acc.slot == s.active_account;
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 54.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 0.0, t(WINDOW_OVER));
+        }
+        let p = ui.painter();
+        p.circle_filled(
+            Pos2::new(rect.left() + 30.0, rect.center().y),
+            14.0,
+            if is_cur { t_btn(ORANGE) } else { t(WINDOW_OVER) },
+        );
+        p.text(
+            Pos2::new(rect.left() + 30.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            format!("{}", acc.slot + 1),
+            FontId::proportional(13.0),
+            Color32::WHITE,
+        );
+        p.text(
+            Pos2::new(rect.left() + 56.0, rect.center().y - 9.0),
+            Align2::LEFT_CENTER,
+            &acc.label,
+            FontId::proportional(14.0),
+            if is_cur { ORANGE } else { WHITE },
+        );
+        let sub = if acc.proxy_url.is_empty() {
+            format!("{} · {}", acc.device_model, acc.system_version)
+        } else {
+            format!("{} · SOCKS5", acc.device_model)
+        };
+        p.text(
+            Pos2::new(rect.left() + 56.0, rect.center().y + 9.0),
+            Align2::LEFT_CENTER,
+            sub,
+            FontId::proportional(11.5),
+            SUBTEXT,
+        );
+        if is_cur {
+            p.text(
+                Pos2::new(rect.right() - kit::PAD, rect.center().y),
+                Align2::RIGHT_CENTER,
+                "Активен ✓",
+                FontId::proportional(12.5),
+                ORANGE,
+            );
+        } else {
+            let del_r = Rect::from_center_size(Pos2::new(rect.right() - 26.0, rect.center().y), Vec2::splat(28.0));
+            let dresp = ui.interact(del_r, ui.make_persistent_id(("rm-acc", acc.slot)), Sense::click());
+            icons::tg(ui.painter(), "info/info_close", del_r.center(), if dresp.hovered() { DANGER } else { SUBTEXT });
+            if dresp.on_hover_text("Удалить слот аккаунта").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                act.remove_account = Some(acc.slot);
+            } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                act.switch_account = Some(acc.slot);
+            }
+        }
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        if orange_button(ui, "+ Добавить изолированный аккаунт", Vec2::new(255.0, 34.0)).clicked() {
+            act.open_add_account = true;
+        }
+    });
+    desc(ui, "Каждый аккаунт хранится в отдельном слоте со своим аппаратным отпечатком (device_model / system_version) и разрывом сетевого пула при переключении.");
+    divider(ui);
     section(ui, "Окно и стекло");
     let mut o = i32::from(s.window_opacity);
     let shown = format!("{o}%");
@@ -1754,13 +1888,21 @@ fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Ac
     toggle(ui, "Размытие стекла (блюр)", &mut s.blur_enabled);
     toggle(ui, "Автозапуск GIF в ленте", &mut s.auto_play_gifs);
     divider(ui);
-    section(ui, "Приватность");
+    section(ui, "Приватность и очистка");
     let mut ghost = s.ghost.active;
     if toggle(ui, "Режим призрака", &mut ghost) {
         s.ghost.set_active(ghost);
     }
+    toggle(
+        ui,
+        "Щит приватности трафика и метаданных",
+        &mut s.privacy_shield.block_activity_telemetry,
+    );
     if nav_row(ui, "menu/customize", "Расширенные настройки Rustgramm", "") {
         act.advanced = true;
+    }
+    if nav_row(ui, "menu/delete", "Тотальная очистка данных у других людей…", "") {
+        act.open_wipe_modal = true;
     }
     divider(ui);
     section(ui, "Оформление и данные");

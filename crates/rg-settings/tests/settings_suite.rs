@@ -3,9 +3,9 @@
 //! `LanguageSettings`, `SecuritySettings`, `hash_passcode`, JSON-миграции).
 
 use rg_settings::{
-    AyuSettings, ChannelBottomButton, Filter, LanguageSettings, MenuVisibility, NotifySettings,
-    PeerIdDisplay, SecuritySettings, SendWithoutSound, Settings, TranslationProvider, WorkMode,
-    hash_passcode,
+    AccountProfile, AyuSettings, ChannelBottomButton, Filter, LanguageSettings, MenuVisibility,
+    NotifySettings, PeerIdDisplay, PrivacyShieldSettings, SecuritySettings, SendWithoutSound,
+    Settings, TranslationProvider, WorkMode, hash_passcode,
 };
 
 macro_rules! passcode_tests {
@@ -531,4 +531,32 @@ fn locked_ghost_flags_and_per_dialog_filter_roundtrip() {
     assert!(loaded.ghost.send_read_stories);
     assert!(loaded.ghost.send_online_packets);
     assert_eq!(loaded.filters[0].dialog_id, Some(-100500));
+}
+
+#[test]
+fn isolated_account_profiles_have_distinct_fingerprints_and_roundtrip() {
+    let a0 = AccountProfile::default();
+    let a1 = AccountProfile::isolated(1, "Рабочий".into(), "socks5://127.0.0.1:9050".into(), 0);
+    let a2 = AccountProfile::isolated(2, "Анонимный".into(), String::new(), 1);
+    assert_ne!(a0.device_model, a1.device_model);
+    assert_ne!(a1.device_model, a2.device_model);
+    assert_ne!(a1.system_version, a2.system_version);
+
+    let s = Settings {
+        active_account: 1,
+        accounts: vec![a0.clone(), a1.clone(), a2.clone()],
+        privacy_shield: PrivacyShieldSettings {
+            block_activity_telemetry: true,
+            traffic_jitter_ms: 140,
+            ephemeral_local_cache: true,
+            anonymize_filenames: true,
+            anti_correlation_accounts: true,
+        },
+        ..Settings::default()
+    };
+    let loaded = Settings::from_json(&s.to_json()).unwrap();
+    assert_eq!(loaded.active_account, 1);
+    assert_eq!(loaded.accounts.len(), 3);
+    assert_eq!(loaded.accounts[1], a1);
+    assert_eq!(loaded.privacy_shield, s.privacy_shield);
 }

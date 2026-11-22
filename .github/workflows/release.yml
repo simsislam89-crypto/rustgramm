@@ -47,10 +47,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
       - name: Install Android NDK & cargo-apk
         run: |
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+          SDKM="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            SDKM="$(find "${ANDROID_HOME}" -name sdkmanager | head -n 1)"
+          fi
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" --install "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
           cargo install cargo-apk --locked
       - name: Build Android Full (with Plugins) & Lite (without Plugins)
         env:
@@ -67,7 +71,7 @@ jobs:
             dist/Rustgramm-Android-Lite.apk
 
   publish-release:
-    name: Publish GitHub Release
+    name: Publish GitHub Releases (1 Windows + 2 Android)
     needs: [windows-pc, android-apk]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -75,11 +79,27 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Create GitHub Release
+      - name: Publish Windows PC Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: "Rustgramm ${{ github.ref_name }} — Windows PC (x64)"
           generate_release_notes: true
           files: |
             artifacts/Rustgramm-Windows-x64/Rustgramm-Windows-x64.exe
+      - name: Publish Android Full Release (с плагинами)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ github.ref_name }}-android-full"
+          name: "Rustgramm ${{ github.ref_name }} — Android Full (с плагинами)"
+          body: "Полная версия Rustgramm для Android (arm64) со встроенной системой плагинов exteraGram / AyuGram."
+          files: |
             artifacts/Rustgramm-Android-APKs/Rustgramm-Android-Full.apk
+      - name: Publish Android Lite Release (без плагинов)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ github.ref_name }}-android-lite"
+          name: "Rustgramm ${{ github.ref_name }} — Android Lite (без плагинов)"
+          body: "Облегчённая версия Rustgramm для Android (arm64) без движка плагинов."
+          files: |
             artifacts/Rustgramm-Android-APKs/Rustgramm-Android-Lite.apk

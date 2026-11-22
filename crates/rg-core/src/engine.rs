@@ -123,6 +123,224 @@ pub struct PeerInfo {
     pub ttl_period: Option<i32>,
     /// Команды бота (`command`, `description`), если это бот.
     pub bot_commands: Vec<(String, String)>,
+    /// Кнопка меню Mini App / WebApp бота (`(текст, url)`), если задана в `BotInfo.menu_button`.
+    pub bot_menu_webapp: Option<(String, String)>,
+    /// Описание бота из `BotInfo.description` (показывается на стартовом экране бота).
+    pub bot_description: String,
+}
+
+/// Действие кнопки бота (инлайн под сообщением или реплай-клавиатуры под полем ввода).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BotBtnKind {
+    /// Обычная текстовая кнопка реплай-клавиатуры (отправляет свой текст как сообщение).
+    Text,
+    /// Callback-кнопка (`messages.getBotCallbackAnswer` с `data`).
+    Callback(Vec<u8>),
+    /// Ссылка (`t.me/...`, `tg://...` или веб-ссылка).
+    Url(String),
+    /// Кнопка Mini App / WebView (`messages.requestWebView` или `messages.requestSimpleWebView`).
+    WebView { url: String, simple: bool },
+    /// Скопировать строку в буфер обмена.
+    Copy(String),
+    /// Вставить инлайн-запрос в поле ввода (`@bot query`).
+    SwitchInline { query: String, same_peer: bool },
+    /// Открыть профиль пользователя по `user_id`.
+    UserProfile(i64),
+}
+
+/// Кнопка бота для отображения в интерфейсе.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BotButton {
+    pub text: String,
+    pub kind: BotBtnKind,
+    /// Стиль кнопки: 0 — обычный, 1 — primary (оранжевый), 2 — danger (красный), 3 — success (зелёный).
+    pub style: u8,
+}
+
+/// Внутренняя ссылка Telegram (`tg://...`, `https://t.me/...`, `@username`), обрабатываемая внутри клиента без браузера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgLink {
+    /// Открыть настройки (`tg://settings`).
+    Settings,
+    /// Настроить SOCKS5-прокси (`tg://socks?server=...&port=...` или `t.me/socks?...`).
+    Proxy(String),
+    /// Приглашение в группу/канал (`t.me/+HASH`, `t.me/joinchat/HASH`, `tg://join?invite=HASH`).
+    Invite(String),
+    /// Ссылка на пост приватного канала/группы (`t.me/c/<channel_id>/<msg_id>`, `tg://privatepost?...`).
+    PrivatePost { channel_id: i64, msg_id: Option<i32> },
+    /// Открыть пользователя по ID (`tg://user?id=<id>`).
+    UserId(i64),
+    /// Открыть `@username` / `t.me/<domain>` (опционально: номер поста, параметр `/start`, запуск Mini App `startapp`).
+    Resolve {
+        domain: String,
+        post: Option<i32>,
+        start: Option<String>,
+        startapp: Option<String>,
+    },
+}
+
+/// Разбирает любую ссылку Telegram (`tg://`, `https://t.me/`, `https://telegram.me/`, `t.me/`, `@username`)
+/// во внутренний маршрут `TgLink`. Возвращает `None` для обычных внешних веб-сайтов.
+pub fn parse_tg_link(raw: &str) -> Option<TgLink> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(u) = s.strip_prefix('@') {
+        let clean: String = u
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if clean.len() >= 3 {
+            return Some(TgLink::Resolve {
+                domain: clean,
+                post: None,
+                start: None,
+                startapp: None,
+            });
+        }
+        return None;
+    }
+    let query_param = |q: &str, key: &str| -> Option<String> {
+        for part in q.split('&') {
+            if let Some((k, v)) = part.split_once('=')
+                && k.eq_ignore_ascii_case(key)
+                && !v.is_empty()
+            {
+                return Some(v.to_owned());
+            }
+        }
+        None
+    };
+    if let Some(rest) = s.strip_prefix("tg://") {
+        let (path, q) = rest.split_once('?').unwrap_or((rest, ""));
+        let path = path.trim_end_matches('/');
+        return match path {
+            "settings" => Some(TgLink::Settings),
+            "join" => query_param(q, "invite").map(TgLink::Invite),
+            "user" => query_param(q, "id")
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(TgLink::UserId),
+            "privatepost" => {
+                let ch = query_param(q, "channel")?.parse::<i64>().ok()?;
+                let post = query_param(q, "post").and_then(|p| p.parse::<i32>().ok());
+                Some(TgLink::PrivatePost {
+                    channel_id: ch,
+                    msg_id: post,
+                })
+            }
+            "socks" | "proxy" => {
+                let srv = query_param(q, "server")?;
+                let port = query_param(q, "port").unwrap_or_else(|| "1080".to_owned());
+                match (query_param(q, "user"), query_param(q, "pass")) {
+                    (Some(u), Some(p)) => Some(TgLink::Proxy(format!("socks5://{u}:{p}@{srv}:{port}"))),
+                    _ => Some(TgLink::Proxy(format!("socks5://{srv}:{port}"))),
+                }
+            }
+            "resolve" => {
+                let domain = query_param(q, "domain")?;
+                let post = query_param(q, "post").and_then(|p| p.parse::<i32>().ok());
+                let start = query_param(q, "start").or_else(|| query_param(q, "startgroup"));
+                let startapp = query_param(q, "startapp").or_else(|| query_param(q, "appname"));
+                Some(TgLink::Resolve {
+                    domain,
+                    post,
+                    start,
+                    startapp,
+                })
+            }
+            _ => None,
+        };
+    }
+    let after_scheme = match s.split_once("://") {
+        Some((scheme, tail)) if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") => tail,
+        _ => s,
+    };
+    let rest = after_scheme
+        .strip_prefix("t.me/")
+        .or_else(|| after_scheme.strip_prefix("telegram.me/"))
+        .or_else(|| after_scheme.strip_prefix("telegram.dog/"))?;
+    let (path, q) = rest.split_once('?').unwrap_or((rest, ""));
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(hash) = path.strip_prefix('+') {
+        if !hash.is_empty() {
+            return Some(TgLink::Invite(hash.to_owned()));
+        }
+        return None;
+    }
+    if let Some(hash) = path.strip_prefix("joinchat/") {
+        if !hash.is_empty() {
+            return Some(TgLink::Invite(hash.to_owned()));
+        }
+        return None;
+    }
+    if path == "socks" || path == "proxy" {
+        let srv = query_param(q, "server")?;
+        let port = query_param(q, "port").unwrap_or_else(|| "1080".to_owned());
+        return match (query_param(q, "user"), query_param(q, "pass")) {
+            (Some(u), Some(p)) => Some(TgLink::Proxy(format!("socks5://{u}:{p}@{srv}:{port}"))),
+            _ => Some(TgLink::Proxy(format!("socks5://{srv}:{port}"))),
+        };
+    }
+    if let Some(c_rest) = path.strip_prefix("c/") {
+        let mut parts = c_rest.split('/');
+        let ch = parts.next()?.parse::<i64>().ok()?;
+        let msg_id = parts.next().and_then(|p| p.parse::<i32>().ok());
+        return Some(TgLink::PrivatePost {
+            channel_id: ch,
+            msg_id,
+        });
+    }
+    let mut segs = path.split('/');
+    let domain = segs.next()?.trim();
+    if domain.is_empty()
+        || !domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let second = segs.next();
+    let post = second.and_then(|p| p.parse::<i32>().ok());
+    let app_seg = second.filter(|p| p.parse::<i32>().is_err() && !p.is_empty()).map(str::to_owned);
+    let start = query_param(q, "start").or_else(|| query_param(q, "startgroup"));
+    let startapp = query_param(q, "startapp").or(app_seg);
+    Some(TgLink::Resolve {
+        domain: domain.to_owned(),
+        post,
+        start,
+        startapp,
+    })
+}
+
+/// Опции тотальной очистки данных у других людей и на сервере без удаления аккаунта.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WipeScope {
+    /// Удалить всю историю переписки в личных чатах и ботах для ОБЕИХ сторон (`revoke = true`).
+    pub revoke_private_chats: bool,
+    /// Найти и удалить свои отправленные сообщения в группах и супергруппах (`revoke = true`).
+    pub delete_my_group_messages: bool,
+    /// Стереть синхронизированные контакты и рейтинг частых собеседников (`contacts.deleteContacts`, `contacts.resetTopPeerRating`).
+    pub clear_contacts_and_top_peers: bool,
+    /// Очистить облачные черновики, недавние стикеры и платёжные данные (`messages.clearAllDrafts`, `messages.clearRecentStickers`, `payments.clearSavedInfo`).
+    pub clear_drafts_stickers_payments: bool,
+    /// Полностью очистить локальные кэши и базу сохранённых сообщений на устройстве.
+    pub wipe_local_storage: bool,
+}
+
+impl Default for WipeScope {
+    fn default() -> Self {
+        Self {
+            revoke_private_chats: true,
+            delete_my_group_messages: true,
+            clear_contacts_and_top_peers: true,
+            clear_drafts_stickers_payments: true,
+            wipe_local_storage: true,
+        }
+    }
 }
 
 /// Тема супергруппы-форума (`messages.getForumTopics`).
@@ -302,6 +520,12 @@ pub struct MessageRow {
     pub entities: Vec<Entity>,
     /// Номер альбома: сообщения с одним номером показываются одним пузырём.
     pub grouped: Option<i64>,
+    /// Инлайн-кнопки бота под сообщением (`ReplyInlineMarkup`).
+    #[serde(default)]
+    pub inline_buttons: Vec<Vec<BotButton>>,
+    /// Реплай-клавиатура бота под полем ввода (`ReplyKeyboardMarkup`).
+    #[serde(default)]
+    pub reply_keyboard: Vec<Vec<BotButton>>,
 }
 
 impl MessageRow {
@@ -325,6 +549,8 @@ impl MessageRow {
             sender_id: 0,
             entities: Vec::new(),
             grouped: None,
+            inline_buttons: Vec::new(),
+            reply_keyboard: Vec::new(),
         }
     }
 }
@@ -499,15 +725,32 @@ impl Engine {
         }
     }
 
-    /// Отметить чат прочитанным, если режим призрака это позволяет. `Ok(false)` — запрос погашен.
+    /// Отметить чат прочитанным, если режим призрака и щит приватности это позволяют. `Ok(false)` — запрос погашен.
     pub async fn mark_read(&self, peer: PeerRef) -> Result<bool, grammers_client::InvocationError> {
-        let ghost_mode = self.settings().ghost;
-        let id = grammers_tl_types_id::READ_HISTORY;
-        if ghost::verdict(&ghost_mode, id) == Verdict::Drop {
+        let cfg = self.settings();
+        if cfg.privacy_shield.block_activity_telemetry {
             return Ok(false);
         }
+        let id = grammers_tl_types_id::READ_HISTORY;
+        if ghost::verdict(&cfg.ghost, id) == Verdict::Drop {
+            return Ok(false);
+        }
+        self.apply_traffic_jitter().await;
         self.client.mark_as_read(peer).await?;
         Ok(true)
+    }
+
+    /// Случайная микрозадержка перед сетевым запросом (`traffic_jitter_ms`) для защиты от тайминг-корреляции трафика.
+    pub async fn apply_traffic_jitter(&self) {
+        let max_ms = u64::from(self.settings().privacy_shield.traffic_jitter_ms.min(600));
+        if max_ms < 10 {
+            return;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::from(d.subsec_nanos()));
+        let ms = 8 + (nanos % max_ms);
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     /// «Прочитать на сервере»: отметка о прочтении отправляется всегда, даже в режиме призрака
@@ -841,16 +1084,20 @@ impl Engine {
                 info.blocked = full.blocked;
                 info.pinned_msg_id = full.pinned_msg_id;
                 info.ttl_period = full.ttl_period;
-                if let Some(tl::enums::BotInfo::Info(bi)) = &full.bot_info
-                    && let Some(cmds) = &bi.commands
-                {
-                    info.bot_commands = cmds
-                        .iter()
-                        .map(|c| {
-                            let tl::enums::BotCommand::Command(cmd) = c;
-                            (cmd.command.clone(), cmd.description.clone())
-                        })
-                        .collect();
+                if let Some(tl::enums::BotInfo::Info(bi)) = &full.bot_info {
+                    info.bot_description = bi.description.clone().unwrap_or_default();
+                    if let Some(tl::enums::BotMenuButton::Button(mb)) = &bi.menu_button {
+                        info.bot_menu_webapp = Some((mb.text.clone(), mb.url.clone()));
+                    }
+                    if let Some(cmds) = &bi.commands {
+                        info.bot_commands = cmds
+                            .iter()
+                            .map(|c| {
+                                let tl::enums::BotCommand::Command(cmd) = c;
+                                (cmd.command.clone(), cmd.description.clone())
+                            })
+                            .collect();
+                    }
                 }
                 if let Some(b) = &full.birthday {
                     info.birthday = fmt_birthday(b);
@@ -1079,6 +1326,12 @@ impl Engine {
                 .or(h.post_author)
                 .unwrap_or_else(|| "скрытый отправитель".to_owned())
         });
+        let (inline_buttons, reply_keyboard) = match &m.raw {
+            grammers_client::tl::enums::Message::Message(x) => {
+                extract_reply_markup(x.reply_markup.as_ref())
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
         MessageRow {
             id: m.id(),
             text: m.text().to_owned(),
@@ -1106,6 +1359,8 @@ impl Engine {
                 .map(|e| convert_entities(m.text(), e))
                 .unwrap_or_default(),
             grouped: m.grouped_id(),
+            inline_buttons,
+            reply_keyboard,
         }
     }
 
@@ -1149,6 +1404,7 @@ impl Engine {
     }
 
     /// Отправить файл (картинки уходят как фото, остальное — документом).
+    /// При включённом `privacy_shield.anonymize_filenames` локальное имя файла заменяется нейтральным `file_<id>.<ext>`.
     pub async fn send_file(
         &self,
         peer: PeerRef,
@@ -1156,13 +1412,26 @@ impl Engine {
         caption: &str,
         reply_to: Option<i32>,
     ) -> Result<(), BoxErr> {
-        let ghost_mode = self.settings().ghost;
-        let up = self.client.upload_file(path).await?;
+        let cfg = self.settings();
+        let ghost_mode = cfg.ghost;
+        self.apply_traffic_jitter().await;
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .unwrap_or_default();
+        let up = if cfg.privacy_shield.anonymize_filenames {
+            let mut f = tokio::fs::File::open(path).await?;
+            let len = f.metadata().await?.len() as usize;
+            let anon_name = if ext.is_empty() {
+                "file.bin".to_owned()
+            } else {
+                format!("file.{ext}")
+            };
+            self.client.upload_stream(&mut f, len, anon_name).await?
+        } else {
+            self.client.upload_file(path).await?
+        };
         let base = grammers_client::message::InputMessage::new()
             .text(caption)
             .reply_to(reply_to)
@@ -3451,17 +3720,21 @@ impl Engine {
         Ok(out)
     }
 
-    /// Отмечает историю прочитанной (`stories.readStories`), соблюдая режим призрака (`send_read_stories`).
+    /// Отмечает историю прочитанной (`stories.readStories`), соблюдая режим призрака (`send_read_stories`) и щит приватности.
     pub async fn read_story(
         &self,
         peer: PeerRef,
         story_id: i32,
     ) -> Result<bool, grammers_client::InvocationError> {
         use grammers_client::tl::{Identifiable, functions};
-        let ghost_mode = self.settings().ghost;
-        if ghost::verdict(&ghost_mode, functions::stories::ReadStories::CONSTRUCTOR_ID) == Verdict::Drop {
+        let cfg = self.settings();
+        if cfg.privacy_shield.block_activity_telemetry {
             return Ok(false);
         }
+        if ghost::verdict(&cfg.ghost, functions::stories::ReadStories::CONSTRUCTOR_ID) == Verdict::Drop {
+            return Ok(false);
+        }
+        self.apply_traffic_jitter().await;
         self.client
             .invoke(&functions::stories::ReadStories {
                 peer: peer.into(),
@@ -3481,6 +3754,434 @@ impl Engine {
             .await?;
         Ok(())
     }
+
+    /// Нажатие инлайн callback-кнопки бота (`messages.getBotCallbackAnswer`).
+    /// Возвращает `(сообщение_всплывашки, url_для_открытия, это_alert)`.
+    pub async fn press_bot_callback(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        data: Vec<u8>,
+    ) -> Result<(Option<String>, Option<String>, bool), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.apply_traffic_jitter().await;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetBotCallbackAnswer {
+                game: false,
+                peer: peer.into(),
+                msg_id,
+                data: Some(data),
+                password: None,
+            })
+            .await?;
+        let tl::enums::messages::BotCallbackAnswer::Answer(ans) = res;
+        Ok((ans.message, ans.url, ans.alert))
+    }
+
+    /// Запрашивает URL для открытия Mini App / WebApp бота (`messages.requestWebView` или `messages.requestSimpleWebView`).
+    pub async fn request_webview_url(
+        &self,
+        peer: PeerRef,
+        msg_id: Option<i32>,
+        url: Option<String>,
+        start_param: Option<String>,
+        simple: bool,
+        spoof_android: bool,
+    ) -> Result<String, BoxErr> {
+        use grammers_client::tl;
+        self.apply_traffic_jitter().await;
+        let platform = if spoof_android {
+            "android".to_owned()
+        } else {
+            "tdesktop".to_owned()
+        };
+        let in_peer = tl::enums::InputPeer::from(peer);
+        let bot_user = match &in_peer {
+            tl::enums::InputPeer::User(u) => tl::enums::InputUser::User(tl::types::InputUser {
+                user_id: u.user_id,
+                access_hash: u.access_hash,
+            }),
+            _ => tl::enums::InputUser::Empty,
+        };
+        let theme_params = Some(tl::enums::DataJson::Json(tl::types::DataJson {
+            data: r##"{"bg_color":"#17212b","secondary_bg_color":"#0e1621","text_color":"#f5f5f5","hint_color":"#708499","link_color":"#f58220","button_color":"#f58220","button_text_color":"#ffffff"}"##.to_owned(),
+        }));
+        let res = if simple || matches!(bot_user, tl::enums::InputUser::Empty) && msg_id.is_none() {
+            self.client
+                .invoke(&tl::functions::messages::RequestSimpleWebView {
+                    from_switch_webview: false,
+                    from_side_menu: false,
+                    compact: false,
+                    fullscreen: false,
+                    bot: bot_user,
+                    url: url.clone(),
+                    start_param,
+                    theme_params,
+                    platform,
+                })
+                .await
+        } else {
+            let reply_to = msg_id.map(|id| {
+                tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                    reply_to_msg_id: id,
+                    top_msg_id: None,
+                    reply_to_peer_id: None,
+                    quote_text: None,
+                    quote_entities: None,
+                    quote_offset: None,
+                    monoforum_peer_id: None,
+                    todo_item_id: None,
+                    poll_option: None,
+                    quote_rich: None,
+                })
+            });
+            self.client
+                .invoke(&tl::functions::messages::RequestWebView {
+                    from_bot_menu: msg_id.is_none() && url.is_some(),
+                    silent: self.settings().ghost.should_send_without_sound(),
+                    compact: false,
+                    fullscreen: false,
+                    peer: in_peer,
+                    bot: bot_user,
+                    url: url.clone(),
+                    start_param,
+                    theme_params,
+                    platform,
+                    reply_to,
+                    send_as: None,
+                })
+                .await
+        };
+        match res {
+            Ok(tl::enums::WebViewResult::Url(u)) => Ok(u.url),
+            Err(e) => {
+                if let Some(fallback) = url.filter(|u| {
+                    u.split_once("://")
+                        .is_some_and(|(sch, _)| sch.eq_ignore_ascii_case("https") || sch.eq_ignore_ascii_case("http"))
+                }) {
+                    Ok(fallback)
+                } else {
+                    Err(Box::new(e))
+                }
+            }
+        }
+    }
+
+    /// Разрешает `@username` (`contacts.resolveUsername`) во внутреннюю ссылку `(PeerRef, dialog_id, name)`.
+    pub async fn resolve_username(&self, domain: &str) -> Result<(PeerRef, i64, String), BoxErr> {
+        use grammers_client::tl;
+        let clean = domain.trim().trim_start_matches('@');
+        let tl::enums::contacts::ResolvedPeer::Peer(res) = self
+            .client
+            .invoke(&tl::functions::contacts::ResolveUsername {
+                username: clean.to_owned(),
+                referer: None,
+            })
+            .await?;
+        for u in &res.users {
+            if let tl::enums::User::User(x) = u {
+                let pref = PeerRef::from(u);
+                let name = [x.first_name.clone(), x.last_name.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return Ok((
+                    pref,
+                    x.id,
+                    if name.trim().is_empty() {
+                        format!("@{clean}")
+                    } else {
+                        name
+                    },
+                ));
+            }
+        }
+        for c in &res.chats {
+            match c {
+                tl::enums::Chat::Channel(ch) => {
+                    return Ok((PeerRef::from(c), -1_000_000_000_000 - ch.id, ch.title.clone()));
+                }
+                tl::enums::Chat::Chat(g) => {
+                    return Ok((PeerRef::from(c), -g.id, g.title.clone()));
+                }
+                _ => {}
+            }
+        }
+        Err(format!("Пользователь или канал @{clean} не найден").into())
+    }
+
+    /// Проверяет и принимает приглашение `t.me/+HASH` (`messages.checkChatInvite` / `messages.importChatInvite`).
+    pub async fn open_or_import_invite(&self, hash: &str) -> Result<(PeerRef, i64, String), BoxErr> {
+        use grammers_client::tl;
+        let checked = self
+            .client
+            .invoke(&tl::functions::messages::CheckChatInvite {
+                hash: hash.to_owned(),
+            })
+            .await?;
+        let extract_chat = |chat: &tl::enums::Chat| -> Option<(PeerRef, i64, String)> {
+            match chat {
+                tl::enums::Chat::Channel(ch) => Some((
+                    PeerRef::from(chat),
+                    -1_000_000_000_000 - ch.id,
+                    ch.title.clone(),
+                )),
+                tl::enums::Chat::Chat(g) => Some((
+                    PeerRef::from(chat),
+                    -g.id,
+                    g.title.clone(),
+                )),
+                _ => None,
+            }
+        };
+        match &checked {
+            tl::enums::ChatInvite::Already(a) => {
+                if let Some(found) = extract_chat(&a.chat) {
+                    return Ok(found);
+                }
+            }
+            tl::enums::ChatInvite::Peek(p) => {
+                if let Some(found) = extract_chat(&p.chat) {
+                    return Ok(found);
+                }
+            }
+            tl::enums::ChatInvite::Invite(_) => {
+                let res = self
+                    .client
+                    .invoke(&tl::functions::messages::ImportChatInvite {
+                        hash: hash.to_owned(),
+                    })
+                    .await?;
+                if let tl::enums::messages::ChatInviteJoinResult::Ok(ok) = &res {
+                    let chats = match &ok.updates {
+                        tl::enums::Updates::Updates(u) => &u.chats[..],
+                        tl::enums::Updates::Combined(u) => &u.chats[..],
+                        _ => &[],
+                    };
+                    for c in chats {
+                        if let Some(found) = extract_chat(c) {
+                            return Ok(found);
+                        }
+                    }
+                }
+            }
+        }
+        Err("Не удалось открыть приглашение".into())
+    }
+
+    /// Тотальная очистка данных у других людей и на сервере без потери аккаунта:
+    /// - Удаляет историю личных чатов и ботов для ОБЕИХ сторон (`revoke = true`);
+    /// - Находит и удаляет собственные сообщения пользователя в группах (`revoke = true`);
+    /// - Стирает синхронизированные контакты, рейтинг частых собеседников, черновики, недавние стикеры и платёжные данные.
+    pub async fn wipe_external_data(&self, scope: WipeScope) -> Result<String, BoxErr> {
+        use grammers_client::tl;
+        let dlgs = self.dialogs(300).await?;
+        let mut wiped_private = 0usize;
+        let mut wiped_group_msgs = 0usize;
+        let mut wiped_contacts = 0usize;
+
+        for d in &dlgs {
+            if d.saved {
+                continue;
+            }
+            let in_peer = tl::enums::InputPeer::from(d.peer);
+            if scope.clear_contacts_and_top_peers {
+                for cat in [
+                    tl::enums::TopPeerCategory::Correspondents,
+                    tl::enums::TopPeerCategory::BotsPm,
+                    tl::enums::TopPeerCategory::Groups,
+                    tl::enums::TopPeerCategory::Channels,
+                    tl::enums::TopPeerCategory::ForwardUsers,
+                    tl::enums::TopPeerCategory::ForwardChats,
+                ] {
+                    let _ = self
+                        .client
+                        .invoke(&tl::functions::contacts::ResetTopPeerRating {
+                            category: cat,
+                            peer: in_peer.clone(),
+                        })
+                        .await;
+                }
+            }
+            match d.kind {
+                DialogKind::User | DialogKind::Bot if scope.revoke_private_chats => {
+                    for _ in 0..8 {
+                        let res = self
+                            .client
+                            .invoke(&tl::functions::messages::DeleteHistory {
+                                just_clear: false,
+                                revoke: true,
+                                peer: in_peer.clone(),
+                                max_id: i32::MAX,
+                                min_date: None,
+                                max_date: None,
+                            })
+                            .await;
+                        match res {
+                            Ok(tl::enums::messages::AffectedHistory::History(h)) => {
+                                if h.offset <= 0 {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    wiped_private += 1;
+                }
+                DialogKind::Group if scope.delete_my_group_messages => {
+                    let mut it = self.client.iter_messages(d.peer);
+                    let mut my_ids = Vec::new();
+                    let mut scanned = 0usize;
+                    while scanned < 200 {
+                        let Ok(Some(m)) = it.next().await else { break };
+                        scanned += 1;
+                        if m.outgoing() {
+                            my_ids.push(m.id());
+                        }
+                    }
+                    if !my_ids.is_empty()
+                        && self.client.delete_messages(d.peer, &my_ids).await.is_ok()
+                    {
+                        wiped_group_msgs += my_ids.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if scope.clear_contacts_and_top_peers
+            && let Ok(tl::enums::contacts::Contacts::Contacts(c)) = self
+                .client
+                .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
+                .await
+        {
+            let mut input_users = Vec::new();
+            for u in &c.users {
+                if let tl::enums::User::User(x) = u
+                    && !x.is_self
+                    && let Some(ah) = x.access_hash
+                {
+                    input_users.push(tl::enums::InputUser::User(tl::types::InputUser {
+                        user_id: x.id,
+                        access_hash: ah,
+                    }));
+                }
+            }
+            if !input_users.is_empty() {
+                wiped_contacts = input_users.len();
+                let _ = self
+                    .client
+                    .invoke(&tl::functions::contacts::DeleteContacts { id: input_users })
+                    .await;
+            }
+        }
+
+        if scope.clear_drafts_stickers_payments {
+            let _ = tokio::join!(
+                self.client
+                    .invoke(&tl::functions::messages::ClearAllDrafts {}),
+                self.client
+                    .invoke(&tl::functions::messages::ClearRecentStickers { attached: false }),
+                self.client
+                    .invoke(&tl::functions::messages::ClearRecentStickers { attached: true }),
+                self.client
+                    .invoke(&tl::functions::payments::ClearSavedInfo {
+                        credentials: true,
+                        info: true,
+                    }),
+            );
+        }
+
+        Ok(format!(
+            "Очищено: личных переписок (у обеих сторон) — {wiped_private}, сообщений в группах — {wiped_group_msgs}, контактов — {wiped_contacts}"
+        ))
+    }
+}
+
+fn button_style_code(style: Option<&grammers_client::tl::enums::KeyboardButtonStyle>) -> u8 {
+    use grammers_client::tl::enums::KeyboardButtonStyle as S;
+    match style {
+        Some(S::Style(s)) if s.bg_primary => 1,
+        Some(S::Style(s)) if s.bg_danger => 2,
+        Some(S::Style(s)) if s.bg_success => 3,
+        _ => 0,
+    }
+}
+
+fn extract_reply_markup(
+    rm: Option<&grammers_client::tl::enums::ReplyMarkup>,
+) -> (Vec<Vec<BotButton>>, Vec<Vec<BotButton>>) {
+    use grammers_client::tl::enums::{
+        ButtonType as BT, InlineButtonType as IBT, KeyboardButton as KB,
+        KeyboardButtonRow as KBR, KeyboardInlineButton as KIB, KeyboardInlineButtonRow as KIBR,
+        ReplyMarkup as RM,
+    };
+    let mut inline_rows = Vec::new();
+    let mut reply_rows = Vec::new();
+    let Some(rm) = rm else {
+        return (inline_rows, reply_rows);
+    };
+    match rm {
+        RM::ReplyInlineMarkup(im) => {
+            for KIBR::Row(row) in &im.rows {
+                let mut r = Vec::new();
+                for KIB::Button(b) in &row.buttons {
+                    let style = button_style_code(b.style.as_ref());
+                    let kind = match &b.r#type {
+                        IBT::Callback(c) => BotBtnKind::Callback(c.data.clone()),
+                        IBT::Url(u) => BotBtnKind::Url(u.url.clone()),
+                        IBT::UrlAuth(u) => BotBtnKind::Url(u.url.clone()),
+                        IBT::WebView(w) => BotBtnKind::WebView {
+                            url: w.url.clone(),
+                            simple: false,
+                        },
+                        IBT::Copy(c) => BotBtnKind::Copy(c.copy_text.clone()),
+                        IBT::SwitchInline(s) => BotBtnKind::SwitchInline {
+                            query: s.query.clone(),
+                            same_peer: s.same_peer,
+                        },
+                        IBT::UserProfile(u) => BotBtnKind::UserProfile(u.user_id),
+                        _ => BotBtnKind::Callback(Vec::new()),
+                    };
+                    r.push(BotButton {
+                        text: b.text.clone(),
+                        kind,
+                        style,
+                    });
+                }
+                if !r.is_empty() {
+                    inline_rows.push(r);
+                }
+            }
+        }
+        RM::ReplyKeyboardMarkup(km) => {
+            for KBR::Row(row) in &km.rows {
+                let mut r = Vec::new();
+                for KB::Button(b) in &row.buttons {
+                    let style = button_style_code(b.style.as_ref());
+                    let kind = match &b.r#type {
+                        BT::SimpleWebView(w) => BotBtnKind::WebView {
+                            url: w.url.clone(),
+                            simple: true,
+                        },
+                        _ => BotBtnKind::Text,
+                    };
+                    r.push(BotButton {
+                        text: b.text.clone(),
+                        kind,
+                        style,
+                    });
+                }
+                if !r.is_empty() {
+                    reply_rows.push(r);
+                }
+            }
+        }
+        RM::ReplyKeyboardHide(_) | RM::ReplyKeyboardForceReply(_) => {}
+    }
+    (inline_rows, reply_rows)
 }
 
 fn typing_label(a: &grammers_client::tl::enums::SendMessageAction) -> &'static str {
@@ -3544,6 +4245,7 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
                 .as_deref()
                 .map(|e| convert_entities(&x.message, e))
                 .unwrap_or_default();
+            let (inline_buttons, reply_keyboard) = extract_reply_markup(x.reply_markup.as_ref());
             Some(MessageRow {
                 sender,
                 sender_id,
@@ -3551,6 +4253,8 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
                 edit_date: x.edit_date.map(i64::from),
                 views: x.views,
                 pinned: x.pinned,
+                inline_buttons,
+                reply_keyboard,
                 ..MessageRow::plain(x.id, x.message.clone(), x.out, i64::from(x.date))
             })
         })
@@ -3830,5 +4534,160 @@ mod tests {
         assert_eq!(rows[0].text, "Комментарий");
         assert!(rows[0].pinned);
         assert_eq!(rows[0].views, Some(12));
+    }
+
+    #[test]
+    fn parse_tg_link_routes_all_telegram_formats() {
+        assert_eq!(
+            parse_tg_link("https://t.me/durov/123"),
+            Some(TgLink::Resolve {
+                domain: "durov".to_owned(),
+                post: Some(123),
+                start: None,
+                startapp: None,
+            })
+        );
+        assert_eq!(
+            parse_tg_link("https://t.me/+AbCdEfGh123"),
+            Some(TgLink::Invite("AbCdEfGh123".to_owned()))
+        );
+        assert_eq!(
+            parse_tg_link("https://t.me/joinchat/SecretHash99"),
+            Some(TgLink::Invite("SecretHash99".to_owned()))
+        );
+        assert_eq!(
+            parse_tg_link("https://t.me/c/123456789/42"),
+            Some(TgLink::PrivatePost {
+                channel_id: 123456789,
+                msg_id: Some(42),
+            })
+        );
+        assert_eq!(
+            parse_tg_link("https://t.me/my_bot?start=ref77"),
+            Some(TgLink::Resolve {
+                domain: "my_bot".to_owned(),
+                post: None,
+                start: Some("ref77".to_owned()),
+                startapp: None,
+            })
+        );
+        assert_eq!(
+            parse_tg_link("https://t.me/my_bot/wallet?startapp=main"),
+            Some(TgLink::Resolve {
+                domain: "my_bot".to_owned(),
+                post: None,
+                start: None,
+                startapp: Some("main".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_tg_link("tg://resolve?domain=eroot_bot&post=15&start=hi"),
+            Some(TgLink::Resolve {
+                domain: "eroot_bot".to_owned(),
+                post: Some(15),
+                start: Some("hi".to_owned()),
+                startapp: None,
+            })
+        );
+        assert_eq!(
+            parse_tg_link("tg://join?invite=Invite777"),
+            Some(TgLink::Invite("Invite777".to_owned()))
+        );
+        assert_eq!(
+            parse_tg_link("tg://privatepost?channel=987654&post=9"),
+            Some(TgLink::PrivatePost {
+                channel_id: 987654,
+                msg_id: Some(9),
+            })
+        );
+        assert_eq!(
+            parse_tg_link("tg://socks?server=127.0.0.1&port=9050"),
+            Some(TgLink::Proxy("socks5://127.0.0.1:9050".to_owned()))
+        );
+        assert_eq!(
+            parse_tg_link("@erootsupport"),
+            Some(TgLink::Resolve {
+                domain: "erootsupport".to_owned(),
+                post: None,
+                start: None,
+                startapp: None,
+            })
+        );
+        assert_eq!(parse_tg_link("mailto:test@localhost"), None);
+    }
+
+    #[test]
+    fn extract_reply_markup_parses_inline_and_reply_buttons() {
+        use grammers_client::tl::{enums, types};
+
+        let inline_markup = enums::ReplyMarkup::ReplyInlineMarkup(types::ReplyInlineMarkup {
+            force_reply: false,
+            rows: vec![enums::KeyboardInlineButtonRow::Row(types::KeyboardInlineButtonRow {
+                buttons: vec![
+                    enums::KeyboardInlineButton::Button(types::KeyboardInlineButton {
+                        style: None,
+                        text: "Оплатить".to_owned(),
+                        r#type: enums::InlineButtonType::Callback(types::InlineButtonTypeCallback {
+                            requires_password: false,
+                            data: b"pay_1".to_vec(),
+                        }),
+                    }),
+                    enums::KeyboardInlineButton::Button(types::KeyboardInlineButton {
+                        style: None,
+                        text: "Mini App".to_owned(),
+                        r#type: enums::InlineButtonType::WebView(types::InlineButtonTypeWebView {
+                            url: "https://t.me/my_bot/app".to_owned(),
+                        }),
+                    }),
+                    enums::KeyboardInlineButton::Button(types::KeyboardInlineButton {
+                        style: None,
+                        text: "Канал".to_owned(),
+                        r#type: enums::InlineButtonType::Url(types::InlineButtonTypeUrl {
+                            url: "https://t.me/durov".to_owned(),
+                        }),
+                    }),
+                ],
+            })],
+        });
+        let (inline, reply) = extract_reply_markup(Some(&inline_markup));
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].len(), 3);
+        assert!(reply.is_empty());
+        assert_eq!(inline[0][0].text, "Оплатить");
+        assert!(matches!(inline[0][0].kind, BotBtnKind::Callback(ref d) if d == b"pay_1"));
+        assert!(matches!(inline[0][1].kind, BotBtnKind::WebView { ref url, simple: false } if url == "https://t.me/my_bot/app"));
+        assert!(matches!(inline[0][2].kind, BotBtnKind::Url(ref u) if u == "https://t.me/durov"));
+
+        let reply_markup = enums::ReplyMarkup::ReplyKeyboardMarkup(types::ReplyKeyboardMarkup {
+            resize: true,
+            single_use: false,
+            selective: false,
+            persistent: true,
+            force_reply: false,
+            rows: vec![enums::KeyboardButtonRow::Row(types::KeyboardButtonRow {
+                buttons: vec![
+                    enums::KeyboardButton::Button(types::KeyboardButton {
+                        style: None,
+                        text: "Профиль".to_owned(),
+                        r#type: enums::ButtonType::Default,
+                    }),
+                    enums::KeyboardButton::Button(types::KeyboardButton {
+                        style: None,
+                        text: "Открыть".to_owned(),
+                        r#type: enums::ButtonType::SimpleWebView(types::ButtonTypeSimpleWebView {
+                            url: "https://t.me/my_bot/simple".to_owned(),
+                        }),
+                    }),
+                ],
+            })],
+            placeholder: None,
+        });
+        let (inline2, reply2) = extract_reply_markup(Some(&reply_markup));
+        assert!(inline2.is_empty());
+        assert_eq!(reply2.len(), 1);
+        assert_eq!(reply2[0].len(), 2);
+        assert_eq!(reply2[0][0].text, "Профиль");
+        assert_eq!(reply2[0][0].kind, BotBtnKind::Text);
+        assert!(matches!(reply2[0][1].kind, BotBtnKind::WebView { simple: true, .. }));
     }
 }

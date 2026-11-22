@@ -276,6 +276,25 @@ struct App {
     composer_sel: Option<(usize, usize)>,
     /// Показать плавающую кнопку «Вниз» (FAB), если пользователь пролистал ленту вверх.
     scrolled_up: bool,
+    /// Кэш измеренных высот пузырей сообщений (`msg_id -> px`) для виртуализации ленты в больших чатах.
+    msg_heights: HashMap<i32, f32>,
+    msg_last_avail: f32,
+    /// Показать реплай-клавиатуру бота под строкой ввода.
+    bot_keyboard_open: bool,
+    /// Всплывающее уведомление (`alert = true`) от инлайн-кнопки бота.
+    bot_alert: Option<String>,
+    /// Открытое окно Mini App / WebApp бота (`(название, url)`).
+    miniapp_modal: Option<(String, String)>,
+    #[cfg(windows)]
+    miniapp_view: Option<video::MiniAppView>,
+    /// Модальное окно добавления изолированного второго аккаунта (анти-корреляция).
+    add_account_open: bool,
+    new_acc_label: String,
+    new_acc_proxy: String,
+    /// Модальное окно тотальной очистки данных у других людей и на сервере.
+    wipe_modal_open: bool,
+    wipe_confirm_step: bool,
+    wipe_scope: rg_core::engine::WipeScope,
 }
 
 pub(crate) struct ShotModal {
@@ -513,6 +532,19 @@ impl App {
             format_bar_open: false,
             composer_sel: None,
             scrolled_up: false,
+            msg_heights: HashMap::new(),
+            msg_last_avail: 0.0,
+            bot_keyboard_open: true,
+            bot_alert: None,
+            miniapp_modal: None,
+            #[cfg(windows)]
+            miniapp_view: None,
+            add_account_open: false,
+            new_acc_label: String::new(),
+            new_acc_proxy: String::new(),
+            wipe_modal_open: false,
+            wipe_confirm_step: false,
+            wipe_scope: rg_core::engine::WipeScope::default(),
         }
     }
 
@@ -1091,6 +1123,7 @@ impl App {
         let blocked = !self.settings.auto_play_gifs
             || self.player_path.is_some()
             || self.player_stream.is_some()
+            || self.miniapp_modal.is_some()
             || self.viewer.is_some()
             || self.drawer_open
             || self.settings_open
@@ -1325,6 +1358,13 @@ impl App {
         self.composer_sel = None;
         self.pending_confirm_media = None;
         self.scrolled_up = false;
+        self.msg_heights.clear();
+        self.bot_keyboard_open = true;
+        self.miniapp_modal = None;
+        #[cfg(windows)]
+        if let Some(m) = self.miniapp_view.take() {
+            m.stop();
+        }
     }
 
     /// Горячие клавиши и боковые кнопки мыши (Mouse Back / Forward, быстрые переходы, чтение на сервере).
@@ -1549,58 +1589,71 @@ impl App {
         if self.tgs_docs.is_empty() && self.tgs_msgs.is_empty() {
             return;
         }
-        if self.tgs_frame_cache.len() > 180 {
+        // Не нагружаем CPU в фоне, когда окно свёрнуто в трей или не в фокусе.
+        let focused = !self.hidden_to_tray && ctx.input(|i| i.focused);
+        if self.tgs_frame_cache.len() > 750 {
             self.tgs_frame_cache.clear();
         }
         let speed = f64::from(self.settings.anim_speed) / 100.0;
-        let t = if speed <= 0.01 { 0.0 } else { ctx.input(|i| i.time) * speed };
+        let t = if speed <= 0.01 || !focused {
+            0.0
+        } else {
+            ctx.input(|i| i.time) * speed
+        };
         let mut active = false;
 
-        // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`).
+        // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`):
+        // если панель эмодзи закрыта, рендерим только 0-й кадр один раз (0% нагрузки CPU в простое!).
         for (&doc_id, anim) in &self.tgs_docs {
-            let f = anim.frame_at_time(t);
-            let bucket = (f.round() as usize / 2) * 2;
+            let bucket = if self.emoji_open && focused {
+                let f = anim.frame_at_time(t);
+                active = true;
+                (f.round() as usize / 4) * 4
+            } else {
+                0
+            };
+            if bucket == 0 && self.sticker_tex.contains_key(&doc_id) && !self.emoji_open {
+                continue;
+            }
             let key = (doc_id, bucket);
             let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
                 let img = anim.render_frame(bucket as f32, 48);
                 ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
             });
             self.sticker_tex.insert(doc_id, tex.clone());
-            active = true;
         }
 
-        // Обновляем анимированные TGS-стикеры прямо в открытом чате (`tgs_msgs`).
-        for (&msg_id, anim) in &self.tgs_msgs {
-            let f = anim.frame_at_time(t);
-            let bucket = (f.round() as usize / 2) * 2;
-            let key = (-i64::from(msg_id) - 1_000_000, bucket);
-            let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
-                let img = anim.render_frame(bucket as f32, 128);
-                ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
-            });
-            self.textures.insert(msg_id, tex.clone());
-            active = true;
+        // Обновляем анимированные TGS-стикеры в открытом чате (`tgs_msgs`, шаг 4 кадра ≈ 15 FPS).
+        if focused {
+            for (&msg_id, anim) in &self.tgs_msgs {
+                let f = anim.frame_at_time(t);
+                let bucket = (f.round() as usize / 4) * 4;
+                let key = (-i64::from(msg_id) - 1_000_000, bucket);
+                let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
+                    let img = anim.render_frame(bucket as f32, 128);
+                    ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
+                });
+                self.textures.insert(msg_id, tex.clone());
+                active = true;
+            }
         }
 
-        if active && speed > 0.01 {
-            ctx.request_repaint_after(std::time::Duration::from_millis(42));
+        if active && focused && speed > 0.01 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(66));
         }
     }
 
-    fn handle_tg_uri(&mut self, uri: &str) {
-        let rest = uri.strip_prefix("tg://").unwrap_or(uri);
-        if rest.starts_with("settings") {
+    pub(crate) fn handle_tg_uri(&mut self, uri: &str) -> bool {
+        let Some(link) = rg_core::engine::parse_tg_link(uri) else {
+            return false;
+        };
+        self.show_window_from_tray();
+        if link == rg_core::engine::TgLink::Settings {
             self.open_tg_settings();
-            return;
+        } else {
+            self.send(Cmd::OpenTgLink(link));
         }
-        if let Some(q) = rest.split("domain=").nth(1) {
-            let domain = q.split('&').next().unwrap_or("").trim();
-            if !domain.is_empty() {
-                self.search = format!("@{domain}");
-                self.send(Cmd::GlobalSearch(domain.to_owned()));
-                self.show_window_from_tray();
-            }
-        }
+        true
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -1768,6 +1821,25 @@ impl App {
                 }
                 Ev::PinnedMsg(id, msg) => {
                     self.pinned_msgs.insert(id, msg);
+                }
+                Ev::MiniAppReady { title, url } => {
+                    #[cfg(windows)]
+                    if let Some(v) = self.miniapp_view.take() {
+                        v.stop();
+                    }
+                    self.miniapp_modal = Some((title, url));
+                }
+                Ev::BotAlert(msg) => {
+                    self.bot_alert = Some(msg);
+                }
+                Ev::NavigateTo { id, post } => {
+                    if let Some(pos) = self.dialogs.iter().position(|d| d.id == id) {
+                        self.in_archive = self.dialogs[pos].archived;
+                        self.open_dialog(pos);
+                        if let Some(pid) = post {
+                            self.scroll_to = Some(pid);
+                        }
+                    }
                 }
                 Ev::EmojiSets(s) => {
                     if self.emoji_pack.is_some_and(|i| i >= s.len()) {
@@ -2784,9 +2856,138 @@ impl eframe::App for App {
             self.inline_gif_overlay(&ctx, frame);
             self.player_overlay(&ctx, frame);
             self.audio_overlay(&ctx, frame);
+            self.miniapp_overlay(&ctx, frame);
         }
         #[cfg(not(windows))]
-        let _ = frame;
+        {
+            let _ = frame;
+            self.miniapp_fallback_window(&ctx);
+        }
+    }
+}
+
+impl App {
+    #[cfg(windows)]
+    #[allow(deprecated)]
+    fn miniapp_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some((title, url)) = self.miniapp_modal.clone() else {
+            if let Some(v) = self.miniapp_view.take() {
+                v.stop();
+            }
+            return;
+        };
+        let screen = ctx.content_rect();
+        let ppp = ctx.pixels_per_point();
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut reload = false;
+        let mut open_ext = false;
+        let base_w: f32 = if self.settings.ayu.increase_webview_width { 560.0 } else { 420.0 };
+        let base_h: f32 = if self.settings.ayu.increase_webview_height { 720.0 } else { 580.0 };
+        let card_w = base_w.min(screen.width() - 24.0).max(280.0);
+        let card_h = base_h.min(screen.height() - 36.0).max(320.0);
+        let card_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(card_w, card_h));
+        let web_rect = egui::Rect::from_min_max(
+            card_rect.min + Vec2::new(2.0, 42.0),
+            card_rect.max - Vec2::new(2.0, 2.0),
+        );
+        if self.miniapp_view.is_none() {
+            let dir = worker::account_home(&worker::home(), self.settings.active_account);
+            match video::MiniAppView::new(
+                frame,
+                &url,
+                &dir,
+                self.settings.ayu.spoof_webview_as_android,
+            ) {
+                Ok(v) => self.miniapp_view = Some(v),
+                Err(e) => {
+                    self.error = e;
+                    self.error_at = self.now;
+                    rich::open_url(&url);
+                    self.miniapp_modal = None;
+                    return;
+                }
+            }
+        }
+        if let Some(v) = self.miniapp_view.as_mut() {
+            v.place((
+                (web_rect.min.x * ppp).round() as i32,
+                (web_rect.min.y * ppp).round() as i32,
+                (web_rect.width() * ppp).round() as u32,
+                (web_rect.height() * ppp).round() as u32,
+            ));
+        }
+        egui::Area::new(egui::Id::new("miniapp-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                paint_frosted_scrim(ui.painter(), rect, 1.0);
+                ui.painter().rect_filled(card_rect, egui::CornerRadius::same(14), t2(WINDOW_BG));
+                paint_modal_subblur(ui.painter(), card_rect, 14.0, 1.0);
+                let hdr = egui::Rect::from_min_size(card_rect.min, Vec2::new(card_w, 40.0));
+                ui.painter().text(
+                    egui::pos2(hdr.left() + 16.0, hdr.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("🌐 {title}"),
+                    FontId::proportional(14.5),
+                    WHITE,
+                );
+                let btn_x = egui::Rect::from_center_size(egui::pos2(hdr.right() - 22.0, hdr.center().y), Vec2::splat(28.0));
+                let xr = ui.interact(btn_x, ui.make_persistent_id("miniapp-close"), Sense::click());
+                icons::tg(ui.painter(), "info/info_close", btn_x.center(), if xr.hovered() { WHITE } else { SUBTEXT });
+                if xr.on_hover_text("Закрыть Mini App").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    close = true;
+                }
+                let btn_ext = egui::Rect::from_center_size(egui::pos2(hdr.right() - 54.0, hdr.center().y), Vec2::splat(28.0));
+                let er = ui.interact(btn_ext, ui.make_persistent_id("miniapp-ext"), Sense::click());
+                ui.painter().text(btn_ext.center(), egui::Align2::CENTER_CENTER, "↗", FontId::proportional(14.0), if er.hovered() { ORANGE } else { SUBTEXT });
+                if er.on_hover_text("Открыть в браузере").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    open_ext = true;
+                }
+                let btn_rel = egui::Rect::from_center_size(egui::pos2(hdr.right() - 84.0, hdr.center().y), Vec2::splat(28.0));
+                let rr = ui.interact(btn_rel, ui.make_persistent_id("miniapp-reload"), Sense::click());
+                ui.painter().text(btn_rel.center(), egui::Align2::CENTER_CENTER, "↻", FontId::proportional(14.0), if rr.hovered() { WHITE } else { SUBTEXT });
+                if rr.on_hover_text("Обновить").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    reload = true;
+                }
+                if resp.clicked() && ! ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| card_rect.contains(p)) {
+                    close = true;
+                }
+            });
+        if reload && let Some(v) = self.miniapp_view.as_ref() {
+            v.reload();
+        }
+        if open_ext {
+            rich::open_url(&url);
+        }
+        if close {
+            if let Some(v) = self.miniapp_view.take() {
+                v.stop();
+            }
+            self.miniapp_modal = None;
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn miniapp_fallback_window(&mut self, ctx: &egui::Context) {
+        let Some((title, url)) = self.miniapp_modal.clone() else { return };
+        let mut open = true;
+        egui::Window::new(format!("Mini App · {title}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&title).strong().color(WHITE));
+                ui.add_space(6.0);
+                if orange_button(ui, "Открыть Mini App", Vec2::new(200.0, 34.0)).clicked() {
+                    rich::open_url(&url);
+                    self.miniapp_modal = None;
+                }
+            });
+        if !open {
+            self.miniapp_modal = None;
+        }
     }
 }
 

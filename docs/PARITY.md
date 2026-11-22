@@ -23,8 +23,20 @@
 | Переводчик (встроенный Telegram) | ✅ этап 18 (`Engine::translate_text`, `messages.translateText` → в пузыре) | `messages.translateText` |
 | Пересылка без автора / расширенная | ✅ пакетная пересылка нескольких сообщений (`selected_msgs` + `Engine::forward_batch`) и скрытие автора (`forward_no_author`) | `ayu/features/forward` |
 | Локальный Premium, скрытие статусов Premium | 🟡 `hide_premium_statuses` скрывает значки; `local_premium` как переключатель в настройках | `lib.rs`, `chat.rs`, `tg_settings.rs` |
-| Иконки приложения, шрифты, темы | ⬜ | `ayu/ui/boxes` |
+| Иконки приложения, шрифты, темы | ✅ `render_app_icon_rgba` (12 палитр + бейдж трея), выбор системных/моноширинных шрифтов (`sys_fonts`), стили фона чата | `theme.rs`, `win.rs`, `settings_ui.rs` |
 | Sentry, update.ayugram.one, api.exteragram.app, jsdelivr, dpaste, iTunes, Google/Yandex-перевод | ⛔ | `docs/AUDIT.md` |
+
+## Новые функции этапа 26 (v0.15.0)
+
+| Функция | Статус | Где |
+|---|---|---|
+| Чистые модалки без затемнения внутри карточек | ✅ убран темнящий оверлей `paint_modal_subblur` (заменён на внешнюю тень + стеклянную кромку) и осветлена вуаль `paint_frosted_scrim` | `theme.rs` |
+| Виртуализация больших чатов и 0% CPU в простое | ✅ `show_viewport` по накопленным высотам `msg_heights` + умный троттлинг `tick_tgs` и кэш кадров без трэшинга | `chat.rs`, `lib.rs` |
+| Полный функционал ботов и Mini Apps | ✅ инлайн-кнопки (`Callback`/`Url`/`WebView`/`Copy`/`SwitchInline`/`UserProfile`), reply-клавиатуры (`⌨`), стартовый экран `/start` + `BotInfo.description`, кнопка меню WebApp (`🌐`), встроенный `MiniAppView` (`wry` WebView2 / Android) | `engine.rs`, `video.rs`, `chat.rs`, `worker.rs`, `lib.rs` |
+| Внутренняя маршрутизация ссылок Telegram | ✅ `parse_tg_link` + `resolve_username` + `open_or_import_invite` (`tg://`, `t.me/`, `t.me/+HASH`, `t.me/c/...`, `@username`) внутри клиента без браузера | `engine.rs`, `worker.rs`, `lib.rs`, `chat.rs` |
+| Щит приватности трафика и метаданных (`PrivacyShieldSettings`) | ✅ блокировка телеметрии активности/онлайна/печати/чтения/просмотра историй, случайный джиттер таймингов пакетов (`0..300 мс`), режим только в ОЗУ (`ephemeral_local_cache`), обезличивание имён файлов при отправке (`file.<ext>`) | `rg-settings`, `engine.rs`, `worker.rs`, `settings_ui.rs`, `tg_settings.rs` |
+| Изолированные аккаунты (анти-корреляция) | ✅ `AccountProfile::isolated` (`accounts/slot_<N>/`): своя БД/сессия/MiniApp-профиль, уникальный отпечаток `device_model`/`system_version`/`app_version` в MTProto `initConnection`, отдельный SOCKS5-прокси, разрыв старого пула `pool_handle.quit()` и случайная пауза перед переключением | `rg-settings`, `rg-core::lib`, `worker.rs`, `settings_ui.rs`, `tg_settings.rs` |
+| Тотальная очистка данных у других людей (`WipeScope`) | ✅ удаление всех личных переписок и чатов с ботами у обеих сторон (`revoke = true`), поиск и удаление своих сообщений в группах (`revoke = true`), удаление контактов и рейтинга частых собеседников, очистка черновиков, недавних стикеров, платёжных данных и локального кэша БЕЗ потери аккаунта | `engine.rs`, `worker.rs`, `settings_ui.rs`, `tg_settings.rs` |
 
 ## Функции Telegram Desktop (клиентское ядро)
 
@@ -57,7 +69,9 @@
 | Встроенный плеер (WebView2) + потоковое воспроизведение (`127.0.0.1` Range) + автозапуск GIF в ленте | ✅ этап 16–17; миниатюры и живое воспроизведение TGS/WebM ✅ |
 | Анимированные стикеры (Lottie/WebM), GIF, видео, голосовые, кружки | ✅ чистый Rust TGS (Lottie JSON) 24 FPS + WebM/видео/GIF/кружки |
 | Опросы, истории, форумы/темы, комментарии каналов | ✅ опросы/викторины (`messages.sendVote`), истории (`stories.getAllStories`, просмотрщик, `stories.readStories`), темы форумов (`messages.getForumTopics`), комментарии каналов (`messages.getDiscussionMessage`, `messages.getReplies`) |
-| Секретные чаты, несколько аккаунтов | ⬜ |
+| Секретные чаты | ⬜ (планируется) |
+| Изолированные несколько аккаунтов | ✅ этап 26 (`AccountProfile::isolated`, отдельные слоты/отпечатки/прокси без корреляции) |
+| Боты (инлайн-кнопки, реплай-клавиатуры, `/start`, Mini Apps) и внутренние `t.me`/`tg://` ссылки | ✅ этап 26 (`extract_reply_markup`, `press_bot_callback`, `request_webview_url`, `MiniAppView`, `parse_tg_link`) |
 | Звонки (tgcalls) | ⬜ — отдельная оценка в `ROADMAP.md` |
 | Уведомления Windows, трей, автозапуск | ✅ системные toast + встроенные карточки, звук/мигание; трей Windows (`Shell_NotifyIconW`, `WorkMode`, бейдж на иконке), автозапуск HKCU Run и URL-схема `tg://` (`win.rs`, `tray.rs`) |
 | Настройки Telegram (аккаунт, уведомления, приватность, данные, папки, внешний вид, язык, устройства, энергосбережение) | ✅ полностью интерактивные этап 23 (поиск, QR, `@username`, все 12 правил `account.setPrivacy`, локальный код-пароль, автоудаление, разблокировка, завершение сеансов `account.resetAuthorization`/`auth.resetAuthorizations`, переводчик чатов, масштаб 75–200%) |

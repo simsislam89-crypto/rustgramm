@@ -240,6 +240,96 @@ pub enum WorkMode {
     WindowOnly,
 }
 
+/// Щит приватности трафика и метаданных (защита от отслеживания времени захода,
+/// просматриваемых сообщений, открытых чатов и корреляции пакетов).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyShieldSettings {
+    /// Блокировать все фоновые пакеты активности (онлайн, набор текста, авточтение, просмотры постов и историй, логи).
+    pub block_activity_telemetry: bool,
+    /// Случайная задержка пакетов (джиттер, мс: 0..=500) для защиты от тайминг-анализа трафика.
+    pub traffic_jitter_ms: u16,
+    /// Не сохранять на диск историю посещённых чатов, кэш диалогов и время просмотра (только в ОЗУ).
+    pub ephemeral_local_cache: bool,
+    /// Обезличивать имена отправляемых файлов (`file_<хеш>.<ext>`), скрывая локальные названия.
+    pub anonymize_filenames: bool,
+    /// Анти-корреляция аккаунтов (уникальный отпечаток устройства, раздельная сессия и разрыв старого соединения перед сменой).
+    pub anti_correlation_accounts: bool,
+}
+
+impl Default for PrivacyShieldSettings {
+    fn default() -> Self {
+        Self {
+            block_activity_telemetry: true,
+            traffic_jitter_ms: 85,
+            ephemeral_local_cache: false,
+            anonymize_filenames: true,
+            anti_correlation_accounts: true,
+        }
+    }
+}
+
+/// Изолированный профиль аккаунта с уникальным аппаратным отпечатком (`InitConnection`)
+/// и собственным прокси, чтобы нельзя было связать основной и дополнительный аккаунты.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountProfile {
+    pub slot: u32,
+    pub label: String,
+    pub proxy_url: String,
+    pub device_model: String,
+    pub system_version: String,
+    pub app_version: String,
+    pub lang_code: String,
+}
+
+impl Default for AccountProfile {
+    fn default() -> Self {
+        Self::isolated(0, "Основной аккаунт".to_owned(), String::new(), 0)
+    }
+}
+
+impl AccountProfile {
+    /// Создаёт изолированный профиль с уникальным отпечатком устройства (`device_model`, `system_version`, `app_version`).
+    pub fn isolated(slot: u32, label: String, proxy_url: String, entropy: u64) -> Self {
+        const MODELS: &[(&str, &str, &str)] = &[
+            ("Desktop PC", "Windows 11 x64", "5.8.2 x64"),
+            ("ThinkPad X1 Carbon Gen 11", "Windows 10 Pro 22H2", "5.7.5 x64"),
+            ("ASUS ROG Zephyrus G14", "Windows 11 23H2", "5.9.0 x64"),
+            ("Dell XPS 15 9530", "Windows 11 Pro 24H2", "5.8.3 x64"),
+            ("HP EliteBook 840 G10", "Windows 10 Enterprise", "5.6.9 x64"),
+            ("MSI Prestige 16 Studio", "Windows 11 Home 23H2", "5.8.1 x64"),
+            ("Lenovo Legion Slim 5", "Windows 11 22H2", "5.7.8 x64"),
+            ("Acer Swift Edge 16", "Windows 10 22H2", "5.8.0 x64"),
+        ];
+        let mix = (u64::from(slot).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ entropy) as usize;
+        let (dev, sys, ver) = MODELS[mix % MODELS.len()];
+        let suffix = (mix / MODELS.len()) % 90 + 10;
+        let device_model = if slot == 0 {
+            dev.to_owned()
+        } else {
+            format!("{dev} ({suffix})")
+        };
+        Self {
+            slot,
+            label: if label.trim().is_empty() {
+                if slot == 0 {
+                    "Основной аккаунт".to_owned()
+                } else {
+                    format!("Аккаунт #{}", slot + 1)
+                }
+            } else {
+                label.trim().to_owned()
+            },
+            proxy_url: proxy_url.trim().to_owned(),
+            device_model,
+            system_version: sys.to_owned(),
+            app_version: ver.to_owned(),
+            lang_code: "ru".to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -285,6 +375,12 @@ pub struct Settings {
     pub autostart: bool,
     /// Запускать свёрнутым в трей.
     pub start_minimized: bool,
+    /// Щит полной приватности трафика и метаданных.
+    pub privacy_shield: PrivacyShieldSettings,
+    /// Активный слот аккаунта (`0` — основной).
+    pub active_account: u32,
+    /// Изолированные профили аккаунтов (у каждого свой отпечаток устройства, сессия и прокси).
+    pub accounts: Vec<AccountProfile>,
 }
 
 impl Default for Settings {
@@ -312,6 +408,9 @@ impl Default for Settings {
             work_mode: WorkMode::WindowAndTray,
             autostart: false,
             start_minimized: false,
+            privacy_shield: PrivacyShieldSettings::default(),
+            active_account: 0,
+            accounts: vec![AccountProfile::default()],
         }
     }
 }

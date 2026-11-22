@@ -340,6 +340,65 @@ impl AudioView {
     }
 }
 
+/// Встроенное окно Mini App / WebApp бота (WebView2 с изолированным контекстом и опциональной подменой User-Agent под Android).
+pub struct MiniAppView {
+    webview: WebView,
+    bounds: (i32, i32, u32, u32),
+}
+
+impl MiniAppView {
+    pub fn new(
+        window: &impl HasWindowHandle,
+        url: &str,
+        dir: &Path,
+        spoof_android: bool,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut context = wry::WebContext::new(Some(dir.join("miniapp_webview")));
+        let mut builder = WebViewBuilder::new_with_web_context(&mut context)
+            .with_url(url)
+            .with_autoplay(true)
+            .with_background_color((23, 33, 43, 255))
+            .with_devtools(false)
+            .with_bounds(Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(16u32, 9u32).into(),
+            });
+        if spoof_android {
+            builder = builder.with_user_agent(
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36 Telegram-Android/11.2.0",
+            );
+        }
+        let webview = builder
+            .build_as_child(window)
+            .map_err(|e| format!("Mini App WebView2: {e}"))?;
+        Ok(Self {
+            webview,
+            bounds: (0, 0, 0, 0),
+        })
+    }
+
+    pub fn place(&mut self, rect: (i32, i32, u32, u32)) {
+        if self.bounds == rect {
+            return;
+        }
+        self.bounds = rect;
+        let (x, y, w, h) = rect;
+        let _ = self.webview.set_bounds(Rect {
+            position: PhysicalPosition::new(x, y).into(),
+            size: PhysicalSize::new(w.max(1), h.max(1)).into(),
+        });
+    }
+
+    pub fn reload(&self) {
+        let _ = self.webview.evaluate_script("location.reload()");
+    }
+
+    pub fn stop(&self) {
+        let _ = self.webview.focus_parent();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

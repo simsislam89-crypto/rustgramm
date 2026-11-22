@@ -17,17 +17,6 @@ pub mod Microsoft {
         pub mod WebView2 {
             pub mod Win32 {
                 mod windows_core {
-                    #[cfg(target_env = "msvc")]
-                    macro_rules! link_webview2 {
-                        ($library:literal $abi:literal fn $($function:tt)*) => (
-                            #[link(name = "WebView2LoaderStatic", kind = "static")]
-                            extern $abi {
-                                pub fn $($function)*;
-                            }
-                        )
-                    }
-
-                    #[cfg(not(target_env = "msvc"))]
                     macro_rules! link_webview2 {
                         ($library:literal $abi:literal fn $name:ident ($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty) => (
                             #[allow(non_snake_case)]
@@ -56,7 +45,6 @@ pub mod Microsoft {
 
 pub mod declared_interfaces;
 
-#[cfg(not(target_env = "msvc"))]
 mod loader {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;

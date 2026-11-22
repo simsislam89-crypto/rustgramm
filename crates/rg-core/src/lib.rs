@@ -101,6 +101,11 @@ pub struct Config {
     pub session_path: String,
     /// `socks5://host:port` — только явный выбор пользователя.
     pub proxy_url: Option<String>,
+    /// Изолированный отпечаток устройства для анти-корреляции мультиаккаунта.
+    pub device_model: Option<String>,
+    pub system_version: Option<String>,
+    pub app_version: Option<String>,
+    pub lang_code: Option<String>,
 }
 
 impl Config {
@@ -121,6 +126,10 @@ impl Config {
             api_hash: api_hash.trim().to_owned(),
             session_path: get("RG_SESSION").unwrap_or_else(|| "rustgramm.session".to_owned()),
             proxy_url: get("RG_PROXY").filter(|p| !p.trim().is_empty()),
+            device_model: None,
+            system_version: None,
+            app_version: None,
+            lang_code: None,
         })
     }
 
@@ -151,6 +160,7 @@ pub async fn open_session(
 pub struct Connected {
     pub session: Arc<GuardedSession<SqliteSession>>,
     pub client: grammers_client::Client,
+    pub pool_handle: grammers_mtsender::SenderPoolFatHandle,
     pub updates: tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>,
 }
 
@@ -169,21 +179,42 @@ pub fn privacy_params(proxy_url: Option<String>) -> grammers_mtsender::Connectio
     }
 }
 
+/// Параметры `initConnection` с учётом изолированного отпечатка профиля аккаунта.
+pub fn isolated_connection_params(cfg: &Config) -> grammers_mtsender::ConnectionParams {
+    let mut p = privacy_params(cfg.proxy_url.clone());
+    if let Some(d) = cfg.device_model.as_ref().filter(|s| !s.trim().is_empty()) {
+        p.device_model.clone_from(d);
+    }
+    if let Some(s) = cfg.system_version.as_ref().filter(|s| !s.trim().is_empty()) {
+        p.system_version.clone_from(s);
+    }
+    if let Some(v) = cfg.app_version.as_ref().filter(|s| !s.trim().is_empty()) {
+        p.app_version.clone_from(v);
+    }
+    if let Some(l) = cfg.lang_code.as_ref().filter(|s| !s.trim().is_empty()) {
+        p.lang_code.clone_from(l);
+        p.system_lang_code.clone_from(l);
+    }
+    p
+}
+
 /// Подключение: пул отправителей с защищённой сессией. Сведений об устройстве не раскрываем.
 pub async fn connect_with_updates(cfg: &Config) -> Result<Connected, Box<dyn std::error::Error>> {
     use grammers_mtsender::SenderPool;
     let session = open_session(cfg).await?;
-    let params = privacy_params(cfg.proxy_url.clone());
+    let params = isolated_connection_params(cfg);
     let SenderPool {
         runner,
         handle,
         updates,
     } = SenderPool::with_configuration(session.clone(), cfg.api_id, params);
+    let pool_handle = handle.clone();
     let client = grammers_client::Client::new(handle);
     tokio::spawn(runner.run());
     Ok(Connected {
         session,
         client,
+        pool_handle,
         updates,
     })
 }
