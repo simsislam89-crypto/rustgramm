@@ -153,6 +153,7 @@ impl App {
         let me_name = self.me.clone();
         let me_tex = self.dialogs.iter().find(|d| d.saved).and_then(|d| self.avatars.get(&d.id));
         let corners = self.settings.ayu.avatar_corners;
+        let streamer = self.settings.ayu.streamer_mode;
         let folders = &self.folders;
         let dialogs = &self.dialogs;
         egui::Area::new(egui::Id::new("tgs-box"))
@@ -202,7 +203,7 @@ impl App {
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
                             match page {
-                                pg::ACCOUNT => account_page(ui, &mut st, &mut save_profile),
+                                pg::ACCOUNT => account_page(ui, &mut st, &mut save_profile, streamer),
                                 pg::NOTIFY => notify_page(ui, &st),
                                 pg::PRIVACY => privacy_page(ui, &st),
                                 pg::DATA => data_page(ui, &st, &mut clear, &mut open_downloads),
@@ -213,7 +214,7 @@ impl App {
                                 pg::POWER => power_page(ui, &mut s),
                                 pg::RUSTGRAMM => rustgramm_page(ui, &mut s, &mut clear, self.emoji.is_some()),
                                 _ => {
-                                    if let Some(p) = main_page(ui, &st, &me_name, me_tex, corners, &mut advanced) {
+                                    if let Some(p) = main_page(ui, &st, &me_name, me_tex, corners, streamer, &mut advanced) {
                                         page = p;
                                     }
                                 }
@@ -271,6 +272,7 @@ fn main_page(
     me: &str,
     tex: Option<&egui::TextureHandle>,
     corners: i32,
+    streamer: bool,
     advanced: &mut bool,
 ) -> Option<usize> {
     let w = ui.available_width();
@@ -286,11 +288,14 @@ fn main_page(
     draw_avatar(ui, Pos2::new(head.left() + 50.0, head.center().y), &name, 1, 56.0, tex, corners);
     let p = ui.painter();
     p.text(Pos2::new(head.left() + 92.0, head.center().y - 14.0), Align2::LEFT_CENTER, &name, FontId::proportional(16.0), WHITE);
-    let line = [(!phone.is_empty()).then(|| format!("+{phone}")), (!user.is_empty()).then(|| format!("@{user}"))]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let line = [
+        (!phone.is_empty()).then(|| mask_streamer(&format!("+{phone}"), streamer)),
+        (!user.is_empty()).then(|| mask_streamer(&format!("@{user}"), streamer)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
     p.text(
         Pos2::new(head.left() + 92.0, head.center().y + 8.0),
         Align2::LEFT_CENTER,
@@ -335,7 +340,7 @@ fn loading(ui: &mut egui::Ui, st: &State) -> bool {
     true
 }
 
-fn account_page(ui: &mut egui::Ui, st: &mut State, save: &mut bool) {
+fn account_page(ui: &mut egui::Ui, st: &mut State, save: &mut bool, streamer: bool) {
     if loading(ui, st) {
         return;
     }
@@ -378,8 +383,8 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, save: &mut bool) {
     ui.add_space(8.0);
     divider(ui);
     section(ui, "Данные аккаунта");
-    info_row(ui, "Телефон", &if a.me.phone.is_empty() { "—".to_owned() } else { format!("+{}", a.me.phone) });
-    info_row(ui, "Имя пользователя", &if a.me.username.is_empty() { "—".to_owned() } else { format!("@{}", a.me.username) });
+    info_row(ui, "Телефон", &if a.me.phone.is_empty() { "—".to_owned() } else { mask_streamer(&format!("+{}", a.me.phone), streamer) });
+    info_row(ui, "Имя пользователя", &if a.me.username.is_empty() { "—".to_owned() } else { mask_streamer(&format!("@{}", a.me.username), streamer) });
     desc(ui, "Смена номера, имени пользователя и удаление аккаунта здесь не предусмотрены: делайте это в официальном клиенте Telegram.");
 }
 

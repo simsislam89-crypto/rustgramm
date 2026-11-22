@@ -765,6 +765,61 @@ impl Engine {
             .map(|_| ())
     }
 
+    /// Пересылка без автора (функция AyuGram): отправляет копию сообщения без плашки «Переслано от».
+    pub async fn forward_no_author(
+        &self,
+        from: PeerRef,
+        to: PeerRef,
+        msg_id: i32,
+    ) -> Result<(), grammers_client::InvocationError> {
+        if let Some(m) = self.message_by_id(from, msg_id).await? {
+            let text = m.text();
+            if !text.is_empty() {
+                self.send_reply(to, text, None).await?;
+                return Ok(());
+            }
+        }
+        self.client
+            .forward_messages(to, &[msg_id], from)
+            .await
+            .map(|_| ())
+    }
+
+    /// Встроенный переводчик Telegram (`messages.translateText`, без сторонних серверов).
+    pub async fn translate_text(
+        &self,
+        text: &str,
+        to_lang: &str,
+    ) -> Result<String, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::TranslateText {
+                peer: None,
+                id: None,
+                text: Some(vec![tl::enums::TextWithEntities::Entities(
+                    tl::types::TextWithEntities {
+                        text: text.to_owned(),
+                        entities: Vec::new(),
+                    },
+                )]),
+                to_lang: to_lang.to_owned(),
+                tone: None,
+            })
+            .await?;
+        let tl::enums::messages::TranslatedText::TranslateResult(r) = res;
+        let out = r
+            .result
+            .into_iter()
+            .map(|t| {
+                let tl::enums::TextWithEntities::Entities(e) = t;
+                e.text
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(out)
+    }
+
     pub async fn pin(
         &self,
         peer: PeerRef,
@@ -826,15 +881,26 @@ impl Engine {
         };
         let Some(media) = m.media() else { return Ok(None) };
         let info = media::describe(&media);
-        let is_thumb = matches!(info.kind, MediaKind::Video | MediaKind::Gif | MediaKind::Round);
+        let is_thumb = matches!(
+            info.kind,
+            MediaKind::AnimatedSticker | MediaKind::Video | MediaKind::Gif | MediaKind::Round
+        );
         if !info.has_preview() || (!is_thumb && info.size > PREVIEW_LIMIT) {
             return Ok(None);
         }
         match &media {
-            // У видео, GIF и кружков для предпросмотра берём самую большую скачиваемую миниатюру.
+            // У видео, GIF, кружков и анимированных стикеров берём самую большую скачиваемую миниатюру.
             grammers_client::media::Media::Document(d) if is_thumb => {
                 use grammers_client::media::Downloadable;
                 let thumbs = d.thumbs();
+                let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
+                    return Ok(None);
+                };
+                self.client.download_media(th, &file).await?;
+            }
+            grammers_client::media::Media::Sticker(s) if is_thumb => {
+                use grammers_client::media::Downloadable;
+                let thumbs = s.document.thumbs();
                 let Some(th) = thumbs.iter().rev().find(|x| x.to_raw_input_location().is_some()) else {
                     return Ok(None);
                 };

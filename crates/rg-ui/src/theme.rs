@@ -572,6 +572,20 @@ pub fn day_label(ts: i64, now: i64) -> String {
     }
 }
 
+/// Маскирует номер телефона, @имя или ID в режиме стримера (`ayu.streamer_mode`).
+pub fn mask_streamer(value: &str, active: bool) -> String {
+    if !active || value.is_empty() {
+        return value.to_owned();
+    }
+    if value.starts_with('+') {
+        "+• ••• ••• •• ••".to_owned()
+    } else if value.starts_with('@') {
+        "@••••••".to_owned()
+    } else {
+        "••••••".to_owned()
+    }
+}
+
 /// Тот же ли календарный день (для разделителей).
 pub fn same_day(a: i64, b: i64) -> bool {
     matches!((zoned(a), zoned(b)), (Some(x), Some(y)) if x.date() == y.date())
@@ -631,5 +645,8 @@ mod tests {
         assert!(same_day(now, now + 10));
         assert!(!same_day(now, now + 86_400 * 2));
         assert!(day_label(now, now).contains(' '));
+        assert_eq!(mask_streamer("+79991234567", true), "+• ••• ••• •• ••");
+        assert_eq!(mask_streamer("@durov", true), "@••••••");
+        assert_eq!(mask_streamer("+79991234567", false), "+79991234567");
     }
 }

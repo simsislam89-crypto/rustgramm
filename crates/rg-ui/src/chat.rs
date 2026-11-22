@@ -39,6 +39,10 @@ pub(crate) enum Act {
     Goto(i32),
     OpenUrl(String),
     Spoiler(i32, usize),
+    /// Перевести текст сообщения встроенным переводчиком Telegram.
+    Translate(i32, String),
+    /// Сохранить карточку-снимок сообщения (Message Shot, функция AyuGram).
+    Shot(i32),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -62,6 +66,8 @@ struct Env<'a> {
     cached: &'a std::collections::HashSet<i32>,
     /// Скачанные GIF (путь на диске) для автозапуска в ленте.
     gif_paths: &'a HashMap<i32, std::path::PathBuf>,
+    /// Переведённые тексты сообщений.
+    translated: &'a HashMap<i32, String>,
     /// Видимая область ленты (для аккуратного размещения встроенного GIF).
     clip_rect: Rect,
 }
@@ -272,10 +278,11 @@ impl App {
                     ui.ctx().copy_text(value.to_owned());
                 }
             };
-            row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { format!("+{}", info.phone) }, "Телефон", true);
-            row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { format!("@{}", info.username) }, "Имя пользователя", true);
+            let streamer = self.settings.ayu.streamer_mode;
+            row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { mask_streamer(&format!("+{}", info.phone), streamer) }, "Телефон", !streamer);
+            row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { mask_streamer(&format!("@{}", info.username), streamer) }, "Имя пользователя", !streamer);
             row(ui, "menu/info", &info.about, if d.id < 0 { "Описание" } else { "О себе" }, true);
-            row(ui, "menu/profile", &format!("{}", d.id), "ID", true);
+            row(ui, "menu/profile", &mask_streamer(&format!("{}", d.id), streamer), "ID", !streamer);
         });
     }
 
@@ -674,6 +681,7 @@ impl App {
                 fetching: &self.fetching,
                 cached: &self.cached_media,
                 gif_paths: &self.gif_paths,
+                translated: &self.translated,
                 clip_rect,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
@@ -808,6 +816,22 @@ impl App {
                     self.spoilers.remove(&(id, idx));
                 }
             }
+            Act::Translate(id, text) => {
+                self.status = "Перевод…".to_owned();
+                self.send(Cmd::Translate(id, text));
+            }
+            Act::Shot(id) => {
+                if let Some(m) = self.messages.iter().find(|m| m.id == id) {
+                    let chat_name = self.selected.and_then(|i| self.dialogs.get(i)).map_or("Чат", |d| d.name.as_str());
+                    match save_message_shot(m, chat_name) {
+                        Some(p) => {
+                            rg_core::media::open_downloaded(&p);
+                            self.status = format!("Снимок сохранён: {}", p.display());
+                        }
+                        None => self.error = "Не удалось сохранить снимок".to_owned(),
+                    }
+                }
+            }
         }
     }
 
@@ -827,6 +851,7 @@ impl App {
                             .hint_text("Поиск чата")
                             .desired_width(300.0),
                     );
+                    ui.checkbox(&mut self.forward_no_author, "Скрыть автора (без подписи)");
                     let needle = self.forward_filter.to_lowercase();
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         for (i, d) in self.dialogs.iter().enumerate() {
@@ -840,7 +865,7 @@ impl App {
                     });
                 });
             if let Some(i) = chosen {
-                self.send(Cmd::Forward(id, i));
+                self.send(Cmd::Forward(id, i, self.forward_no_author));
                 open = false;
             }
             if !open {
@@ -1230,6 +1255,18 @@ fn bubble(
                             }
                         }
                     }
+                    if let Some(tr) = env.translated.get(&m.id) {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let (bar, _) = ui.allocate_exact_size(Vec2::new(2.5, 28.0), Sense::hover());
+                            ui.painter().rect_filled(bar, 1.0, t_btn(ORANGE));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new("Перевод").size(11.5).color(ORANGE));
+                                ui.label(RichText::new(tr).size(14.0).color(text_c));
+                            });
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         let mut extra: Vec<(&str, String)> = Vec::new();
@@ -1356,6 +1393,10 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     }
     if !m.text.is_empty() {
         item(ui, "menu/copy", "Копировать текст", Act::Copy(m.text.clone()));
+        item(ui, "settings/language", "Перевести", Act::Translate(m.id, m.text.clone()));
+    }
+    if s.show_message_shot && (!m.text.is_empty() || m.media.is_some()) {
+        item(ui, "menu/photo", "Снимок сообщения", Act::Shot(m.id));
     }
     if m.media.as_ref().is_some_and(|i| i.is_downloadable()) {
         item(ui, "menu/download", "Сохранить файл", Act::Save(m.id));
@@ -1396,4 +1437,40 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
             ui.close();
         }
     }
+}
+
+/// Генерирует карточку-снимок сообщения (Message Shot) в PNG и сохраняет в каталог загрузок.
+fn save_message_shot(m: &MessageRow, _chat_name: &str) -> Option<std::path::PathBuf> {
+    let dir = super::worker::home().join("downloads");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("shot_{}.png", m.id));
+    let lines = (m.text.chars().count() / 36 + 1).clamp(1, 12) as u32;
+    let w = 480u32;
+    let h = 110 + lines * 24;
+    let mut img = image::RgbaImage::from_pixel(w, h, image::Rgba([14, 14, 18, 255]));
+    // Тёмная карточка пузыря с оранжевой полосой акцента слева.
+    for y in 20..(h - 20) {
+        for x in 24..(w - 24) {
+            let c = if x < 28 {
+                image::Rgba([245, 130, 32, 255])
+            } else if y == 20 || y == h - 21 || x == w - 25 {
+                image::Rgba([54, 54, 64, 255])
+            } else {
+                image::Rgba([28, 28, 34, 255])
+            };
+            img.put_pixel(x, y, c);
+        }
+    }
+    // Декоративные полосы текста (визуальное представление строк сообщения).
+    for row in 0..lines {
+        let y0 = 48 + row * 22;
+        let line_w = if row + 1 == lines { 180 } else { 360 };
+        for y in y0..(y0 + 8).min(h - 30) {
+            for x in 46..(46 + line_w).min(w - 40) {
+                img.put_pixel(x, y, image::Rgba([226, 226, 232, 255]));
+            }
+        }
+    }
+    img.save_with_format(&path, image::ImageFormat::Png).ok()?;
+    Some(path)
 }

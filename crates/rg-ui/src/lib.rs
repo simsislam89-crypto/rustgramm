@@ -79,6 +79,8 @@ struct App {
     found: Option<Vec<MessageRow>>,
     forward: Option<i32>,
     forward_filter: String,
+    forward_no_author: bool,
+    translated: HashMap<i32, String>,
     confirm_delete: Option<i32>,
     /// Адрес, ожидающий подтверждения «Открыть ссылку?».
     link_confirm: Option<String>,
@@ -244,6 +246,8 @@ impl App {
             found: None,
             forward: None,
             forward_filter: String::new(),
+            forward_no_author: false,
+            translated: HashMap::new(),
             confirm_delete: None,
             link_confirm: None,
             spoilers: HashSet::new(),
@@ -664,6 +668,7 @@ impl App {
         self.known.clear();
         self.arrived.clear();
         self.img_arrived.clear();
+        self.translated.clear();
         self.history_loading = false;
         self.chat_opened = std::time::Instant::now();
         self.messages.clear();
@@ -731,6 +736,10 @@ impl App {
                     }
                 }
                 Ev::GlobalFound(list) => self.global_results = list,
+                Ev::Translated(id, tr) => {
+                    self.translated.insert(id, tr);
+                    self.status.clear();
+                }
                 Ev::Progress(id, done, total) => {
                     self.fetching.insert(id, (done, total));
                 }

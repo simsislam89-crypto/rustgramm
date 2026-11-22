@@ -52,8 +52,10 @@ pub enum Cmd {
     /// Прежние версии текста сообщения.
     EditHistory(i32),
     Delete(i32),
-    /// Переслать сообщение в чат с таким индексом списка.
-    Forward(i32, usize),
+    /// Переслать сообщение в чат с таким индексом списка (`true` — без автора, функция AyuGram).
+    Forward(i32, usize, bool),
+    /// Перевести текст сообщения встроенным переводчиком Telegram.
+    Translate(i32, String),
     Pin(i32, bool),
     React(i32, String),
     /// Поиск в открытом чате; пустая строка — выйти из поиска.
@@ -164,6 +166,8 @@ pub enum Ev {
     EmojiKeywords(Vec<(String, Vec<String>)>),
     /// Результаты глобального поиска.
     GlobalFound(Vec<ContactRow>),
+    /// Переведённый текст сообщения (идентификатор сообщения, перевод).
+    Translated(i32, String),
     /// Ход загрузки вложения: сообщение, скачано, всего (байт).
     Progress(i32, u64, u64),
     /// Загрузка вложения закончилась (успешно, отменена или с ошибкой).
@@ -924,13 +928,32 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     Err(e) => out.err(format!("Не удалено: {e}")),
                 }
             }
-            Cmd::Forward(id, to) => {
+            Cmd::Forward(id, to, no_author) => {
                 let Some(i) = current else { continue };
                 let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to)) else { continue };
-                match engine.forward(from.peer, dest.peer, &[id]).await {
-                    Ok(()) => out.send(Ev::Status(format!("Переслано: {}", dest.name))),
+                let res = if no_author {
+                    engine.forward_no_author(from.peer, dest.peer, id).await
+                } else {
+                    engine.forward(from.peer, dest.peer, &[id]).await
+                };
+                match res {
+                    Ok(()) => out.send(Ev::Status(format!(
+                        "Переслано{}: {}",
+                        if no_author { " без автора" } else { "" },
+                        dest.name
+                    ))),
                     Err(e) => out.err(format!("Не переслано: {e}")),
                 }
+            }
+            Cmd::Translate(id, text) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.translate_text(&text, "ru").await {
+                        Ok(tr) if !tr.trim().is_empty() => out.send(Ev::Translated(id, tr)),
+                        Ok(_) => out.err("Перевод пуст"),
+                        Err(e) => out.err(format!("Перевод: {e}")),
+                    }
+                });
             }
             Cmd::Pin(id, pinned) => {
                 let Some(i) = current else { continue };

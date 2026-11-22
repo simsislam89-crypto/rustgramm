@@ -11,7 +11,7 @@ pub enum MediaKind {
     Photo,
     /// Статичный стикер WebP, который можно показать.
     Sticker,
-    /// Анимированный или видео-стикер: показываем подпись.
+    /// Анимированный (TGS) или видео-стикер (WebM) с миниатюрой и воспроизведением.
     AnimatedSticker,
     Video,
     /// Короткая зацикленная анимация.
@@ -21,6 +21,21 @@ pub enum MediaKind {
     Voice,
     Audio,
     File,
+    /// Превью веб-ссылки (адрес, сайт, заголовок, описание).
+    WebPage {
+        url: String,
+        site: String,
+        title: String,
+        desc: String,
+    },
+    /// Опрос или викторина (вопрос, варианты `(текст, процент, выбран)`, всего голосов, закрыт, викторина).
+    Poll {
+        question: String,
+        options: Vec<(String, u8, bool)>,
+        total: i32,
+        closed: bool,
+        quiz: bool,
+    },
     Other(String),
 }
 
@@ -58,14 +73,17 @@ impl MediaInfo {
     pub fn has_preview(&self) -> bool {
         match self.kind {
             MediaKind::Photo | MediaKind::Sticker => true,
-            MediaKind::Video | MediaKind::Gif | MediaKind::Round => self.has_thumb,
+            MediaKind::AnimatedSticker | MediaKind::Video | MediaKind::Gif | MediaKind::Round => self.has_thumb,
             _ => false,
         }
     }
 
     /// Сохраняется ли вложение как файл («Скачать»).
     pub fn is_downloadable(&self) -> bool {
-        !matches!(self.kind, MediaKind::Other(_) | MediaKind::AnimatedSticker)
+        !matches!(
+            self.kind,
+            MediaKind::Other(_) | MediaKind::WebPage { .. } | MediaKind::Poll { .. }
+        )
     }
 }
 
@@ -107,12 +125,17 @@ pub fn describe(media: &Media) -> MediaInfo {
     match media {
         Media::Photo(p) => MediaInfo::basic(MediaKind::Photo, "Фото", p.size().map_or(0, |s| s as u64)),
         Media::Sticker(s) => {
-            let mime = s.document.mime_type().unwrap_or_default();
-            MediaInfo::basic(
+            let mime = s.document.mime_type().unwrap_or_default().to_owned();
+            let emoji = s.raw_attrs.alt.clone();
+            let label = if emoji.is_empty() { "Стикер".to_owned() } else { format!("Стикер {emoji}") };
+            let mut info = MediaInfo::basic(
                 if mime == "image/webp" { MediaKind::Sticker } else { MediaKind::AnimatedSticker },
-                "Стикер",
+                label,
                 s.document.size().map_or(0, |v| v as u64),
-            )
+            );
+            info.has_thumb = !s.document.thumbs().is_empty();
+            info.mime = mime;
+            info
         }
         Media::Document(d) => {
             let mime = d.mime_type().unwrap_or_default().to_owned();
@@ -175,11 +198,59 @@ pub fn describe(media: &Media) -> MediaInfo {
             info.mime = mime;
             info
         }
-        Media::Contact(_) => other("Контакт"),
-        Media::Poll(_) => other("Опрос"),
+        Media::Contact(c) => other(&format!(
+            "Контакт: {} {} (+{})",
+            c.raw.first_name, c.raw.last_name, c.raw.phone_number
+        )),
+        Media::Poll(p) => {
+            let tl::enums::TextWithEntities::Entities(q) = &p.raw.question;
+            let total = p.raw_results.total_voters.unwrap_or(0).max(0);
+            let voters = p.raw_results.results.as_deref().unwrap_or(&[]);
+            let mut options = Vec::with_capacity(p.raw.answers.len());
+            for ans in &p.raw.answers {
+                let tl::enums::PollAnswer::Answer(a) = ans else { continue };
+                let tl::enums::TextWithEntities::Entities(t) = &a.text;
+                let (cnt, chosen) = voters
+                    .iter()
+                    .find_map(|v| {
+                        let tl::enums::PollAnswerVoters::Voters(v) = v;
+                        (v.option == a.option).then_some((v.voters.unwrap_or(0).max(0), v.chosen))
+                    })
+                    .unwrap_or((0, false));
+                let pct = if total > 0 {
+                    ((i64::from(cnt) * 100 / i64::from(total)).clamp(0, 100)) as u8
+                } else {
+                    0
+                };
+                options.push((t.text.clone(), pct, chosen));
+            }
+            MediaInfo::basic(
+                MediaKind::Poll {
+                    question: q.text.clone(),
+                    options,
+                    total,
+                    closed: p.raw.closed,
+                    quiz: p.raw.quiz,
+                },
+                "Опрос",
+                0,
+            )
+        }
         Media::Geo(_) | Media::Venue(_) | Media::GeoLive(_) => other("Место"),
-        Media::Dice(_) => other("Кубик"),
-        Media::WebPage(_) => other("Ссылка"),
+        Media::Dice(d) => other(&format!("{} ({})", d.raw.emoticon, d.raw.value)),
+        Media::WebPage(w) => match &w.raw.webpage {
+            tl::enums::WebPage::Page(wp) => MediaInfo::basic(
+                MediaKind::WebPage {
+                    url: wp.url.clone(),
+                    site: wp.site_name.clone().unwrap_or_else(|| wp.display_url.clone()),
+                    title: wp.title.clone().unwrap_or_default(),
+                    desc: wp.description.clone().unwrap_or_default(),
+                },
+                "Ссылка",
+                0,
+            ),
+            _ => other("Ссылка"),
+        },
         _ => other("Вложение"),
     }
 }
@@ -362,5 +433,39 @@ mod tests {
     fn mime_gives_extension() {
         assert_eq!(ext_for_mime("audio/ogg"), "ogg");
         assert_eq!(ext_for_mime("weird/thing"), "bin");
+    }
+
+    #[test]
+    fn animated_sticker_webpage_and_poll_flags() {
+        let mut st = MediaInfo::basic(MediaKind::AnimatedSticker, "Стикер 🔥", 12_000);
+        assert!(!st.has_preview());
+        st.has_thumb = true;
+        assert!(st.has_preview());
+        assert!(st.is_downloadable());
+
+        let wp = MediaInfo::basic(
+            MediaKind::WebPage {
+                url: "https://telegram.org".into(),
+                site: "Telegram".into(),
+                title: "Telegram Messenger".into(),
+                desc: "Fast and secure".into(),
+            },
+            "Ссылка",
+            0,
+        );
+        assert!(!wp.is_downloadable());
+
+        let poll = MediaInfo::basic(
+            MediaKind::Poll {
+                question: "Rust?".into(),
+                options: vec![("Да".into(), 100, true)],
+                total: 1,
+                closed: false,
+                quiz: false,
+            },
+            "Опрос",
+            0,
+        );
+        assert!(!poll.is_downloadable());
     }
 }

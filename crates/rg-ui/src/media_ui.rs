@@ -96,11 +96,32 @@ pub fn card(
                 placeholder(ui, w, 150.0, "Фото", date_c, false);
             }
         }
-        MediaKind::Sticker => {
+        MediaKind::Sticker | MediaKind::AnimatedSticker => {
+            let is_anim = info.kind == MediaKind::AnimatedSticker;
             if let Some(tex) = tex {
-                ui.add(egui::Image::new(tex).max_width(w.min(180.0)));
+                let r = ui.add(egui::Image::new(tex).max_width(w.min(180.0)).corner_radius(6)).rect;
+                if is_anim && info.mime == "video/webm" {
+                    cards.push((r, Act::Open(m.id)));
+                } else {
+                    cards.push((r, Act::Viewer(m.id)));
+                }
             } else {
-                ui.label(RichText::new("Стикер").color(date_c));
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(136.0_f32.min(w)), Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::same(14),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, (14.0 * opacity_f32()) as u8),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    &info.name,
+                    FontId::proportional(14.0),
+                    date_c,
+                );
+                if is_anim && info.mime == "video/webm" {
+                    cards.push((rect, Act::Open(m.id)));
+                }
             }
         }
         MediaKind::Video | MediaKind::Gif | MediaKind::Round => {
@@ -231,7 +252,96 @@ pub fn card(
             );
             cards.push((rect, if matches!(load, Load::Active(..)) { Act::CancelFetch(m.id) } else { Act::Save(m.id) }));
         }
-        MediaKind::AnimatedSticker | MediaKind::Other(_) => {
+        MediaKind::WebPage { url, site, title, desc } => {
+            let mut h = 24.0;
+            if !title.is_empty() {
+                h += 20.0;
+            }
+            if !desc.is_empty() {
+                h += 34.0;
+            }
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(
+                rect,
+                CornerRadius::same(8),
+                Color32::from_rgba_unmultiplied(0, 0, 0, (42.0 * opacity_f32()) as u8),
+            );
+            let bar = Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(2.5, rect.height() - 12.0));
+            p.rect_filled(bar, CornerRadius::same(1), t_btn(ORANGE));
+            let left = rect.left() + 15.0;
+            let mut y = rect.top() + 6.0;
+            p.text(
+                Pos2::new(left, y),
+                Align2::LEFT_TOP,
+                clip_text(if site.is_empty() { url } else { site }, 34),
+                FontId::proportional(12.5),
+                ORANGE,
+            );
+            y += 17.0;
+            if !title.is_empty() {
+                p.text(
+                    Pos2::new(left, y),
+                    Align2::LEFT_TOP,
+                    clip_text(title, 38),
+                    FontId::proportional(13.5),
+                    text_c,
+                );
+                y += 18.0;
+            }
+            if !desc.is_empty() {
+                let g = p.layout(clip_text(desc, 85), FontId::proportional(12.5), date_c, (w - 22.0).max(60.0));
+                p.galley(Pos2::new(left, y), g, date_c);
+            }
+            if !url.is_empty() {
+                cards.push((rect, Act::OpenUrl(url.clone())));
+            }
+        }
+        MediaKind::Poll { question, options, total, closed, quiz } => {
+            let kind_label = match (*quiz, *closed) {
+                (true, true) => "Викторина · завершена",
+                (true, false) => "Викторина",
+                (false, true) => "Опрос · завершён",
+                (false, false) => "Опрос",
+            };
+            ui.label(RichText::new(kind_label).size(11.5).color(ORANGE));
+            ui.label(RichText::new(question).strong().size(14.5).color(text_c));
+            ui.add_space(4.0);
+            for (opt, pct, chosen) in options {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(
+                    r,
+                    CornerRadius::same(7),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, (14.0 * opacity_f32()) as u8),
+                );
+                let fill_w = (r.width() * (f32::from(*pct) / 100.0)).clamp(4.0, r.width());
+                let fill_r = Rect::from_min_size(r.min, Vec2::new(fill_w, r.height()));
+                let bar_c = if *chosen {
+                    t_btn(ORANGE)
+                } else {
+                    Color32::from_rgba_unmultiplied(245, 130, 32, (72.0 * opacity_f32()) as u8)
+                };
+                p.rect_filled(fill_r, CornerRadius::same(7), bar_c);
+                p.text(
+                    Pos2::new(r.left() + 10.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    clip_text(opt, 28),
+                    FontId::proportional(13.0),
+                    text_c,
+                );
+                p.text(
+                    Pos2::new(r.right() - 10.0, r.center().y),
+                    Align2::RIGHT_CENTER,
+                    format!("{pct}%"),
+                    FontId::proportional(12.0),
+                    text_c,
+                );
+                ui.add_space(2.0);
+            }
+            ui.label(RichText::new(format!("Голосов: {total}")).size(12.0).color(date_c));
+        }
+        MediaKind::Other(_) => {
             ui.label(RichText::new(format!("[{}]", info.name)).color(date_c));
         }
     }
