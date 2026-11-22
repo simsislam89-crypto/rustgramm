@@ -29,6 +29,11 @@ impl StreamState {
             "mkv" => "video/x-matroska",
             "ogv" => "video/ogg",
             "gif" => "image/gif",
+            "mp3" => "audio/mpeg",
+            "m4a" | "aac" => "audio/mp4",
+            "ogg" | "oga" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            "wav" => "audio/wav",
             _ => "video/mp4",
         };
         Arc::new(Self {

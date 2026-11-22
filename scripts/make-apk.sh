@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Сборка Rustgramm.apk (Android, arm64) в dist/.
-# Нужно заранее: Android SDK (platform 34, build-tools 34) и NDK, переменные ANDROID_HOME и
-# ANDROID_NDK_ROOT, Rust-цель aarch64-linux-android, `cargo install cargo-apk`, Java (keytool).
-# Ключи приложения (api_id, api_hash) вшиваются при сборке из .rg/api.keys, в git они не попадают.
+# Сборка двух версий Rustgramm для Android (arm64) в dist/:
+#   1) dist/Rustgramm-Android-Full.apk — полная версия (с системой плагинов exteraGram/AyuGram)
+#   2) dist/Rustgramm-Android-Lite.apk — облегчённая версия (без плагинов)
+#   + копия dist/Rustgramm.apk (указывает на полную версию).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,8 +27,17 @@ fi
 export CARGO_APK_RELEASE_KEYSTORE="$PWD/$KS"
 export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$(cat "$PASS_FILE")"
 
-cargo apk build -p rg-android --release
 mkdir -p dist
-APK="$(ls target/release/apk/*.apk | head -n 1)"
-cp "$APK" dist/Rustgramm.apk
-ls -la dist/Rustgramm.apk
+
+# 1. Полная версия для телефона (с плагинами)
+cargo apk build -p rg-android --release --features plugins
+APK_FULL="$(ls target/release/apk/*.apk | head -n 1)"
+cp -f "$APK_FULL" dist/Rustgramm-Android-Full.apk
+cp -f "$APK_FULL" dist/Rustgramm.apk
+
+# 2. Облегчённая версия для телефона (без плагинов)
+cargo apk build -p rg-android --release --no-default-features
+APK_LITE="$(ls target/release/apk/*.apk | head -n 1)"
+cp -f "$APK_LITE" dist/Rustgramm-Android-Lite.apk
+
+ls -la dist/Rustgramm-Android-Full.apk dist/Rustgramm-Android-Lite.apk dist/Rustgramm.apk

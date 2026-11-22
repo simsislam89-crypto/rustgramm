@@ -456,9 +456,70 @@ impl Engine {
         Ok(true)
     }
 
-    /// «Прочитать на сервере»: отметка о прочтении отправляется всегда, даже в режиме призрака.
+    /// «Прочитать на сервере»: отметка о прочтении отправляется всегда, даже в режиме призрака
+    /// (сбрасывает непрочитанные сообщения, упоминания `@`, реакции и метку «непрочитано»).
     pub async fn force_read(&self, peer: PeerRef) -> Result<(), grammers_client::InvocationError> {
-        self.client.mark_as_read(peer).await
+        use grammers_client::tl;
+        let in_peer = tl::enums::InputPeer::from(peer);
+        let read_res = match &in_peer {
+            tl::enums::InputPeer::Channel(c) => {
+                self.client
+                    .invoke(&tl::functions::channels::ReadHistory {
+                        channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                            channel_id: c.channel_id,
+                            access_hash: c.access_hash,
+                        }),
+                        max_id: i32::MAX,
+                    })
+                    .await
+                    .map(|_| ())
+            }
+            _ => {
+                self.client
+                    .invoke(&tl::functions::messages::ReadHistory {
+                        peer: in_peer.clone(),
+                        max_id: i32::MAX,
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let req_mentions = tl::functions::messages::ReadMentions {
+            peer: in_peer.clone(),
+            top_msg_id: None,
+        };
+        let req_reactions = tl::functions::messages::ReadReactions {
+            peer: in_peer.clone(),
+            top_msg_id: None,
+            saved_peer_id: None,
+        };
+        let req_unmark = tl::functions::messages::MarkDialogUnread {
+            unread: false,
+            parent_peer: None,
+            peer: tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer: in_peer }),
+        };
+        let _ = tokio::join!(
+            self.client.invoke(&req_mentions),
+            self.client.invoke(&req_reactions),
+            self.client.invoke(&req_unmark),
+        );
+        read_res
+    }
+
+    /// Пакетно отметить прочитанными на сервере сразу несколько чатов (кнопка «Прочитать на сервере» в боковом меню).
+    pub async fn force_read_many(&self, peers: &[PeerRef]) -> usize {
+        let mut handles = Vec::with_capacity(peers.len());
+        for &p in peers.iter().take(40) {
+            let eng = self.clone();
+            handles.push(tokio::spawn(async move { eng.force_read(p).await.is_ok() }));
+        }
+        let mut ok_count = 0usize;
+        for h in handles {
+            if h.await.unwrap_or(false) {
+                ok_count += 1;
+            }
+        }
+        ok_count
     }
 
     /// Чаты из папки «Архив» (folder_id = 1).
@@ -807,7 +868,18 @@ impl Engine {
 
     /// Скачать музыкальный трек (из `saved_music`) в кэш `cache/audio/<id>.<ext>`.
     pub async fn download_track(&self, track: &AudioTrack) -> Result<PathBuf, BoxErr> {
+        self.download_track_streaming(track, |_, _, _, _| {}).await
+    }
+
+    /// Потоковая загрузка музыкального трека кусками по 512 КБ с колбэком `(done, total, &part, &dest)`:
+    /// позволяет начать воспроизведение через `stream.rs` уже после первых 128 КБ.
+    pub async fn download_track_streaming(
+        &self,
+        track: &AudioTrack,
+        mut progress: impl FnMut(u64, u64, &Path, &Path),
+    ) -> Result<PathBuf, BoxErr> {
         use grammers_client::tl;
+        use std::io::Write;
         let dir = self.dirs.cache.join("audio");
         std::fs::create_dir_all(&dir)?;
         let file = dir.join(format!("{}.{}", track.id, track.ext()));
@@ -823,7 +895,17 @@ impl Engine {
                 thumb_size: String::new(),
             },
         ));
-        self.client.download_media(&loc, &part).await?;
+        let total = track.size.max(1);
+        let mut dl = self.client.iter_download(&loc).chunk_size(512 * 1024);
+        let mut out = std::fs::File::create(&part)?;
+        let mut done = 0u64;
+        while let Some(chunk) = dl.next().await? {
+            out.write_all(&chunk)?;
+            let _ = out.flush();
+            done += chunk.len() as u64;
+            progress(done, total, &part, &file);
+        }
+        drop(out);
         let _ = std::fs::rename(&part, &file);
         Ok(file)
     }

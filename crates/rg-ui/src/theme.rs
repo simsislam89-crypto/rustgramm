@@ -164,18 +164,55 @@ pub fn ios_spring(k: f32) -> f32 {
     1.0 - (1.0 - k).powi(4)
 }
 
-/// Полупрозрачная вуаль под модальными окнами с мягким «блюр-дымом» в стиле iOS.
+/// Полупрозрачная вуаль под модальными окнами с мягким многослойным «подблюром» в стиле iOS / AyuGram.
 pub fn paint_frosted_scrim(p: &egui::Painter, rect: Rect, raw: f32) {
     let raw = raw.clamp(0.0, 1.0);
     let k = ios_spring(raw);
     let op = opacity_f32();
-    let dark_a = (150.0 * k * (0.45 + 0.55 * op)) as u8;
+    let dark_a = (168.0 * k * (0.5 + 0.5 * op)) as u8;
     p.rect_filled(rect, 0.0, Color32::from_black_alpha(dark_a));
     if blur_on() {
-        // Лёгкий молочно-стеклянный слой поверх затемнения (эффект матового стекла iOS).
-        let frost_a = (16.0 * k * (0.5 + 0.5 * op)) as u8;
-        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(210, 218, 232, frost_a));
+        // Многослойная матовая диффузия (эффект лёгкого подблюра под открытым окном).
+        let frost_a = (26.0 * k * (0.55 + 0.45 * op)) as u8;
+        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(28, 32, 42, frost_a));
+        let mist_a = (14.0 * k * (0.5 + 0.5 * op)) as u8;
+        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(215, 224, 240, mist_a));
+        // Мягкое радиальное матовое пятно в центре экрана под модальным окном.
+        let center = rect.center();
+        let base_r = rect.width().min(rect.height()) * 0.46;
+        for (mul, alpha_f) in [(1.15, 10.0), (0.85, 14.0), (0.58, 18.0)] {
+            p.circle_filled(
+                center,
+                base_r * mul,
+                Color32::from_rgba_unmultiplied(36, 40, 52, (alpha_f * k) as u8),
+            );
+        }
     }
+}
+
+/// Мягкий многослойный гауссовый ореол («подблюр») и стеклянная кромка вокруг модальной карточки.
+pub fn paint_modal_subblur(p: &egui::Painter, rect: Rect, radius: f32, raw: f32) {
+    let k = ios_spring(raw.clamp(0.0, 1.0));
+    if blur_on() {
+        for (spread, dark_a, glow_a) in [
+            (34.0, 22.0, 4.0),
+            (24.0, 32.0, 6.0),
+            (15.0, 44.0, 9.0),
+            (8.0, 58.0, 12.0),
+            (3.0, 72.0, 16.0),
+        ] {
+            let r = rect.expand(spread * k);
+            let cr = CornerRadius::same((radius + spread * 0.55).clamp(4.0, 42.0) as u8);
+            p.rect_filled(r, cr, Color32::from_black_alpha((dark_a * k) as u8));
+            p.rect_stroke(
+                r,
+                cr,
+                Stroke::new(1.5, Color32::from_rgba_unmultiplied(220, 230, 248, (glow_a * k) as u8)),
+                egui::StrokeKind::Middle,
+            );
+        }
+    }
+    paint_glass_rim(p, rect, radius);
 }
 
 /// Рисует тонкий верхний стеклянный блик на карточке или модальном окне.
@@ -297,12 +334,16 @@ pub fn sync_visuals(ctx: &egui::Context) {
     });
 }
 
-/// Плавный переход к `target` за `dur` секунд (мгновенно при «уменьшении движения»).
+/// Плавный переход к `target` за `dur` секунд (всегда запрашивает перерисовку, пока идёт движение).
 pub fn tween(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, dur: f32) -> f32 {
     let id = egui::Id::NULL.with(id);
     let speed = f32::from(ANIM.load(Ordering::Relaxed)) / 100.0;
     let dur = if speed <= 0.0 { 0.0 } else { dur / speed };
-    ctx.animate_value_with_time(id, target, dur)
+    let val = ctx.animate_value_with_time(id, target, dur);
+    if (val - target).abs() > 0.001 {
+        ctx.request_repaint();
+    }
+    val
 }
 
 /// Экспоненциальное замедление: быстрый старт, мягкая посадка.

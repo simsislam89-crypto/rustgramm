@@ -83,6 +83,8 @@ pub enum Cmd {
     Older(i32),
     /// Отметить открытый чат прочитанным принудительно (мимо режима призрака).
     ForceRead,
+    /// Отметить ВСЕ непрочитанные чаты прочитанными на сервере (из левого меню / горячей клавиши).
+    ForceReadAll,
     /// Выйти из аккаунта: сессия и локальная база стираются, приложение перезапускается.
     LogOut,
     /// Архивировать (true) или вернуть из архива чат с индексом.
@@ -207,6 +209,8 @@ pub enum Ev {
     StreamVideo(String, String),
     /// Аудио/музыка/голосовое готово к воспроизведению во встроенном мини-плеере (путь, название, длительность).
     PlayAudio(PathBuf, String, u32),
+    /// Потоковое воспроизведение музыки по локальному HTTP Range адресу после первых 128 КБ.
+    StreamAudio(String, String, u32),
     /// Короткий GIF скачан в кэш и готов к автозапуску в ленте.
     GifReady(i32, PathBuf),
     /// Ключевые слова для поиска эмодзи из Telegram.
@@ -912,11 +916,19 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 }
             }
             Cmd::ReadDialog(i) => {
-                let Some(d) = dialogs.get(i) else { continue };
-                match engine.force_read(d.peer).await {
-                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
-                    Err(e) => out.err(format!("Не отмечено: {e}")),
+                let Some(peer) = dialogs.get(i).map(|d| d.peer) else { continue };
+                if let Some(d) = dialogs.get_mut(i) {
+                    d.unread = 0;
                 }
+                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                out.send(Ev::Dialogs(dialogs.clone()));
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.force_read(peer).await {
+                        Ok(()) => out.send(Ev::Status("Чат отмечен прочитанным на сервере".into())),
+                        Err(e) => out.err(format!("Не отмечено: {e}")),
+                    }
+                });
             }
             Cmd::Contacts => match engine.contacts().await {
                 Ok(c) => out.send(Ev::Contacts(c)),
@@ -1036,7 +1048,16 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
                 tokio::spawn(async move {
                     match eng.peer_info(peer).await {
-                        Ok(info) => out.send(Ev::PeerInfo(id, info)),
+                        Ok(info) => {
+                            // Фоновая предзагрузка первого трека из профиля, чтобы музыка играла за 0 мс по клику.
+                            if let Some(first_track) = info.saved_music.first().cloned() {
+                                let eng_bg = eng.clone();
+                                tokio::spawn(async move {
+                                    let _ = eng_bg.download_track(&first_track).await;
+                                });
+                            }
+                            out.send(Ev::PeerInfo(id, info));
+                        }
                         Err(e) => out.err(format!("Сведения о чате: {e}")),
                     }
                 });
@@ -1114,11 +1135,45 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::ForceRead => {
                 let Some(i) = current else { continue };
-                let Some(d) = dialogs.get(i) else { continue };
-                match engine.force_read(d.peer).await {
-                    Ok(()) => out.send(Ev::Status("Отмечено прочитанным на сервере".into())),
-                    Err(e) => out.err(format!("Не отмечено: {e}")),
+                let Some(peer) = dialogs.get(i).map(|d| d.peer) else { continue };
+                if let Some(d) = dialogs.get_mut(i) {
+                    d.unread = 0;
                 }
+                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                out.send(Ev::Dialogs(dialogs.clone()));
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.force_read(peer).await {
+                        Ok(()) => out.send(Ev::Status("Отмечено прочитанным на сервере".into())),
+                        Err(e) => out.err(format!("Не отмечено: {e}")),
+                    }
+                });
+            }
+            Cmd::ForceReadAll => {
+                let mut peers: Vec<grammers_session::types::PeerRef> = dialogs
+                    .iter()
+                    .filter(|d| d.unread > 0)
+                    .map(|d| d.peer)
+                    .collect();
+                if let Some(cur_peer) = current.and_then(|i| dialogs.get(i)).map(|d| d.peer)
+                    && !peers.iter().any(|p| p.id == cur_peer.id)
+                {
+                    peers.push(cur_peer);
+                }
+                for d in &mut dialogs {
+                    d.unread = 0;
+                }
+                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                out.send(Ev::Dialogs(dialogs.clone()));
+                if peers.is_empty() {
+                    out.send(Ev::Status("Все чаты уже прочитаны на сервере".into()));
+                    continue;
+                }
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    let count = eng.force_read_many(&peers).await;
+                    out.send(Ev::Status(format!("Прочитано на сервере: {count} чатов")));
+                });
             }
             Cmd::Edit(id, text) => {
                 let Some(i) = current else { continue };
@@ -1575,11 +1630,54 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let title = track.display_title();
                 let dur = track.duration;
                 out.send(Ev::Status(format!("Загрузка трека «{title}»…")));
+                let rt_handle = tokio::runtime::Handle::current();
                 tokio::spawn(async move {
-                    match eng.download_track(&track).await {
+                    let stream_slot: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::stream::StreamState>>>> =
+                        std::sync::Arc::default();
+                    let s_prog = stream_slot.clone();
+                    let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let streamed_c = streamed.clone();
+                    let out_stream = out.clone();
+                    let title_stream = title.clone();
+                    let res = eng
+                        .download_track_streaming(&track, move |done, total, part, dest| {
+                            if let Some(st) = s_prog.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+                                st.done.store(done, std::sync::atomic::Ordering::Release);
+                                return;
+                            }
+                            if cfg!(windows)
+                                && done >= 128 * 1024
+                                && done < total
+                                && !streamed_c.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("mp3");
+                                let st = crate::stream::StreamState::new(part.to_path_buf(), dest.to_path_buf(), total, ext);
+                                st.done.store(done, std::sync::atomic::Ordering::Release);
+                                *s_prog.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(st.clone());
+                                let o_url = out_stream.clone();
+                                let t_url = title_stream.clone();
+                                rt_handle.spawn(async move {
+                                    if let Some(url) = crate::stream::start(st).await {
+                                        o_url.send(Ev::Status(String::new()));
+                                        o_url.send(Ev::StreamAudio(url, t_url, dur));
+                                    }
+                                });
+                            }
+                        })
+                        .await;
+                    if let Some(st) = stream_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+                        if res.is_ok() {
+                            st.finished.store(true, std::sync::atomic::Ordering::Release);
+                        } else {
+                            st.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    match res {
                         Ok(path) => {
                             out.send(Ev::Status(String::new()));
-                            out.send(Ev::PlayAudio(path, title, dur));
+                            if !streamed.load(std::sync::atomic::Ordering::SeqCst) {
+                                out.send(Ev::PlayAudio(path, title, dur));
+                            }
                         }
                         Err(e) => out.err(format!("Музыка: {e}")),
                     }

@@ -1,4 +1,4 @@
-/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 16», «Этап 17–19», «Этап 20–22 (v0.11.0)», «Этап 23 (v0.12.0)») и docs/PARITY.md. Версия сейчас 0.12.0.
+/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 20–22 (v0.11.0)», «Этап 23 (v0.12.0)», «Этап 24 (v0.13.0)») и docs/PARITY.md. Версия сейчас 0.13.0.
 
 СУТЬ: интерфейс и поведение 1 в 1 как в настоящем AyuGram, с оранжевыми основными кнопками, непрозрачным стартом (100%) + регулируемой прозрачностью окна и кнопок с iOS/Acrylic-блюром. Эталон — запущенный D:\download WIN\AyuGram\AyuGram.exe.
 Единственный релизный файл — `dist\Rustgramm.exe` (`scripts/make-dist.sh` обновляет его на месте, не создавая `-new`).
@@ -18,6 +18,11 @@
 - Музыка в профиле (`UserFull.saved_music` / `users.getSavedMusic`) + встроенный аудиоплеер (`AudioView` + мини-плеер сверху чата для M4A/MP3/OGG/Opus/FLAC).
 - Premium-эмодзи статусы (`EmojiStatus`) и значки Verified/Premium в списке чатов, шапке и профиле; превью медиа в списке чатов; исправлена обрезка шапки чата и «Прочитать на сервере» в боковом меню.
 - Оптимизация: дисковый кэш истории чатов (`cache/history/<id>.json`) + предзагрузка топ-3 чатов + параллельный `account_overview()`, лимиты кэшей ОЗУ, отказ от `seguiemj.ttf` и `default_fonts` на Windows, сжатие атласа эмодзи `emoji.png` → `emoji.webp`, `opt-level = "s"` для уменьшения `dist/Rustgramm.exe`.
+- Плавные анимации открытия всех модальных окон (`tg_settings_window`, `my_profile_window`, `settings_window`, `contacts_window`, `create_window`) с 5-слойным гауссовым подблюром (`paint_modal_subblur`) и скольжением страниц настроек.
+- Отдельное модальное окно «Мой профиль» (`my_profile_window`, 1 в 1 с AyuGram, без переброса в «Избранное») и мгновенное «Прочитать на сервере» для всех чатов из бокового меню (`force_read_all` + `Engine::force_read_many`).
+- Горячие клавиши и кнопки мыши: автоскролл при нажатии колёсика (`PointerButton::Middle`), ускорение колеса `Shift`/`Alt` ×3.5, боковые кнопки мыши `Extra1`/`Extra2` (Назад/Вперёд по истории чатов и страниц настроек), `Ctrl+Z`/`Ctrl+Y` в поле ввода, стрелка `↑` для редактирования последнего сообщения.
+- Потоковая музыка в профиле (старт воспроизведения после первых 128 КБ через HTTP Range + фоновая предзагрузка первого трека профиля).
+- Система плагинов (`rg-ayu::plugins`) для телефона и ПК + сборки Full (`--features plugins`) и Lite (`--no-default-features`), `scripts/make-apk.sh`, `.github/workflows/release.yml`, и **2074 модульных и характеристических теста** (`cargo test --workspace`).
 
 ЧТО ДЕЛАТЬ ДАЛЬШЕ:
 1. Живая визуальная сверка v0.11.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.

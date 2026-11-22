@@ -4,3 +4,4 @@
 pub mod ghost;
 pub mod store;
 pub mod filters;
+pub mod plugins;

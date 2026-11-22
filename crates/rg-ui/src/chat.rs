@@ -239,6 +239,12 @@ impl App {
                     }
                 });
                 if let Some(cmd) = act {
+                    if matches!(cmd, Cmd::ForceRead)
+                        && let Some(i) = self.selected
+                        && let Some(d) = self.dialogs.get_mut(i)
+                    {
+                        d.unread = 0;
+                    }
                     self.send(cmd);
                 }
                 // Переключатель правой панели со сведениями о чате.
@@ -829,6 +835,37 @@ impl App {
             let width = (ui.available_width() - right_w).max(80.0);
             let id = ui.make_persistent_id("composer-input");
             let focused = ui.memory(|m| m.has_focus(id));
+            // Горячие клавиши в поле ввода:
+            // - Стрелка Вверх в пустом поле — редактировать последнее своё сообщение (как в Telegram/AyuGram)
+            // - Ctrl+Z / Ctrl+Y (и Ctrl+Shift+Z) — откат / возврат текста в поле ввода
+            if focused {
+                if self.input.is_empty()
+                    && self.editing.is_none()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+                    && let Some(last) = self.messages.iter().rev().find(|m| m.outgoing && !m.deleted && !m.text.is_empty())
+                {
+                    self.reply = None;
+                    self.editing = Some(last.id);
+                    self.input = last.text.clone();
+                }
+                let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+                let redo = ui.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                        || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+                });
+                if undo {
+                    if let Some(prev) = self.input_undo.pop() {
+                        let cur = std::mem::replace(&mut self.input, prev);
+                        self.input_redo.push(cur);
+                    }
+                } else if redo
+                    && let Some(next) = self.input_redo.pop()
+                {
+                    let cur = std::mem::replace(&mut self.input, next);
+                    self.input_undo.push(cur);
+                }
+            }
+            let before_input = self.input.clone();
             // Enter отправляет, Shift+Enter — новая строка.
             let enter = focused
                 && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
@@ -842,6 +879,15 @@ impl App {
                     .frame(egui::Frame::NONE)
                     .margin(Vec2::new(4.0, 8.0)),
             );
+            if r.changed() && self.input != before_input {
+                if self.input_undo.last() != Some(&before_input) {
+                    self.input_undo.push(before_input);
+                    if self.input_undo.len() > 64 {
+                        self.input_undo.remove(0);
+                    }
+                }
+                self.input_redo.clear();
+            }
             if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
                 self.input_custom_emojis.clear();
             }
@@ -880,7 +926,15 @@ impl App {
             let sresp = if active { sresp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { sresp };
             if (sresp.clicked() || enter) && active && self.selected.is_some() {
                 let lead = self.input.chars().take_while(|c| c.is_whitespace()).count();
-                let text = self.input.trim().to_owned();
+                let raw_text = self.input.trim().to_owned();
+                let text = if cfg!(feature = "plugins") && self.settings.plugins_enabled {
+                    match self.plugins.apply_outgoing(&raw_text) {
+                        rg_ayu::plugins::HookOutcome::Modified(s) => s,
+                        rg_ayu::plugins::HookOutcome::Unchanged => raw_text,
+                    }
+                } else {
+                    raw_text
+                };
                 let char_total = text.chars().count();
                 let custom: Vec<(usize, usize, i64)> = std::mem::take(&mut self.input_custom_emojis)
                     .into_iter()
@@ -890,6 +944,8 @@ impl App {
                     })
                     .collect();
                 self.input.clear();
+                self.input_undo.clear();
+                self.input_redo.clear();
                 if let Some(id) = self.editing.take() {
                     self.send(Cmd::Edit(id, text));
                 } else {
@@ -1159,6 +1215,45 @@ impl App {
         let shift = ui.input(|i| i.modifiers.shift);
         let viewport_h = ui.available_height();
         let clip_rect = ui.clip_rect();
+        // Быстрый скролл при нажатии колёсика мыши (Middle Click Auto-Scroll) и ускорение колеса (Shift/Alt/Middle ×3.5).
+        let ptr_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+        let mid_clicked = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+        let mid_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let any_other_click = ui.input(|i| {
+            i.pointer.button_clicked(egui::PointerButton::Primary)
+                || i.pointer.button_clicked(egui::PointerButton::Secondary)
+                || i.key_pressed(egui::Key::Escape)
+        });
+        if mid_clicked
+            && let Some(p) = ptr_pos
+            && clip_rect.contains(p)
+        {
+            if self.autoscroll_anchor.is_some() {
+                self.autoscroll_anchor = None;
+            } else {
+                self.autoscroll_anchor = Some(p);
+            }
+        } else if any_other_click {
+            self.autoscroll_anchor = None;
+        }
+        let fast_wheel_delta = ui.input(|i| {
+            if (i.modifiers.shift || i.modifiers.alt || mid_down) && i.smooth_scroll_delta.y.abs() > 0.1 {
+                i.smooth_scroll_delta.y * 2.5
+            } else {
+                0.0
+            }
+        });
+        let autoscroll_dy = if let (Some(anchor), Some(cur)) = (self.autoscroll_anchor, ptr_pos) {
+            let diff = anchor.y - cur.y;
+            if diff.abs() > 6.0 {
+                ui.ctx().request_repaint();
+                diff * 0.24
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         let scroll_to = self.scroll_to.take();
         let mut acts: Vec<Act> = Vec::new();
         let mut want_older = false;
@@ -1199,8 +1294,11 @@ impl App {
             let hidden = &self.hidden;
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
-                .stick_to_bottom(!searching)
+                .stick_to_bottom(!searching && self.autoscroll_anchor.is_none())
                 .show(ui, |ui| {
+                    if (fast_wheel_delta + autoscroll_dy).abs() > 0.1 {
+                        ui.scroll_with_delta(Vec2::new(0.0, fast_wheel_delta + autoscroll_dy));
+                    }
                     let mut prev_date: Option<i64> = None;
                     // Короткая переписка прижата к низу, как в Telegram.
                     ui.add_space(8.0 + pad);
@@ -1240,6 +1338,33 @@ impl App {
         };
         self.inline_gif_rect = gif_candidate;
         self.msgs_h = (out.content_size.y - pad).max(0.0);
+        // Отрисовка якоря быстрого скролла колёсиком мыши (Middle Click Auto-Scroll).
+        if let Some(anchor) = self.autoscroll_anchor {
+            let p = ui.painter();
+            if let Some(cur) = ptr_pos {
+                p.line_segment(
+                    [anchor, Pos2::new(anchor.x, cur.y)],
+                    egui::Stroke::new(1.5, t_btn(ORANGE).gamma_multiply(0.55)),
+                );
+            }
+            p.circle_filled(anchor, 16.0, t2(WINDOW_BG));
+            p.circle_stroke(anchor, 16.0, egui::Stroke::new(1.5, t_btn(ORANGE)));
+            p.circle_filled(anchor, 3.0, t_btn(ORANGE));
+            p.text(
+                Pos2::new(anchor.x, anchor.y - 9.0),
+                egui::Align2::CENTER_CENTER,
+                "▲",
+                FontId::proportional(8.0),
+                WHITE,
+            );
+            p.text(
+                Pos2::new(anchor.x, anchor.y + 9.0),
+                egui::Align2::CENTER_CENTER,
+                "▼",
+                FontId::proportional(8.0),
+                WHITE,
+            );
+        }
         // Достигли верха — просим более старую историю.
         if !searching && out.state.clamped_offset().y <= 4.0 && out.content_size.y > out.inner_rect.height() {
             want_older = true;

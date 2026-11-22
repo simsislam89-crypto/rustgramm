@@ -28,6 +28,7 @@ pub(crate) mod pg {
     pub const DEVICES: usize = 8;
     pub const POWER: usize = 9;
     pub const RUSTGRAMM: usize = 10;
+    pub const PLUGINS: usize = 11;
 }
 
 fn title_of(p: usize) -> &'static str {
@@ -42,6 +43,7 @@ fn title_of(p: usize) -> &'static str {
         pg::DEVICES => "Активные сеансы",
         pg::POWER => "Энергосбережение",
         pg::RUSTGRAMM => "Rustgramm",
+        pg::PLUGINS => "Плагины и телефон",
         _ => "Настройки",
     }
 }
@@ -109,6 +111,19 @@ pub(crate) struct State {
     /// Подтверждение завершения сеанса (`Some(0)` — все остальные, `Some(hash)` — один).
     pub confirm_kill_session: Option<i64>,
     pub session_ttl_open: bool,
+    /// Момент открытия окна и смены страницы (для гарантированной 60fps iOS-анимации).
+    pub opened_at: Option<std::time::Instant>,
+    pub page_at: Option<std::time::Instant>,
+    /// История переходов по страницам настроек (для боковых кнопок мыши Назад / Вперёд).
+    pub page_back: Vec<usize>,
+    pub page_fwd: Vec<usize>,
+    /// Редактор нового пользовательского `.plugin` файла.
+    pub new_plugin_open: bool,
+    pub new_plugin_code: String,
+    pub new_plugin_err: String,
+    /// Отдельное модальное окно «Мой профиль» (как в AyuGram, без переброса в «Избранное»).
+    pub profile_open: bool,
+    pub profile_at: Option<std::time::Instant>,
 }
 
 /// Действия, собранные за кадр в окне настроек и выполняемые после отрисовки.
@@ -229,6 +244,7 @@ fn has_subview(st: &State, page: usize) -> bool {
                 || st.account_ttl_open))
         || (page == pg::LANGUAGE && st.dnt_open)
         || (page == pg::DEVICES && st.session_ttl_open)
+        || (page == pg::PLUGINS && st.new_plugin_open)
 }
 
 fn pop_subview(st: &mut State, page: &mut usize) {
@@ -254,6 +270,9 @@ fn pop_subview(st: &mut State, page: &mut usize) {
         st.dnt_open = false;
     } else if *page == pg::DEVICES && st.session_ttl_open {
         st.session_ttl_open = false;
+    } else if *page == pg::PLUGINS && st.new_plugin_open {
+        st.new_plugin_open = false;
+        st.new_plugin_err.clear();
     } else {
         *page = pg::MAIN;
     }
@@ -262,7 +281,11 @@ fn pop_subview(st: &mut State, page: &mut usize) {
 impl App {
     pub(crate) fn open_tg_settings(&mut self) {
         self.tgs.open = true;
+        self.tgs.opened_at = Some(std::time::Instant::now());
+        self.tgs.page_at = Some(std::time::Instant::now());
         self.tgs.page = pg::MAIN;
+        self.tgs.page_back.clear();
+        self.tgs.page_fwd.clear();
         self.tgs.filled = false;
         self.tgs.qr_open = false;
         self.tgs.search_open = false;
@@ -276,16 +299,42 @@ impl App {
         self.tgs.session_ttl_open = false;
         self.tgs.confirm_kill_session = None;
         self.tgs.confirm_clear_pay = false;
+        self.tgs.new_plugin_open = false;
+        self.send(Cmd::Account);
+    }
+
+    /// Открывает настоящее модальное окно «Мой профиль» (как в AyuGram, не переключая чат на «Избранное»).
+    pub(crate) fn open_my_profile(&mut self) {
+        self.tgs.profile_open = true;
+        self.tgs.profile_at = Some(std::time::Instant::now());
+        self.tgs.qr_open = false;
         self.send(Cmd::Account);
     }
 
     #[allow(deprecated)]
     pub(crate) fn tg_settings_window(&mut self, ctx: &egui::Context) {
-        let raw = tween(ctx, "tgs", f32::from(u8::from(self.tgs.open)), 0.2);
+        self.my_profile_window(ctx);
+        let tw = tween(ctx, "tgs", f32::from(u8::from(self.tgs.open)), 0.24);
+        let elapsed_k = self
+            .tgs
+            .opened_at
+            .map_or(1.0, |t| (t.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0));
+        if elapsed_k < 1.0 && self.tgs.open {
+            ctx.request_repaint();
+        }
+        let raw = if self.tgs.open { tw.min(elapsed_k) } else { tw };
         if raw < 0.005 && !self.tgs.open {
             return;
         }
         let appear = ios_spring(raw);
+        let page_k = self
+            .tgs
+            .page_at
+            .map_or(1.0, |t| (t.elapsed().as_secs_f32() / 0.18).clamp(0.0, 1.0));
+        if page_k < 1.0 {
+            ctx.request_repaint();
+        }
+        let page_slide = (1.0 - ios_spring(page_k)) * 18.0;
         let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("tgs-dim"))
             .order(egui::Order::Foreground)
@@ -299,6 +348,7 @@ impl App {
             });
         let mut s = self.settings.clone();
         let mut page = self.tgs.page;
+        let prev_page = page;
         let mut act = Actions::default();
         let max_h = (screen.height() - 36.0).clamp(320.0, 760.0);
         let was_open = self.tgs.open;
@@ -311,18 +361,40 @@ impl App {
         let dialogs = &self.dialogs;
         let has_emoji = self.emoji.is_some();
         let now = self.now;
+        let mut plugins_reg = self.plugins.clone();
+
+        // Боковые кнопки мыши (Назад Extra1 / Вперёд Extra2) внутри окна настроек.
+        let mouse_back = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
+        let mouse_fwd = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra2));
+        if mouse_back {
+            if has_subview(&st, page) {
+                pop_subview(&mut st, &mut page);
+            } else if let Some(prev) = st.page_back.pop() {
+                st.page_fwd.push(page);
+                page = prev;
+            } else if page != pg::MAIN {
+                st.page_fwd.push(page);
+                page = pg::MAIN;
+            } else {
+                act.close = true;
+            }
+        } else if mouse_fwd && let Some(next) = st.page_fwd.pop() {
+            st.page_back.push(page);
+            page = next;
+        }
 
         egui::Area::new(egui::Id::new("tgs-box"))
             .order(egui::Order::Tooltip)
-            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 20.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::new(page_slide, (1.0 - appear) * 32.0))
             .show(ctx, |ui| {
-                ui.set_opacity(raw.min(1.0).powf(0.55));
+                ui.set_opacity(appear.clamp(0.02, 1.0));
+                let scale = 0.94 + 0.06 * appear;
                 let card = egui::Frame::new()
                     .fill(t2(WINDOW_BG))
-                    .stroke(Stroke::new(1.0, Color32::from_white_alpha((26.0 * opacity_f32()) as u8)))
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha((32.0 * opacity_f32()) as u8)))
                     .corner_radius(CornerRadius::same(14))
                     .show(ui, |ui| {
-                        let width = BOX_W.min(screen.width() - 16.0);
+                        let width = (BOX_W * scale).min(screen.width() - 16.0);
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         let (head, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
@@ -351,7 +423,12 @@ impl App {
                             let r = ui.interact(back, ui.make_persistent_id("tgs-back"), Sense::click());
                             icons::back(ui.painter(), back.center(), if r.hovered() { WHITE } else { SUBTEXT });
                             if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                pop_subview(&mut st, &mut page);
+                                if sub_active {
+                                    pop_subview(&mut st, &mut page);
+                                } else {
+                                    st.page_fwd.push(page);
+                                    page = st.page_back.pop().unwrap_or(pg::MAIN);
+                                }
                             }
                         }
                         ui.painter().text(
@@ -385,6 +462,7 @@ impl App {
                                 ui.set_min_width(190.0);
                                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                                 if kit::menu_item(ui, "menu/edit", "Изменить профиль", false) {
+                                    st.page_back.push(page);
                                     page = pg::ACCOUNT;
                                     ui.close();
                                 }
@@ -426,16 +504,23 @@ impl App {
                                     pg::DEVICES => devices_page(ui, &mut st, now, &mut act),
                                     pg::POWER => power_page(ui, &mut s),
                                     pg::RUSTGRAMM => rustgramm_page(ui, &mut s, &mut act, has_emoji),
+                                    pg::PLUGINS => plugins_page(ui, &mut st, &mut s, &mut plugins_reg),
                                     _ => {
                                         if let Some(p) = main_page(ui, &mut st, &mut s, &me_name, me_tex, corners, streamer, &mut act) {
+                                            st.page_back.push(page);
+                                            st.page_fwd.clear();
                                             page = p;
                                         }
                                     }
                                 }
                             });
                     });
-                paint_glass_rim(ui.painter(), card.response.rect, 14.0);
+                paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
             });
+        self.plugins = plugins_reg;
+        if page != prev_page {
+            st.page_at = Some(std::time::Instant::now());
+        }
 
         if (page == pg::DATA || page == pg::RUSTGRAMM) && st.page != page {
             st.cache_bytes = dir_size(&worker::home().join("cache"));
@@ -641,6 +726,14 @@ fn main_page(
     // Первый пункт — как «AyuGram Preferences» в оригинале.
     if nav_row(ui, "menu/customize", "Настройки Rustgramm", "") {
         act.advanced = true;
+    }
+    let plug_lbl = if cfg!(feature = "plugins") {
+        if s.plugins_enabled { "Вкл (Full)" } else { "Выкл" }
+    } else {
+        "Lite (без плагинов)"
+    };
+    if nav_row(ui, "settings/stickers", "Плагины и телефон (Full / Lite)", plug_lbl) {
+        go = Some(pg::PLUGINS);
     }
     divider(ui);
     let sess_cnt = st
@@ -1606,4 +1699,375 @@ fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Ac
         act.clear_cache = true;
     }
     info_row(ui, "Версия", env!("CARGO_PKG_VERSION"));
+}
+
+fn plugins_page(
+    ui: &mut egui::Ui,
+    st: &mut State,
+    s: &mut rg_settings::Settings,
+    reg: &mut rg_ayu::plugins::PluginRegistry,
+) {
+    section(ui, "Режим сборки клиента");
+    info_row(
+        ui,
+        "Сборка",
+        if cfg!(feature = "plugins") {
+            "Полная (Full · с плагинами)"
+        } else {
+            "Облегчённая (Lite · без плагинов)"
+        },
+    );
+    if !cfg!(feature = "plugins") {
+        desc(ui, "Эта сборка скомпилирована с флагом --no-default-features (Lite без плагинов). Для полной версии используйте сборку Rustgramm-Android-Full / стандартный билд.");
+        return;
+    }
+    toggle(ui, "Включить систему плагинов", &mut s.plugins_enabled);
+    desc(ui, "Плагины работают локально на Rust (команды /shrug, /flip, /calc, /upper, макросы и ваши файлы .plugin в папке plugins/).");
+
+    divider(ui);
+    section(ui, &format!("Установленные плагины ({})", reg.plugins.len()));
+    let w = ui.available_width();
+    let mut remove_id: Option<String> = None;
+    let mut toggled = false;
+    for p in &mut reg.plugins {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 60.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 0.0, t(WINDOW_OVER));
+        }
+        let painter = ui.painter();
+        painter.text(
+            Pos2::new(rect.left() + kit::PAD, rect.top() + 14.0),
+            Align2::LEFT_CENTER,
+            format!("{}  v{}", p.name, p.version),
+            FontId::proportional(14.0),
+            WHITE,
+        );
+        let desc_clip = Rect::from_min_max(
+            Pos2::new(rect.left() + kit::PAD, rect.top() + 26.0),
+            Pos2::new(rect.right() - 80.0, rect.bottom()),
+        );
+        painter.with_clip_rect(desc_clip).text(
+            Pos2::new(rect.left() + kit::PAD, rect.top() + 36.0),
+            Align2::LEFT_CENTER,
+            &p.description,
+            FontId::proportional(12.0),
+            SUBTEXT,
+        );
+        let sw_c = Pos2::new(rect.right() - kit::PAD - 17.0, rect.center().y);
+        let track = Rect::from_center_size(sw_c, Vec2::new(34.0, 14.0));
+        painter.rect_filled(track, CornerRadius::same(7), if p.enabled { t_btn(ORANGE) } else { t_btn(navy(0x4b5866)) });
+        let kx = if p.enabled { track.right() - 7.0 } else { track.left() + 7.0 };
+        painter.circle_filled(Pos2::new(kx, track.center().y), 6.0, Color32::WHITE);
+        if !p.builtin {
+            let del_r = Rect::from_center_size(Pos2::new(track.left() - 22.0, rect.center().y), Vec2::splat(26.0));
+            let dr = ui.interact(del_r, ui.make_persistent_id(("delplg", &p.id)), Sense::click());
+            icons::tg(ui.painter(), "menu/delete", del_r.center(), if dr.hovered() { DANGER } else { SUBTEXT });
+            if dr.on_hover_text("Удалить плагин").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                remove_id = Some(p.id.clone());
+            }
+        }
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            p.enabled = !p.enabled;
+            toggled = true;
+        }
+    }
+    if let Some(id) = remove_id {
+        reg.remove(&id);
+        let _ = std::fs::remove_file(worker::home().join("plugins").join(format!("{id}.plugin")));
+        toggled = true;
+    }
+    if toggled {
+        s.disabled_plugins = reg.disabled_ids();
+    }
+
+    ui.add_space(8.0);
+    if !st.new_plugin_open {
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            if orange_button(ui, "Создать / установить .plugin", Vec2::new(220.0, 34.0)).clicked() {
+                st.new_plugin_open = true;
+                if st.new_plugin_code.is_empty() {
+                    st.new_plugin_code = "__id__ = \"user.greeting\"\n__name__ = \"Мои команды\"\n__version__ = \"1.0\"\n# cmd: /gm => \"Доброе утро! ☀️ {args}\"\n# replace: \":heart:\" => \"❤️\"".to_owned();
+                }
+            }
+        });
+    } else {
+        section(ui, "Код плагина (.plugin)");
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            ui.add_sized(
+                [w - 2.0 * kit::PAD, 110.0],
+                egui::TextEdit::multiline(&mut st.new_plugin_code)
+                    .code_editor()
+                    .desired_rows(5),
+            );
+        });
+        if !st.new_plugin_err.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(kit::PAD);
+                ui.colored_label(DANGER, &st.new_plugin_err);
+            });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            if orange_button(ui, "Установить плагин", Vec2::new(165.0, 32.0)).clicked() {
+                match rg_ayu::plugins::parse_plugin(&st.new_plugin_code) {
+                    Ok(p) => {
+                        let dir = worker::home().join("plugins");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(dir.join(format!("{}.plugin", p.id)), &st.new_plugin_code);
+                        reg.upsert(p);
+                        st.new_plugin_err.clear();
+                        st.new_plugin_open = false;
+                    }
+                    Err(e) => st.new_plugin_err = e,
+                }
+            }
+            ui.add_space(8.0);
+            if ui.button("Отмена").clicked() {
+                st.new_plugin_open = false;
+                st.new_plugin_err.clear();
+            }
+        });
+    }
+    ui.add_space(8.0);
+    if nav_row(ui, "menu/show_in_folder", "Открыть папку плагинов", "") {
+        let dir = worker::home().join("plugins");
+        let _ = std::fs::create_dir_all(&dir);
+        rg_core::media::open_downloaded(&dir);
+    }
+
+    divider(ui);
+    section(ui, "Настройки телефона (exteraGram / Android)");
+    toggle(ui, "Иконки Solar и квадратная FAB-кнопка", &mut s.extera.use_solar_icons);
+    toggle(ui, "Центрировать заголовок шапки", &mut s.extera.center_title);
+    toggle(ui, "Скрыть статус в шапке", &mut s.extera.hide_action_bar_status);
+    toggle(ui, "Скрывать клавиатуру при прокрутке чата", &mut s.extera.hide_keyboard_on_scroll);
+    toggle(ui, "Ускорение загрузки медиа (Speed Boost)", &mut s.extera.upload_speed_boost);
+    toggle(ui, "Показывать секунды во времени", &mut s.extera.format_time_with_seconds);
+    toggle(ui, "Архив по свайпу вниз", &mut s.extera.archive_on_pull);
+}
+
+impl App {
+    /// Модальное окно «Мой профиль» (как в AyuGram на скрине 10 — поверх текущего чата, без перехода в «Избранное»).
+    #[allow(deprecated)]
+    pub(crate) fn my_profile_window(&mut self, ctx: &egui::Context) {
+        let tw = tween(ctx, "my-prof-win", f32::from(u8::from(self.tgs.profile_open)), 0.24);
+        let elapsed_k = self
+            .tgs
+            .profile_at
+            .map_or(1.0, |t| (t.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0));
+        if elapsed_k < 1.0 && self.tgs.profile_open {
+            ctx.request_repaint();
+        }
+        let raw = if self.tgs.profile_open { tw.min(elapsed_k) } else { tw };
+        if raw < 0.005 && !self.tgs.profile_open {
+            return;
+        }
+        let appear = ios_spring(raw);
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("my-prof-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                paint_frosted_scrim(ui.painter(), rect, raw);
+                if resp.clicked() {
+                    self.tgs.profile_open = false;
+                }
+            });
+
+        let me_info = self.tgs.account.as_ref().map(|a| a.me.clone()).unwrap_or_default();
+        let name = if me_info.name.is_empty() { self.me.clone() } else { me_info.name.clone() };
+        let me_tex = self.dialogs.iter().find(|d| d.saved).and_then(|d| self.avatars.get(&d.id));
+        let corners = self.settings.ayu.avatar_corners;
+        let streamer = self.settings.ayu.streamer_mode;
+        let cur_audio_title = self.audio_title.clone();
+        let cur_audio_playing = self.audio_is_playing();
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.button_clicked(egui::PointerButton::Extra1));
+        let mut edit_account = false;
+        let mut show_qr = false;
+        let mut play_track: Option<rg_core::engine::AudioTrack> = None;
+        let mut toggle_audio = false;
+
+        egui::Area::new(egui::Id::new("my-prof-box"))
+            .order(egui::Order::Tooltip)
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 32.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(appear.clamp(0.02, 1.0));
+                let scale = 0.94 + 0.06 * appear;
+                let card = egui::Frame::new()
+                    .fill(t2(WINDOW_BG))
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha((32.0 * opacity_f32()) as u8)))
+                    .corner_radius(CornerRadius::same(14))
+                    .show(ui, |ui| {
+                        let width = (376.0 * scale).min(screen.width() - 16.0);
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+
+                        // Верхняя панель: аватар по центру, карандаш редактирования и крестик справа (1 в 1 со скрином 10 AyuGram!).
+                        let (top, _) = ui.allocate_exact_size(Vec2::new(width, 168.0), Sense::hover());
+                        let ed_r = Rect::from_center_size(Pos2::new(top.right() - 58.0, top.top() + 24.0), Vec2::splat(32.0));
+                        let ed_resp = ui.interact(ed_r, ui.make_persistent_id("mp-edit"), Sense::click());
+                        icons::tg(ui.painter(), "info/info_edit", ed_r.center(), if ed_resp.hovered() { WHITE } else { SUBTEXT });
+                        if ed_resp.on_hover_text("Изменить профиль").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            edit_account = true;
+                        }
+                        let x_r = Rect::from_center_size(Pos2::new(top.right() - 24.0, top.top() + 24.0), Vec2::splat(32.0));
+                        let x_resp = ui.interact(x_r, ui.make_persistent_id("mp-close"), Sense::click());
+                        icons::tg(ui.painter(), "info/info_close", x_r.center(), if x_resp.hovered() { WHITE } else { SUBTEXT });
+                        if x_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            close = true;
+                        }
+
+                        draw_avatar(ui, Pos2::new(top.center().x, top.top() + 58.0), &name, 1, 82.0, me_tex, corners);
+                        let p = ui.painter();
+                        let ng = p.layout_no_wrap(name.clone(), FontId::proportional(17.5), WHITE);
+                        let has_badge = me_info.emoji_status.is_some() || me_info.verified || me_info.premium;
+                        let nx = top.center().x - if has_badge { 10.0 } else { 0.0 };
+                        p.text(Pos2::new(nx, top.top() + 120.0), Align2::CENTER_CENTER, &name, FontId::proportional(17.5), WHITE);
+                        if has_badge {
+                            let bc = Pos2::new(nx + ng.size().x * 0.5 + 12.0, top.top() + 120.0);
+                            if let Some(doc_id) = me_info.emoji_status
+                                && let Some(tex) = self.sticker_tex.get(&doc_id)
+                            {
+                                egui::Image::new(tex)
+                                    .fit_to_exact_size(Vec2::splat(17.0))
+                                    .paint_at(ui, Rect::from_center_size(bc, Vec2::splat(17.0)));
+                            } else {
+                                icons::tg(ui.painter(), "dialogs/dialogs_premium", bc, ORANGE);
+                            }
+                        }
+                        p.text(
+                            Pos2::new(top.center().x, top.top() + 144.0),
+                            Align2::CENTER_CENTER,
+                            if me_info.status.is_empty() { "в сети" } else { &me_info.status },
+                            FontId::proportional(13.0),
+                            SUBTEXT,
+                        );
+
+                        // Музыка в вашем профиле (если добавлена).
+                        if !me_info.saved_music.is_empty() {
+                            for track in me_info.saved_music.iter().take(2) {
+                                let title = track.display_title();
+                                let is_cur = cur_audio_title == title && !title.is_empty();
+                                let (mr, mresp) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::click());
+                                let c_rect = Rect::from_min_max(mr.min + Vec2::new(14.0, 2.0), mr.max - Vec2::new(14.0, 2.0));
+                                ui.painter().rect_filled(
+                                    c_rect,
+                                    CornerRadius::same(10),
+                                    if is_cur { t_btn(ORANGE).gamma_multiply(0.28) } else { t(WINDOW_OVER) },
+                                );
+                                let ic_r = Rect::from_min_size(c_rect.min + Vec2::new(6.0, 5.0), Vec2::splat(30.0));
+                                ui.painter().rect_filled(ic_r, CornerRadius::same(7), t_btn(ORANGE));
+                                icons::tg_sized(
+                                    ui.painter(),
+                                    if is_cur && cur_audio_playing { "media_pause" } else { "media_play" },
+                                    ic_r.center(),
+                                    Vec2::splat(14.0),
+                                    Color32::WHITE,
+                                );
+                                ui.painter().text(
+                                    Pos2::new(ic_r.right() + 10.0, c_rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    &title,
+                                    FontId::proportional(13.0),
+                                    WHITE,
+                                );
+                                if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    if is_cur {
+                                        toggle_audio = true;
+                                    } else {
+                                        play_track = Some(track.clone());
+                                    }
+                                }
+                            }
+                            ui.add_space(6.0);
+                        }
+
+                        divider(ui);
+
+                        // Поля профиля (как на скрине 10 справа: Mobile, Bio, @username + QR, ID + DC).
+                        let field_row = |ui: &mut egui::Ui, val: &str, lbl: &str, val_color: Color32, with_qr: bool| -> bool {
+                            if val.is_empty() {
+                                return false;
+                            }
+                            let g = ui.painter().layout(val.to_owned(), FontId::proportional(14.0), val_color, (width - 64.0).max(100.0));
+                            let h = (g.size().y + 32.0).max(52.0);
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(width, h), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
+                            }
+                            ui.painter().galley(Pos2::new(r.left() + 20.0, r.top() + 9.0), g.clone(), val_color);
+                            ui.painter().text(
+                                Pos2::new(r.left() + 20.0, r.top() + 13.0 + g.size().y + 7.0),
+                                Align2::LEFT_CENTER,
+                                lbl,
+                                FontId::proportional(12.0),
+                                SUBTEXT,
+                            );
+                            let mut qr_clicked = false;
+                            if with_qr {
+                                let qr_box = Rect::from_center_size(Pos2::new(r.right() - 28.0, r.center().y), Vec2::splat(32.0));
+                                let qresp = ui.interact(qr_box, ui.make_persistent_id("mp-qr"), Sense::click());
+                                icons::tg(ui.painter(), "menu/qr_code", qr_box.center(), if qresp.hovered() { WHITE } else { ORANGE });
+                                if qresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    qr_clicked = true;
+                                }
+                            } else if resp.on_hover_text("Нажмите, чтобы скопировать").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                ui.ctx().copy_text(val.to_owned());
+                            }
+                            qr_clicked
+                        };
+
+                        if !me_info.phone.is_empty() {
+                            field_row(ui, &mask_streamer(&format!("+{}", me_info.phone), streamer), "Мобильный", WHITE, false);
+                        }
+                        if !me_info.about.is_empty() {
+                            field_row(ui, &me_info.about, "О себе", WHITE, false);
+                        }
+                        if !me_info.username.is_empty()
+                            && field_row(ui, &mask_streamer(&format!("@{}", me_info.username), streamer), "Имя пользователя", ORANGE, true)
+                        {
+                            show_qr = true;
+                        }
+                        if !me_info.birthday.is_empty() {
+                            field_row(ui, &me_info.birthday, "День рождения", WHITE, false);
+                        }
+                        if me_info.id != 0 {
+                            field_row(ui, &mask_streamer(&me_info.id.to_string(), streamer), "DC · ID аккаунта", ORANGE, false);
+                        }
+
+                        divider(ui);
+                        let (foot, _) = ui.allocate_exact_size(Vec2::new(width, 62.0), Sense::hover());
+                        ui.painter().text(
+                            foot.center(),
+                            Align2::CENTER_CENTER,
+                            "Здесь отображаются ваши истории и музыка профиля.",
+                            FontId::proportional(12.5),
+                            SUBTEXT,
+                        );
+                    });
+                paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
+            });
+
+        if let Some(tr) = play_track {
+            self.send(Cmd::PlayTrack(tr));
+        }
+        if toggle_audio {
+            self.toggle_audio_playback();
+        }
+        if edit_account {
+            self.tgs.profile_open = false;
+            self.open_tg_settings();
+            self.tgs.page = pg::ACCOUNT;
+        } else if show_qr {
+            self.tgs.profile_open = false;
+            self.open_tg_settings();
+            self.tgs.qr_open = true;
+        } else if close {
+            self.tgs.profile_open = false;
+        }
+    }
 }

@@ -10,7 +10,7 @@ mod media_ui;
 mod panels;
 mod rich;
 mod settings_ui;
-mod stream;
+pub mod stream;
 mod tg_settings;
 pub mod theme;
 mod win;
@@ -177,6 +177,7 @@ struct App {
     passcode_checked: bool,
     /// Встроенный аудиоплеер (музыка профиля, голосовые, аудиофайлы).
     audio_path: Option<std::path::PathBuf>,
+    audio_stream: Option<String>,
     audio_title: String,
     audio_dur: u32,
     audio_vol: f32,
@@ -184,6 +185,19 @@ struct App {
     audio_view: Option<video::AudioView>,
     #[cfg(windows)]
     player: Option<video::VideoView>,
+    /// Реестр плагинов Rustgramm (встроенные + пользовательские `.plugin`).
+    plugins: rg_ayu::plugins::PluginRegistry,
+    /// Время открытия окна настроек Rustgramm (для плавной пружинной анимации).
+    settings_opened_at: Option<std::time::Instant>,
+    /// История переходов по чатам для боковых кнопок мыши (Back/Forward) и Alt+←/→.
+    chat_nav_back: Vec<i64>,
+    chat_nav_fwd: Vec<i64>,
+    nav_jumping: bool,
+    /// Стек отката/возврата текста в поле ввода (`Ctrl+Z` / `Ctrl+Y` и кнопки мыши).
+    input_undo: Vec<String>,
+    input_redo: Vec<String>,
+    /// Якорь быстрого скролла при нажатии/зажатии колёсика мыши (Middle Click Auto-Scroll).
+    autoscroll_anchor: Option<egui::Pos2>,
     refresh_at: Option<std::time::Instant>,
     featured_sets: Vec<StickerSetRow>,
     emoji_sets_requested: bool,
@@ -355,6 +369,7 @@ impl App {
             lock_err: String::new(),
             passcode_checked: false,
             audio_path: None,
+            audio_stream: None,
             audio_title: String::new(),
             audio_dur: 0,
             audio_vol: 1.0,
@@ -362,6 +377,18 @@ impl App {
             audio_view: None,
             #[cfg(windows)]
             player: None,
+            plugins: {
+                let mut reg = rg_ayu::plugins::PluginRegistry::with_builtins();
+                let _ = reg.load_dir(&worker::home().join("plugins"));
+                reg
+            },
+            settings_opened_at: None,
+            chat_nav_back: Vec::new(),
+            chat_nav_fwd: Vec::new(),
+            nav_jumping: false,
+            input_undo: Vec::new(),
+            input_redo: Vec::new(),
+            autoscroll_anchor: None,
             refresh_at: None,
             featured_sets: Vec::new(),
             emoji_sets_requested: false,
@@ -419,7 +446,10 @@ impl App {
         let open_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
         match l {
             Live::Message(key, row) => {
-                let row = *row;
+                let mut row = *row;
+                if cfg!(feature = "plugins") && self.settings.plugins_enabled && !row.outgoing {
+                    row.text = self.plugins.apply_incoming(&row.text);
+                }
                 let row_snapshot = (row.date, row.outgoing, row.text.chars().take(80).collect::<String>());
                 if open_id == Some(key) {
                     let idx = self.selected.unwrap_or(0);
@@ -627,8 +657,18 @@ impl App {
             v.stop();
         }
         self.audio_path = None;
+        self.audio_stream = None;
         self.audio_title.clear();
         self.audio_dur = 0;
+    }
+
+    /// Отмечает все чаты прочитанными на сервере и мгновенно обнуляет счётчики непрочитанных в UI.
+    pub(crate) fn force_read_all(&mut self) {
+        for d in &mut self.dialogs {
+            d.unread = 0;
+        }
+        self.status = "Отмечаем чаты прочитанными на сервере…".to_owned();
+        self.send(Cmd::ForceReadAll);
     }
 
     /// Мини-плеер музыки/аудио сверху чата (как в Telegram/AyuGram).
@@ -738,23 +778,32 @@ impl App {
         }
     }
 
-    /// Синхронизирует скрытый WebView2 аудиоплеер с текущим треком (создаётся только при проигрывании).
+    /// Синхронизирует скрытый WebView2 аудиоплеер с текущим треком (файл или потоковый HTTP Range URL).
     #[cfg(windows)]
     fn audio_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let Some(path) = self.audio_path.clone() else {
+        let has_source = self.audio_path.is_some() || self.audio_stream.is_some();
+        if !has_source {
             if let Some(v) = self.audio_view.take() {
                 v.stop();
             }
             return;
-        };
+        }
         if self.audio_view.is_none() {
             let dir = worker::home().join("audio_player");
-            match video::AudioView::new(frame, &path, &dir, self.audio_vol) {
+            let built = if let Some(url) = &self.audio_stream {
+                video::AudioView::new_url(frame, url, &dir, self.audio_vol)
+            } else if let Some(path) = &self.audio_path {
+                video::AudioView::new(frame, path, &dir, self.audio_vol)
+            } else {
+                return;
+            };
+            match built {
                 Ok(v) => self.audio_view = Some(v),
                 Err(e) => {
                     self.error = e;
                     self.error_at = self.now;
                     self.audio_path = None;
+                    self.audio_stream = None;
                     return;
                 }
             }
@@ -928,6 +977,7 @@ impl App {
             || self.drawer_open
             || self.settings_open
             || self.tgs.open
+            || self.tgs.profile_open
             || self.contacts_open
             || self.create_kind != 0
             || self.forward.is_some()
@@ -1057,6 +1107,18 @@ impl App {
 
     /// Открыть чат из списка (мгновенно из кэша в памяти, если уже открывался).
     fn open_dialog(&mut self, i: usize) {
+        if !self.nav_jumping
+            && let Some(prev_id) = self.selected.and_then(|cur| self.dialogs.get(cur)).map(|d| d.id)
+            && self.dialogs.get(i).is_none_or(|d| d.id != prev_id)
+        {
+            if self.chat_nav_back.last() != Some(&prev_id) {
+                self.chat_nav_back.push(prev_id);
+                if self.chat_nav_back.len() > 32 {
+                    self.chat_nav_back.remove(0);
+                }
+            }
+            self.chat_nav_fwd.clear();
+        }
         self.reset_chat_state();
         self.selected = Some(i);
         if let Some(id) = self.dialogs.get(i).map(|d| d.id) {
@@ -1112,6 +1174,120 @@ impl App {
         self.older_pending = false;
         self.history_end = false;
         self.scroll_to = None;
+        self.autoscroll_anchor = None;
+    }
+
+    /// Горячие клавиши и боковые кнопки мыши (Mouse Back / Forward, быстрые переходы, чтение на сервере).
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.app_locked || self.stage != Stage::Ready {
+            return;
+        }
+        let modal_open = self.tgs.open
+            || self.tgs.profile_open
+            || self.settings_open
+            || self.contacts_open
+            || self.create_kind != 0
+            || self.drawer_open
+            || self.viewer.is_some()
+            || self.forward.is_some();
+
+        // Боковые кнопки мыши (Extra1 = Назад, Extra2 = Вперёд) и Alt+← / Alt+→ для истории чатов.
+        if !modal_open {
+            let nav_back = ctx.input(|i| {
+                i.pointer.button_clicked(egui::PointerButton::Extra1)
+                    || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft))
+            });
+            let nav_fwd = ctx.input(|i| {
+                i.pointer.button_clicked(egui::PointerButton::Extra2)
+                    || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight))
+            });
+            if nav_back {
+                while let Some(prev_id) = self.chat_nav_back.pop() {
+                    if let Some(pos) = self.dialogs.iter().position(|d| d.id == prev_id) {
+                        if let Some(cur_id) = self.selected.and_then(|c| self.dialogs.get(c)).map(|d| d.id) {
+                            self.chat_nav_fwd.push(cur_id);
+                        }
+                        self.nav_jumping = true;
+                        self.open_dialog(pos);
+                        self.nav_jumping = false;
+                        break;
+                    }
+                }
+            } else if nav_fwd {
+                while let Some(next_id) = self.chat_nav_fwd.pop() {
+                    if let Some(pos) = self.dialogs.iter().position(|d| d.id == next_id) {
+                        if let Some(cur_id) = self.selected.and_then(|c| self.dialogs.get(c)).map(|d| d.id) {
+                            self.chat_nav_back.push(cur_id);
+                        }
+                        self.nav_jumping = true;
+                        self.open_dialog(pos);
+                        self.nav_jumping = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Ctrl+, — открыть Настройки Telegram.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.open_tg_settings();
+        }
+        // Ctrl+P — открыть карточку «Мой профиль».
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.open_my_profile();
+        }
+        // Ctrl+F — поиск сообщений в открытом чате.
+        if self.selected.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
+        {
+            self.search_open = !self.search_open;
+            if !self.search_open {
+                self.chat_search.clear();
+                self.found = None;
+            }
+        }
+        // Ctrl+Shift+R — отметить все чаты прочитанными на сервере.
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::R)
+        }) {
+            self.force_read_all();
+        }
+        // Ctrl+L — заблокировать приложение локальным код-паролем.
+        if !self.settings.security.passcode_hash.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::L))
+        {
+            self.app_locked = true;
+        }
+        // Ctrl+Up / Ctrl+Down — быстрое переключение на предыдущий / следующий чат.
+        if !modal_open && !self.dialogs.is_empty() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp)) {
+                let next = match self.selected {
+                    Some(i) if i > 0 => i - 1,
+                    _ => 0,
+                };
+                self.open_dialog(next);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown)) {
+                let next = match self.selected {
+                    Some(i) if i + 1 < self.dialogs.len() => i + 1,
+                    Some(i) => i,
+                    None => 0,
+                };
+                self.open_dialog(next);
+            }
+        }
+        // Ctrl+Tab — переключение вкладок папок.
+        if !modal_open
+            && !self.folders.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab))
+        {
+            self.folder = match self.folder {
+                None => self.folders.first().map(|f| f.id),
+                Some(cur) => {
+                    let pos = self.folders.iter().position(|f| f.id == cur);
+                    pos.and_then(|idx| self.folders.get(idx + 1)).map(|f| f.id)
+                }
+            };
+        }
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -1162,7 +1338,18 @@ impl App {
                     if let Some(v) = self.audio_view.take() {
                         v.stop();
                     }
+                    self.audio_stream = None;
                     self.audio_path = Some(path);
+                    self.audio_title = title;
+                    self.audio_dur = dur;
+                }
+                Ev::StreamAudio(url, title, dur) => {
+                    #[cfg(windows)]
+                    if let Some(v) = self.audio_view.take() {
+                        v.stop();
+                    }
+                    self.audio_path = None;
+                    self.audio_stream = Some(url);
                     self.audio_title = title;
                     self.audio_dur = dur;
                 }
@@ -1307,6 +1494,7 @@ impl App {
                 }
                 Ev::Settings(s) => {
                     self.settings = *s;
+                    self.plugins.sync_disabled(&self.settings.disabled_plugins);
                     if !self.passcode_checked {
                         self.passcode_checked = true;
                         if !self.settings.security.passcode_hash.is_empty() {
@@ -1863,7 +2051,12 @@ impl App {
             match a {
                 DialogAct::Pin(on) => self.send(Cmd::PinDialog(i, on)),
                 DialogAct::Mute(on) => self.send(Cmd::MuteDialog(i, on)),
-                DialogAct::Read => self.send(Cmd::ReadDialog(i)),
+                DialogAct::Read => {
+                    if let Some(d) = self.dialogs.get_mut(i) {
+                        d.unread = 0;
+                    }
+                    self.send(Cmd::ReadDialog(i));
+                }
                 DialogAct::Archive(on) => self.send(Cmd::Archive(i, on)),
             }
         }
@@ -2013,6 +2206,7 @@ impl eframe::App for App {
             self.emoji = emoji::Emoji::load(&ctx);
         }
         self.drain_events(&ctx);
+        self.handle_shortcuts(&ctx);
         self.now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(self.now, |d| d.as_secs() as i64);
@@ -2083,7 +2277,7 @@ impl eframe::App for App {
             .exact_size(TOP_BAR_HEIGHT)
             .frame(egui::Frame::new().fill(tint_panel()))
             .show(ui, |ui| self.header_ui(ui, narrow));
-        if self.audio_path.is_some() {
+        if self.audio_path.is_some() || self.audio_stream.is_some() {
             egui::Panel::top("audio-bar")
                 .exact_size(40.0)
                 .frame(egui::Frame::new().fill(t(WINDOW_BG)))
@@ -2157,6 +2351,7 @@ impl eframe::App for App {
         self.create_window(&ctx);
         self.settings_window(&ctx);
         self.tg_settings_window(&ctx);
+        self.my_profile_window(&ctx);
         self.proxy_window(&ctx);
         self.toasts_overlay(&ctx);
         #[cfg(windows)]

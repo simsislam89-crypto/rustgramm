@@ -1,5 +1,10 @@
 //! Rustgramm для Android: тонкая оболочка NativeActivity над общим интерфейсом `rg-ui`.
-//! Весь интерфейс и вся логика общие с ПК; здесь только точка входа и каталог данных.
+//! Поддерживает две сборки:
+//! - Полная (с плагинами, по умолчанию `--features plugins`): `Rustgramm-Android-Full.apk`
+//! - Облегчённая (без плагинов, `--no-default-features`): `Rustgramm-Android-Lite.apk`
+
+/// Включена ли система плагинов в этой сборке Android-клиента.
+pub const WITH_PLUGINS: bool = cfg!(feature = "plugins");
 
 /// Точка входа NativeActivity. Каталог данных приложения — во внутреннем хранилище
 /// (недоступен другим приложениям).

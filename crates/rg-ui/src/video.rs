@@ -230,9 +230,12 @@ pub struct AudioView {
 
 impl AudioView {
     pub fn new(window: &impl HasWindowHandle, audio: &Path, dir: &Path, volume: f32) -> Result<Self, String> {
+        Self::new_url(window, &file_url(audio), dir, volume)
+    }
+
+    pub fn new_url(window: &impl HasWindowHandle, src: &str, dir: &Path, volume: f32) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let html_path = dir.join("audio.html");
-        let src = file_url(audio);
         let vol = volume.clamp(0.0, 1.0);
         let html = format!(
             "<!doctype html><html><head><meta charset=utf-8></head><body>\

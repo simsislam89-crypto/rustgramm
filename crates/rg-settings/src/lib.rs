@@ -239,6 +239,10 @@ pub struct Settings {
     pub ayu: AyuSettings,
     /// Настройки exteraGram (основа Android-версии).
     pub extera: ExteraSettings,
+    /// Включена ли система плагинов (полная версия для телефона и ПК).
+    pub plugins_enabled: bool,
+    /// Идентификаторы отключённых пользователем плагинов.
+    pub disabled_plugins: Vec<String>,
     /// Фильтры сообщений.
     pub filters: Vec<Filter>,
     /// Настройки уведомлений и звуков.
@@ -273,6 +277,8 @@ impl Default for Settings {
             user_hosts: Vec::new(),
             ayu: AyuSettings::default(),
             extera: ExteraSettings::default(),
+            plugins_enabled: true,
+            disabled_plugins: vec!["extera.typography".to_owned()],
             filters: Vec::new(),
             notify: NotifySettings::default(),
             language: LanguageSettings::default(),

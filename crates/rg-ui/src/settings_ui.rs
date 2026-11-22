@@ -190,6 +190,7 @@ impl App {
             Some("prefs") => {
                 self.drawer_open = false;
                 self.settings_open = true;
+                self.settings_opened_at = Some(std::time::Instant::now());
                 self.settings_tab = page::MENU;
             }
             Some("settings") => {
@@ -204,7 +205,7 @@ impl App {
             }
             Some("read") => {
                 self.drawer_open = false;
-                self.send(Cmd::ForceRead);
+                self.force_read_all();
             }
             Some("contacts") => {
                 self.drawer_open = false;
@@ -214,10 +215,7 @@ impl App {
             }
             Some("profile") => {
                 self.drawer_open = false;
-                if let Some(i) = self.dialogs.iter().position(|d| d.saved) {
-                    self.open_dialog(i);
-                    self.info_open = true;
-                }
+                self.open_my_profile();
             }
             Some("group") => {
                 self.drawer_open = false;
@@ -268,7 +266,14 @@ impl App {
     #[allow(deprecated)]
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         self.logout_window(ctx);
-        let raw = tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.2);
+        let tw = tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.24);
+        let elapsed_k = self
+            .settings_opened_at
+            .map_or(1.0, |t| (t.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0));
+        if elapsed_k < 1.0 && self.settings_open {
+            ctx.request_repaint();
+        }
+        let raw = if self.settings_open { tw.min(elapsed_k) } else { tw };
         let appear = ios_spring(raw);
         if raw < 0.005 && !self.settings_open {
             return;
@@ -287,6 +292,16 @@ impl App {
         let mut s = self.settings.clone();
         let mut tab = self.settings_tab;
         let mut close = false;
+        if ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
+            if tab != page::MENU {
+                tab = match tab {
+                    page::SHARED | page::SHADOW => page::FILTERS,
+                    _ => page::MENU,
+                };
+            } else {
+                close = true;
+            }
+        }
         let mut new_filter = std::mem::take(&mut self.filter_new);
         let mut shadow_new = std::mem::take(&mut self.shadow_new);
         let mut expanded = self.expanded;
@@ -295,14 +310,16 @@ impl App {
         let max_h = (screen.height() - 40.0).clamp(240.0, 700.0);
         egui::Area::new(egui::Id::new("prefs-box"))
             .order(egui::Order::Tooltip)
-            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 18.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 32.0))
             .show(ctx, |ui| {
-                ui.set_opacity(raw.min(1.0).powf(0.6));
-                egui::Frame::new()
+                ui.set_opacity(appear.clamp(0.02, 1.0));
+                let scale = 0.94 + 0.06 * appear;
+                let card = egui::Frame::new()
                     .fill(t2(WINDOW_BG))
-                    .corner_radius(CornerRadius::same(10))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha((32.0 * opacity_f32()) as u8)))
+                    .corner_radius(CornerRadius::same(14))
                     .show(ui, |ui| {
-                        let width = BOX_W.min(screen.width() - 16.0);
+                        let width = (BOX_W * scale).min(screen.width() - 16.0);
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         // Шапка.
@@ -367,6 +384,7 @@ impl App {
                                 }
                             });
                     });
+                paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
             });
         self.filter_new = new_filter;
         self.shadow_new = shadow_new;
@@ -1124,7 +1142,7 @@ impl App {
                             }
                         });
                     });
-                paint_glass_rim(ui.painter(), card.response.rect, 14.0);
+                paint_modal_subblur(ui.painter(), card.response.rect, 14.0, 1.0);
             });
         if create {
             let members: Vec<_> = self

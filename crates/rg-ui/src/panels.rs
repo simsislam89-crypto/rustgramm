@@ -131,15 +131,15 @@ impl App {
         let max_h = (screen.height() - 60.0).clamp(240.0, 640.0);
         egui::Area::new(egui::Id::new("contacts-box"))
             .order(egui::Order::Tooltip)
-            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 18.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 28.0))
             .show(ctx, |ui| {
-                ui.set_opacity(raw.min(1.0).powf(0.6));
-                egui::Frame::new()
+                ui.set_opacity(appear.clamp(0.02, 1.0));
+                let card = egui::Frame::new()
                     .fill(t2(WINDOW_BG))
-                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
-                    .corner_radius(CornerRadius::same(12))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28)))
+                    .corner_radius(CornerRadius::same(14))
                     .show(ui, |ui| {
-                        let width = 380.0_f32.min(screen.width() - 16.0);
+                        let width = (380.0_f32 * (0.94 + 0.06 * appear)).min(screen.width() - 16.0);
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         let (head, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
@@ -197,6 +197,7 @@ impl App {
                         });
                         ui.add_space(8.0);
                     });
+                paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
             });
         for (peer, id) in want_avatar {
             if self.contact_av_req.insert(id) {
