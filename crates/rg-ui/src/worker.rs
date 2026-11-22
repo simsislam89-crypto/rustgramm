@@ -218,6 +218,12 @@ pub enum Cmd {
         label: String,
         proxy_url: String,
     },
+    /// Быстрое добавление аккаунта как в Telegram/AyuGram: сразу создаёт изолированный слот и открывает вход.
+    AddAccountAuto,
+    /// Окончательно удалить уже удалённое сообщение только у себя из локальной БД/кэша.
+    PurgeLocal(i32),
+    /// Окончательно убрать все сохранённые удалённые сообщения открытого чата только у себя.
+    PurgeAllDeleted,
     /// Удалить дополнительный изолированный слот аккаунта (`slot > 0`).
     RemoveAccountSlot(u32),
     Settings(Box<Settings>),
@@ -308,6 +314,12 @@ pub enum Ev {
         id: i64,
         post: Option<i32>,
     },
+    /// Локально скрыто уже удалённое сообщение (удалено только у себя).
+    LocalPurged(i64, i32),
+    /// Локально скрыты все удалённые сообщения чата.
+    LocalPurgedAll(i64),
+    /// Бесшовное переключение слота аккаунта без перезапуска процесса (для Android и ПК).
+    ResetSession,
     Status(String),
     Error(String),
 }
@@ -315,10 +327,14 @@ pub enum Ev {
 /// Каталог данных на Android задаёт оболочка до запуска интерфейса.
 pub static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Ключи, вшитые при сборке (`RG_BUILTIN_API_ID` и `RG_BUILTIN_API_HASH`).
+/// Ключи, вшитые при сборке (`RG_BUILTIN_API_ID` и `RG_BUILTIN_API_HASH`),
+/// или стандартные открытые ключи Telegram Desktop (`tdesktop`) как запасной вариант,
+/// чтобы вход с телефона и ПК сразу открывал ввод номера / QR без запроса API.
 fn builtin_keys() -> Option<Config> {
-    let id = option_env!("RG_BUILTIN_API_ID")?;
-    let hash = option_env!("RG_BUILTIN_API_HASH")?;
+    let id = option_env!("RG_BUILTIN_API_ID").filter(|s| !s.trim().is_empty()).unwrap_or("2040");
+    let hash = option_env!("RG_BUILTIN_API_HASH")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("b18441a1ff607e10a989891a5462e627");
     Config::from_lookup(|k| match k {
         "RG_API_ID" => Some(id.to_owned()),
         "RG_API_HASH" => Some(hash.to_owned()),
@@ -575,14 +591,6 @@ fn load_history_cache(home: &std::path::Path, dialog_id: i64) -> Option<Vec<Mess
     (!rows.is_empty()).then_some(rows)
 }
 
-/// Запускает новую копию приложения и завершает текущую.
-fn restart_app() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
-    }
-    std::process::exit(0);
-}
-
 fn load_settings(path: &std::path::Path) -> Settings {
     match std::fs::read_to_string(path) {
         Ok(s) => Settings::from_json(&s).unwrap_or_default(),
@@ -624,141 +632,155 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let out = Out { ev, ctx };
     let root_home = home();
     let settings_path = root_home.join("settings.json");
-    let mut settings = load_settings(&settings_path);
-    if settings.accounts.is_empty() {
-        settings.accounts.push(rg_settings::AccountProfile::default());
-    }
-    let home = account_home(&root_home, settings.active_account);
-    wipe_if_logged_out(&home);
-    if settings.privacy_shield.ephemeral_local_cache {
-        let _ = std::fs::remove_file(home.join("dialogs_cache.json"));
-        let _ = std::fs::remove_dir_all(home.join("cache").join("history"));
-    }
-    // Ключи: переменные окружения или файл `api.keys` (две строки: api_id, api_hash).
-    let mut cfg = loop {
-        if let Some(c) = Config::from_env()
-            .ok()
-            .or_else(|| keys_from_file(&root_home))
-            .or_else(builtin_keys) {
-            break c;
-        }
-        out.send(Ev::Stage(Stage::NeedKeys));
-        match cmds.recv().await {
-            Some(Cmd::Keys(id, hash)) => match id.trim().parse::<i32>() {
-                Ok(n) if n > 0 && !hash.trim().is_empty() => {
-                    let _ = std::fs::write(root_home.join("api.keys"), format!("{n}\n{}\n", hash.trim()));
-                }
-                _ => out.err("api_id — число, api_hash — строка из 32 символов"),
-            },
-            Some(_) => {}
-            None => return,
-        }
-    };
-    cfg.session_path = home.join("main.session").to_string_lossy().into_owned();
-    if cfg.proxy_url.is_none() {
-        cfg.proxy_url = std::fs::read_to_string(home.join("proxy.txt"))
-            .or_else(|_| std::fs::read_to_string(root_home.join("proxy.txt")))
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| s.starts_with("socks5://"));
-    }
-    if settings.privacy_shield.anti_correlation_accounts
-        && let Some(prof) = settings.accounts.iter().find(|a| a.slot == settings.active_account)
-    {
-        cfg.device_model = Some(prof.device_model.clone());
-        cfg.system_version = Some(prof.system_version.clone());
-        cfg.app_version = Some(prof.app_version.clone());
-        cfg.lang_code = Some(prof.lang_code.clone());
-        if !prof.proxy_url.is_empty() && prof.proxy_url.starts_with("socks5://") {
-            cfg.proxy_url = Some(prof.proxy_url.clone());
-        }
-    }
 
-    out.send(Ev::Settings(Box::new(settings.clone())));
-
-    // Мгновенный старт из локального кэша (если сессия уже есть и не включён RAM-only режим).
-    let mut cached_me = String::new();
-    let mut cached_folders: Vec<FolderRow> = Vec::new();
-    let mut dialogs: Vec<DialogRow> = Vec::new();
-    if !settings.privacy_shield.ephemeral_local_cache
-        && home.join("main.session").exists()
-        && let Some((me, dlgs, flds)) = load_disk_cache(&home)
-    {
-        cached_me = me.clone();
-        cached_folders = flds.clone();
-        let preload_ids: Vec<i64> = dlgs.iter().take(28).map(|d| d.id).collect();
-        dialogs = dlgs.clone();
-        if !me.is_empty() {
-            out.send(Ev::Me(me));
+    'account_loop: loop {
+        let mut settings = load_settings(&settings_path);
+        if settings.accounts.is_empty() {
+            settings.accounts.push(rg_settings::AccountProfile::default());
         }
-        if !flds.is_empty() {
-            out.send(Ev::Folders(flds));
+        let home = account_home(&root_home, settings.active_account);
+        wipe_if_logged_out(&home);
+        if settings.privacy_shield.ephemeral_local_cache {
+            let _ = std::fs::remove_file(home.join("dialogs_cache.json"));
+            let _ = std::fs::remove_dir_all(home.join("cache").join("history"));
         }
-        out.send(Ev::Dialogs(dlgs));
-        out.send(Ev::Stage(Stage::Ready));
-        let av_dir = home.join("cache").join("avatars");
-        let out_av = out.clone();
-        tokio::task::spawn_blocking(move || {
-            for id in preload_ids {
-                let p = av_dir.join(format!("{id}.jpg"));
-                if p.exists()
-                    && let Some(img) = decode_square(&p, 112)
-                {
-                    out_av.send(Ev::Avatar(id, Box::new(img)));
-                }
+        // Ключи: переменные окружения, файл `api.keys` или встроенные открытые ключи.
+        let mut cfg = loop {
+            if let Some(c) = Config::from_env()
+                .ok()
+                .or_else(|| keys_from_file(&root_home))
+                .or_else(builtin_keys)
+            {
+                break c;
             }
-        });
-    }
-
-    let connected = match connect_with_updates(&cfg).await {
-        Ok(c) => c,
-        Err(e) => {
-            out.err(format!("Не удалось подключиться: {e}"));
-            return;
+            out.send(Ev::Stage(Stage::NeedKeys));
+            match cmds.recv().await {
+                Some(Cmd::Keys(id, hash)) => match id.trim().parse::<i32>() {
+                    Ok(n) if n > 0 && !hash.trim().is_empty() => {
+                        let _ = std::fs::write(root_home.join("api.keys"), format!("{n}\n{}\n", hash.trim()));
+                    }
+                    _ => out.err("api_id — число, api_hash — строка из 32 символов"),
+                },
+                Some(Cmd::SwitchAccount(slot)) => {
+                    let mut s = settings.clone();
+                    s.active_account = slot;
+                    let _ = std::fs::write(&settings_path, s.to_json());
+                    out.send(Ev::ResetSession);
+                    continue 'account_loop;
+                }
+                Some(_) => {}
+                None => return,
+            }
+        };
+        cfg.session_path = home.join("main.session").to_string_lossy().into_owned();
+        if cfg.proxy_url.is_none() {
+            cfg.proxy_url = std::fs::read_to_string(home.join("proxy.txt"))
+                .or_else(|_| std::fs::read_to_string(root_home.join("proxy.txt")))
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| s.starts_with("socks5://"));
         }
-    };
-    let store_res = if settings.privacy_shield.ephemeral_local_cache {
-        MessageStore::in_memory().await
-    } else {
-        MessageStore::open(&home.join("messages.db").to_string_lossy()).await
-    };
-    let store = match store_res {
-        Ok(s) => s,
-        Err(e) => {
-            out.err(format!("Хранилище сообщений: {e}"));
-            return;
+        if settings.privacy_shield.anti_correlation_accounts
+            && let Some(prof) = settings.accounts.iter().find(|a| a.slot == settings.active_account)
+        {
+            cfg.device_model = Some(prof.device_model.clone());
+            cfg.system_version = Some(prof.system_version.clone());
+            cfg.app_version = Some(prof.app_version.clone());
+            cfg.lang_code = Some(prof.lang_code.clone());
+            if !prof.proxy_url.is_empty() && prof.proxy_url.starts_with("socks5://") {
+                cfg.proxy_url = Some(prof.proxy_url.clone());
+            }
         }
-    };
-    let engine = Engine::new(connected.client.clone(), settings, store)
-        .with_dirs(&home.join("cache"), &home.join("downloads"));
-    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-    // Фото профилей маленькие: качаем много штук одновременно.
-    let avatar_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(24));
-    let mut updates = Some(connected.updates);
 
-    let mut login: Option<LoginToken> = None;
-    let mut password: Option<PasswordToken> = None;
-    let mut current: Option<usize> = None;
-    let open_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut sticker_sets: Vec<StickerSetRow> = Vec::new();
-    let mut sticker_docs: std::collections::HashMap<i64, StickerRow> = std::collections::HashMap::new();
-    let fetches: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
-        std::sync::Arc::default();
+        out.send(Ev::Settings(Box::new(settings.clone())));
 
-    let authorized = connected.client.is_authorized().await.unwrap_or(false);
-    let mut qr_mode = false;
-    if authorized {
-        enter(&engine, &out, &mut updates, &mut dialogs, &home, &mut cached_me, &mut cached_folders).await;
-    } else {
-        qr_mode = true;
-        out.send(Ev::Stage(Stage::Qr(String::new())));
-    }
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut last_url = String::new();
+        // Мгновенный старт из локального кэша (если сессия уже есть и не включён RAM-only режим).
+        let mut cached_me = String::new();
+        let mut cached_folders: Vec<FolderRow> = Vec::new();
+        let mut dialogs: Vec<DialogRow> = Vec::new();
+        if !settings.privacy_shield.ephemeral_local_cache
+            && home.join("main.session").exists()
+            && let Some((me, dlgs, flds)) = load_disk_cache(&home)
+        {
+            cached_me = me.clone();
+            cached_folders = flds.clone();
+            let preload_ids: Vec<i64> = dlgs.iter().take(28).map(|d| d.id).collect();
+            dialogs = dlgs.clone();
+            if !me.is_empty() {
+                out.send(Ev::Me(me));
+            }
+            if !flds.is_empty() {
+                out.send(Ev::Folders(flds));
+            }
+            out.send(Ev::Dialogs(dlgs));
+            out.send(Ev::Stage(Stage::Ready));
+            let av_dir = home.join("cache").join("avatars");
+            let out_av = out.clone();
+            tokio::task::spawn_blocking(move || {
+                for id in preload_ids {
+                    let p = av_dir.join(format!("{id}.jpg"));
+                    if p.exists()
+                        && let Some(img) = decode_square(&p, 112)
+                    {
+                        out_av.send(Ev::Avatar(id, Box::new(img)));
+                    }
+                }
+            });
+        }
 
-    loop {
+        let connected = match connect_with_updates(&cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                out.err(format!("Не удалось подключиться: {e}"));
+                return;
+            }
+        };
+        let store_res = if settings.privacy_shield.ephemeral_local_cache {
+            MessageStore::in_memory().await
+        } else {
+            MessageStore::open(&home.join("messages.db").to_string_lossy()).await
+        };
+        let store = match store_res {
+            Ok(s) => s,
+            Err(e) => {
+                out.err(format!("Хранилище сообщений: {e}"));
+                return;
+            }
+        };
+        let engine = Engine::new(connected.client.clone(), settings, store)
+            .with_dirs(&home.join("cache"), &home.join("downloads"));
+        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        // Фото профилей маленькие: качаем много штук одновременно.
+        let avatar_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(24));
+        let mut updates = Some(connected.updates);
+
+        let mut login: Option<LoginToken> = None;
+        let mut password: Option<PasswordToken> = None;
+        let mut current: Option<usize> = None;
+        let open_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sticker_sets: Vec<StickerSetRow> = Vec::new();
+        let mut sticker_docs: std::collections::HashMap<i64, StickerRow> = std::collections::HashMap::new();
+        let fetches: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
+            std::sync::Arc::default();
+
+        let authorized = connected.client.is_authorized().await.unwrap_or(false);
+        let mut qr_mode = false;
+        if authorized {
+            enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await;
+        } else if cfg!(target_os = "android") {
+            qr_mode = false;
+            out.send(Ev::Stage(Stage::NeedPhone));
+        } else {
+            qr_mode = true;
+            out.send(Ev::Stage(Stage::Qr(String::new())));
+        }
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut last_url = String::new();
+
+        #[allow(clippy::never_loop)]
+        let switch_now: bool = loop {
         let cmd = tokio::select! {
-            c = cmds.recv() => match c { Some(c) => c, None => break },
+            c = cmds.recv() => match c { Some(c) => c, None => break false },
             _ = tick.tick(), if qr_mode => {
                 match rg_core::qr::poll(&connected.client, &*connected.session, cfg.api_id, &cfg.api_hash).await {
                     Ok(rg_core::qr::QrStep::Token { url }) => {
@@ -769,7 +791,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                     Ok(rg_core::qr::QrStep::Done) => {
                         qr_mode = false;
-                        enter(&engine, &out, &mut updates, &mut dialogs, &home, &mut cached_me, &mut cached_folders).await;
+                        enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await;
                     }
                     Ok(rg_core::qr::QrStep::NeedPassword(p)) => {
                         qr_mode = false;
@@ -812,7 +834,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::Code(code) => {
                 let Some(t) = login.as_ref() else { continue };
                 match connected.client.sign_in(t, &code).await {
-                    Ok(_) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &mut cached_me, &mut cached_folders).await,
+                    Ok(_) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
                     Err(SignInError::PasswordRequired(p)) => {
                         let hint = p.hint().unwrap_or("нет").to_owned();
                         password = Some(p);
@@ -825,7 +847,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::Password(pw) => {
                 let Some(p) = password.take() else { continue };
                 match connected.client.check_password(p, pw.trim()).await {
-                    Ok(_) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &mut cached_me, &mut cached_folders).await,
+                    Ok(_) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
                     Err(SignInError::InvalidPassword(p)) => {
                         let hint = p.hint().unwrap_or("нет").to_owned();
                         password = Some(p);
@@ -1379,7 +1401,18 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                 }
                 let _ = std::fs::write(home.join("logout.flag"), b"1");
-                restart_app();
+                let mut s = engine.settings();
+                if let Some(a) = s.accounts.iter_mut().find(|a| a.slot == s.active_account) {
+                    a.display_name.clear();
+                    a.username.clear();
+                    a.phone.clear();
+                    a.user_id = 0;
+                }
+                let _ = std::fs::write(&settings_path, s.to_json());
+                connected.pool_handle.quit();
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                out.send(Ev::ResetSession);
+                break true;
             }
             Cmd::ForceRead => {
                 let Some(i) = current else { continue };
@@ -2150,8 +2183,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 s.active_account = slot;
                 let _ = std::fs::write(&settings_path, s.to_json());
                 connected.pool_handle.quit();
-                tokio::time::sleep(std::time::Duration::from_millis(240)).await;
-                restart_app();
+                tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                out.send(Ev::ResetSession);
+                break true;
             }
             Cmd::AddIsolatedAccount { label, proxy_url } => {
                 let mut s = engine.settings();
@@ -2164,8 +2198,52 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 s.active_account = next_slot;
                 let _ = std::fs::write(&settings_path, s.to_json());
                 connected.pool_handle.quit();
-                tokio::time::sleep(std::time::Duration::from_millis(260)).await;
-                restart_app();
+                tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                out.send(Ev::ResetSession);
+                break true;
+            }
+            Cmd::AddAccountAuto => {
+                let mut s = engine.settings();
+                let next_slot = s.accounts.iter().map(|a| a.slot).max().unwrap_or(0) + 1;
+                let entropy = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                let prof = rg_settings::AccountProfile::isolated(next_slot, String::new(), String::new(), entropy);
+                s.accounts.push(prof);
+                s.active_account = next_slot;
+                let _ = std::fs::write(&settings_path, s.to_json());
+                connected.pool_handle.quit();
+                tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                out.send(Ev::ResetSession);
+                break true;
+            }
+            Cmd::PurgeLocal(msg_id) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did, h_dir) =
+                    (engine.clone(), out.clone(), d.peer, d.id, home.clone());
+                tokio::spawn(async move {
+                    eng.purge_local_deleted(&peer, msg_id).await;
+                    if let Some(mut rows) = load_history_cache(&h_dir, did) {
+                        rows.retain(|m| m.id != msg_id);
+                        save_history_cache(&h_dir, did, &rows);
+                    }
+                    out.send(Ev::LocalPurged(did, msg_id));
+                });
+            }
+            Cmd::PurgeAllDeleted => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did, h_dir) =
+                    (engine.clone(), out.clone(), d.peer, d.id, home.clone());
+                tokio::spawn(async move {
+                    eng.purge_all_local_deleted(&peer).await;
+                    if let Some(mut rows) = load_history_cache(&h_dir, did) {
+                        rows.retain(|m| !m.deleted);
+                        save_history_cache(&h_dir, did, &rows);
+                    }
+                    out.send(Ev::LocalPurgedAll(did));
+                });
             }
             Cmd::RemoveAccountSlot(slot) => {
                 if slot == 0 {
@@ -2184,8 +2262,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 out.send(Ev::Settings(Box::new(s)));
                 if need_restart {
                     connected.pool_handle.quit();
-                    tokio::time::sleep(std::time::Duration::from_millis(220)).await;
-                    restart_app();
+                    tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                    out.send(Ev::ResetSession);
+                    break true;
                 }
             }
             Cmd::Settings(s) => {
@@ -2198,6 +2277,10 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 engine.update_settings(|cur| *cur = s);
                 let _ = std::fs::write(&settings_path, json);
             }
+        }
+        };
+        if !switch_now {
+            break 'account_loop;
         }
     }
 }
@@ -2238,12 +2321,14 @@ async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerR
 
 /// После входа: параллельно загружаем профиль, чаты, архив и папки, сохраняем дисковый кэш,
 /// запускаем поток обновлений и в фоне прогреваем кэш первых 3 чатов для открытия за 0 мс.
+#[allow(clippy::too_many_arguments)]
 async fn enter(
     engine: &Engine,
     out: &Out,
     updates: &mut Option<tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>>,
     dialogs: &mut Vec<DialogRow>,
     home: &std::path::Path,
+    settings_path: &std::path::Path,
     cached_me: &mut String,
     cached_folders: &mut Vec<FolderRow>,
 ) {
@@ -2256,6 +2341,20 @@ async fn enter(
     if let Ok(me) = me_res {
         *cached_me = me.full_name();
         out.send(Ev::Me(cached_me.clone()));
+        let uname = me.username().unwrap_or_default().to_owned();
+        let phone = me.phone().unwrap_or_default().to_owned();
+        let uid = me.raw.id();
+        let mut s = engine.settings();
+        if let Some(prof) = s.accounts.iter_mut().find(|a| a.slot == s.active_account) {
+            prof.display_name.clone_from(cached_me);
+            prof.username = uname;
+            prof.phone = phone;
+            prof.user_id = uid;
+            let json = s.to_json();
+            engine.update_settings(|cur| *cur = s.clone());
+            let _ = std::fs::write(settings_path, json);
+            out.send(Ev::Settings(Box::new(s)));
+        }
     }
     if let Ok(mut d) = main_res {
         for x in arch_res.unwrap_or_default() {
@@ -2406,5 +2505,12 @@ mod tests {
         let loaded_msgs = load_history_cache(&dir, 4242).unwrap();
         assert_eq!(loaded_msgs, sample_msgs);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_keys_always_provide_public_fallback_without_prompt() {
+        let cfg = builtin_keys().expect("builtin_keys must fall back cleanly without API prompt");
+        assert!(cfg.api_id > 0);
+        assert!(!cfg.api_hash.is_empty());
     }
 }

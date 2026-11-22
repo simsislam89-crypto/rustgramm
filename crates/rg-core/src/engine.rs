@@ -1834,6 +1834,16 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Окончательно удалить уже удалённое сообщение только у себя из локальной БД.
+    pub async fn purge_local_deleted(&self, peer: &PeerRef, msg_id: i32) {
+        let _ = self.store.purge_deleted(peer_key(peer), msg_id).await;
+    }
+
+    /// Окончательно убрать все сохранённые удалённые сообщения чата из локальной БД.
+    pub async fn purge_all_local_deleted(&self, peer: &PeerRef) {
+        let _ = self.store.purge_all_deleted(peer_key(peer)).await;
+    }
+
 
     /// Прежние версии правок сообщения.
     pub async fn edit_history(&self, peer: &PeerRef, id: i32) -> Vec<String> {

@@ -295,6 +295,8 @@ struct App {
     wipe_modal_open: bool,
     wipe_confirm_step: bool,
     wipe_scope: rg_core::engine::WipeScope,
+    /// Подсветка целевого сообщения после перехода к реплаю / поиску / закрепу `(msg_id, started_at)`.
+    highlight_msg: Option<(i32, f64)>,
 }
 
 pub(crate) struct ShotModal {
@@ -545,6 +547,7 @@ impl App {
             wipe_modal_open: false,
             wipe_confirm_step: false,
             wipe_scope: rg_core::engine::WipeScope::default(),
+            highlight_msg: None,
         }
     }
 
@@ -1346,6 +1349,7 @@ impl App {
         self.older_pending = false;
         self.history_end = false;
         self.scroll_to = None;
+        self.highlight_msg = None;
         self.autoscroll_anchor = None;
         self.active_topic = None;
         self.topic_msgs = None;
@@ -1838,8 +1842,48 @@ impl App {
                         self.open_dialog(pos);
                         if let Some(pid) = post {
                             self.scroll_to = Some(pid);
+                            self.highlight_msg = Some((pid, ctx.input(|i| i.time)));
                         }
                     }
+                }
+                Ev::LocalPurged(did, msg_id) => {
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did) {
+                        self.messages.retain(|m| m.id != msg_id);
+                        self.msg_heights.remove(&msg_id);
+                    }
+                    if let Some(cached) = self.history_cache.get_mut(&did) {
+                        cached.retain(|m| m.id != msg_id);
+                    }
+                }
+                Ev::LocalPurgedAll(did) => {
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did) {
+                        self.messages.retain(|m| !m.deleted);
+                        self.msg_heights.clear();
+                    }
+                    if let Some(cached) = self.history_cache.get_mut(&did) {
+                        cached.retain(|m| !m.deleted);
+                    }
+                }
+                Ev::ResetSession => {
+                    self.reset_chat_state();
+                    self.selected = None;
+                    self.dialogs.clear();
+                    self.folders.clear();
+                    self.avatars.clear();
+                    self.avatar_req.clear();
+                    self.peer_infos.clear();
+                    self.history_cache.clear();
+                    self.me.clear();
+                    self.stage = Stage::Starting;
+                    self.phone.clear();
+                    self.code.clear();
+                    self.password.clear();
+                    self.error.clear();
+                    self.tgs.account = None;
+                    self.tgs.open = false;
+                    self.settings_open = false;
+                    self.drawer_open = false;
+                    self.miniapp_modal = None;
                 }
                 Ev::EmojiSets(s) => {
                     if self.emoji_pack.is_some_and(|i| i >= s.len()) {
@@ -1986,6 +2030,24 @@ impl App {
                 if !self.error.is_empty() {
                     ui.add_space(10.0);
                     ui.colored_label(DANGER, &self.error);
+                }
+                // Если уже есть другой авторизованный аккаунт, можно отменить вход и вернуться обратно.
+                if let Some(prev) = self
+                    .settings
+                    .accounts
+                    .iter()
+                    .find(|a| a.slot != self.settings.active_account && a.is_authorized_hint())
+                    .cloned()
+                {
+                    ui.add_space(14.0);
+                    if link(ui, &format!("← Вернуться к {}", prev.title())).clicked() {
+                        let cur = self.settings.active_account;
+                        if cur > 0 {
+                            self.send(Cmd::RemoveAccountSlot(cur));
+                        } else {
+                            self.send(Cmd::SwitchAccount(prev.slot));
+                        }
+                    }
                 }
                 ui.add_space(24.0);
                 ui.label(
@@ -2925,10 +2987,12 @@ impl App {
                 ui.painter().rect_filled(card_rect, egui::CornerRadius::same(14), t2(WINDOW_BG));
                 paint_modal_subblur(ui.painter(), card_rect, 14.0, 1.0);
                 let hdr = egui::Rect::from_min_size(card_rect.min, Vec2::new(card_w, 40.0));
-                ui.painter().text(
-                    egui::pos2(hdr.left() + 16.0, hdr.center().y),
+                let hdr_clip = egui::Rect::from_min_max(hdr.min, egui::pos2((hdr.right() - 102.0).max(hdr.left() + 40.0), hdr.bottom()));
+                icons::tg_sized(ui.painter(), "settings/language", egui::pos2(hdr.left() + 24.0, hdr.center().y), Vec2::splat(16.0), ORANGE);
+                ui.painter().with_clip_rect(hdr_clip).text(
+                    egui::pos2(hdr.left() + 42.0, hdr.center().y),
                     egui::Align2::LEFT_CENTER,
-                    format!("🌐 {title}"),
+                    &title,
                     FontId::proportional(14.5),
                     WHITE,
                 );
@@ -3001,11 +3065,17 @@ pub fn native_options() -> eframe::NativeOptions {
             Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])
         })
         .unwrap_or([1100.0, 720.0]);
+    let icon_rgba = win::render_app_icon_rgba(0, 0, false, true, false, 64);
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
             .with_min_inner_size([420.0, 480.0])
             .with_title("Rustgramm")
+            .with_icon(egui::IconData {
+                rgba: icon_rgba,
+                width: 64,
+                height: 64,
+            })
             .with_transparent(true)
             .with_decorations(false),
         ..Default::default()

@@ -276,6 +276,14 @@ impl Default for PrivacyShieldSettings {
 pub struct AccountProfile {
     pub slot: u32,
     pub label: String,
+    /// Настоящее имя / никнейм пользователя в Telegram (заполняется автоматически после входа).
+    pub display_name: String,
+    /// `@username` пользователя в Telegram (без `@`).
+    pub username: String,
+    /// Номер телефона пользователя.
+    pub phone: String,
+    /// Telegram User ID.
+    pub user_id: i64,
     pub proxy_url: String,
     pub device_model: String,
     pub system_version: String,
@@ -285,7 +293,7 @@ pub struct AccountProfile {
 
 impl Default for AccountProfile {
     fn default() -> Self {
-        Self::isolated(0, "Основной аккаунт".to_owned(), String::new(), 0)
+        Self::isolated(0, String::new(), String::new(), 0)
     }
 }
 
@@ -312,21 +320,35 @@ impl AccountProfile {
         };
         Self {
             slot,
-            label: if label.trim().is_empty() {
-                if slot == 0 {
-                    "Основной аккаунт".to_owned()
-                } else {
-                    format!("Аккаунт #{}", slot + 1)
-                }
-            } else {
-                label.trim().to_owned()
-            },
+            label: label.trim().to_owned(),
+            display_name: String::new(),
+            username: String::new(),
+            phone: String::new(),
+            user_id: 0,
             proxy_url: proxy_url.trim().to_owned(),
             device_model,
             system_version: sys.to_owned(),
             app_version: ver.to_owned(),
             lang_code: "ru".to_owned(),
         }
+    }
+
+    /// Человекочитаемое имя профиля (сначала настоящее имя из Telegram, затем метка, иначе запасное).
+    pub fn title(&self) -> String {
+        if !self.display_name.trim().is_empty() {
+            self.display_name.clone()
+        } else if !self.label.trim().is_empty() {
+            self.label.clone()
+        } else if self.slot == 0 {
+            "Основной аккаунт".to_owned()
+        } else {
+            format!("Аккаунт #{}", self.slot + 1)
+        }
+    }
+
+    /// Есть ли уже выполненный вход в этом слоте.
+    pub fn is_authorized_hint(&self) -> bool {
+        self.user_id != 0 || !self.display_name.is_empty()
     }
 }
 

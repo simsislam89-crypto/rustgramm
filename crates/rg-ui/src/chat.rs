@@ -53,6 +53,12 @@ pub(crate) enum Act {
     FilterUser(i64, String),
     /// Нажатие инлайн- или реплай-кнопки бота (`(msg_id, текст, действие)`).
     BotBtn(i32, String, rg_core::engine::BotBtnKind),
+    /// Окончательно удалить уже удалённое сообщение только у себя из локальной БД.
+    PurgeLocal(i32),
+    /// Окончательно убрать все удалённые сообщения в открытом чате только у себя.
+    PurgeAllDeleted,
+    /// Скопировать ссылку `t.me/...` на сообщение или пост канала.
+    CopyLink(i32),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -90,6 +96,10 @@ struct Env<'a> {
     clip_rect: Rect,
     /// Выбранные сообщения (режим множественного выделения).
     selected_msgs: &'a std::collections::HashSet<i32>,
+    /// Подсветить целевое сообщение после перехода к реплаю/поиску.
+    highlight_msg: Option<i32>,
+    /// Можно ли скопировать публичную/приватную ссылку `t.me/` на сообщение в этом чате.
+    can_copy_link: bool,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -1021,8 +1031,8 @@ impl App {
                 }
             }
             if let Some((w_lbl, w_url)) = &bot_webapp {
-                let btn_t = format!("🌐 {}", short(w_lbl, 12));
-                if orange_button(ui, &btn_t, Vec2::new(112.0, 32.0))
+                let btn_t = short(w_lbl, 12);
+                if orange_button(ui, &btn_t, Vec2::new(104.0, 32.0))
                     .on_hover_text(format!("Открыть Mini App: {w_lbl}"))
                     .clicked()
                     && let Some(idx) = self.selected
@@ -1138,13 +1148,15 @@ impl App {
             }
             if has_reply_kb {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 44.0), Sense::click());
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "⌨",
-                    FontId::proportional(15.0),
-                    if self.bot_keyboard_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE },
-                );
+                let kc = if self.bot_keyboard_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE };
+                let p = ui.painter();
+                let c = rect.center();
+                let kb_rect = Rect::from_center_size(c, Vec2::new(17.0, 12.0));
+                p.rect_stroke(kb_rect, egui::CornerRadius::same(2), egui::Stroke::new(1.4, kc), egui::StrokeKind::Inside);
+                for kx in [-4.0, 0.0, 4.0] {
+                    p.circle_filled(Pos2::new(c.x + kx, c.y - 2.0), 1.1, kc);
+                }
+                p.rect_filled(Rect::from_center_size(Pos2::new(c.x, c.y + 2.5), Vec2::new(9.0, 1.8)), 0.5, kc);
                 if resp.on_hover_text("Клавиатура бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.bot_keyboard_open = !self.bot_keyboard_open;
                 }
@@ -1152,11 +1164,11 @@ impl App {
             if s.field_auto_delete_button {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 44.0), Sense::click());
                 let active_ttl = cur_ttl.is_some_and(|v| v > 0);
-                ui.painter().text(
+                icons::tg_sized(
+                    ui.painter(),
+                    "settings/ttl",
                     rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "⏱",
-                    FontId::proportional(15.0),
+                    Vec2::splat(18.0),
                     if active_ttl || self.ttl_popup_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE },
                 );
                 if resp.on_hover_text("Таймер автоудаления сообщений").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -1259,14 +1271,15 @@ impl App {
                             _ => t(SERVICE_BG),
                         };
                         ui.painter().rect_filled(rect, egui::CornerRadius::same(8), fill);
-                        let icon = match &btn.kind {
-                            rg_core::engine::BotBtnKind::WebView { .. } => "🌐 ",
+                        let suffix = match &btn.kind {
+                            rg_core::engine::BotBtnKind::WebView { .. } => " ↗",
                             _ => "",
                         };
-                        ui.painter().text(
+                        let text_clip = rect.shrink2(Vec2::new(6.0, 2.0));
+                        ui.painter().with_clip_rect(text_clip).text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
-                            format!("{icon}{}", short(&btn.text, 28)),
+                            format!("{}{suffix}", short(&btn.text, 28)),
                             FontId::proportional(13.5),
                             WHITE,
                         );
@@ -1731,6 +1744,21 @@ impl App {
                 topic_slice.unwrap_or(&self.messages)
             };
             let read_out = self.selected.and_then(|i| self.dialogs.get(i)).map_or(0, |d| d.read_out);
+            let now_t = ui.input(|i| i.time);
+            let active_highlight = self
+                .highlight_msg
+                .filter(|(_, t0)| now_t - *t0 < 1.8)
+                .map(|(id, _)| id);
+            if active_highlight.is_some() {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+            } else {
+                self.highlight_msg = None;
+            }
+            let cur_dialog = self.selected.and_then(|i| self.dialogs.get(i));
+            let cur_info = cur_dialog.and_then(|d| self.peer_infos.get(&d.id));
+            let can_copy_link = cur_dialog.is_some_and(|d| {
+                d.id < -1_000_000_000_000 || cur_info.is_some_and(|p| !p.username.trim().is_empty())
+            });
             let env = Env {
                 read_out,
                 avatars: &self.avatars,
@@ -1742,6 +1770,8 @@ impl App {
                 show_translate: self.settings.language.show_translate_button,
                 clip_rect,
                 selected_msgs: &self.selected_msgs,
+                highlight_msg: active_highlight,
+                can_copy_link,
                 avail: cur_avail,
                 s: &self.settings.ayu,
                 tex: &self.textures,
@@ -2126,7 +2156,53 @@ impl App {
                 self.details = Some(id);
                 self.send(Cmd::EditHistory(id));
             }
-            Act::Goto(id) => self.scroll_to = Some(id),
+            Act::Goto(id) => {
+                self.scroll_to = Some(id);
+                self.highlight_msg = Some((id, ctx.input(|i| i.time)));
+            }
+            Act::PurgeLocal(id) => {
+                self.messages.retain(|m| m.id != id);
+                self.msg_heights.remove(&id);
+                if let Some(did) = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id)
+                    && let Some(cached) = self.history_cache.get_mut(&did)
+                {
+                    cached.retain(|m| m.id != id);
+                }
+                self.send(Cmd::PurgeLocal(id));
+                self.status = "Удалённое сообщение скрыто у вас".to_owned();
+            }
+            Act::PurgeAllDeleted => {
+                self.messages.retain(|m| !m.deleted);
+                self.msg_heights.clear();
+                if let Some(did) = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id)
+                    && let Some(cached) = self.history_cache.get_mut(&did)
+                {
+                    cached.retain(|m| !m.deleted);
+                }
+                self.send(Cmd::PurgeAllDeleted);
+                self.status = "Все удалённые сообщения этого чата убраны у вас".to_owned();
+            }
+            Act::CopyLink(msg_id) => {
+                if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)) {
+                    let uname = self
+                        .peer_infos
+                        .get(&d.id)
+                        .map(|p| p.username.trim())
+                        .unwrap_or("");
+                    let link = if !uname.is_empty() {
+                        Some(format!("https://t.me/{uname}/{msg_id}"))
+                    } else if d.id < -1_000_000_000_000 {
+                        let raw_ch = (-d.id) - 1_000_000_000_000;
+                        Some(format!("https://t.me/c/{raw_ch}/{msg_id}"))
+                    } else {
+                        None
+                    };
+                    if let Some(url) = link {
+                        ctx.copy_text(url);
+                        self.status = "Ссылка на сообщение скопирована".to_owned();
+                    }
+                }
+            }
             Act::OpenUrl(url) => {
                 // Внутренняя маршрутизация ссылок Telegram (`tg://`, `https://t.me/...`, `@username`) внутри клиента.
                 if self.handle_tg_uri(&url) {
@@ -3070,12 +3146,15 @@ fn bubble(
         let mut cards: Vec<(Rect, Act)> = Vec::new();
         let mut hot: Vec<(Rect, super::rich::Hit)> = Vec::new();
         let selected = env.selected_msgs.contains(&m.id);
+        let highlighted = env.highlight_msg == Some(m.id);
         let mut frame = egui::Frame::new()
             .fill(fill)
             .corner_radius(radius)
             .inner_margin(egui::Margin::symmetric(MSG_PAD_X as i8, MSG_PAD_Y as i8));
         if selected {
             frame = frame.stroke(egui::Stroke::new(2.0, ORANGE));
+        } else if highlighted {
+            frame = frame.stroke(egui::Stroke::new(2.0, ORANGE.gamma_multiply(0.85)));
         }
         let inner = frame.show(ui, |ui| {
                 ui.set_width(w);
@@ -3209,9 +3288,16 @@ fn bubble(
                             }
                         }
                         if m.deleted {
-                            let mark = if s.deleted_mark.is_empty() { "🗑" } else { s.deleted_mark.as_str() };
-                            let resp = ui.label(RichText::new(mark).size(11.5).color(date_c));
-                            resp.on_hover_text("удалено");
+                            let custom = s.deleted_mark.trim();
+                            let default_icon = custom.is_empty() || matches!(custom, "🧹" | "🗑" | "🗑️");
+                            if default_icon {
+                                let (r, resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                                icons::tg_sized(ui.painter(), "menu/delete", r.center(), Vec2::splat(13.0), date_c);
+                                resp.on_hover_text("Сообщение удалено отправителем");
+                            } else {
+                                let resp = ui.label(RichText::new(custom).size(11.5).color(date_c));
+                                resp.on_hover_text("Сообщение удалено отправителем");
+                            }
                         }
                         ui.label(RichText::new(meta).size(12.0).color(date_c));
                         if m.outgoing {
@@ -3223,7 +3309,7 @@ fn bubble(
                         ui.add_space(2.0);
                         ui.separator();
                         let cr = ui.add(
-                            egui::Button::new(RichText::new("💬 Комментарии").size(12.5).color(ORANGE))
+                            egui::Button::new(RichText::new("Комментарии").size(12.5).color(ORANGE))
                                 .frame(false),
                         );
                         if cr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -3341,15 +3427,14 @@ fn bubble(
                         };
                         ui.painter().rect_filled(brect, egui::CornerRadius::same(8), bfill);
                         let badge = match &btn.kind {
-                            rg_core::engine::BotBtnKind::Url(_) => " ↗",
-                            rg_core::engine::BotBtnKind::WebView { .. } => " 🌐",
-                            rg_core::engine::BotBtnKind::Copy(_) => " 📋",
+                            rg_core::engine::BotBtnKind::Url(_)
+                            | rg_core::engine::BotBtnKind::WebView { .. } => " ↗",
                             rg_core::engine::BotBtnKind::SwitchInline { .. } => " ↪",
                             _ => "",
                         };
                         let max_chars = ((bw / 7.5) as usize).clamp(4, 34);
                         let lbl = format!("{}{badge}", short(&btn.text, max_chars));
-                        ui.painter().text(
+                        ui.painter().with_clip_rect(brect.shrink2(Vec2::new(4.0, 2.0))).text(
                             brect.center(),
                             egui::Align2::CENTER_CENTER,
                             lbl,
@@ -3445,13 +3530,16 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     if s.menu_views_panel.shown(env.shift)
         && let Some(v) = m.views
     {
-        ui.label(RichText::new(format!("👁 Просмотров: {v}")).size(12.5).color(SUBTEXT));
+        ui.label(RichText::new(format!("Просмотров: {v}")).size(12.5).color(SUBTEXT));
     }
     if env.is_channel && env.has_discussion && !m.deleted {
         item(ui, "menu/reply", "Комментарии", Act::Discuss(m.id));
     }
     if s.menu_user_messages.shown(env.shift) && env.group && m.sender_id != 0 {
         item(ui, "menu/search", "Сообщения участника", Act::FilterUser(m.sender_id, m.sender.clone()));
+    }
+    if !m.deleted && m.id > 0 && env.can_copy_link {
+        item(ui, "info/info_link", "Копировать ссылку", Act::CopyLink(m.id));
     }
     if s.menu_message_details.shown(env.shift) {
         item(ui, "menu/info", "Сведения", Act::Details(m.id));
@@ -3461,6 +3549,16 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         ui.separator();
         if kit::menu_item(ui, "menu/delete", "Удалить", true) {
             acts.push(Act::Delete(m.id));
+            ui.close();
+        }
+    } else {
+        ui.separator();
+        if kit::menu_item(ui, "menu/delete", "Удалить у себя", true) {
+            acts.push(Act::PurgeLocal(m.id));
+            ui.close();
+        }
+        if kit::menu_item(ui, "menu/clear", "Убрать все удалённые", false) {
+            acts.push(Act::PurgeAllDeleted);
             ui.close();
         }
     }

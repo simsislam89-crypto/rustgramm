@@ -35,7 +35,8 @@ pub fn divider(ui: &mut egui::Ui) {
 /// Синий заголовок раздела.
 pub fn section(ui: &mut egui::Ui, title: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
-    ui.painter().text(
+    let clip = Rect::from_min_max(rect.min, Pos2::new((rect.right() - PAD).max(rect.left() + 10.0), rect.bottom()));
+    ui.painter().with_clip_rect(clip).text(
         Pos2::new(rect.left() + PAD, rect.bottom() - 8.0),
         egui::Align2::LEFT_BOTTOM,
         title,
@@ -105,7 +106,11 @@ pub fn toggle_icon(ui: &mut egui::Ui, icon: super::icons::Ico, label: &str, valu
     row_bg(ui, rect, &resp);
     let p = ui.painter();
     super::icons::ico(p, Pos2::new(rect.left() + 30.0, rect.center().y), icon, DIALOG_DATE);
-    p.text(
+    let text_clip = Rect::from_min_max(
+        Pos2::new(rect.left() + 60.0, rect.top()),
+        Pos2::new((rect.right() - PAD - 44.0).max(rect.left() + 64.0), rect.bottom()),
+    );
+    p.with_clip_rect(text_clip).text(
         Pos2::new(rect.left() + 64.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
@@ -131,27 +136,30 @@ pub fn toggle_ex(
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
     row_bg(ui, rect, &resp);
     let p = ui.painter();
-    let galley = p.layout_no_wrap(label.to_owned(), FontId::proportional(14.0), WHITE);
+    let max_x = (rect.right() - PAD - 44.0).max(rect.left() + PAD + 20.0);
+    let clip = Rect::from_min_max(Pos2::new(rect.left() + PAD, rect.top()), Pos2::new(max_x, rect.bottom()));
+    let cp = p.with_clip_rect(clip);
+    let galley = cp.layout_no_wrap(label.to_owned(), FontId::proportional(14.0), WHITE);
     let mut x = rect.left() + PAD;
-    p.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), WHITE);
+    cp.galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), WHITE);
     x += galley.size().x + 6.0;
     if beta {
-        badge(p, Pos2::new(x, rect.center().y), "BETA");
+        badge(&cp, Pos2::new(x, rect.center().y), "BETA");
         x += 38.0;
     }
     if let Some((n, m, open)) = counter {
-        let label_w = p
+        let label_w = cp
             .layout_no_wrap(format!("{n}/{m}"), FontId::proportional(13.0), WHITE)
             .size()
             .x;
-        p.text(
+        cp.text(
             Pos2::new(x + 2.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             format!("{n}/{m}"),
             FontId::proportional(13.0),
             WHITE,
         );
-        super::icons::chevron(p, Pos2::new(x + label_w + 14.0, rect.center().y), open, WHITE);
+        super::icons::chevron(&cp, Pos2::new(x + label_w + 14.0, rect.center().y), open, WHITE);
     }
     switch(ui, Pos2::new(rect.right() - PAD - 17.0, rect.center().y), *value, label);
     if resp.clicked() {
@@ -178,20 +186,22 @@ pub fn value_row(ui: &mut egui::Ui, label: &str, value: &str, beta: bool) -> boo
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
     row_bg(ui, rect, &resp);
     let p = ui.painter();
-    let g = p.layout_no_wrap(label.to_owned(), FontId::proportional(14.0), WHITE);
-    p.galley(
+    let vg = p.layout_no_wrap(value.to_owned(), FontId::proportional(14.0), ACCENT);
+    let right_limit = (rect.right() - PAD - vg.size().x - 10.0).max(rect.left() + PAD + 20.0);
+    let clip = Rect::from_min_max(Pos2::new(rect.left() + PAD, rect.top()), Pos2::new(right_limit, rect.bottom()));
+    let cp = p.with_clip_rect(clip);
+    let g = cp.layout_no_wrap(label.to_owned(), FontId::proportional(14.0), WHITE);
+    cp.galley(
         Pos2::new(rect.left() + PAD, rect.center().y - g.size().y / 2.0),
         g.clone(),
         WHITE,
     );
     if beta {
-        badge(p, Pos2::new(rect.left() + PAD + g.size().x + 6.0, rect.center().y), "BETA");
+        badge(&cp, Pos2::new(rect.left() + PAD + g.size().x + 6.0, rect.center().y), "BETA");
     }
-    p.text(
-        Pos2::new(rect.right() - PAD, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        value,
-        FontId::proportional(14.0),
+    p.galley(
+        Pos2::new(rect.right() - PAD - vg.size().x, rect.center().y - vg.size().y / 2.0),
+        vg,
         ACCENT,
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
@@ -207,22 +217,27 @@ pub fn nav_row(ui: &mut egui::Ui, icon: &str, label: &str, value: &str) -> bool 
         super::icons::any(p, icon, Pos2::new(x + 12.0, rect.center().y), SUBTEXT);
         x += 44.0;
     }
-    p.text(
+    let val_w = if value.is_empty() {
+        0.0
+    } else {
+        let vg = p.layout_no_wrap(value.to_owned(), FontId::proportional(14.0), ACCENT);
+        let w = vg.size().x;
+        p.galley(
+            Pos2::new(rect.right() - PAD - w, rect.center().y - vg.size().y / 2.0),
+            vg,
+            ACCENT,
+        );
+        w + 10.0
+    };
+    let right_limit = (rect.right() - PAD - val_w).max(x + 16.0);
+    let clip = Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(right_limit, rect.bottom()));
+    p.with_clip_rect(clip).text(
         Pos2::new(x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         FontId::proportional(14.0),
         WHITE,
     );
-    if !value.is_empty() {
-        p.text(
-            Pos2::new(rect.right() - PAD, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            value,
-            FontId::proportional(14.0),
-            ACCENT,
-        );
-    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
@@ -278,7 +293,11 @@ pub fn sub_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
     row_bg(ui, rect, &resp);
     let p = ui.painter();
-    p.text(
+    let clip = Rect::from_min_max(
+        Pos2::new(rect.left() + PAD + 14.0, rect.top()),
+        Pos2::new((rect.right() - PAD - 44.0).max(rect.left() + PAD + 24.0), rect.bottom()),
+    );
+    p.with_clip_rect(clip).text(
         Pos2::new(rect.left() + PAD + 14.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
@@ -303,7 +322,11 @@ pub fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, danger: bool) -> bo
     }
     let (icon_c, text_c) = if danger { (DANGER, DANGER) } else { (DIALOG_DATE, WHITE) };
     super::icons::tg(p, icon, Pos2::new(rect.left() + 26.0, rect.center().y), icon_c);
-    p.text(
+    let clip = Rect::from_min_max(
+        Pos2::new(rect.left() + 52.0, rect.top()),
+        Pos2::new((rect.right() - 12.0).max(rect.left() + 60.0), rect.bottom()),
+    );
+    p.with_clip_rect(clip).text(
         Pos2::new(rect.left() + 53.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,

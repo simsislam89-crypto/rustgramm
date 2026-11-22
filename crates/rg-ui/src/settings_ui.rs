@@ -97,7 +97,11 @@ impl App {
                 // Шапка: аватар, имя, ссылка на настройки AyuGram.
                 let (head, _) = ui.allocate_exact_size(Vec2::new(w, 152.0), Sense::hover());
                 draw_avatar(ui, Pos2::new(head.left() + 46.0, head.top() + 46.0), &me, 1, 56.0, me_tex, corners);
-                ui.painter().text(
+                let head_clip = Rect::from_min_max(
+                    Pos2::new(head.left() + 18.0, head.top() + 76.0),
+                    Pos2::new((head.right() - 16.0).max(head.left() + 30.0), head.top() + 144.0),
+                );
+                ui.painter().with_clip_rect(head_clip).text(
                     Pos2::new(head.left() + 18.0, head.top() + 96.0),
                     Align2::LEFT_CENTER,
                     &me,
@@ -109,7 +113,7 @@ impl App {
                     Vec2::new(w - 16.0, 28.0),
                 );
                 let pr = ui.interact(prefs, ui.make_persistent_id("prefs-link"), Sense::click());
-                ui.painter().text(
+                ui.painter().with_clip_rect(head_clip).text(
                     Pos2::new(head.left() + 18.0, prefs.center().y),
                     Align2::LEFT_CENTER,
                     "Настройки Rustgramm",
@@ -126,7 +130,11 @@ impl App {
                         ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
                     }
                     icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, DIALOG_DATE);
-                    ui.painter().text(
+                    let clip = Rect::from_min_max(
+                        Pos2::new(r.left() + 62.0, r.top()),
+                        Pos2::new((r.right() - 12.0).max(r.left() + 70.0), r.bottom()),
+                    );
+                    ui.painter().with_clip_rect(clip).text(
                         Pos2::new(r.left() + 64.0, r.center().y),
                         Align2::LEFT_CENTER,
                         text,
@@ -135,54 +143,71 @@ impl App {
                     );
                     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 };
-                // Список изолированных аккаунтов и кнопка добавления второго/нового аккаунта без корреляции.
+                // Список аккаунтов с реальными никнеймами / @username (анти-корреляция работает в фоне).
                 for acc in &s.accounts {
                     let is_cur = acc.slot == s.active_account;
-                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 38.0), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 44.0), Sense::click());
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
                     }
-                    let badge_c = if is_cur { ORANGE } else { SUBTEXT };
-                    ui.painter().circle_filled(Pos2::new(r.left() + 30.0, r.center().y), 11.0, badge_c.gamma_multiply(0.28));
-                    ui.painter().text(
-                        Pos2::new(r.left() + 30.0, r.center().y),
-                        Align2::CENTER_CENTER,
-                        format!("{}", acc.slot + 1),
-                        FontId::proportional(11.5),
-                        if is_cur { ORANGE } else { WHITE },
-                    );
                     let title = if is_cur && !me.is_empty() {
-                        format!("{} · {}", acc.label, me)
+                        me.clone()
                     } else {
-                        acc.label.clone()
+                        acc.title()
                     };
-                    ui.painter().text(
-                        Pos2::new(r.left() + 56.0, r.center().y - 7.0),
+                    let av_pos = Pos2::new(r.left() + 30.0, r.center().y);
+                    let av_id = if acc.user_id != 0 { acc.user_id } else { i64::from(acc.slot) + 1 };
+                    draw_avatar(
+                        ui,
+                        av_pos,
+                        &title,
+                        av_id,
+                        28.0,
+                        if is_cur { me_tex } else { None },
+                        corners,
+                    );
+                    let sub = if !acc.username.is_empty() {
+                        mask_streamer(&format!("@{}", acc.username), s.ayu.streamer_mode)
+                    } else if !acc.phone.is_empty() {
+                        mask_streamer(&format!("+{}", acc.phone), s.ayu.streamer_mode || s.extera.hide_phone_number)
+                    } else if is_cur {
+                        "в сети".to_owned()
+                    } else {
+                        "нажмите для входа".to_owned()
+                    };
+                    let right_pad = if is_cur { 30.0 } else { 12.0 };
+                    let text_clip = Rect::from_min_max(
+                        Pos2::new(r.left() + 54.0, r.top()),
+                        Pos2::new((r.right() - right_pad).max(r.left() + 64.0), r.bottom()),
+                    );
+                    let cp = ui.painter().with_clip_rect(text_clip);
+                    cp.text(
+                        Pos2::new(r.left() + 56.0, r.center().y - 8.0),
                         Align2::LEFT_CENTER,
-                        title.chars().take(24).collect::<String>(),
-                        FontId::proportional(13.0),
+                        &title,
+                        FontId::proportional(13.5),
                         if is_cur { ORANGE } else { WHITE },
                     );
-                    ui.painter().text(
+                    cp.text(
                         Pos2::new(r.left() + 56.0, r.center().y + 8.0),
                         Align2::LEFT_CENTER,
-                        format!("🔒 {}", acc.device_model),
-                        FontId::proportional(10.5),
+                        &sub,
+                        FontId::proportional(11.0),
                         SUBTEXT,
                     );
                     if is_cur {
                         ui.painter().text(
-                            Pos2::new(r.right() - 18.0, r.center().y),
+                            Pos2::new(r.right() - 16.0, r.center().y),
                             Align2::RIGHT_CENTER,
                             "✓",
-                            FontId::proportional(13.0),
+                            FontId::proportional(13.5),
                             ORANGE,
                         );
                     } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         switch_slot = Some(acc.slot);
                     }
                 }
-                if item(ui, icons::Ico::Profile, "+ Добавить аккаунт (изолированный)") {
+                if item(ui, icons::Ico::Profile, "Добавить аккаунт") {
                     act = Some("add_account");
                 }
                 kit::divider(ui);
@@ -299,9 +324,7 @@ impl App {
             }
             Some("add_account") => {
                 self.drawer_open = false;
-                self.add_account_open = true;
-                self.new_acc_label.clear();
-                self.new_acc_proxy.clear();
+                self.send(Cmd::AddAccountAuto);
             }
             Some(other) => {
                 self.drawer_open = false;
@@ -734,9 +757,9 @@ fn ayu_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
         let lock_row = |ui: &mut egui::Ui, label: &str, val: &mut bool, locked: &mut bool| {
             ui.horizontal(|ui| {
                 sub_toggle(ui, label, val);
-                let l_lbl = if *locked { "🔒" } else { "🔓" };
+                let l_lbl = if *locked { "Закр." } else { "Своб." };
                 let r = ui
-                    .small_button(l_lbl)
+                    .small_button(RichText::new(l_lbl).color(if *locked { ORANGE } else { SUBTEXT }).size(11.0))
                     .on_hover_text("Закрепить: общий переключатель призрака не меняет этот пункт");
                 if r.clicked() {
                     *locked = !*locked;

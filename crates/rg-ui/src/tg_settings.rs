@@ -638,9 +638,7 @@ impl App {
             self.proxy_open = true;
         }
         if act.open_add_account {
-            self.add_account_open = true;
-            self.new_acc_label.clear();
-            self.new_acc_proxy.clear();
+            self.send(Cmd::AddAccountAuto);
             act.close = true;
         }
         if let Some(slot) = act.switch_account {
@@ -1811,7 +1809,7 @@ fn power_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
 }
 
 fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Actions, atlas: bool) {
-    section(ui, "Изолированные аккаунты (анти-корреляция)");
+    section(ui, "Аккаунты (изолированные слоты)");
     let w = ui.available_width();
     for acc in &s.accounts {
         let is_cur = acc.slot == s.active_account;
@@ -1832,19 +1830,24 @@ fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Ac
             FontId::proportional(13.0),
             Color32::WHITE,
         );
-        p.text(
+        let right_lim = (rect.right() - if is_cur { 78.0 } else { 44.0 }).max(rect.left() + 70.0);
+        let clip = Rect::from_min_max(Pos2::new(rect.left() + 54.0, rect.top()), Pos2::new(right_lim, rect.bottom()));
+        let cp = p.with_clip_rect(clip);
+        cp.text(
             Pos2::new(rect.left() + 56.0, rect.center().y - 9.0),
             Align2::LEFT_CENTER,
-            &acc.label,
+            acc.title(),
             FontId::proportional(14.0),
             if is_cur { ORANGE } else { WHITE },
         );
-        let sub = if acc.proxy_url.is_empty() {
-            format!("{} · {}", acc.device_model, acc.system_version)
-        } else {
+        let sub = if !acc.username.is_empty() {
+            format!("@{} · {}", acc.username, acc.device_model)
+        } else if !acc.proxy_url.is_empty() {
             format!("{} · SOCKS5", acc.device_model)
+        } else {
+            format!("{} · {}", acc.device_model, acc.system_version)
         };
-        p.text(
+        cp.text(
             Pos2::new(rect.left() + 56.0, rect.center().y + 9.0),
             Align2::LEFT_CENTER,
             sub,
@@ -1873,7 +1876,7 @@ fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Ac
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(kit::PAD);
-        if orange_button(ui, "+ Добавить изолированный аккаунт", Vec2::new(255.0, 34.0)).clicked() {
+        if orange_button(ui, "Добавить аккаунт", Vec2::new(190.0, 34.0)).clicked() {
             act.open_add_account = true;
         }
     });

@@ -560,3 +560,16 @@ fn isolated_account_profiles_have_distinct_fingerprints_and_roundtrip() {
     assert_eq!(loaded.accounts[1], a1);
     assert_eq!(loaded.privacy_shield, s.privacy_shield);
 }
+
+#[test]
+fn account_profile_prefers_real_telegram_nickname_over_fallback() {
+    let mut prof = AccountProfile::isolated(1, String::new(), String::new(), 42);
+    assert!(!prof.is_authorized_hint());
+    assert_eq!(prof.title(), "Аккаунт #2");
+
+    prof.display_name = "Николай".to_owned();
+    prof.username = "nick_test".to_owned();
+    prof.user_id = 777_001;
+    assert!(prof.is_authorized_hint());
+    assert_eq!(prof.title(), "Николай");
+}

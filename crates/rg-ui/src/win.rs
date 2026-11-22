@@ -5,9 +5,9 @@
 //! - автозапуск Windows (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) и регистрация `tg://`,
 //! - сворачивание в трей и восстановление (`hide_to_tray`, `show_from_tray`).
 
-/// Набор цветов 12 иконок приложения (1 в 1 с `settings_ui.rs` / `ayu_logo.h`).
+/// Набор цветов 12 иконок приложения (первый — фирменный оранжевый Rustgramm `#F58220`).
 pub const APP_ICON_PALETTE: [u32; 12] = [
-    0x3a3260, 0x8f6af0, 0x5865f2, 0x14150f, 0xd9423f, 0xf4f4f4, 0xf4f4f4, 0xf6f0f4, 0x1f8f86, 0x2a2840,
+    0xf58220, 0x8f6af0, 0x5865f2, 0x14150f, 0xd9423f, 0xf4f4f4, 0x3a3260, 0xf6f0f4, 0x1f8f86, 0x2a2840,
     0x6a4fb0, 0xd7332f,
 ];
 

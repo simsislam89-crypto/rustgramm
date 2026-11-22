@@ -1,4 +1,4 @@
-/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 24 (v0.13.0)», «Этап 25 (v0.14.0)», «Этап 26 (v0.15.0)») и docs/PARITY.md. Версия сейчас 0.15.0.
+/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 25 (v0.14.0)», «Этап 26 (v0.15.0)», «Этап 27 (v0.16.0)») и docs/PARITY.md. Версия сейчас 0.16.0.
 
 СУТЬ: интерфейс и поведение 1 в 1 как в настоящем AyuGram, с оранжевыми основными кнопками, непрозрачным стартом (100%) + регулируемой прозрачностью окна и кнопок с iOS/Acrylic-блюром. Эталон — запущенный D:\download WIN\AyuGram\AyuGram.exe.
 Единственный релизный файл — `dist\Rustgramm.exe` (`scripts/make-dist.sh` обновляет его на месте, не создавая `-new`).
@@ -28,8 +28,9 @@
 - Исправлено затемнение модальных окон (`paint_modal_subblur` + осветлённый `paint_frosted_scrim`), добавлена виртуализация ленты сообщений (`show_viewport` + `msg_heights`) и 0% нагрузка CPU от `.tgs` в простое (`tick_tgs`) — v0.15.0.
 - Полный функционал ботов (инлайн/реплай-клавиатуры, `/start`, `getBotCallbackAnswer`, меню WebApp и встроенные Mini Apps через `MiniAppView`) и внутренняя система ссылок (`parse_tg_link`: `t.me/...`, `t.me/+HASH`, `tg://...`, `@username`) без браузера.
 - Полный щит приватности трафика (`PrivacyShieldSettings`: блокировка телеметрии, джиттер таймингов 0–300 мс, кэш только в ОЗУ `ephemeral_local_cache`, обезличивание имён файлов), тотальная очистка всех следов у других людей и на серверах без потери аккаунта (`WipeScope` / `wipe_external_data`), а также изолированные аккаунты с разными аппаратными отпечатками `initConnection` и раздельными слотами/прокси (`AccountProfile::isolated`).
-- Репозиторий сделан публичным (`simsislam89-crypto/rustgramm`), настроены 3 релиза GitHub (Windows PC x64 + Android Full с плагинами + Android Lite без плагинов).
+- Репозиторий сделан публичным (`simsislam89-crypto/rustgramm`), настроены 3 релиза GitHub (Windows PC x64 + Android Full с плагинами + Android Lite без плагинов), исправлена подпись APK (`zipalign` + `apksigner` v1/v2/v3).
+- Добавлена фирменная оранжевая иконка Rustgramm (Android адаптивная + mipmap и Windows `.ico`), убран запрос `api_id`/`api_hash` (прямой вход по номеру телефона/QR на ПК и сразу по телефону на Android), реализовано бесшовное добавление и переключение аккаунтов с реальными никнеймами/`@username` без перезапуска процесса (`'account_loop`), исправлены вылезание текста (`with_clip_rect`) и квадраты вместо иконки корзины (`menu/delete`), добавлено «Удалить у себя» / «Убрать все удалённые» (`purge_deleted`), «Копировать ссылку» (`t.me/...`) и подсветка целевого сообщения при переходе (`highlight_msg`) — v0.16.0.
 
 ЧТО ДЕЛАТЬ ДАЛЬШЕ:
-1. Живая визуальная сверка v0.15.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.
-2. Секретные чаты и звонки (`tgcalls`, по плану в `ROADMAP.md`).
+1. Живая визуальная сверка v0.16.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.
+2. Запрошенные приоритетные функции из AyuGram Desktop / Telegram Android (админка/права групп/каналов, голосовые/видеокружки/звонки, публикация историй, реакции в каналах, темы и кастомные паки иконок).

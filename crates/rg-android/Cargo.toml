@@ -23,6 +23,7 @@ eframe = { version = "0.37", default-features = false, features = ["default_font
 [package.metadata.android]
 package = "app.rustgramm"
 apk_name = "Rustgramm"
+resources = "res"
 build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.sdk]
@@ -31,6 +32,7 @@ target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "Rustgramm"
+icon = "@mipmap/ic_launcher"
 debuggable = false
 
 [package.metadata.android.application.activity]

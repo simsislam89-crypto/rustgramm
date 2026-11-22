@@ -234,6 +234,41 @@ impl MessageStore {
             .await
     }
 
+    /// Окончательно удалить уже удалённое сообщение только у себя из локальной базы, чтобы оно больше не показывалось.
+    pub async fn purge_deleted(&self, peer: i64, msg_id: i32) -> Result<u64> {
+        let id = i64::from(msg_id);
+        let _ = self
+            .conn
+            .execute(
+                "DELETE FROM edits WHERE peer=?1 AND msg_id=?2",
+                params![peer, id],
+            )
+            .await;
+        self.conn
+            .execute(
+                "DELETE FROM messages WHERE peer=?1 AND msg_id=?2 AND deleted=1",
+                params![peer, id],
+            )
+            .await
+    }
+
+    /// Окончательно убрать все удалённые сообщения данного чата из локальной базы.
+    pub async fn purge_all_deleted(&self, peer: i64) -> Result<u64> {
+        let _ = self
+            .conn
+            .execute(
+                "DELETE FROM edits WHERE peer=?1 AND msg_id IN (SELECT msg_id FROM messages WHERE peer=?1 AND deleted=1)",
+                params![peer],
+            )
+            .await;
+        self.conn
+            .execute(
+                "DELETE FROM messages WHERE peer=?1 AND deleted=1",
+                params![peer],
+            )
+            .await
+    }
+
     /// Все сохранённые удалённые или изменённые сообщения чата с историей правок (`ayu/ui/message_history`).
     pub async fn audit_peer(&self, peer: i64) -> Result<Vec<SavedAudit>> {
         let mut rows = self
@@ -363,5 +398,25 @@ mod tests {
         assert!(audit[0].deleted);
         assert_eq!(audit[1].msg_id, 100);
         assert_eq!(audit[1].edits, vec![("draft".to_owned(), 20)]);
+    }
+
+    #[tokio::test]
+    async fn purge_deleted_removes_only_target_deleted_message() {
+        let s = MessageStore::in_memory().await.unwrap();
+        s.remember(10, 1, "keep_live", 10).await.unwrap();
+        s.remember(10, 2, "del_a", 11).await.unwrap();
+        s.remember(10, 3, "del_b", 12).await.unwrap();
+        s.mark_deleted(10, &[2, 3]).await.unwrap();
+        // Живое сообщение (msg_id=1) purge_deleted не трогает.
+        assert_eq!(s.purge_deleted(10, 1).await.unwrap(), 0);
+        assert!(s.get(10, 1).await.unwrap().is_some());
+        // Удалённое msg_id=2 стирается у себя навсегда.
+        assert_eq!(s.purge_deleted(10, 2).await.unwrap(), 1);
+        assert!(s.get(10, 2).await.unwrap().is_none());
+        assert_eq!(s.deleted(10).await.unwrap().len(), 1);
+        // Массовая очистка удалённых стирает оставшиеся deleted=1, сохраняя живое.
+        assert_eq!(s.purge_all_deleted(10).await.unwrap(), 1);
+        assert!(s.deleted(10).await.unwrap().is_empty());
+        assert!(s.get(10, 1).await.unwrap().is_some());
     }
 }
