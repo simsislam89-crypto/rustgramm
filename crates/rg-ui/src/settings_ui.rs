@@ -305,6 +305,14 @@ impl App {
         let mut new_filter = std::mem::take(&mut self.filter_new);
         let mut shadow_new = std::mem::take(&mut self.shadow_new);
         let mut expanded = self.expanded;
+        let mut font_open = self.font_picker_open;
+        let mut font_search = std::mem::take(&mut self.font_search);
+        if self.sys_fonts.is_empty() {
+            self.sys_fonts = enumerate_system_fonts();
+        }
+        let sys_fonts = &self.sys_fonts;
+        let active_dialog_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
+        let mut toast_msg: Option<String> = None;
         let mut reset = false;
         let mut logout_ask = false;
         let max_h = (screen.height() - 40.0).clamp(240.0, 700.0);
@@ -371,10 +379,10 @@ impl App {
                                         }
                                     }
                                     page::GENERAL => general_page(ui, &mut s, &mut expanded),
-                                    page::APPEARANCE => appearance_page(ui, &mut s),
+                                    page::APPEARANCE => appearance_page(ui, &mut s, &mut font_open, &mut font_search, sys_fonts),
                                     page::CHATS => chats_page(ui, &mut s, &mut expanded),
                                     page::OTHER => reset = other_page(ui, &mut logout_ask),
-                                    page::SHARED => shared_page(ui, &mut s, &mut new_filter),
+                                    page::SHARED => shared_page(ui, &mut s, &mut new_filter, active_dialog_id, &mut toast_msg),
                                     page::SHADOW => shadow_page(ui, &mut s, &mut shadow_new),
                                     _ => {
                                         if let Some(p) = menu_page(ui) {
@@ -390,6 +398,11 @@ impl App {
         self.shadow_new = shadow_new;
         self.expanded = expanded;
         self.settings_tab = tab;
+        self.font_picker_open = font_open;
+        self.font_search = font_search;
+        if let Some(m) = toast_msg {
+            self.status = m;
+        }
         if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.settings_open = false;
         }
@@ -508,23 +521,45 @@ fn ayu_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     }
     if *expanded & 1 != 0 {
         let g = &mut s.ghost;
+        let lock_row = |ui: &mut egui::Ui, label: &str, val: &mut bool, locked: &mut bool| {
+            ui.horizontal(|ui| {
+                sub_toggle(ui, label, val);
+                let l_lbl = if *locked { "🔒" } else { "🔓" };
+                let r = ui
+                    .small_button(l_lbl)
+                    .on_hover_text("Закрепить: общий переключатель призрака не меняет этот пункт");
+                if r.clicked() {
+                    *locked = !*locked;
+                }
+            });
+        };
         let mut v = !g.send_read_messages;
-        if sub_toggle(ui, "Не отправлять «прочитано»", &mut v) {
+        let old_v = v;
+        lock_row(ui, "Не отправлять «прочитано»", &mut v, &mut g.locked_read_messages);
+        if v != old_v {
             g.send_read_messages = !v;
         }
         let mut v = !g.send_read_stories;
-        if sub_toggle(ui, "Не отправлять просмотры историй", &mut v) {
+        let old_v = v;
+        lock_row(ui, "Не отправлять просмотры историй", &mut v, &mut g.locked_read_stories);
+        if v != old_v {
             g.send_read_stories = !v;
         }
         let mut v = !g.send_online_packets;
-        if sub_toggle(ui, "Не отправлять «в сети»", &mut v) {
+        let old_v = v;
+        lock_row(ui, "Не отправлять «в сети»", &mut v, &mut g.locked_online_packets);
+        if v != old_v {
             g.send_online_packets = !v;
         }
         let mut v = !g.send_upload_progress;
-        if sub_toggle(ui, "Не отправлять «печатает…»", &mut v) {
+        let old_v = v;
+        lock_row(ui, "Не отправлять «печатает…»", &mut v, &mut g.locked_upload_progress);
+        if v != old_v {
             g.send_upload_progress = !v;
         }
-        sub_toggle(ui, "Сразу «не в сети»", &mut g.send_offline_after_online);
+        let mut off = g.send_offline_after_online;
+        lock_row(ui, "Сразу «не в сети»", &mut off, &mut g.locked_offline_after_online);
+        g.send_offline_after_online = off;
     }
     toggle(ui, "Прочитывать при действии", &mut s.ghost.mark_read_after_action);
     desc(ui, "Автоматически отмечает сообщения прочитанными, когда вы отправляете новое или ставите реакцию.");
@@ -578,14 +613,20 @@ fn filters_page(ui: &mut egui::Ui, s: &mut Settings) -> Option<usize> {
     go
 }
 
-fn shared_page(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
+fn shared_page(
+    ui: &mut egui::Ui,
+    s: &mut Settings,
+    new_filter: &mut String,
+    active_dialog_id: Option<i64>,
+    toast: &mut Option<String>,
+) {
     section(ui, "Правила");
     ui.horizontal(|ui| {
         ui.add_space(kit::PAD);
         ui.add(
             egui::TextEdit::singleline(new_filter)
                 .hint_text("Текст или регулярное выражение")
-                .desired_width(220.0),
+                .desired_width(210.0),
         );
         let t = new_filter.trim().to_owned();
         if ui.button("Добавить").clicked() && !t.is_empty() {
@@ -598,6 +639,56 @@ fn shared_page(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
         }
     });
     ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        if ui.button("Экспорт JSON").clicked() {
+            let json = rg_ayu::filters::export_filters_json(&s.filters);
+            ui.ctx().copy_text(json);
+            *toast = Some(format!("Экспортировано правил: {}", s.filters.len()));
+        }
+        if ui.button("Импорт из буфера").clicked() {
+            #[cfg(not(target_os = "android"))]
+            if let Ok(mut cb) = arboard::Clipboard::new()
+                && let Ok(txt) = cb.get_text()
+            {
+                match rg_ayu::filters::import_filters_json(&txt) {
+                    Ok(imported) => {
+                        let mut added = 0usize;
+                        for f in imported {
+                            if !s.filters.iter().any(|cur| cur.text == f.text && cur.dialog_id == f.dialog_id) {
+                                s.filters.push(f);
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            s.ayu.filters_enabled = true;
+                        }
+                        *toast = Some(format!("Импортировано правил: {added}"));
+                    }
+                    Err(e) => *toast = Some(format!("Ошибка JSON фильтров: {e}")),
+                }
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        if ui.button("Файл…").clicked()
+            && let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file()
+            && let Ok(txt) = std::fs::read_to_string(path)
+            && let Ok(imported) = rg_ayu::filters::import_filters_json(&txt)
+        {
+            let mut added = 0usize;
+            for f in imported {
+                if !s.filters.iter().any(|cur| cur.text == f.text && cur.dialog_id == f.dialog_id) {
+                    s.filters.push(f);
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                s.ayu.filters_enabled = true;
+            }
+            *toast = Some(format!("Импортировано из файла: {added}"));
+        }
+    });
+    ui.add_space(6.0);
     let mut remove = None;
     for (i, f) in s.filters.iter_mut().enumerate() {
         toggle(ui, &f.text.chars().take(28).collect::<String>(), &mut f.enabled);
@@ -605,6 +696,14 @@ fn shared_page(ui: &mut egui::Ui, s: &mut Settings, new_filter: &mut String) {
             ui.add_space(kit::PAD);
             ui.checkbox(&mut f.is_regex, "regex");
             ui.checkbox(&mut f.case_sensitive, "Aa");
+            if let Some(did) = active_dialog_id {
+                let only_here = f.dialog_id == Some(did);
+                if ui.selectable_label(only_here, if only_here { "Чат ✓" } else { "Глобальный" }).clicked() {
+                    f.dialog_id = if only_here { None } else { Some(did) };
+                }
+            } else if let Some(did) = f.dialog_id {
+                ui.label(RichText::new(format!("чат {did}")).size(11.0).color(SUBTEXT));
+            }
             if ui.small_button("Удалить").clicked() {
                 remove = Some(i);
             }
@@ -732,7 +831,40 @@ fn general_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     ui.add_space(8.0);
 }
 
-fn appearance_page(ui: &mut egui::Ui, s: &mut Settings) {
+fn enumerate_system_fonts() -> Vec<String> {
+    let mut names: Vec<String> = vec![
+        "Consolas".to_owned(),
+        "Cascadia Mono".to_owned(),
+        "JetBrains Mono".to_owned(),
+        "Fira Code".to_owned(),
+        "Courier New".to_owned(),
+        "Lucida Console".to_owned(),
+    ];
+    #[cfg(windows)]
+    if let Ok(rd) = std::fs::read_dir(r"C:\Windows\Fonts") {
+        for e in rd.flatten() {
+            if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                let low = stem.to_ascii_lowercase();
+                if (low.contains("mono") || low.contains("code") || low.contains("consol") || low.contains("cour"))
+                    && !names.iter().any(|n| n.eq_ignore_ascii_case(stem))
+                {
+                    names.push(stem.to_owned());
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn appearance_page(
+    ui: &mut egui::Ui,
+    s: &mut Settings,
+    font_open: &mut bool,
+    font_search: &mut String,
+    sys_fonts: &[String],
+) {
     section(ui, "Окно");
     let mut o = i32::from(s.window_opacity);
     let shown = format!("{o}%");
@@ -784,8 +916,43 @@ fn appearance_page(ui: &mut egui::Ui, s: &mut Settings) {
     toggle(ui, "Скрыть статусы Premium", &mut a.hide_premium_statuses);
     let font = if a.mono_font.is_empty() { "По умолчанию".to_owned() } else { a.mono_font.clone() };
     if value_row(ui, "Моноширинный шрифт", &font, false) {
-        a.mono_font = if a.mono_font.is_empty() { "Consolas".to_owned() } else { String::new() };
+        *font_open = !*font_open;
     }
+    if *font_open {
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            ui.add(
+                egui::TextEdit::singleline(font_search)
+                    .hint_text("Поиск шрифта…")
+                    .desired_width(210.0),
+            );
+            if ui.small_button("Сброс").clicked() {
+                a.mono_font.clear();
+                *font_open = false;
+            }
+        });
+        let q = font_search.trim().to_ascii_lowercase();
+        egui::ScrollArea::vertical().id_salt("mono-fonts").max_height(130.0).show(ui, |ui| {
+            for f in sys_fonts.iter().filter(|n| q.is_empty() || n.to_ascii_lowercase().contains(&q)).take(24) {
+                ui.horizontal(|ui| {
+                    ui.add_space(kit::PAD);
+                    if ui.selectable_label(a.mono_font == *f, f).clicked() {
+                        a.mono_font = f.clone();
+                        *font_open = false;
+                    }
+                });
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        ui.label(RichText::new("Метка удалённых:").size(13.0).color(SUBTEXT));
+        ui.add(egui::TextEdit::singleline(&mut a.deleted_mark).desired_width(68.0).hint_text("🧹"));
+        ui.add_space(8.0);
+        ui.label(RichText::new("Метка правок:").size(13.0).color(SUBTEXT));
+        ui.add(egui::TextEdit::singleline(&mut a.edited_mark).desired_width(68.0).hint_text("изм."));
+    });
+    ui.add_space(4.0);
     divider(ui);
     section(ui, "Папки чатов");
     toggle(ui, "Скрыть счётчики уведомлений", &mut a.hide_notification_counters);
@@ -932,23 +1099,7 @@ fn other_page(ui: &mut egui::Ui, logout_ask: &mut bool) -> bool {
 
 /// Регистрирует Rustgramm обработчиком ссылок `tg://` для текущего пользователя.
 fn register_url_scheme(ctx: &egui::Context) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        if let Ok(exe) = std::env::current_exe() {
-            let exe = exe.to_string_lossy().into_owned();
-            let run = |args: &[&str]| {
-                let _ = std::process::Command::new("reg")
-                    .args(args)
-                    .creation_flags(0x0800_0000)
-                    .status();
-            };
-            run(&["add", r"HKCU\Software\Classes\tg", "/ve", "/d", "URL:Telegram Link", "/f"]);
-            run(&["add", r"HKCU\Software\Classes\tg", "/v", "URL Protocol", "/d", "", "/f"]);
-            let cmd = format!("\"{exe}\" \"%1\"");
-            run(&["add", r"HKCU\Software\Classes\tg\shell\open\command", "/ve", "/d", &cmd, "/f"]);
-        }
-    }
+    let _ = super::win::register_tg_url_scheme();
     ctx.request_repaint();
 }
 

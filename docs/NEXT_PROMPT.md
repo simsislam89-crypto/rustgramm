@@ -1,4 +1,4 @@
-/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 20–22 (v0.11.0)», «Этап 23 (v0.12.0)», «Этап 24 (v0.13.0)») и docs/PARITY.md. Версия сейчас 0.13.0.
+/allskill Продолжаем Rustgramm — порт AyuGram Desktop на Rust (egui). Сначала прочитай RRR.md (разделы «Этап 23 (v0.12.0)», «Этап 24 (v0.13.0)», «Этап 25 (v0.14.0)») и docs/PARITY.md. Версия сейчас 0.14.0.
 
 СУТЬ: интерфейс и поведение 1 в 1 как в настоящем AyuGram, с оранжевыми основными кнопками, непрозрачным стартом (100%) + регулируемой прозрачностью окна и кнопок с iOS/Acrylic-блюром. Эталон — запущенный D:\download WIN\AyuGram\AyuGram.exe.
 Единственный релизный файл — `dist\Rustgramm.exe` (`scripts/make-dist.sh` обновляет его на месте, не создавая `-new`).
@@ -22,11 +22,11 @@
 - Отдельное модальное окно «Мой профиль» (`my_profile_window`, 1 в 1 с AyuGram, без переброса в «Избранное») и мгновенное «Прочитать на сервере» для всех чатов из бокового меню (`force_read_all` + `Engine::force_read_many`).
 - Горячие клавиши и кнопки мыши: автоскролл при нажатии колёсика (`PointerButton::Middle`), ускорение колеса `Shift`/`Alt` ×3.5, боковые кнопки мыши `Extra1`/`Extra2` (Назад/Вперёд по истории чатов и страниц настроек), `Ctrl+Z`/`Ctrl+Y` в поле ввода, стрелка `↑` для редактирования последнего сообщения.
 - Потоковая музыка в профиле (старт воспроизведения после первых 128 КБ через HTTP Range + фоновая предзагрузка первого трека профиля).
-- Система плагинов (`rg-ayu::plugins`) для телефона и ПК + сборки Full (`--features plugins`) и Lite (`--no-default-features`), `scripts/make-apk.sh`, `.github/workflows/release.yml`, и **2074 модульных и характеристических теста** (`cargo test --workspace`).
+- Система плагинов (`rg-ayu::plugins`) для телефона и ПК + сборки Full (`--features plugins`) и Lite (`--no-default-features`), `scripts/make-apk.sh`, `.github/workflows/release.yml`, и **2097 модульных и характеристических тестов** (`cargo test --workspace`).
+- Полноценный системный трей Windows (`tray.rs::TrayManager` на `Shell_NotifyIconW`, динамическая иконка с бейджем непрочитанных `render_app_icon_rgba`, режимы `WorkMode`, меню, автозапуск через HKCU Run, URL-протокол `tg://`, `WDA_EXCLUDEFROMCAPTURE` для режима стримера) — v0.14.0.
+- Живая векторная Lottie-анимация `.tgs` на чистом Rust (`lottie.rs::TgsAnim`, ключевые кадры/Безье, 24 FPS в стикерах/эмодзи), интерактивный Message Shot (`shot.rs`: GDI ClearType, 5 тем, буфер `arboard` и PNG), отложенная отправка в Ghost Mode (`schedule_date` + `offline = true`) и замки `locked_*`, просмотр журнала удалённых/правок (`audit_peer`), пакетная пересылка (`forward_batch`), импорт/экспорт фильтров JSON + пер-диалоговые фильтры, полоса/просмотрщик историй, форумы и темы, комментарии каналов, закреплённый баннер, форматирование при отправке (`parse_formatted`, `[Aa]`, `Ctrl+B/I/Shift+X/M/P`), галерея просмотрщика (`←`/`→`), Drag & Drop и переключатели exteraGram (`pg::EXTERA`).
 
 ЧТО ДЕЛАТЬ ДАЛЬШЕ:
-1. Живая визуальная сверка v0.11.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.
-2. Полноценная анимация векторных TGS (Lottie) прямо в карточке стикера и Custom Emoji.
-3. Форумы/темы (топики супергрупп `messages.getForumTopics`), комментарии к постам каналов, истории (Stories).
-4. Иконка в системном трее Windows (сворачивание в трей, счётчик непрочитанных) и автозапуск.
-5. Несколько аккаунтов и звонки (tgcalls, по плану в `ROADMAP.md`).
+1. Живая визуальная сверка v0.14.0 с AyuGram на рабочем столе (`vendor\rg-click\target\release\rg-click.exe tour dist/ui_tour` или `request_access` в Claude Code), тестовые сообщения ТОЛЬКО в `sudoyp` с удалением за собой.
+2. Закачка Android NDK (`aarch64-linux-android-clang`) или релиз через GitHub Actions `.github/workflows/release.yml` для сборки `Rustgramm-Android-Full.apk` и `Rustgramm-Android-Lite.apk`.
+3. Несколько аккаунтов, секретные чаты и звонки (`tgcalls`, по плану в `ROADMAP.md`).

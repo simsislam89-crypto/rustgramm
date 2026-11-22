@@ -45,6 +45,12 @@ pub(crate) enum Act {
     Shot(i32),
     /// Проголосовать в опросе (идентификатор сообщения, байты варианта).
     VotePoll(i32, Vec<u8>),
+    /// Выбрать / снять выделение сообщения (мультивыбор для пересылки и снимка).
+    ToggleSelect(i32),
+    /// Открыть ветку комментариев к посту канала.
+    Discuss(i32),
+    /// Фильтровать ленту по конкретному отправителю.
+    FilterUser(i64, String),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -55,6 +61,10 @@ struct Env<'a> {
     shift: bool,
     scroll_to: Option<i32>,
     group: bool,
+    is_channel: bool,
+    has_discussion: bool,
+    format_secs: bool,
+    double_tap_action: i32,
     arrived: &'a HashMap<i32, f64>,
     img_arrived: &'a HashMap<i32, f64>,
     time: f64,
@@ -76,6 +86,8 @@ struct Env<'a> {
     show_translate: bool,
     /// Видимая область ленты (для аккуратного размещения встроенного GIF).
     clip_rect: Rect,
+    /// Выбранные сообщения (режим множественного выделения).
+    selected_msgs: &'a std::collections::HashSet<i32>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -100,7 +112,17 @@ impl App {
             }
             if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)) {
                 let info = self.peer_infos.get(&d.id);
-                let sub = if d.saved {
+                let live_typing = self
+                    .typing
+                    .get(&d.id)
+                    .filter(|(_, at)| at.elapsed().as_secs() < 6)
+                    .map(|(lbl, _)| lbl.clone());
+                let hide_status = self.settings.extera.hide_action_bar_status;
+                let sub = if let Some(lbl) = &live_typing {
+                    lbl.clone()
+                } else if hide_status {
+                    String::new()
+                } else if d.saved {
                     "Сохраняйте важные сообщения".to_owned()
                 } else if let Some(inf) = info {
                     if inf.members > 0 {
@@ -136,11 +158,23 @@ impl App {
                     (true, false) => id_note,
                     (true, true) => String::new(),
                 };
-                let online = subtitle.starts_with("в сети");
+                let online = live_typing.is_none() && subtitle.starts_with("в сети");
+                let sub_color = if live_typing.is_some() {
+                    ORANGE
+                } else if online {
+                    GREEN
+                } else {
+                    SUBTEXT
+                };
                 let title_str = if d.saved { "Избранное" } else { d.name.as_str() };
-                let emoji_id = d.emoji_status.or_else(|| info.and_then(|x| x.emoji_status));
+                let show_prem = !self.settings.ayu.hide_premium_statuses;
+                let emoji_id = if show_prem {
+                    d.emoji_status.or_else(|| info.and_then(|x| x.emoji_status))
+                } else {
+                    None
+                };
                 let verified = d.verified || info.is_some_and(|x| x.verified);
-                let premium = d.premium || info.is_some_and(|x| x.premium);
+                let premium = show_prem && (d.premium || info.is_some_and(|x| x.premium));
                 let hdr_w = (ui.available_width() - 150.0).max(160.0);
                 let (hrect, hresp) = ui.allocate_exact_size(Vec2::new(hdr_w, TOP_BAR_HEIGHT - 4.0), Sense::click());
                 draw_avatar(
@@ -157,16 +191,25 @@ impl App {
                 let p = ui.painter();
                 let title_galley = p.layout_no_wrap(title_str.to_owned(), FontId::proportional(15.5), WHITE);
                 let title_w = title_galley.size().x.min((hrect.right() - text_x - 24.0).max(40.0));
-                let clip_t = Rect::from_min_max(Pos2::new(text_x, hrect.top()), Pos2::new(text_x + title_w, hrect.bottom()));
+                let centered = self.settings.extera.center_title;
+                let title_start_x = if centered {
+                    (hrect.center().x - title_w * 0.5).max(text_x)
+                } else {
+                    text_x
+                };
+                let clip_t = Rect::from_min_max(
+                    Pos2::new(title_start_x, hrect.top()),
+                    Pos2::new(title_start_x + title_w, hrect.bottom()),
+                );
                 p.with_clip_rect(clip_t).text(
-                    Pos2::new(text_x, title_y),
+                    Pos2::new(title_start_x, title_y),
                     egui::Align2::LEFT_CENTER,
                     title_str,
                     FontId::proportional(15.5),
                     WHITE,
                 );
                 // Значок Premium-эмодзи статуса / галочки / Premium прямо рядом с именем (как в AyuGram!).
-                let badge_c = Pos2::new(text_x + title_w + 11.0, title_y);
+                let badge_c = Pos2::new(title_start_x + title_w + 11.0, title_y);
                 if let Some(doc_id) = emoji_id {
                     if let Some(tex) = self.sticker_tex.get(&doc_id) {
                         egui::Image::new(tex)
@@ -182,13 +225,23 @@ impl App {
                 }
                 if !subtitle.is_empty() {
                     let clip_s = Rect::from_min_max(Pos2::new(text_x, hrect.top()), Pos2::new(hrect.right(), hrect.bottom()));
-                    ui.painter().with_clip_rect(clip_s).text(
-                        Pos2::new(text_x, hrect.center().y + 10.0),
-                        egui::Align2::LEFT_CENTER,
-                        subtitle,
-                        FontId::proportional(12.5),
-                        if online { GREEN } else { SUBTEXT },
-                    );
+                    if centered {
+                        ui.painter().with_clip_rect(clip_s).text(
+                            Pos2::new(hrect.center().x.max(text_x + 40.0), hrect.center().y + 10.0),
+                            egui::Align2::CENTER_CENTER,
+                            subtitle,
+                            FontId::proportional(12.5),
+                            sub_color,
+                        );
+                    } else {
+                        ui.painter().with_clip_rect(clip_s).text(
+                            Pos2::new(text_x, hrect.center().y + 10.0),
+                            egui::Align2::LEFT_CENTER,
+                            subtitle,
+                            FontId::proportional(12.5),
+                            sub_color,
+                        );
+                    }
                 }
                 if hresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.info_open = !self.info_open;
@@ -223,6 +276,10 @@ impl App {
                         }
                         if kit::menu_item(ui, "menu/read", "Прочитать на сервере", false) {
                             act = Some(Cmd::ForceRead);
+                            ui.close();
+                        }
+                        if kit::menu_item(ui, "menu/edited_status", "Удалённые и правки", false) {
+                            act = Some(Cmd::SavedHistory);
                             ui.close();
                         }
                         if !saved
@@ -346,9 +403,14 @@ impl App {
             }
             let pname = if d.saved { "Избранное" } else { d.name.as_str() };
             let name_galley = ui.painter().layout_no_wrap(pname.to_owned(), FontId::proportional(17.5), WHITE);
-            let emoji_id = info.as_ref().and_then(|x| x.emoji_status).or(d.emoji_status);
+            let show_prem = !self.settings.ayu.hide_premium_statuses;
+            let emoji_id = if show_prem {
+                info.as_ref().and_then(|x| x.emoji_status).or(d.emoji_status)
+            } else {
+                None
+            };
             let verified = info.as_ref().is_some_and(|x| x.verified) || d.verified;
-            let premium = info.as_ref().is_some_and(|x| x.premium) || d.premium;
+            let premium = show_prem && (info.as_ref().is_some_and(|x| x.premium) || d.premium);
             let has_badge = emoji_id.is_some() || verified || premium;
             let name_x = top.center().x - if has_badge { 10.0 } else { 0.0 };
             ui.painter().text(
@@ -516,7 +578,18 @@ impl App {
                     }
                 };
                 let streamer = self.settings.ayu.streamer_mode;
-                row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { mask_streamer(&format!("+{}", info.phone), streamer) }, "Телефон", !streamer);
+                let mask_phone = streamer || self.settings.extera.hide_phone_number;
+                row(
+                    ui,
+                    "menu/phone",
+                    &if info.phone.is_empty() {
+                        String::new()
+                    } else {
+                        mask_streamer(&format!("+{}", info.phone), mask_phone)
+                    },
+                    "Телефон",
+                    !mask_phone,
+                );
                 row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { mask_streamer(&format!("@{}", info.username), streamer) }, "Имя пользователя", !streamer);
                 row(ui, "menu/info", &info.about, if is_group { "Описание" } else { "О себе" }, true);
                 if !info.birthday.is_empty() {
@@ -818,8 +891,96 @@ impl App {
     }
 
     pub(crate) fn composer_ui(&mut self, ui: &mut egui::Ui) {
+        self.channel_bottom_bar(ui);
         self.context_bar(ui);
         let s = self.settings.ayu.clone();
+        let has_cmds = self
+            .selected
+            .and_then(|i| self.dialogs.get(i))
+            .and_then(|d| self.peer_infos.get(&d.id))
+            .is_some_and(|x| !x.bot_commands.is_empty());
+        let bot_cmds = if has_cmds {
+            self.selected
+                .and_then(|i| self.dialogs.get(i))
+                .and_then(|d| self.peer_infos.get(&d.id))
+                .map(|x| x.bot_commands.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let cur_ttl = self
+            .selected
+            .and_then(|i| self.dialogs.get(i))
+            .and_then(|d| self.peer_infos.get(&d.id))
+            .and_then(|x| x.ttl_period);
+        // Необязательная полоса форматирования над строкой ввода (`[Aa]`).
+        if self.format_bar_open {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let sel = self.composer_sel;
+                if ui.small_button(RichText::new("B").strong()).on_hover_text("Жирный (Ctrl+B)").clicked() {
+                    super::rich::wrap_selection(&mut self.input, sel, "**", "**");
+                }
+                if ui.small_button(RichText::new("I").italics()).on_hover_text("Курсив (Ctrl+I)").clicked() {
+                    super::rich::wrap_selection(&mut self.input, sel, "__", "__");
+                }
+                if ui.small_button(RichText::new("S").strikethrough()).on_hover_text("Зачёркнутый (Ctrl+Shift+X)").clicked() {
+                    super::rich::wrap_selection(&mut self.input, sel, "~~", "~~");
+                }
+                if ui.small_button("</>").on_hover_text("Моноширинный (Ctrl+Shift+M)").clicked() {
+                    super::rich::wrap_selection(&mut self.input, sel, "`", "`");
+                }
+                if ui.small_button("||").on_hover_text("Спойлер (Ctrl+Shift+P)").clicked() {
+                    super::rich::wrap_selection(&mut self.input, sel, "||", "||");
+                }
+                if ui.small_button("Цитата").clicked() {
+                    super::rich::wrap_selection(&mut self.input, sel, "> ", "");
+                }
+            });
+        }
+        // Всплывающий выбор команд бота (`/`).
+        if self.cmd_popup_open && !bot_cmds.is_empty() {
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (cmd, desc) in &bot_cmds {
+                            let lbl = if desc.is_empty() {
+                                format!("/{cmd}")
+                            } else {
+                                format!("/{cmd} — {desc}")
+                            };
+                            if ui.small_button(lbl).clicked() {
+                                self.input = format!("/{cmd} ");
+                                self.cmd_popup_open = false;
+                            }
+                        }
+                    });
+                });
+        }
+        // Всплывающий выбор таймера автоудаления (`field_auto_delete_button`).
+        if self.ttl_popup_open {
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Автоудаление:").size(12.5).color(SUBTEXT));
+                        for (lbl, sec) in [("Выкл.", 0), ("24 часа", 86_400), ("7 дней", 604_800), ("1 месяц", 2_678_400)] {
+                            let active = cur_ttl.unwrap_or(0) == sec;
+                            let txt = if active { RichText::new(lbl).color(ORANGE).strong() } else { RichText::new(lbl) };
+                            if ui.small_button(txt).clicked() {
+                                self.send(Cmd::SetChatTtl(sec));
+                                self.ttl_popup_open = false;
+                            }
+                        }
+                    });
+                });
+        }
         let mut attach = false;
         ui.horizontal(|ui| {
             ui.set_min_height(46.0);
@@ -830,14 +991,32 @@ impl App {
                 icons::attach(ui.painter(), rect.center(), if resp.hovered() { WHITE } else { DIALOG_DATE });
                 attach = resp.on_hover_text("Отправить файл").clicked();
             }
+            if s.field_commands_button && has_cmds {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 44.0), Sense::click());
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "/",
+                    FontId::proportional(17.0),
+                    if self.cmd_popup_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE },
+                );
+                if resp.on_hover_text("Команды бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.cmd_popup_open = !self.cmd_popup_open;
+                    self.ttl_popup_open = false;
+                }
+            }
             // Точный расчёт правой части (без лишнего пустого зазора в строке ввода).
-            let right_w = 44.0 + if s.field_emoji_button { 46.0 } else { 0.0 };
+            let right_w = 44.0
+                + 34.0
+                + if s.field_emoji_button { 46.0 } else { 0.0 }
+                + if s.field_auto_delete_button { 36.0 } else { 0.0 };
             let width = (ui.available_width() - right_w).max(80.0);
             let id = ui.make_persistent_id("composer-input");
             let focused = ui.memory(|m| m.has_focus(id));
             // Горячие клавиши в поле ввода:
-            // - Стрелка Вверх в пустом поле — редактировать последнее своё сообщение (как в Telegram/AyuGram)
-            // - Ctrl+Z / Ctrl+Y (и Ctrl+Shift+Z) — откат / возврат текста в поле ввода
+            // - Стрелка Вверх в пустом поле — редактировать последнее своё сообщение
+            // - Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z — откат / возврат текста
+            // - Ctrl+B / Ctrl+I / Ctrl+Shift+X / Ctrl+Shift+M / Ctrl+Shift+P — форматирование выделения
             if focused {
                 if self.input.is_empty()
                     && self.editing.is_none()
@@ -864,21 +1043,40 @@ impl App {
                     let cur = std::mem::replace(&mut self.input, next);
                     self.input_undo.push(cur);
                 }
+                let sel = self.composer_sel;
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
+                    super::rich::wrap_selection(&mut self.input, sel, "**", "**");
+                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::I)) {
+                    super::rich::wrap_selection(&mut self.input, sel, "__", "__");
+                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::X)) {
+                    super::rich::wrap_selection(&mut self.input, sel, "~~", "~~");
+                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::M)) {
+                    super::rich::wrap_selection(&mut self.input, sel, "`", "`");
+                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P)) {
+                    super::rich::wrap_selection(&mut self.input, sel, "||", "||");
+                }
             }
             let before_input = self.input.clone();
             // Enter отправляет, Shift+Enter — новая строка.
             let enter = focused
                 && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
                 && ui.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Enter));
-            let r = ui.add_sized(
-                [width, 36.0],
-                egui::TextEdit::multiline(&mut self.input)
-                    .id(id)
-                    .desired_rows(1)
-                    .hint_text("Написать сообщение…")
-                    .frame(egui::Frame::NONE)
-                    .margin(Vec2::new(4.0, 8.0)),
-            );
+            let text_out = ui
+                .allocate_ui(Vec2::new(width, 36.0), |ui| {
+                    egui::TextEdit::multiline(&mut self.input)
+                        .id(id)
+                        .desired_width(width)
+                        .desired_rows(1)
+                        .hint_text("Написать сообщение…")
+                        .frame(egui::Frame::NONE)
+                        .margin(Vec2::new(4.0, 8.0))
+                        .show(ui)
+                })
+                .inner;
+            if let Some(cr) = text_out.cursor_range {
+                self.composer_sel = Some((cr.primary.index.into(), cr.secondary.index.into()));
+            }
+            let r = text_out.response;
             if r.changed() && self.input != before_input {
                 if self.input_undo.last() != Some(&before_input) {
                     self.input_undo.push(before_input);
@@ -890,6 +1088,35 @@ impl App {
             }
             if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
                 self.input_custom_emojis.clear();
+            }
+            // Кнопка панели форматирования [Aa].
+            {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 44.0), Sense::click());
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Aa",
+                    FontId::proportional(13.5),
+                    if self.format_bar_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE },
+                );
+                if resp.on_hover_text("Форматирование (**жирный**, __курсив__, `код`, ||спойлер||)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.format_bar_open = !self.format_bar_open;
+                }
+            }
+            if s.field_auto_delete_button {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 44.0), Sense::click());
+                let active_ttl = cur_ttl.is_some_and(|v| v > 0);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "⏱",
+                    FontId::proportional(15.0),
+                    if active_ttl || self.ttl_popup_open { ORANGE } else if resp.hovered() { WHITE } else { DIALOG_DATE },
+                );
+                if resp.on_hover_text("Таймер автоудаления сообщений").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.ttl_popup_open = !self.ttl_popup_open;
+                    self.cmd_popup_open = false;
+                }
             }
             if s.field_emoji_button {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 44.0), Sense::click());
@@ -946,14 +1173,16 @@ impl App {
                 self.input.clear();
                 self.input_undo.clear();
                 self.input_redo.clear();
+                self.composer_sel = None;
+                let (clean, ents) = super::rich::parse_formatted(&text, &custom);
                 if let Some(id) = self.editing.take() {
-                    self.send(Cmd::Edit(id, text));
+                    self.send(Cmd::Edit(id, clean));
                 } else {
                     let reply = self.reply.take().map(|(id, _)| id);
-                    if custom.is_empty() {
-                        self.send(Cmd::Send(text, reply));
+                    if ents.is_empty() {
+                        self.send(Cmd::Send(clean, reply));
                     } else {
-                        self.send(Cmd::SendRich(text, custom, reply));
+                        self.send(Cmd::SendFormatted(clean, ents, reply));
                     }
                 }
                 r.request_focus();
@@ -1085,8 +1314,19 @@ impl App {
                     }
                 }
                 A::Send(id) => {
-                    let reply = self.reply.take().map(|(r, _)| r);
-                    self.send(Cmd::SendSticker(id, reply));
+                    let is_gif = self.emoji_tab == 2;
+                    let confirm = if is_gif {
+                        self.settings.ayu.gif_confirmation
+                    } else {
+                        self.settings.ayu.sticker_confirmation
+                    };
+                    let reply = self.reply.as_ref().map(|(r, _)| *r);
+                    if confirm {
+                        self.pending_confirm_media = Some((is_gif, id, reply));
+                    } else {
+                        self.reply.take();
+                        self.send(Cmd::SendSticker(id, reply));
+                    }
                 }
                 A::SelectSet(i) => self.sticker_cur = i,
                 A::Gifs => {
@@ -1210,9 +1450,111 @@ impl App {
         }
         ui.set_opacity(ios_spring(fade));
         let now = self.now;
-        // Имя отправителя показываем только в группах и каналах (их идентификаторы отрицательные).
-        let group = self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id < 0);
+        let dlg_meta = self.selected.and_then(|i| {
+            self.dialogs.get(i).map(|d| {
+                (
+                    i,
+                    d.id,
+                    d.kind == rg_core::engine::DialogKind::Channel,
+                    d.unread,
+                    self.peer_infos
+                        .get(&d.id)
+                        .and_then(|x| x.linked_chat_id)
+                        .is_some(),
+                )
+            })
+        });
+        let group = dlg_meta.is_some_and(|(_, id, _, _, _)| id < 0);
+        let is_channel = dlg_meta.is_some_and(|(_, _, ch, _, _)| ch);
+        let has_discussion = dlg_meta.is_some_and(|(_, _, _, _, disc)| disc);
+        let unread_cnt = dlg_meta.map_or(0, |(_, _, _, u, _)| u);
         let shift = ui.input(|i| i.modifiers.shift);
+        if let Some((idx, cid, _, _, _)) = dlg_meta {
+            if let Some(pin) = self.pinned_msgs.get(&cid).cloned() {
+                egui::Frame::new()
+                    .fill(t2(WINDOW_BG))
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 28.0), Sense::hover());
+                            ui.painter().rect_filled(bar, 1.5, ORANGE);
+                            let txt_w = (ui.available_width() - 32.0).max(80.0);
+                            let preview = if pin.text.is_empty() {
+                                "Вложение".to_owned()
+                            } else {
+                                short(&pin.text, 55)
+                            };
+                            let resp = ui
+                                .allocate_ui(Vec2::new(txt_w, 28.0), |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        ui.label(RichText::new("Закреплённое сообщение").size(11.5).color(ORANGE).strong());
+                                        ui.label(RichText::new(preview).size(12.5).color(SUBTEXT));
+                                    });
+                                })
+                                .response;
+                            if ui.interact(resp.rect, ui.make_persistent_id("pin-banner"), Sense::click()).clicked() {
+                                if self.messages.iter().any(|m| m.id == pin.id) {
+                                    self.scroll_to = Some(pin.id);
+                                } else {
+                                    self.status = "Закреплённое сообщение выше в истории".to_owned();
+                                }
+                            }
+                            if ui.small_button("✕").on_hover_text("Открепить").clicked() {
+                                self.send(Cmd::Pin(pin.id, false));
+                                self.pinned_msgs.remove(&cid);
+                            }
+                        });
+                    });
+            }
+            if let Some(topics) = self.forum_topics.get(&cid).cloned()
+                && !topics.is_empty()
+            {
+                let mut picked_topic: Option<Option<i32>> = None;
+                let show_cnt = !self.settings.ayu.hide_notification_counters;
+                egui::ScrollArea::horizontal()
+                    .id_salt("forum-topics-bar")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            if ui.selectable_label(self.active_topic.is_none(), "Все сообщения").clicked() {
+                                picked_topic = Some(None);
+                            }
+                            for t_row in &topics {
+                                let lbl = if show_cnt && t_row.unread > 0 {
+                                    format!("{} ({})", t_row.title, t_row.unread)
+                                } else {
+                                    t_row.title.clone()
+                                };
+                                if ui.selectable_label(self.active_topic == Some(t_row.id), lbl).clicked() {
+                                    picked_topic = Some(Some(t_row.id));
+                                }
+                            }
+                        });
+                    });
+                if let Some(pick) = picked_topic {
+                    self.active_topic = pick;
+                    if let Some(tid) = pick {
+                        self.topic_msgs = None;
+                        self.send(Cmd::TopicMessages(idx, tid));
+                    }
+                }
+            }
+        }
+        if let Some((_, uname)) = self.user_filter.clone() {
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Фильтр по отправителю: {uname}")).size(12.5).color(ORANGE));
+                        if ui.small_button("Сбросить").clicked() {
+                            self.user_filter = None;
+                        }
+                    });
+                });
+        }
         let viewport_h = ui.available_height();
         let clip_rect = ui.clip_rect();
         // Быстрый скролл при нажатии колёсика мыши (Middle Click Auto-Scroll) и ускорение колеса (Shift/Alt/Middle ×3.5).
@@ -1267,7 +1609,17 @@ impl App {
         }
         let pad = (viewport_h - self.msgs_h).max(0.0);
         let out = {
-            let list: &[MessageRow] = self.found.as_deref().unwrap_or(&self.messages);
+            let topic_slice = self.active_topic.and_then(|tid| {
+                self.topic_msgs
+                    .as_ref()
+                    .filter(|(mtid, _)| *mtid == tid)
+                    .map(|(_, rows)| rows.as_slice())
+            });
+            let list: &[MessageRow] = if searching {
+                self.found.as_deref().unwrap_or(&self.messages)
+            } else {
+                topic_slice.unwrap_or(&self.messages)
+            };
             let read_out = self.selected.and_then(|i| self.dialogs.get(i)).map_or(0, |d| d.read_out);
             let env = Env {
                 read_out,
@@ -1279,12 +1631,17 @@ impl App {
                 custom_tex: &self.sticker_tex,
                 show_translate: self.settings.language.show_translate_button,
                 clip_rect,
+                selected_msgs: &self.selected_msgs,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
                 tex: &self.textures,
                 shift,
                 scroll_to,
                 group,
+                is_channel,
+                has_discussion,
+                format_secs: self.settings.ayu.show_message_seconds || self.settings.extera.format_time_with_seconds,
+                double_tap_action: self.settings.extera.double_tap_action,
                 arrived: &self.arrived,
                 img_arrived: &self.img_arrived,
                 time: ui.input(|i| i.time),
@@ -1292,9 +1649,12 @@ impl App {
                 spoilers: &self.spoilers,
             };
             let hidden = &self.hidden;
+            let hide_blocked = self.settings.ayu.hide_from_blocked;
+            let blocked_ids = &self.blocked_ids;
+            let user_filter = self.user_filter.as_ref().map(|(id, _)| *id);
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
-                .stick_to_bottom(!searching && self.autoscroll_anchor.is_none())
+                .stick_to_bottom(!searching && self.autoscroll_anchor.is_none() && self.active_topic.is_none())
                 .show(ui, |ui| {
                     if (fast_wheel_delta + autoscroll_dy).abs() > 0.1 {
                         ui.scroll_with_delta(Vec2::new(0.0, fast_wheel_delta + autoscroll_dy));
@@ -1305,7 +1665,14 @@ impl App {
                     if searching && list.is_empty() {
                         ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(SUBTEXT)));
                     }
-                    let visible: Vec<&MessageRow> = list.iter().filter(|m| !hidden.contains(&m.id)).collect();
+                    let visible: Vec<&MessageRow> = list
+                        .iter()
+                        .filter(|m| {
+                            !hidden.contains(&m.id)
+                                && (!hide_blocked || !blocked_ids.contains(&m.sender_id))
+                                && user_filter.is_none_or(|uid| m.sender_id == uid)
+                        })
+                        .collect();
                     let mut i = 0;
                     while i < visible.len() {
                         let m = visible[i];
@@ -1338,6 +1705,43 @@ impl App {
         };
         self.inline_gif_rect = gif_candidate;
         self.msgs_h = (out.content_size.y - pad).max(0.0);
+        self.scrolled_up = out.content_size.y > out.inner_rect.height() + 20.0
+            && (out.state.clamped_offset().y + out.inner_rect.height() < out.content_size.y - 48.0);
+        if self.settings.extera.hide_keyboard_on_scroll && ui.input(|i| i.smooth_scroll_delta.y.abs() > 3.0) {
+            if !self.emoji_pinned {
+                self.emoji_open = false;
+            }
+            self.cmd_popup_open = false;
+            self.ttl_popup_open = false;
+        }
+        // Плавающая кнопка прокрутки вниз (учитывает настройку square_fab).
+        if self.scrolled_up && self.selected_msgs.is_empty() {
+            let center = Pos2::new(clip_rect.right() - 28.0, clip_rect.bottom() - 28.0);
+            let fab_rect = Rect::from_center_size(center, Vec2::splat(40.0));
+            let resp = ui.interact(fab_rect, ui.make_persistent_id("scroll-down-fab"), Sense::click());
+            let bg = if resp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
+            if self.settings.extera.square_fab {
+                ui.painter().rect_filled(fab_rect, egui::CornerRadius::same(13), bg);
+                ui.painter().rect_stroke(
+                    fab_rect,
+                    egui::CornerRadius::same(13),
+                    egui::Stroke::new(1.0, Color32::from_white_alpha(32)),
+                    egui::StrokeKind::Inside,
+                );
+            } else {
+                ui.painter().circle_filled(center, 20.0, bg);
+                ui.painter().circle_stroke(center, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+            }
+            ui.painter().text(center, egui::Align2::CENTER_CENTER, "↓", FontId::proportional(18.0), WHITE);
+            if unread_cnt > 0 && !self.settings.ayu.hide_notification_counters {
+                let badge = Rect::from_center_size(center - Vec2::new(0.0, 22.0), Vec2::new(26.0, 16.0));
+                ui.painter().rect_filled(badge, egui::CornerRadius::same(8), t_btn(ORANGE));
+                ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, unread_cnt.min(999).to_string(), FontId::proportional(10.5), Color32::WHITE);
+            }
+            if resp.on_hover_text("Вниз").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.scroll_to = self.messages.last().map(|m| m.id);
+            }
+        }
         // Отрисовка якоря быстрого скролла колёсиком мыши (Middle Click Auto-Scroll).
         if let Some(anchor) = self.autoscroll_anchor {
             let p = ui.painter();
@@ -1378,6 +1782,137 @@ impl App {
         for a in acts {
             self.apply(ui.ctx(), a);
         }
+        // Плавающая панель действий при множественном выделении сообщений.
+        if !self.selected_msgs.is_empty() {
+            let bar_w = 460.0_f32.min(clip_rect.width() - 24.0);
+            let bar = Rect::from_min_size(
+                Pos2::new(clip_rect.center().x - bar_w * 0.5, clip_rect.bottom() - 48.0),
+                Vec2::new(bar_w, 40.0),
+            );
+            ui.painter().rect_filled(bar, egui::CornerRadius::same(12), t2(WINDOW_BG));
+            ui.painter().rect_stroke(
+                bar,
+                egui::CornerRadius::same(12),
+                egui::Stroke::new(1.0, Color32::from_white_alpha(36)),
+                egui::StrokeKind::Inside,
+            );
+            let mut clear_sel = false;
+            let mut open_fwd = false;
+            let mut open_shot = false;
+            let mut copy_sel = false;
+            let count = self.selected_msgs.len();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(10.0, 4.0))), |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(RichText::new(format!("Выбрано: {count}")).strong().color(WHITE));
+                    ui.add_space(6.0);
+                    if orange_button(ui, "Переслать", Vec2::new(96.0, 28.0)).clicked() {
+                        open_fwd = true;
+                    }
+                    if ui.button("Снимок").clicked() {
+                        open_shot = true;
+                    }
+                    if ui.button("Копия").clicked() {
+                        copy_sel = true;
+                    }
+                    if ui.button("Снять").clicked() {
+                        clear_sel = true;
+                    }
+                });
+            });
+            if copy_sel {
+                let text = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selected_msgs.contains(&m.id) && !m.text.is_empty())
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    ui.ctx().copy_text(text);
+                    self.status = "Выделенные тексты скопированы".to_owned();
+                }
+                clear_sel = true;
+            }
+            if open_fwd {
+                let ids: Vec<i32> = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selected_msgs.contains(&m.id))
+                    .map(|m| m.id)
+                    .collect();
+                if !ids.is_empty() {
+                    self.forward_batch = Some(ids);
+                }
+            }
+            if open_shot {
+                let rows: Vec<MessageRow> = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selected_msgs.contains(&m.id))
+                    .cloned()
+                    .collect();
+                if !rows.is_empty() {
+                    self.open_shot_modal(rows);
+                    clear_sel = true;
+                }
+            }
+            if clear_sel {
+                self.selected_msgs.clear();
+            }
+        }
+    }
+
+    fn channel_bottom_bar(&mut self, ui: &mut egui::Ui) {
+        use rg_settings::ChannelBottomButton as CB;
+        let btn_mode = self.settings.ayu.channel_bottom_button;
+        if btn_mode == CB::Hidden {
+            return;
+        }
+        let Some(idx) = self.selected else { return };
+        let Some(d) = self.dialogs.get(idx) else { return };
+        if d.kind != rg_core::engine::DialogKind::Channel {
+            return;
+        }
+        let info = self.peer_infos.get(&d.id);
+        let has_linked = info.and_then(|x| x.linked_chat_id).is_some();
+        let muted = d.muted;
+        let last_post_id = self.messages.last().map(|m| m.id);
+        let want_discuss = match btn_mode {
+            CB::Hidden => return,
+            CB::Mute => false,
+            CB::Discuss => has_linked,
+            CB::DiscussWithFallback => has_linked,
+        };
+        if btn_mode == CB::Discuss && !has_linked {
+            return;
+        }
+        ui.horizontal(|ui| {
+            let w = ui.available_width();
+            if want_discuss {
+                if orange_button(ui, "Обсудить", Vec2::new(w, 34.0)).clicked()
+                    && let Some(pid) = last_post_id
+                {
+                    self.send(Cmd::Discussion(idx, pid));
+                }
+            } else {
+                let lbl = if muted { "Включить звук" } else { "Выключить звук" };
+                if orange_button(ui, lbl, Vec2::new(w, 34.0)).clicked() {
+                    self.send(Cmd::MuteDialog(idx, !muted));
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    fn open_shot_modal(&mut self, rows: Vec<MessageRow>) {
+        self.shot_modal = Some(super::ShotModal {
+            messages: rows,
+            theme: super::shot::ShotTheme::Night,
+            cached_key: None,
+            rgba: Vec::new(),
+            dims: (0, 0),
+            preview_tex: None,
+        });
     }
 
     fn apply(&mut self, ctx: &egui::Context, a: Act) {
@@ -1447,19 +1982,28 @@ impl App {
                 self.send(Cmd::Translate(id, text));
             }
             Act::Shot(id) => {
-                if let Some(m) = self.messages.iter().find(|m| m.id == id) {
-                    let chat_name = self.selected.and_then(|i| self.dialogs.get(i)).map_or("Чат", |d| d.name.as_str());
-                    match save_message_shot(m, chat_name) {
-                        Some(p) => {
-                            rg_core::media::open_downloaded(&p);
-                            self.status = format!("Снимок сохранён: {}", p.display());
-                        }
-                        None => self.error = "Не удалось сохранить снимок".to_owned(),
-                    }
+                if let Some(m) = self.messages.iter().find(|m| m.id == id).cloned() {
+                    self.open_shot_modal(vec![m]);
                 }
             }
             Act::VotePoll(id, option) => {
                 self.send(Cmd::VotePoll(id, option));
+            }
+            Act::ToggleSelect(id) => {
+                if !self.selected_msgs.remove(&id) {
+                    self.selected_msgs.insert(id);
+                }
+            }
+            Act::Discuss(post_id) => {
+                if let Some(idx) = self.selected {
+                    self.send(Cmd::Discussion(idx, post_id));
+                }
+            }
+            Act::FilterUser(uid, uname) => {
+                self.user_filter = Some((
+                    uid,
+                    if uname.is_empty() { format!("ID {uid}") } else { uname },
+                ));
             }
         }
     }
@@ -1601,6 +2145,446 @@ impl App {
                 self.edit_history = None;
             }
         }
+        // Пакетная пересылка выделенных сообщений (`ayu_forward.cpp`).
+        if let Some(ids) = self.forward_batch.clone() {
+            let mut open = true;
+            let mut chosen = None;
+            egui::Window::new(format!("Переслать ({})", ids.len()))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.forward_filter)
+                            .hint_text("Поиск чата")
+                            .desired_width(300.0),
+                    );
+                    ui.checkbox(&mut self.forward_no_author, "Скрыть автора (без подписи)");
+                    let needle = self.forward_filter.to_lowercase();
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for (i, d) in self.dialogs.iter().enumerate() {
+                            if !needle.is_empty() && !d.name.to_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            if ui.selectable_label(false, &d.name).clicked() {
+                                chosen = Some(i);
+                            }
+                        }
+                    });
+                });
+            if let Some(i) = chosen {
+                self.send(Cmd::ForwardBatch(ids, i, self.forward_no_author));
+                self.selected_msgs.clear();
+                open = false;
+            }
+            if !open {
+                self.forward_batch = None;
+                self.forward_filter.clear();
+            }
+        }
+        // Интерактивный «Снимок сообщения» (`message_shot_box.cpp`).
+        if self.shot_modal.is_some() {
+            let chat_title = self
+                .selected
+                .and_then(|i| self.dialogs.get(i))
+                .map_or("Чат", |d| d.name.as_str())
+                .to_owned();
+            let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            let mut ayu_changed = false;
+            let mut save_png = false;
+            let mut copy_clip = false;
+            let mut s_copy = self.settings.clone();
+            if let Some(modal) = self.shot_modal.as_mut() {
+                let key = (
+                    modal.theme,
+                    s_copy.ayu.show_background,
+                    s_copy.ayu.show_date,
+                    s_copy.ayu.show_reactions,
+                    s_copy.ayu.show_header_decorations,
+                    s_copy.ayu.show_colorful_replies,
+                    s_copy.ayu.reveal_spoilers,
+                );
+                if modal.cached_key != Some(key) {
+                    let refs: Vec<&MessageRow> = modal.messages.iter().collect();
+                    let (w, h, rgba) = super::shot::render_message_shot(&super::shot::ShotInput {
+                        chat_title: &chat_title,
+                        messages: &refs,
+                        ayu: &s_copy.ayu,
+                        theme: modal.theme,
+                    });
+                    let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    modal.preview_tex = Some(ctx.load_texture("msg-shot-preview", img, egui::TextureOptions::LINEAR));
+                    modal.rgba = rgba;
+                    modal.dims = (w, h);
+                    modal.cached_key = Some(key);
+                }
+                let mut open = true;
+                egui::Window::new("Снимок сообщения")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.set_max_width(480.0);
+                        if let Some(tex) = &modal.preview_tex {
+                            let sz = tex.size_vec2();
+                            let scale = (450.0 / sz.x).min(290.0 / sz.y).min(1.0);
+                            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(egui::Image::new(tex).fit_to_exact_size(sz * scale).corner_radius(8));
+                                });
+                            });
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for th in super::shot::ShotTheme::ALL {
+                                if ui.selectable_label(modal.theme == th, th.title()).clicked() {
+                                    modal.theme = th;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ayu_changed |= ui.checkbox(&mut s_copy.ayu.show_background, "Фон").changed();
+                            ayu_changed |= ui.checkbox(&mut s_copy.ayu.show_date, "Дата").changed();
+                            ayu_changed |= ui.checkbox(&mut s_copy.ayu.show_reactions, "Реакции").changed();
+                            ayu_changed |= ui.checkbox(&mut s_copy.ayu.show_header_decorations, "Заголовок").changed();
+                            ayu_changed |= ui.checkbox(&mut s_copy.ayu.show_colorful_replies, "Цветные ответы").changed();
+                            ayu_changed |= ui.checkbox(&mut s_copy.ayu.reveal_spoilers, "Спойлеры").changed();
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if orange_button(ui, "Копировать", Vec2::new(130.0, 32.0)).clicked() {
+                                copy_clip = true;
+                            }
+                            if ui.button("Сохранить PNG…").clicked() {
+                                save_png = true;
+                            }
+                            if ui.button("Закрыть").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                if !open {
+                    close = true;
+                }
+            }
+            if ayu_changed {
+                self.settings = s_copy.clone();
+                self.send(Cmd::Settings(Box::new(s_copy)));
+            }
+            if copy_clip && let Some(modal) = &self.shot_modal {
+                match super::shot::copy_shot_to_clipboard(modal.dims.0, modal.dims.1, &modal.rgba) {
+                    Ok(()) => {
+                        self.status = "Снимок скопирован в буфер обмена".to_owned();
+                        close = true;
+                    }
+                    Err(e) => self.error = format!("Буфер: {e}"),
+                }
+            }
+            if save_png && let Some(modal) = &self.shot_modal {
+                #[cfg(not(target_os = "android"))]
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("rustgramm_shot.png")
+                    .add_filter("PNG", &["png"])
+                    .save_file()
+                    && let Some(img) = image::RgbaImage::from_raw(modal.dims.0, modal.dims.1, modal.rgba.clone())
+                {
+                    if img.save_with_format(&path, image::ImageFormat::Png).is_ok() {
+                        self.status = format!("Снимок сохранён: {}", path.display());
+                        close = true;
+                    } else {
+                        self.error = "Не удалось записать PNG".to_owned();
+                    }
+                }
+            }
+            if close {
+                self.shot_modal = None;
+            }
+        }
+        // Журнал удалённых и изменённых сообщений чата (`ayu/ui/message_history`).
+        if let Some((_peer_id, entries)) = self.audit_history.clone() {
+            let mut open = true;
+            egui::Window::new("Удалённые и история правок")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([430.0, 460.0])
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    if entries.is_empty() {
+                        ui.label(RichText::new("В этом чате пока нет сохранённых удалённых сообщений или правок.").color(SUBTEXT));
+                        return;
+                    }
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        for e in &entries {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    let badge = if e.deleted {
+                                        RichText::new("УДАЛЕНО").color(DANGER).strong()
+                                    } else {
+                                        RichText::new("ИЗМЕНЕНО").color(ORANGE).strong()
+                                    };
+                                    ui.label(badge);
+                                    ui.label(RichText::new(format!("#{} · {}", e.msg_id, full_date(e.date))).size(11.5).color(SUBTEXT));
+                                    if ui.small_button("Копия").clicked() {
+                                        ctx.copy_text(e.text.clone());
+                                    }
+                                });
+                                if !e.edits.is_empty() {
+                                    for (idx, (old, at)) in e.edits.iter().enumerate() {
+                                        ui.label(RichText::new(format!("Версия {} ({}): {}", idx + 1, full_date(*at), old)).size(12.5).color(SUBTEXT));
+                                    }
+                                    ui.label(RichText::new(format!("Текущий: {}", e.text)).color(WHITE));
+                                } else {
+                                    ui.label(RichText::new(&e.text).color(WHITE));
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+                });
+            if !open {
+                self.audit_history = None;
+            }
+        }
+        // Перетаскивание файлов (Drag & Drop) — подтверждение и подпись.
+        if !self.drop_paths.is_empty() {
+            let mut send_all = false;
+            let mut cancel = false;
+            egui::Window::new("Отправка файлов")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.0)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(format!("Файлов выбрано: {}", self.drop_paths.len())).color(WHITE).strong());
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        for p in &self.drop_paths {
+                            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("файл");
+                            ui.label(RichText::new(format!("• {name}")).size(12.5).color(SUBTEXT));
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.drop_caption)
+                            .hint_text("Подпись (необязательно)")
+                            .desired_width(330.0),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if orange_button(ui, "Отправить", Vec2::new(120.0, 32.0)).clicked() {
+                            send_all = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if send_all {
+                let paths = std::mem::take(&mut self.drop_paths);
+                let cap = std::mem::take(&mut self.drop_caption);
+                let reply = self.reply.take().map(|(id, _)| id);
+                for (k, p) in paths.into_iter().enumerate() {
+                    let c = if k == 0 { cap.trim().to_owned() } else { String::new() };
+                    self.send(Cmd::SendFile(p, c, if k == 0 { reply } else { None }));
+                }
+            } else if cancel {
+                self.drop_paths.clear();
+                self.drop_caption.clear();
+            }
+        }
+        // Запрос включения режима призрака перед просмотром истории (`suggest_ghost_mode_before_viewing_story`).
+        if let Some(idx) = self.story_ghost_ask {
+            let mut open = true;
+            egui::Window::new("Просмотр истории")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Скрыть отметку о просмотре этой истории (режим призрака)?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if orange_button(ui, "Смотреть анонимно", Vec2::new(165.0, 32.0)).clicked() {
+                            self.settings.ghost.send_read_stories = false;
+                            self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                            self.story_ghost_ask = None;
+                            self.story_open = Some(idx);
+                        }
+                        if ui.button("Открыть обычно").clicked() {
+                            self.story_ghost_ask = None;
+                            self.story_open = Some(idx);
+                            if let Some(st) = self.stories.get_mut(idx) {
+                                st.unread = false;
+                                let (peer, sid) = (st.peer, st.story_id);
+                                self.send(Cmd::ReadStory(peer, sid));
+                            }
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.story_ghost_ask = None;
+                        }
+                    });
+                });
+            if !open {
+                self.story_ghost_ask = None;
+            }
+        }
+        // Просмотрщик активных историй.
+        if let Some(idx) = self.story_open {
+            let mut next_idx = Some(idx);
+            let mut open = true;
+            if let Some(st) = self.stories.get(idx).cloned() {
+                egui::Window::new(format!("История · {}", st.author))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(380.0)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            draw_avatar(
+                                ui,
+                                ui.cursor().min + Vec2::splat(20.0),
+                                &st.author,
+                                st.peer_id,
+                                36.0,
+                                self.avatars.get(&st.peer_id),
+                                self.settings.ayu.avatar_corners,
+                            );
+                            ui.add_space(46.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&st.author).strong().color(WHITE));
+                                ui.label(RichText::new(full_date(i64::from(st.date))).size(11.5).color(SUBTEXT));
+                            });
+                        });
+                        ui.add_space(10.0);
+                        egui::Frame::new()
+                            .fill(t(SIDEBAR_BG))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::same(14))
+                            .show(ui, |ui| {
+                                ui.set_min_width(330.0);
+                                let body = if st.caption.is_empty() {
+                                    "Медиа-история Telegram"
+                                } else {
+                                    st.caption.as_str()
+                                };
+                                ui.label(RichText::new(body).size(15.0).color(WHITE));
+                            });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if idx > 0 && ui.button("← Предыдущая").clicked() {
+                                next_idx = Some(idx - 1);
+                            }
+                            if idx + 1 < self.stories.len() && orange_button(ui, "Следующая →", Vec2::new(130.0, 30.0)).clicked() {
+                                next_idx = Some(idx + 1);
+                            }
+                            if ui.button("Закрыть").clicked() {
+                                next_idx = None;
+                            }
+                        });
+                    });
+                if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.story_open = None;
+                } else {
+                    if next_idx != Some(idx)
+                        && let Some(ni) = next_idx
+                        && let Some(ns) = self.stories.get_mut(ni)
+                        && ns.unread
+                    {
+                        ns.unread = false;
+                        if self.settings.ghost.send_read_stories {
+                            let (peer, sid) = (ns.peer, ns.story_id);
+                            self.send(Cmd::ReadStory(peer, sid));
+                        }
+                    }
+                    self.story_open = next_idx;
+                }
+            } else {
+                self.story_open = None;
+            }
+        }
+        // Комментарии к посту канала (`messages.getDiscussionMessage` + `messages.getReplies`).
+        if let Some(disc) = self.discussion.clone() {
+            let mut open = true;
+            let mut send_txt: Option<String> = None;
+            egui::Window::new(format!("Комментарии · пост #{}", disc.post_id))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([420.0, 460.0])
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                        if disc.comments.is_empty() {
+                            ui.label(RichText::new("Комментариев пока нет. Будьте первым!").color(SUBTEXT));
+                        } else {
+                            for c in &disc.comments {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        let who = if c.sender.is_empty() { "Участник" } else { c.sender.as_str() };
+                                        ui.label(RichText::new(who).strong().size(13.0).color(ORANGE));
+                                        ui.label(RichText::new(hhmm(c.date)).size(11.5).color(SUBTEXT));
+                                    });
+                                    let body = if c.text.is_empty() { "[Вложение]" } else { c.text.as_str() };
+                                    ui.label(RichText::new(body).color(WHITE));
+                                });
+                                ui.add_space(4.0);
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.comment_input)
+                                .hint_text("Написать комментарий…")
+                                .desired_width(290.0),
+                        );
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (orange_button(ui, "Отправить", Vec2::new(96.0, 30.0)).clicked() || enter)
+                            && !self.comment_input.trim().is_empty()
+                        {
+                            send_txt = Some(std::mem::take(&mut self.comment_input).trim().to_owned());
+                        }
+                    });
+                });
+            if let Some(txt) = send_txt {
+                self.send(Cmd::SendComment(disc.disc_peer, disc.root_msg_id, disc.post_id, txt));
+            }
+            if !open {
+                self.discussion = None;
+            }
+        }
+        // Подтверждение перед отправкой стикера или GIF (`sticker_confirmation` / `gif_confirmation`).
+        if let Some((is_gif, doc_id, reply)) = self.pending_confirm_media {
+            let title = if is_gif { "Отправить GIF?" } else { "Отправить стикер?" };
+            let mut open = true;
+            egui::Window::new(title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(if is_gif { "Подтвердите отправку выбранного GIF." } else { "Подтвердите отправку выбранного стикера." });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if orange_button(ui, "Отправить", Vec2::new(110.0, 32.0)).clicked() {
+                            self.reply.take();
+                            self.pending_confirm_media = None;
+                            self.send(Cmd::SendSticker(doc_id, reply));
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.pending_confirm_media = None;
+                        }
+                    });
+                });
+            if !open {
+                self.pending_confirm_media = None;
+            }
+        }
     }
 }
 
@@ -1614,6 +2598,31 @@ impl App {
         let zoom_delta = ctx.input(|i| i.smooth_scroll_delta.y);
         if zoom_delta != 0.0 {
             self.viewer_zoom = (self.viewer_zoom * (1.0 + zoom_delta / 400.0)).clamp(0.5, 6.0);
+        }
+        let media_ids: Vec<i32> = self
+            .messages
+            .iter()
+            .filter(|m| {
+                m.id == id
+                    || self.textures.contains_key(&m.id)
+                    || m.media
+                        .as_ref()
+                        .is_some_and(|i| i.kind == rg_core::media::MediaKind::Photo)
+            })
+            .map(|m| m.id)
+            .collect();
+        let pos = media_ids.iter().position(|&mid| mid == id);
+        let prev_id = pos.and_then(|p| p.checked_sub(1)).and_then(|i| media_ids.get(i).copied());
+        let next_id = pos.and_then(|p| media_ids.get(p + 1).copied());
+        let mut step_to: Option<i32> = None;
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft))
+            && let Some(pid) = prev_id
+        {
+            step_to = Some(pid);
+        } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight))
+            && let Some(nid) = next_id
+        {
+            step_to = Some(nid);
         }
         let tex = self.textures.get(&id).cloned();
         let zoom = self.viewer_zoom;
@@ -1634,6 +2643,24 @@ impl App {
                     }
                 } else if bg.clicked() {
                     close = true;
+                }
+                if let Some(pid) = prev_id {
+                    let lr = Rect::from_center_size(Pos2::new(rect.left() + 34.0, rect.center().y), Vec2::splat(44.0));
+                    let lresp = ui.interact(lr, ui.make_persistent_id("viewer-prev"), Sense::click());
+                    ui.painter().circle_filled(lr.center(), 20.0, t2(WINDOW_BG));
+                    ui.painter().text(lr.center(), egui::Align2::CENTER_CENTER, "‹", FontId::proportional(24.0), WHITE);
+                    if lresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        step_to = Some(pid);
+                    }
+                }
+                if let Some(nid) = next_id {
+                    let rr = Rect::from_center_size(Pos2::new(rect.right() - 34.0, rect.center().y), Vec2::splat(44.0));
+                    let rresp = ui.interact(rr, ui.make_persistent_id("viewer-next"), Sense::click());
+                    ui.painter().circle_filled(rr.center(), 20.0, t2(WINDOW_BG));
+                    ui.painter().text(rr.center(), egui::Align2::CENTER_CENTER, "›", FontId::proportional(24.0), WHITE);
+                    if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        step_to = Some(nid);
+                    }
                 }
                 let bar = Rect::from_center_size(
                     egui::pos2(rect.center().x, rect.bottom() - 36.0),
@@ -1656,7 +2683,15 @@ impl App {
         for a in acts {
             self.apply(ctx, a);
         }
-        if close {
+        if let Some(new_id) = step_to {
+            self.viewer = Some(new_id);
+            self.viewer_zoom = 1.0;
+            if !self.textures.contains_key(&new_id)
+                && let Some(idx) = self.selected
+            {
+                self.send(Cmd::Preview(idx, new_id));
+            }
+        } else if close {
             self.viewer = None;
         }
     }
@@ -1771,9 +2806,15 @@ fn bubble(
             .painter()
             .layout(m.text.clone(), FontId::proportional(15.0), text_c, max_inner);
         let edited = m.edit_date.is_some() || m.edits > 0;
-        let mut meta = time_label(m.date, s.show_message_seconds);
+        let mut meta = time_label(m.date, env.format_secs);
         if edited {
-            let mark = if s.edited_mark.is_empty() { "изм." } else { s.edited_mark.as_str() };
+            let mark = if s.replace_bottom_info_with_icons {
+                "✎"
+            } else if s.edited_mark.is_empty() {
+                "изм."
+            } else {
+                s.edited_mark.as_str()
+            };
             meta = format!("{mark} {meta}");
         }
         let tick_w = if m.outgoing { 22.0 } else { 0.0 };
@@ -1801,11 +2842,15 @@ fn bubble(
         let bid = ui.make_persistent_id(("m", m.id));
         let mut cards: Vec<(Rect, Act)> = Vec::new();
         let mut hot: Vec<(Rect, super::rich::Hit)> = Vec::new();
-        let inner = egui::Frame::new()
+        let selected = env.selected_msgs.contains(&m.id);
+        let mut frame = egui::Frame::new()
             .fill(fill)
             .corner_radius(radius)
-            .inner_margin(egui::Margin::symmetric(MSG_PAD_X as i8, MSG_PAD_Y as i8))
-            .show(ui, |ui| {
+            .inner_margin(egui::Margin::symmetric(MSG_PAD_X as i8, MSG_PAD_Y as i8));
+        if selected {
+            frame = frame.stroke(egui::Stroke::new(2.0, ORANGE));
+        }
+        let inner = frame.show(ui, |ui| {
                 ui.set_width(w);
                 ui.style_mut().visuals.override_text_color = Some(text_c);
                 ui.style_mut().interaction.selectable_labels = false;
@@ -1820,18 +2865,21 @@ fn bubble(
                     }
                     if let Some((rid, snippet)) = &m.reply_to {
                         let bar_c = if s.show_colorful_replies { ACCENT } else { date_c };
-                        let resp = ui
-                            .horizontal(|ui| {
+                        let snippet_t = if snippet.is_empty() { "сообщение" } else { snippet.as_str() };
+                        let resp = if s.simple_quotes_and_replies {
+                            ui.label(RichText::new(format!("↪ Ответ: {}", short(snippet_t, 45))).size(12.5).color(bar_c))
+                        } else {
+                            ui.horizontal(|ui| {
                                 let (bar, _) = ui.allocate_exact_size(Vec2::new(2.5, 30.0), Sense::hover());
                                 ui.painter().rect_filled(bar, 1.0, bar_c);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
                                     ui.label(RichText::new("Ответ").size(12.0).color(bar_c));
-                                    let t = if snippet.is_empty() { "сообщение" } else { snippet.as_str() };
-                                    ui.label(RichText::new(short(t, 60)).size(13.0).color(date_c));
+                                    ui.label(RichText::new(short(snippet_t, 60)).size(13.0).color(date_c));
                                 });
                             })
-                            .response;
+                            .response
+                        };
                         if ui.interact(resp.rect, ui.make_persistent_id(("q", m.id)), Sense::click()).clicked() {
                             acts.push(Act::Goto(*rid));
                         }
@@ -1934,8 +2982,8 @@ fn bubble(
                             }
                         }
                         if m.deleted {
-                            let (r, resp) = ui.allocate_exact_size(Vec2::new(13.0, 14.0), Sense::hover());
-                            icons::tg_sized(ui.painter(), "menu/delete", r.center(), Vec2::splat(18.0), date_c);
+                            let mark = if s.deleted_mark.is_empty() { "🗑" } else { s.deleted_mark.as_str() };
+                            let resp = ui.label(RichText::new(mark).size(11.5).color(date_c));
                             resp.on_hover_text("удалено");
                         }
                         ui.label(RichText::new(meta).size(12.0).color(date_c));
@@ -1944,9 +2992,49 @@ fn bubble(
                             icons::tick(ui.painter(), r.center(), OUT_TICK, m.id <= env.read_out);
                         }
                     });
+                    if env.is_channel && env.has_discussion && !m.deleted {
+                        ui.add_space(2.0);
+                        ui.separator();
+                        let cr = ui.add(
+                            egui::Button::new(RichText::new("💬 Комментарии").size(12.5).color(ORANGE))
+                                .frame(false),
+                        );
+                        if cr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            acts.push(Act::Discuss(m.id));
+                        }
+                    }
                 });
             });
         let rect = inner.response.rect;
+        // Хвостик пузыря (выключается настройкой `remove_message_tail`).
+        if !s.remove_message_tail && (m.outgoing || show_avatar) {
+            let tail = if m.outgoing {
+                vec![
+                    Pos2::new(rect.right() - 4.0, rect.bottom() - 10.0),
+                    Pos2::new(rect.right() + 5.0, rect.bottom() - 2.0),
+                    Pos2::new(rect.right() - 8.0, rect.bottom() - 2.0),
+                ]
+            } else {
+                vec![
+                    Pos2::new(rect.left() + 4.0, rect.bottom() - 10.0),
+                    Pos2::new(rect.left() - 5.0, rect.bottom() - 2.0),
+                    Pos2::new(rect.left() + 8.0, rect.bottom() - 2.0),
+                ]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(tail, fill, egui::Stroke::NONE));
+        }
+        // Кнопка быстрой пересылки справа от поста канала / пересланного сообщения (`!hide_fast_share`).
+        if !s.hide_fast_share && !m.deleted && !m.outgoing && (env.is_channel || m.forwarded_from.is_some()) {
+            let f_center = Pos2::new(rect.right() + 18.0, rect.center().y);
+            let f_rect = Rect::from_center_size(f_center, Vec2::splat(24.0));
+            let fresp = ui.interact(f_rect, ui.make_persistent_id(("fshare", m.id)), Sense::click());
+            let bg = if fresp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
+            ui.painter().circle_filled(f_center, 11.5, bg);
+            ui.painter().text(f_center, egui::Align2::CENTER_CENTER, "↪", FontId::proportional(13.0), WHITE);
+            if fresp.on_hover_text("Быстрая пересылка").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                acts.push(Act::Forward(m.id));
+            }
+        }
         // Мягкая дымка фокусировки (iOS blur-dissolve), тающая по мере появления сообщения.
         if k_in < 0.99 && blur_on() {
             let mist = (1.0 - ease_in).powi(2);
@@ -1956,7 +3044,7 @@ fn bubble(
                 Color32::from_rgba_unmultiplied(210, 218, 232, (36.0 * mist * opacity_f32()) as u8),
             );
         }
-        // Один отклик на весь пузырь: правый клик — меню, левый — по области ссылки, спойлера или карточки.
+        // Один отклик на весь пузырь: правый клик — меню, двойной — быстрое действие, левый — ссылка/спойлер/карточка.
         let resp = ui.interact(rect, bid, Sense::click());
         let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
         let over = |r: &Rect| pointer.is_some_and(|p| r.contains(p));
@@ -1972,8 +3060,20 @@ fn bubble(
         {
             acts.push(Act::Spoiler(m.id, *i));
         }
-        if resp.clicked() {
-            if let Some(a) = on_card {
+        if resp.double_clicked() && !m.deleted {
+            match env.double_tap_action {
+                1 => acts.push(Act::React(m.id, "👍")),
+                2 => acts.push(Act::Reply(m.id, m.text.clone())),
+                3 if !m.text.is_empty() => acts.push(Act::Copy(m.text.clone())),
+                4 => acts.push(Act::Forward(m.id)),
+                5 if m.outgoing && !m.text.is_empty() => acts.push(Act::Edit(m.id, m.text.clone())),
+                _ => {}
+            }
+        } else if resp.clicked() {
+            let ctrl = ui.ctx().input(|i| i.modifiers.command);
+            if ctrl || !env.selected_msgs.is_empty() {
+                acts.push(Act::ToggleSelect(m.id));
+            } else if let Some(a) = on_card {
                 acts.push(a);
             } else if let Some(h) = on_hot {
                 acts.push(match h {
@@ -2043,6 +3143,7 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         item(ui, "menu/edit", "Изменить", Act::Edit(m.id, m.text.clone()));
     }
     if !m.deleted {
+        item(ui, "menu/select", if env.selected_msgs.contains(&m.id) { "Снять выбор" } else { "Выбрать" }, Act::ToggleSelect(m.id));
         item(ui, "menu/forward", "Переслать", Act::Forward(m.id));
         item(
             ui,
@@ -2063,6 +3164,17 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     if m.edits > 0 {
         item(ui, "menu/edited_status", "История правок", Act::History(m.id));
     }
+    if s.menu_views_panel.shown(env.shift)
+        && let Some(v) = m.views
+    {
+        ui.label(RichText::new(format!("👁 Просмотров: {v}")).size(12.5).color(SUBTEXT));
+    }
+    if env.is_channel && env.has_discussion && !m.deleted {
+        item(ui, "menu/reply", "Комментарии", Act::Discuss(m.id));
+    }
+    if s.menu_user_messages.shown(env.shift) && env.group && m.sender_id != 0 {
+        item(ui, "menu/search", "Сообщения участника", Act::FilterUser(m.sender_id, m.sender.clone()));
+    }
     if s.menu_message_details.shown(env.shift) {
         item(ui, "menu/info", "Сведения", Act::Details(m.id));
         item(ui, "menu/copy", "Копировать ID", Act::CopyId(m.id));
@@ -2074,40 +3186,4 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
             ui.close();
         }
     }
-}
-
-/// Генерирует карточку-снимок сообщения (Message Shot) в PNG и сохраняет в каталог загрузок.
-fn save_message_shot(m: &MessageRow, _chat_name: &str) -> Option<std::path::PathBuf> {
-    let dir = super::worker::home().join("downloads");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("shot_{}.png", m.id));
-    let lines = (m.text.chars().count() / 36 + 1).clamp(1, 12) as u32;
-    let w = 480u32;
-    let h = 110 + lines * 24;
-    let mut img = image::RgbaImage::from_pixel(w, h, image::Rgba([14, 14, 18, 255]));
-    // Тёмная карточка пузыря с оранжевой полосой акцента слева.
-    for y in 20..(h - 20) {
-        for x in 24..(w - 24) {
-            let c = if x < 28 {
-                image::Rgba([245, 130, 32, 255])
-            } else if y == 20 || y == h - 21 || x == w - 25 {
-                image::Rgba([54, 54, 64, 255])
-            } else {
-                image::Rgba([28, 28, 34, 255])
-            };
-            img.put_pixel(x, y, c);
-        }
-    }
-    // Декоративные полосы текста (визуальное представление строк сообщения).
-    for row in 0..lines {
-        let y0 = 48 + row * 22;
-        let line_w = if row + 1 == lines { 180 } else { 360 };
-        for y in y0..(y0 + 8).min(h - 30) {
-            for x in 46..(46 + line_w).min(w - 40) {
-                img.put_pixel(x, y, image::Rgba([226, 226, 232, 255]));
-            }
-        }
-    }
-    img.save_with_format(&path, image::ImageFormat::Png).ok()?;
-    Some(path)
 }

@@ -97,7 +97,7 @@ impl App {
         self.window_button(ui, mini, Glyph::Minimize);
     }
 
-    fn window_button(&self, ui: &mut egui::Ui, rect: Rect, g: Glyph) {
+    fn window_button(&mut self, ui: &mut egui::Ui, rect: Rect, g: Glyph) {
         let id = ui.make_persistent_id(("winbtn", g as u8));
         let resp = ui.interact(rect, id, Sense::click());
         let hover = tween(ui.ctx(), ("wb", g as u8), f32::from(u8::from(resp.hovered())), 0.12);
@@ -120,7 +120,13 @@ impl App {
             let ctx = ui.ctx();
             match g {
                 Glyph::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Glyph::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                Glyph::Minimize => {
+                    if self.settings.work_mode == rg_settings::WorkMode::TrayOnly {
+                        self.hide_window_to_tray();
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                }
                 _ => {
                     let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));

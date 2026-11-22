@@ -58,6 +58,22 @@ pub fn should_mark_read_after_action(g: &GhostMode) -> bool {
     g.active && g.mark_read_after_action
 }
 
+/// Дата отложенной отправки (+12 секунд), когда включён режим отправки отложкой.
+pub fn schedule_date(g: &GhostMode) -> Option<i32> {
+    if !g.uses_scheduled_messages() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    Some((now + 12) as i32)
+}
+
+/// Нужно ли принудительно отправить пакет `offline = true` после действия.
+pub fn should_send_offline_after(g: &GhostMode) -> bool {
+    g.active && g.send_offline_after_online
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +132,18 @@ mod tests {
     fn mark_read_after_action_only_in_ghost() {
         assert!(!should_mark_read_after_action(&GhostMode::default()));
         assert!(should_mark_read_after_action(&ghost()));
+    }
+
+    #[test]
+    fn schedule_and_offline_after_follow_ghost_flags() {
+        assert!(schedule_date(&GhostMode::default()).is_none());
+        let mut g = GhostMode {
+            use_scheduled_messages: true,
+            ..GhostMode::default()
+        };
+        g.set_active(true);
+        assert!(schedule_date(&g).is_some());
+        assert!(should_send_offline_after(&ghost()));
+        assert!(!should_send_offline_after(&GhostMode::default()));
     }
 }

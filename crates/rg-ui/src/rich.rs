@@ -18,12 +18,184 @@ pub struct Run {
     pub underline: bool,
     pub strike: bool,
     pub code: bool,
+    pub pre: bool,
     pub quote: bool,
     pub spoiler: bool,
     /// Куда ведёт ссылка (только http/https).
     pub url: Option<String>,
     /// Пользовательский Premium-эмодзи (идентификатор документа Telegram).
     pub custom_emoji: Option<i64>,
+}
+
+/// Оборачивает выделение (или конец строки, если ничего не выделено) парными тегами форматирования.
+pub fn wrap_selection(text: &mut String, sel_chars: Option<(usize, usize)>, open: &str, close: &str) {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let (a, b) = sel_chars.unwrap_or((total, total));
+    let (lo, hi) = (a.min(b).min(total), a.max(b).min(total));
+    if lo == hi {
+        text.push_str(open);
+        text.push_str(close);
+        return;
+    }
+    let before: String = chars[..lo].iter().collect();
+    let mid: String = chars[lo..hi].iter().collect();
+    let after: String = chars[hi..].iter().collect();
+    *text = format!("{before}{open}{mid}{close}{after}");
+}
+
+/// Разбирает разметку Telegram-стиля (`**жирный**`, `__курсив__`, `~~зачёркнутый~~`,
+/// `` `код` ``, ```` ```блок``` ````, `||спойлер||`, `[текст](url)`, цитаты `> ...`),
+/// возвращая чистый текст и `Vec<Entity>`, сохраняя точные индексы `custom_emojis`.
+pub fn parse_formatted(raw: &str, custom_emojis: &[(usize, usize, i64)]) -> (String, Vec<Entity>) {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut clean = String::with_capacity(raw.len());
+    let mut char_map = vec![0usize; n + 1];
+    let mut entities: Vec<Entity> = Vec::new();
+    let mut i = 0usize;
+    let mut out_len = 0usize;
+
+    let starts_with = |idx: usize, pat: &[char]| -> bool {
+        idx + pat.len() <= n && &chars[idx..idx + pat.len()] == pat
+    };
+    let find_close = |from: usize, pat: &[char]| -> Option<usize> {
+        let mut j = from;
+        while j + pat.len() <= n {
+            if &chars[j..j + pat.len()] == pat {
+                return Some(j);
+            }
+            j += 1;
+        }
+        None
+    };
+
+    while i < n {
+        char_map[i] = out_len;
+        // Цитата в начале строки: `> текст`
+        let at_line_start = i == 0 || chars[i - 1] == '\n';
+        if at_line_start && starts_with(i, &['>', ' ']) {
+            let mut end_line = i + 2;
+            while end_line < n && chars[end_line] != '\n' {
+                end_line += 1;
+            }
+            if end_line > i + 2 {
+                let start_c = out_len;
+                for idx in (i + 2)..end_line {
+                    char_map[idx] = out_len;
+                    clean.push(chars[idx]);
+                    out_len += 1;
+                }
+                char_map[end_line] = out_len;
+                entities.push(Entity { kind: EntityKind::Quote, start: start_c, end: out_len, url: None });
+                i = end_line;
+                continue;
+            }
+        }
+
+        // Блок кода: ```...```
+        if starts_with(i, &['`', '`', '`'])
+            && let Some(end) = find_close(i + 3, &['`', '`', '`'])
+            && end > i + 3
+        {
+            let mut body_start = i + 3;
+            if chars[body_start] == '\n' {
+                body_start += 1;
+            }
+            if end > body_start {
+                let start_c = out_len;
+                for idx in body_start..end {
+                    char_map[idx] = out_len;
+                    clean.push(chars[idx]);
+                    out_len += 1;
+                }
+                entities.push(Entity { kind: EntityKind::Pre, start: start_c, end: out_len, url: None });
+                i = end + 3;
+                continue;
+            }
+        }
+
+        // Инлайн-маркеры: **, __, ~~, ||, `
+        let mut matched_delim = false;
+        for (pat, kind) in [
+            (&['*', '*'][..], EntityKind::Bold),
+            (&['_', '_'][..], EntityKind::Italic),
+            (&['~', '~'][..], EntityKind::Strike),
+            (&['|', '|'][..], EntityKind::Spoiler),
+            (&['`'][..], EntityKind::Code),
+        ] {
+            if starts_with(i, pat)
+                && let Some(end) = find_close(i + pat.len(), pat)
+                && end > i + pat.len()
+            {
+                // Запрещаем случайный перенос через двойные звёздочки в математике без пары рядом, но разрешаем многословность внутри строки.
+                let body = &chars[i + pat.len()..end];
+                if !(pat.len() == 1 && body.contains(&'\n')) {
+                    let start_c = out_len;
+                    for idx in (i + pat.len())..end {
+                        char_map[idx] = out_len;
+                        clean.push(chars[idx]);
+                        out_len += 1;
+                    }
+                    entities.push(Entity { kind, start: start_c, end: out_len, url: None });
+                    i = end + pat.len();
+                    matched_delim = true;
+                    break;
+                }
+            }
+        }
+        if matched_delim {
+            continue;
+        }
+
+        // Ссылка: [label](url)
+        if chars[i] == '['
+            && let Some(mid) = find_close(i + 1, &[']', '('])
+            && let Some(end) = find_close(mid + 2, &[')'])
+            && mid > i + 1
+            && end > mid + 2
+        {
+            let url_s: String = chars[(mid + 2)..end].iter().collect();
+            if is_safe_url(&url_s) {
+                let start_c = out_len;
+                for idx in (i + 1)..mid {
+                    char_map[idx] = out_len;
+                    clean.push(chars[idx]);
+                    out_len += 1;
+                }
+                entities.push(Entity {
+                    kind: EntityKind::Link,
+                    start: start_c,
+                    end: out_len,
+                    url: Some(url_s),
+                });
+                i = end + 1;
+                continue;
+            }
+        }
+
+        clean.push(chars[i]);
+        out_len += 1;
+        i += 1;
+    }
+    char_map[n] = out_len;
+
+    for &(st, ln, doc_id) in custom_emojis {
+        if st < n && st + ln <= n {
+            let cs = char_map[st];
+            let ce = char_map[st + ln].max(cs + ln);
+            if ce > cs {
+                entities.push(Entity {
+                    kind: EntityKind::CustomEmoji(doc_id),
+                    start: cs,
+                    end: ce,
+                    url: None,
+                });
+            }
+        }
+    }
+
+    (clean, entities)
 }
 
 /// Разрешён ли адрес для открытия в браузере: только http и https.
@@ -68,7 +240,11 @@ pub fn build_runs(text: &str, ents: &[Entity]) -> Vec<Run> {
                 EntityKind::Italic => r.italic = true,
                 EntityKind::Underline => r.underline = true,
                 EntityKind::Strike => r.strike = true,
-                EntityKind::Code | EntityKind::Pre => r.code = true,
+                EntityKind::Code => r.code = true,
+                EntityKind::Pre => {
+                    r.code = true;
+                    r.pre = true;
+                }
                 EntityKind::Spoiler => r.spoiler = true,
                 EntityKind::Quote => r.quote = true,
                 EntityKind::Link => {
@@ -143,8 +319,13 @@ pub fn render(
                         if run.bold {
                             rt = rt.font(FontId::new(size, FontFamily::Name(FAM_DISPLAY.into())));
                         }
-                        if run.italic || run.quote {
+                        if run.italic {
                             rt = rt.italics();
+                        }
+                        if run.quote {
+                            rt = rt
+                                .italics()
+                                .background_color(Color32::from_rgba_unmultiplied(245, 130, 32, 26));
                         }
                         if run.underline {
                             rt = rt.underline();
@@ -152,10 +333,15 @@ pub fn render(
                         if run.strike {
                             rt = rt.strikethrough();
                         }
-                        if run.code {
+                        if run.code || run.pre {
                             rt = rt
                                 .monospace()
-                                .background_color(Color32::from_rgba_unmultiplied(255, 255, 255, 24));
+                                .background_color(Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    if run.pre { 32 } else { 22 },
+                                ));
                         }
                         if run.url.is_some() {
                             rt = rt.color(link).underline();
@@ -255,5 +441,38 @@ mod tests {
         assert_eq!(r[0].custom_emoji, None);
         assert_eq!(r[1].custom_emoji, Some(42));
         assert_eq!(r[2].custom_emoji, None);
+    }
+
+    #[test]
+    fn parse_formatted_extracts_markdown_and_remaps_custom_emoji() {
+        let raw = "**жирный** и `код` ||секрет|| 🔥";
+        let fire_idx = raw.chars().position(|c| c == '🔥').unwrap();
+        let (clean, ents) = parse_formatted(raw, &[(fire_idx, 1, 777)]);
+        assert_eq!(clean, "жирный и код секрет 🔥");
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Bold && e.start == 0 && e.end == 6));
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Code && e.start == 9 && e.end == 12));
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Spoiler && e.start == 13 && e.end == 19));
+        assert!(ents.iter().any(|e| e.kind == EntityKind::CustomEmoji(777) && e.start == 20 && e.end == 21));
+    }
+
+    #[test]
+    fn parse_formatted_handles_quotes_and_links() {
+        let (clean, ents) = parse_formatted("> цитата\n[сайт](https://t.me/test)", &[]);
+        assert_eq!(clean, "цитата\nсайт");
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Quote));
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Link && e.url.as_deref() == Some("https://t.me/test")));
+    }
+
+    #[test]
+    fn wrap_selection_and_pre_block_work() {
+        let mut s = "привет мир".to_owned();
+        wrap_selection(&mut s, Some((7, 10)), "**", "**");
+        assert_eq!(s, "привет **мир**");
+        let (clean, ents) = parse_formatted("```fn main() {}``` и __курсив__ ~~нет~~ [x](javascript:1)", &[]);
+        assert_eq!(clean, "fn main() {} и курсив нет [x](javascript:1)");
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Pre));
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Italic));
+        assert!(ents.iter().any(|e| e.kind == EntityKind::Strike));
+        assert!(!ents.iter().any(|e| e.kind == EntityKind::Link));
     }
 }

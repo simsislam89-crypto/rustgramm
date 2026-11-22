@@ -6,13 +6,16 @@ pub mod emoji;
 mod frame;
 pub mod icons;
 mod kit;
+mod lottie;
 mod media_ui;
 mod panels;
 mod rich;
 mod settings_ui;
+mod shot;
 pub mod stream;
 mod tg_settings;
 pub mod theme;
+mod tray;
 mod win;
 #[cfg(windows)]
 mod video;
@@ -23,7 +26,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui::{self, Color32, FontId, RichText, Sense, Vec2};
 use rg_core::engine::{
-    ContactRow, DialogRow, FolderRow, MessageRow, StickerRow, StickerSetRow, folder_matches,
+    ContactRow, DialogRow, DiscussionThread, FolderRow, ForumTopicRow, MessageRow, StickerRow,
+    StickerSetRow, StoryRow, folder_matches,
 };
 use rg_settings::Settings;
 use tokio::sync::mpsc::UnboundedSender;
@@ -215,6 +219,72 @@ struct App {
     older_pending: bool,
     history_end: bool,
     scroll_to: Option<i32>,
+    /// Системный трей Windows и состояние окна.
+    tray: Option<tray::TrayManager>,
+    is_demo: bool,
+    quitting: bool,
+    hidden_to_tray: bool,
+    autostart_minimized: bool,
+    pending_tg_uri: Option<String>,
+    /// Декодированные `.tgs` (Lottie) анимации стикеров/эмодзи (`doc_id` -> `TgsAnim`) и сообщений (`msg_id`).
+    tgs_docs: HashMap<i64, std::sync::Arc<lottie::TgsAnim>>,
+    tgs_msgs: HashMap<i32, std::sync::Arc<lottie::TgsAnim>>,
+    tgs_msg_req: HashSet<i32>,
+    tgs_frame_cache: HashMap<(i64, usize), egui::TextureHandle>,
+    /// Интерактивное окно «Снимок сообщения» (`message_shot_box.cpp`).
+    shot_modal: Option<ShotModal>,
+    /// Множественное выделение сообщений в ленте и пакетная пересылка (`ayu_forward.cpp`).
+    selected_msgs: HashSet<i32>,
+    forward_batch: Option<Vec<i32>>,
+    /// Журнал удалённых и изменённых сообщений чата (`ayu/ui/message_history`).
+    audit_history: Option<(i64, Vec<rg_ayu::store::SavedAudit>)>,
+    /// Кэшированные идентификаторы заблокированных пользователей (`hide_from_blocked`).
+    blocked_ids: HashSet<i64>,
+    /// Выбор моноширинного шрифта в настройках.
+    font_picker_open: bool,
+    font_search: String,
+    sys_fonts: Vec<String>,
+    /// Активные индикаторы «печатает...» по ID чата (`(текст, время последнего события)`).
+    typing: HashMap<i64, (String, std::time::Instant)>,
+    /// Кэш закреплённых сообщений для баннера в шапке (`chat_id -> MessageRow`).
+    pinned_msgs: HashMap<i64, MessageRow>,
+    pinned_req: HashSet<(i64, i32)>,
+    /// Форумы и темы супергрупп (`chat_id -> topics`).
+    forum_topics: HashMap<i64, Vec<ForumTopicRow>>,
+    forum_req: HashSet<i64>,
+    active_topic: Option<i32>,
+    topic_msgs: Option<(i32, Vec<MessageRow>)>,
+    /// Комментарии к посту канала (`messages.getDiscussionMessage` + `messages.getReplies`).
+    discussion: Option<DiscussionThread>,
+    comment_input: String,
+    /// Активные истории контактов и окно просмотра.
+    stories: Vec<StoryRow>,
+    story_open: Option<usize>,
+    story_ghost_ask: Option<usize>,
+    /// Перетащенные в окно файлы (`Drag & Drop`) и подпись к отправке.
+    drop_paths: Vec<std::path::PathBuf>,
+    drop_caption: String,
+    /// Подтверждение перед отправкой стикера или GIF (`sticker_confirmation` / `gif_confirmation`).
+    /// `(is_gif, doc_or_msg_id, reply_to)`.
+    pending_confirm_media: Option<(bool, i64, Option<i32>)>,
+    /// Фильтр ленты по конкретному отправителю (`menu_user_messages`).
+    user_filter: Option<(i64, String)>,
+    /// Попапы поля ввода: команды бота (`/`), автоудаление, панель форматирования.
+    cmd_popup_open: bool,
+    ttl_popup_open: bool,
+    format_bar_open: bool,
+    composer_sel: Option<(usize, usize)>,
+    /// Показать плавающую кнопку «Вниз» (FAB), если пользователь пролистал ленту вверх.
+    scrolled_up: bool,
+}
+
+pub(crate) struct ShotModal {
+    pub messages: Vec<MessageRow>,
+    pub theme: shot::ShotTheme,
+    pub cached_key: Option<(shot::ShotTheme, bool, bool, bool, bool, bool, bool)>,
+    pub rgba: Vec<u8>,
+    pub dims: (u32, u32),
+    pub preview_tex: Option<egui::TextureHandle>,
 }
 
 /// Карточка встроенного уведомления Rustgramm (позиционируется в выбранном углу экрана).
@@ -404,6 +474,45 @@ impl App {
             older_pending: false,
             history_end: false,
             scroll_to: None,
+            tray: None,
+            is_demo: false,
+            quitting: false,
+            hidden_to_tray: false,
+            autostart_minimized: std::env::args().skip(1).any(|a| a == "--autostart"),
+            pending_tg_uri: std::env::args().skip(1).find(|a| a.starts_with("tg://")),
+            tgs_docs: HashMap::new(),
+            tgs_msgs: HashMap::new(),
+            tgs_msg_req: HashSet::new(),
+            tgs_frame_cache: HashMap::new(),
+            shot_modal: None,
+            selected_msgs: HashSet::new(),
+            forward_batch: None,
+            audit_history: None,
+            blocked_ids: HashSet::new(),
+            font_picker_open: false,
+            font_search: String::new(),
+            sys_fonts: Vec::new(),
+            typing: HashMap::new(),
+            pinned_msgs: HashMap::new(),
+            pinned_req: HashSet::new(),
+            forum_topics: HashMap::new(),
+            forum_req: HashSet::new(),
+            active_topic: None,
+            topic_msgs: None,
+            discussion: None,
+            comment_input: String::new(),
+            stories: Vec::new(),
+            story_open: None,
+            story_ghost_ask: None,
+            drop_paths: Vec::new(),
+            drop_caption: String::new(),
+            pending_confirm_media: None,
+            user_filter: None,
+            cmd_popup_open: false,
+            ttl_popup_open: false,
+            format_bar_open: false,
+            composer_sel: None,
+            scrolled_up: false,
         }
     }
 
@@ -446,6 +555,7 @@ impl App {
         let open_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
         match l {
             Live::Message(key, row) => {
+                self.typing.remove(&key);
                 let mut row = *row;
                 if cfg!(feature = "plugins") && self.settings.plugins_enabled && !row.outgoing {
                     row.text = self.plugins.apply_incoming(&row.text);
@@ -516,6 +626,14 @@ impl App {
                 if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key) {
                     d.read_out = d.read_out.max(max);
                 }
+            }
+            Live::Typing(key, lbl) => {
+                if lbl.is_empty() {
+                    self.typing.remove(&key);
+                } else {
+                    self.typing.insert(key, (lbl, std::time::Instant::now()));
+                }
+                ctx.request_repaint();
             }
         }
     }
@@ -1056,6 +1174,23 @@ impl App {
                 let _ = self.cmd.send(Cmd::Preview(idx, id));
             }
         }
+        // Для анимированных .tgs стикеров в ленте дополнительно качаем векторную Lottie-анимацию.
+        let tgs_want: Vec<i32> = rows
+            .iter()
+            .rev()
+            .filter(|r| {
+                r.media.as_ref().is_some_and(|x| {
+                    x.kind == rg_core::media::MediaKind::AnimatedSticker && x.mime == "application/x-tgsticker"
+                })
+            })
+            .take(8)
+            .map(|r| r.id)
+            .collect();
+        for id in tgs_want {
+            if !self.tgs_msgs.contains_key(&id) && self.tgs_msg_req.insert(id) {
+                let _ = self.cmd.send(Cmd::TgsMessage(idx, id));
+            }
+        }
         // Какие ролики уже скачаны: на них рисуется play, остальные — стрелка загрузки.
         let videos: Vec<i32> = rows
             .iter()
@@ -1165,6 +1300,10 @@ impl App {
         self.messages.clear();
         self.textures.clear();
         self.requested.clear();
+        self.tgs_msgs.clear();
+        self.tgs_msg_req.clear();
+        self.selected_msgs.clear();
+        self.forward_batch = None;
         self.found = None;
         self.reply = None;
         self.editing = None;
@@ -1175,6 +1314,17 @@ impl App {
         self.history_end = false;
         self.scroll_to = None;
         self.autoscroll_anchor = None;
+        self.active_topic = None;
+        self.topic_msgs = None;
+        self.discussion = None;
+        self.comment_input.clear();
+        self.user_filter = None;
+        self.cmd_popup_open = false;
+        self.ttl_popup_open = false;
+        self.format_bar_open = false;
+        self.composer_sel = None;
+        self.pending_confirm_media = None;
+        self.scrolled_up = false;
     }
 
     /// Горячие клавиши и боковые кнопки мыши (Mouse Back / Forward, быстрые переходы, чтение на сервере).
@@ -1288,6 +1438,169 @@ impl App {
                 }
             };
         }
+        // Ctrl+Q — полное завершение приложения (с закрытием системного трея).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
+            self.quitting = true;
+            if let Some(mut t) = self.tray.take() {
+                t.shutdown();
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    pub(crate) fn hide_window_to_tray(&mut self) {
+        self.hidden_to_tray = true;
+        win::hide_to_tray();
+    }
+
+    pub(crate) fn show_window_from_tray(&mut self) {
+        self.hidden_to_tray = false;
+        win::show_from_tray();
+    }
+
+    fn current_tray_state(&self) -> tray::TrayState {
+        let mut unread = 0i32;
+        let mut unmuted_unread = 0i32;
+        for d in &self.dialogs {
+            let add = if self.settings.notify.badge_count_messages {
+                d.unread
+            } else {
+                i32::from(d.unread > 0)
+            };
+            if !d.muted {
+                unmuted_unread += add;
+                unread += add;
+            } else if self.settings.notify.badge_include_muted {
+                unread += add;
+            }
+        }
+        tray::TrayState {
+            enabled: self.settings.work_mode != rg_settings::WorkMode::WindowOnly,
+            window_visible: !self.hidden_to_tray && win::is_window_visible(),
+            icon_idx: self.settings.ayu.app_icon.parse().unwrap_or(0),
+            unread,
+            unread_muted: unread > 0 && unmuted_unread == 0,
+            hide_badge: self.settings.ayu.hide_notification_badge,
+            desktop_notify: self.settings.notify.desktop_notifications,
+            ghost_active: self.settings.ghost.active,
+            streamer_mode: self.settings.ayu.streamer_mode,
+            show_ghost_toggle: self.settings.ayu.tray_ghost_toggle,
+            show_streamer_toggle: self.settings.ayu.tray_streamer_toggle,
+        }
+    }
+
+    fn sync_tray_and_window(&mut self, ctx: &egui::Context) {
+        win::set_capture_excluded(self.settings.ayu.streamer_mode);
+        let st = self.current_tray_state();
+        if !self.is_demo {
+            win::set_window_icon(st.icon_idx, st.unread, st.unread_muted, st.hide_badge);
+        }
+        if self.is_demo || !st.enabled {
+            if let Some(mut t) = self.tray.take() {
+                t.shutdown();
+            }
+            return;
+        }
+        if self.tray.is_none() {
+            self.tray = Some(tray::TrayManager::start(ctx.clone(), st.clone()));
+        }
+        if let Some(t) = self.tray.as_mut() {
+            t.sync(st);
+            let events = t.poll();
+            for ev in events {
+                match ev {
+                    tray::TrayEvent::ToggleWindow => {
+                        if win::is_window_visible() && !self.hidden_to_tray {
+                            self.hide_window_to_tray();
+                        } else {
+                            self.show_window_from_tray();
+                        }
+                    }
+                    tray::TrayEvent::ToggleNotifications => {
+                        self.settings.notify.desktop_notifications = !self.settings.notify.desktop_notifications;
+                        self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                    }
+                    tray::TrayEvent::ToggleGhost => {
+                        let on = !self.settings.ghost.active;
+                        self.settings.ghost.set_active(on);
+                        self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                    }
+                    tray::TrayEvent::ToggleStreamer => {
+                        self.settings.ayu.streamer_mode = !self.settings.ayu.streamer_mode;
+                        self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                    }
+                    tray::TrayEvent::Quit => {
+                        self.quitting = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+        if let Some(uri) = self.pending_tg_uri.clone()
+            && self.stage == Stage::Ready
+            && !self.dialogs.is_empty()
+        {
+            self.pending_tg_uri = None;
+            self.handle_tg_uri(&uri);
+        }
+    }
+
+    fn tick_tgs(&mut self, ctx: &egui::Context) {
+        if self.tgs_docs.is_empty() && self.tgs_msgs.is_empty() {
+            return;
+        }
+        if self.tgs_frame_cache.len() > 180 {
+            self.tgs_frame_cache.clear();
+        }
+        let speed = f64::from(self.settings.anim_speed) / 100.0;
+        let t = if speed <= 0.01 { 0.0 } else { ctx.input(|i| i.time) * speed };
+        let mut active = false;
+
+        // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`).
+        for (&doc_id, anim) in &self.tgs_docs {
+            let f = anim.frame_at_time(t);
+            let bucket = (f.round() as usize / 2) * 2;
+            let key = (doc_id, bucket);
+            let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
+                let img = anim.render_frame(bucket as f32, 48);
+                ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
+            });
+            self.sticker_tex.insert(doc_id, tex.clone());
+            active = true;
+        }
+
+        // Обновляем анимированные TGS-стикеры прямо в открытом чате (`tgs_msgs`).
+        for (&msg_id, anim) in &self.tgs_msgs {
+            let f = anim.frame_at_time(t);
+            let bucket = (f.round() as usize / 2) * 2;
+            let key = (-i64::from(msg_id) - 1_000_000, bucket);
+            let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
+                let img = anim.render_frame(bucket as f32, 128);
+                ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
+            });
+            self.textures.insert(msg_id, tex.clone());
+            active = true;
+        }
+
+        if active && speed > 0.01 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(42));
+        }
+    }
+
+    fn handle_tg_uri(&mut self, uri: &str) {
+        let rest = uri.strip_prefix("tg://").unwrap_or(uri);
+        if rest.starts_with("settings") {
+            self.open_tg_settings();
+            return;
+        }
+        if let Some(q) = rest.split("domain=").nth(1) {
+            let domain = q.split('&').next().unwrap_or("").trim();
+            if !domain.is_empty() {
+                self.search = format!("@{domain}");
+                self.send(Cmd::GlobalSearch(domain.to_owned()));
+                self.show_window_from_tray();
+            }
+        }
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -1387,8 +1700,28 @@ impl App {
                 }
                 Ev::Cached(ids) => self.cached_media.extend(ids),
                 Ev::Account(a) => {
+                    self.blocked_ids = a.blocked.iter().map(|u| u.id).collect();
                     self.tgs.account = Some(*a);
                     self.tgs.filled = false;
+                }
+                Ev::SavedHistory(id, rows) => {
+                    self.audit_history = Some((id, rows));
+                }
+                Ev::TgsDoc(id, bytes) => {
+                    if self.tgs_docs.len() > 80 {
+                        self.tgs_docs.clear();
+                    }
+                    if let Some(anim) = lottie::TgsAnim::from_bytes(&bytes) {
+                        self.tgs_docs.insert(id, anim);
+                    }
+                }
+                Ev::TgsMsg(msg_id, bytes) => {
+                    if self.tgs_msgs.len() > 30 {
+                        self.tgs_msgs.clear();
+                    }
+                    if let Some(anim) = lottie::TgsAnim::from_bytes(&bytes) {
+                        self.tgs_msgs.insert(msg_id, anim);
+                    }
                 }
                 Ev::Gifs(g) => self.gif_list = g,
                 Ev::PeerInfo(id, info) => {
@@ -1398,7 +1731,43 @@ impl App {
                     {
                         self.send(Cmd::CustomEmojiDocs(vec![doc_id]));
                     }
+                    if let Some(idx) = self.selected.filter(|&i| self.dialogs.get(i).is_some_and(|d| d.id == id)) {
+                        if let Some(pid) = info.pinned_msg_id
+                            && self.pinned_msgs.get(&id).is_none_or(|m| m.id != pid)
+                            && self.pinned_req.insert((id, pid))
+                        {
+                            self.send(Cmd::LoadPinned(idx, pid));
+                        }
+                        if info.forum
+                            && !self.forum_topics.contains_key(&id)
+                            && self.forum_req.insert(id)
+                        {
+                            self.send(Cmd::ForumTopics(idx));
+                        }
+                    }
                     self.peer_infos.insert(id, info);
+                }
+                Ev::ForumTopics(id, topics) => {
+                    self.forum_topics.insert(id, topics);
+                }
+                Ev::TopicMessages(id, topic_id, rows) => {
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == id)
+                        && self.active_topic == Some(topic_id)
+                    {
+                        if let Some(idx) = self.selected {
+                            self.request_previews(idx, &rows);
+                        }
+                        self.topic_msgs = Some((topic_id, rows));
+                    }
+                }
+                Ev::Discussion(thread) => {
+                    self.discussion = Some(thread);
+                }
+                Ev::Stories(list) => {
+                    self.stories = list;
+                }
+                Ev::PinnedMsg(id, msg) => {
+                    self.pinned_msgs.insert(id, msg);
                 }
                 Ev::EmojiSets(s) => {
                     if self.emoji_pack.is_some_and(|i| i >= s.len()) {
@@ -1500,6 +1869,13 @@ impl App {
                         if !self.settings.security.passcode_hash.is_empty() {
                             self.app_locked = true;
                         }
+                        if self.autostart_minimized
+                            && self.settings.start_minimized
+                            && self.settings.work_mode != rg_settings::WorkMode::WindowOnly
+                        {
+                            self.hide_window_to_tray();
+                        }
+                        self.autostart_minimized = false;
                     }
                 }
                 Ev::Status(s) => self.status = s,
@@ -1791,6 +2167,9 @@ impl App {
             self.global_query_at = None;
         }
         let now = self.now;
+        if needle.is_empty() {
+            self.stories_strip(ui);
+        }
         self.folder_tabs(ui);
         let mut open = None;
         let mut open_global: Option<(grammers_session::types::PeerRef, i64, String)> = None;
@@ -1891,7 +2270,7 @@ impl App {
                     };
                     // Бейдж непрочитанных справа внизу, время справа вверху.
                     let mut right = rect.right() - 12.0;
-                    if d.unread > 0 {
+                    if d.unread > 0 && !self.settings.ayu.hide_notification_counters {
                         let label = if d.unread > 999 {
                             "999+".to_owned()
                         } else {
@@ -1961,7 +2340,9 @@ impl App {
                     // Значки после имени: Premium-эмодзи статус / галочка / Premium / без звука (как в AyuGram!).
                     let mut badge_x = rect.left() + 68.0 + title_w + 11.0;
                     let badge_y = rect.top() + 21.0;
-                    if let Some(doc_id) = d.emoji_status
+                    let show_prem = !self.settings.ayu.hide_premium_statuses;
+                    if show_prem
+                        && let Some(doc_id) = d.emoji_status
                         && badge_x < clip_right - 8.0
                     {
                         if let Some(tex) = self.sticker_tex.get(&doc_id) {
@@ -1974,30 +2355,45 @@ impl App {
                     } else if d.verified && badge_x < clip_right - 8.0 {
                         icons::tg(ui.painter(), "dialogs/dialogs_verified_star", egui::pos2(badge_x, badge_y), ORANGE);
                         badge_x += 18.0;
-                    } else if d.premium && badge_x < clip_right - 8.0 {
+                    } else if show_prem && d.premium && badge_x < clip_right - 8.0 {
                         icons::tg(ui.painter(), "dialogs/dialogs_premium", egui::pos2(badge_x, badge_y), ORANGE);
                         badge_x += 18.0;
                     }
                     if d.muted && badge_x < clip_right - 8.0 {
                         icons::tg(ui.painter(), "dialogs/dialogs_mute", egui::pos2(badge_x - 2.0, badge_y), date_c);
                     }
-                    match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
-                        Some(e) => e.paint_line(
-                            ui,
-                            text_clip,
+                    let live_typing = self
+                        .typing
+                        .get(&d.id)
+                        .filter(|(_, at)| at.elapsed().as_secs() < 6)
+                        .map(|(lbl, _)| lbl.as_str());
+                    if let Some(lbl) = live_typing {
+                        p.with_clip_rect(text_clip).text(
                             rect.left_top() + Vec2::new(68.0, 35.0),
-                            &d.last,
-                            14.0,
-                            text_c,
-                        ),
-                        None => {
-                            p.with_clip_rect(text_clip).text(
+                            egui::Align2::LEFT_TOP,
+                            lbl,
+                            FontId::proportional(14.0),
+                            ORANGE,
+                        );
+                    } else {
+                        match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
+                            Some(e) => e.paint_line(
+                                ui,
+                                text_clip,
                                 rect.left_top() + Vec2::new(68.0, 35.0),
-                                egui::Align2::LEFT_TOP,
                                 &d.last,
-                                FontId::proportional(14.0),
+                                14.0,
                                 text_c,
-                            );
+                            ),
+                            None => {
+                                p.with_clip_rect(text_clip).text(
+                                    rect.left_top() + Vec2::new(68.0, 35.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &d.last,
+                                    FontId::proportional(14.0),
+                                    text_c,
+                                );
+                            }
                         }
                     }
                     if resp.clicked() {
@@ -2185,11 +2581,35 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.flush_refresh(ui.ctx());
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting
+            && !self.is_demo
+            && self.settings.work_mode != rg_settings::WorkMode::WindowOnly
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window_to_tray();
+        }
         theme::set_opacity(self.settings.window_opacity);
         theme::set_blur(self.settings.blur_enabled);
         theme::sync_visuals(&ctx);
+        kit::sync_prefs(
+            self.settings.ayu.material_switches,
+            self.settings.extera.disable_dividers,
+        );
         win::set_window_blur(self.settings.blur_enabled && self.settings.window_opacity < 100);
+        self.sync_tray_and_window(&ctx);
         theme::set_anim_speed(self.settings.anim_speed);
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        if !dropped.is_empty() && self.selected.is_some() {
+            self.drop_paths = dropped;
+        }
         let scale_pct = if self.settings.default_scale {
             100
         } else {
@@ -2206,6 +2626,7 @@ impl eframe::App for App {
             self.emoji = emoji::Emoji::load(&ctx);
         }
         self.drain_events(&ctx);
+        self.tick_tgs(&ctx);
         self.handle_shortcuts(&ctx);
         self.now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2325,7 +2746,11 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         let slide = if self.selected.is_some() { (1.0 - ios_spring(push)) * 14.0 } else { 0.0 };
-        let bg_style = self.settings.chat_bg_style;
+        let bg_style = if self.settings.ayu.disable_custom_backgrounds {
+            0
+        } else {
+            self.settings.chat_bg_style
+        };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -2417,6 +2842,7 @@ fn demo_app(mode: &str) -> App {
     let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (_tx, ev) = channel();
     let mut app = App::new(cmd, ev);
+    app.is_demo = true;
     if qr {
         app.stage = Stage::Qr("tg://login?token=Zm9vYmFyYmF6RGVtb1Rva2VuRm9yU2NyZWVuc2hvdA".to_owned());
         return app;

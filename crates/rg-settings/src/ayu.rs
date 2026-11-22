@@ -75,6 +75,8 @@ pub struct Filter {
     pub is_regex: bool,
     pub case_sensitive: bool,
     pub enabled: bool,
+    /// Если задано — фильтр действует только в этом чате (Bot API ID); иначе глобально.
+    pub dialog_id: Option<i64>,
     /// Чаты (формат Bot API), где правило не действует.
     pub excluded_chats: Vec<i64>,
 }
@@ -86,6 +88,7 @@ impl Default for Filter {
             is_regex: false,
             case_sensitive: false,
             enabled: true,
+            dialog_id: None,
             excluded_chats: Vec::new(),
         }
     }

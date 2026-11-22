@@ -39,6 +39,11 @@ impl FilterSet {
     /// Нужно ли скрыть сообщение с таким текстом в этом чате.
     pub fn hides(&self, chat: i64, text: &str) -> bool {
         self.rules.iter().any(|(f, re)| {
+            if let Some(target_dialog) = f.dialog_id
+                && target_dialog != chat
+            {
+                return false;
+            }
             if f.excluded_chats.contains(&chat) {
                 return false;
             }
@@ -49,6 +54,57 @@ impl FilterSet {
             }
         })
     }
+}
+
+/// Экспорт фильтров в JSON (совместимый формат для буфера и файлов).
+pub fn export_filters_json(filters: &[Filter]) -> String {
+    serde_json::to_string_pretty(filters).unwrap_or_else(|_| "[]".to_owned())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ImportPayload {
+    List(Vec<ImportFilterItem>),
+    Wrapped { filters: Vec<ImportFilterItem> },
+}
+
+#[derive(serde::Deserialize)]
+struct ImportFilterItem {
+    text: String,
+    #[serde(default, alias = "isRegex")]
+    is_regex: bool,
+    #[serde(default, alias = "caseSensitive")]
+    case_sensitive: bool,
+    #[serde(default = "yes_default")]
+    enabled: bool,
+    #[serde(default, alias = "dialogId")]
+    dialog_id: Option<i64>,
+    #[serde(default, alias = "excludedChats")]
+    excluded_chats: Vec<i64>,
+}
+
+fn yes_default() -> bool {
+    true
+}
+
+/// Импорт фильтров из JSON (поддерживаются списки Rustgramm и AyuGram Desktop).
+pub fn import_filters_json(raw: &str) -> Result<Vec<Filter>, String> {
+    let payload: ImportPayload = serde_json::from_str(raw.trim()).map_err(|e| format!("JSON: {e}"))?;
+    let items = match payload {
+        ImportPayload::List(v) | ImportPayload::Wrapped { filters: v } => v,
+    };
+    Ok(items
+        .into_iter()
+        .filter(|x| !x.text.trim().is_empty())
+        .map(|x| Filter {
+            text: x.text,
+            is_regex: x.is_regex,
+            case_sensitive: x.case_sensitive,
+            enabled: x.enabled,
+            dialog_id: x.dialog_id,
+            excluded_chats: x.excluded_chats,
+        })
+        .collect())
 }
 
 /// Убирает «зальго» — нагромождение комбинируемых диакритических знаков (U+0300..U+036F и
@@ -129,5 +185,32 @@ mod tests {
         let z = "a\u{0300}\u{0301}\u{0302}\u{0303}\u{0304}b";
         assert_eq!(strip_zalgo(z), "a\u{0300}\u{0301}b");
         assert_eq!(strip_zalgo("привет"), "привет");
+    }
+
+    #[test]
+    fn dialog_specific_filter_applies_only_to_that_chat() {
+        let mut d = f("секрет", false);
+        d.dialog_id = Some(42);
+        let (set, _) = FilterSet::build(&[d]);
+        assert!(set.hides(42, "тут секрет"));
+        assert!(!set.hides(43, "тут секрет"));
+    }
+
+    #[test]
+    fn export_and_import_filters_roundtrip_and_ayu_camelcase() {
+        let mut rule = f("акция", false);
+        rule.dialog_id = Some(-100);
+        rule.excluded_chats = vec![7];
+        let exported = export_filters_json(&[rule.clone()]);
+        let back = import_filters_json(&exported).unwrap();
+        assert_eq!(back, vec![rule]);
+
+        let ayu_json = r#"{"filters":[{"text":"^spam$","isRegex":true,"caseSensitive":true,"dialogId":5,"excludedChats":[9]},{"text":"   "}]}"#;
+        let parsed = import_filters_json(ayu_json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].is_regex && parsed[0].case_sensitive);
+        assert_eq!(parsed[0].dialog_id, Some(5));
+        assert_eq!(parsed[0].excluded_chats, vec![9]);
+        assert!(import_filters_json("not-json").is_err());
     }
 }

@@ -29,6 +29,7 @@ pub(crate) mod pg {
     pub const POWER: usize = 9;
     pub const RUSTGRAMM: usize = 10;
     pub const PLUGINS: usize = 11;
+    pub const EXTERA: usize = 12;
 }
 
 fn title_of(p: usize) -> &'static str {
@@ -44,6 +45,7 @@ fn title_of(p: usize) -> &'static str {
         pg::POWER => "Энергосбережение",
         pg::RUSTGRAMM => "Rustgramm",
         pg::PLUGINS => "Плагины и телефон",
+        pg::EXTERA => "Настройки exteraGram",
         _ => "Настройки",
     }
 }
@@ -88,9 +90,8 @@ pub(crate) struct State {
     pub about: String,
     pub username: String,
     pub filled: bool,
-    /// Размеры кэша и загрузок (байт).
-    pub cache_bytes: u64,
-    pub downloads_bytes: u64,
+    /// Размеры кэша и загрузок (байт), обновляются в фоновом потоке без зависания интерфейса.
+    pub size_probe: std::sync::Arc<SizeProbe>,
     /// Редактор папки (None — список папок, Some — создание/правка).
     pub edit_folder: Option<rg_core::engine::FolderRow>,
     pub edit_folder_is_new: bool,
@@ -124,6 +125,30 @@ pub(crate) struct State {
     /// Отдельное модальное окно «Мой профиль» (как в AyuGram, без переброса в «Избранное»).
     pub profile_open: bool,
     pub profile_at: Option<std::time::Instant>,
+}
+
+/// Фоновый подсчёт размера кэша и загрузок (без блокировки UI).
+#[derive(Default)]
+pub(crate) struct SizeProbe {
+    pub cache: std::sync::atomic::AtomicU64,
+    pub downloads: std::sync::atomic::AtomicU64,
+    pub busy: std::sync::atomic::AtomicBool,
+}
+
+impl SizeProbe {
+    pub(crate) fn refresh_async(this: std::sync::Arc<Self>, cache_dir: std::path::PathBuf, dl_dir: std::path::PathBuf) {
+        use std::sync::atomic::Ordering;
+        if this.busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        std::thread::spawn(move || {
+            let c = dir_size(&cache_dir);
+            let d = dir_size(&dl_dir);
+            this.cache.store(c, Ordering::Relaxed);
+            this.downloads.store(d, Ordering::Relaxed);
+            this.busy.store(false, Ordering::Release);
+        });
+    }
 }
 
 /// Действия, собранные за кадр в окне настроек и выполняемые после отрисовки.
@@ -300,6 +325,10 @@ impl App {
         self.tgs.confirm_kill_session = None;
         self.tgs.confirm_clear_pay = false;
         self.tgs.new_plugin_open = false;
+        #[cfg(windows)]
+        {
+            self.settings.autostart = super::win::autostart_enabled();
+        }
         self.send(Cmd::Account);
     }
 
@@ -494,7 +523,7 @@ impl App {
                                     return;
                                 }
                                 match page {
-                                    pg::ACCOUNT => account_page(ui, &mut st, &mut act, streamer),
+                                    pg::ACCOUNT => account_page(ui, &mut st, &mut act, streamer, s.extera.hide_phone_number),
                                     pg::NOTIFY => notify_page(ui, &st, &mut s, &mut act),
                                     pg::PRIVACY => privacy_page(ui, &mut st, &mut s, &mut page, &mut act),
                                     pg::DATA => data_page(ui, &st, &mut s, &mut act, has_emoji),
@@ -505,6 +534,7 @@ impl App {
                                     pg::POWER => power_page(ui, &mut s),
                                     pg::RUSTGRAMM => rustgramm_page(ui, &mut s, &mut act, has_emoji),
                                     pg::PLUGINS => plugins_page(ui, &mut st, &mut s, &mut plugins_reg),
+                                    pg::EXTERA => extera_page(ui, &mut s),
                                     _ => {
                                         if let Some(p) = main_page(ui, &mut st, &mut s, &me_name, me_tex, corners, streamer, &mut act) {
                                             st.page_back.push(page);
@@ -523,13 +553,20 @@ impl App {
         }
 
         if (page == pg::DATA || page == pg::RUSTGRAMM) && st.page != page {
-            st.cache_bytes = dir_size(&worker::home().join("cache"));
-            st.downloads_bytes = dir_size(&worker::home().join("downloads"));
+            SizeProbe::refresh_async(
+                std::sync::Arc::clone(&st.size_probe),
+                worker::home().join("cache"),
+                worker::home().join("downloads"),
+            );
         }
         st.page = page;
         if act.clear_cache {
             let freed = clear_cache(&worker::home().join("cache"));
-            st.cache_bytes = dir_size(&worker::home().join("cache"));
+            SizeProbe::refresh_async(
+                std::sync::Arc::clone(&st.size_probe),
+                worker::home().join("cache"),
+                worker::home().join("downloads"),
+            );
             self.cached_media.clear();
             self.history_cache.clear();
             self.status = format!("Кэш очищен: освобождено {}", size_text(freed));
@@ -735,6 +772,9 @@ fn main_page(
     if nav_row(ui, "settings/stickers", "Плагины и телефон (Full / Lite)", plug_lbl) {
         go = Some(pg::PLUGINS);
     }
+    if nav_row(ui, "menu/customize", "Настройки exteraGram (Телефон)", "") {
+        go = Some(pg::EXTERA);
+    }
     divider(ui);
     let sess_cnt = st
         .account
@@ -838,7 +878,7 @@ fn loading(ui: &mut egui::Ui, st: &State) -> bool {
     true
 }
 
-fn account_page(ui: &mut egui::Ui, st: &mut State, act: &mut Actions, streamer: bool) {
+fn account_page(ui: &mut egui::Ui, st: &mut State, act: &mut Actions, streamer: bool, hide_phone: bool) {
     if loading(ui, st) {
         return;
     }
@@ -904,7 +944,8 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, act: &mut Actions, streamer: 
     ui.add_space(8.0);
     divider(ui);
     section(ui, "Данные аккаунта");
-    info_row(ui, "Телефон", &if a.me.phone.is_empty() { "—".to_owned() } else { mask_streamer(&format!("+{}", a.me.phone), streamer) });
+    let mask_p = streamer || hide_phone;
+    info_row(ui, "Телефон", &if a.me.phone.is_empty() { "—".to_owned() } else { mask_streamer(&format!("+{}", a.me.phone), mask_p) });
     if a.me.id != 0 {
         info_row(ui, "ID", &mask_streamer(&a.me.id.to_string(), streamer));
     }
@@ -1326,21 +1367,52 @@ fn privacy_page(
 }
 
 fn data_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act: &mut Actions, atlas: bool) {
+    use std::sync::atomic::Ordering;
+    let cache_bytes = st.size_probe.cache.load(Ordering::Relaxed);
+    let dl_bytes = st.size_probe.downloads.load(Ordering::Relaxed);
+    let busy = st.size_probe.busy.load(Ordering::Relaxed);
+    if busy {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+    }
     section(ui, "Память на этом устройстве");
-    info_row(ui, "Кэш медиа и истории", &size_text(st.cache_bytes));
+    info_row(ui, "Кэш медиа и истории", &if busy && cache_bytes == 0 { "подсчёт…".to_owned() } else { size_text(cache_bytes) });
     if nav_row(ui, "menu/clear", "Очистить кэш", "") {
         act.clear_cache = true;
     }
     desc(ui, "Удаляются скачанные ролики, музыка и кэш истории. Фото профилей и сохранённые удалённые сообщения остаются.");
     divider(ui);
     section(ui, "Загрузки и сеть");
-    info_row(ui, "Сохранённые файлы", &size_text(st.downloads_bytes));
+    info_row(ui, "Сохранённые файлы", &if busy && dl_bytes == 0 { "подсчёт…".to_owned() } else { size_text(dl_bytes) });
     if nav_row(ui, "menu/show_in_folder", "Открыть папку загрузок", "") {
         act.open_downloads = true;
     }
     if nav_row(ui, "settings/advanced", "Настройки соединения и прокси (SOCKS5)", "") {
         act.open_proxy = true;
     }
+    divider(ui);
+    section(ui, "Системный трей и автозапуск");
+    #[cfg(windows)]
+    {
+        if toggle(ui, "Запускать при старте Windows", &mut s.autostart) {
+            let _ = super::win::set_autostart(s.autostart, s.start_minimized);
+        }
+        if s.autostart && toggle(ui, "Запускать свёрнутым в трей", &mut s.start_minimized) {
+            let _ = super::win::set_autostart(s.autostart, s.start_minimized);
+        }
+    }
+    let wm_label = match s.work_mode {
+        rg_settings::WorkMode::WindowAndTray => "Окно и трей",
+        rg_settings::WorkMode::TrayOnly => "Только трей",
+        rg_settings::WorkMode::WindowOnly => "Только окно",
+    };
+    if value_row(ui, "Значок в трее", wm_label, false) {
+        s.work_mode = match s.work_mode {
+            rg_settings::WorkMode::WindowAndTray => rg_settings::WorkMode::TrayOnly,
+            rg_settings::WorkMode::TrayOnly => rg_settings::WorkMode::WindowOnly,
+            rg_settings::WorkMode::WindowOnly => rg_settings::WorkMode::WindowAndTray,
+        };
+    }
+    desc(ui, "При включённом трее закрытие окна сворачивает Rustgramm в область уведомлений вместо завершения работы.");
     divider(ui);
     section(ui, "Режим призрака и медиа");
     let mut ghost = s.ghost.active;
@@ -1840,13 +1912,59 @@ fn plugins_page(
 
     divider(ui);
     section(ui, "Настройки телефона (exteraGram / Android)");
-    toggle(ui, "Иконки Solar и квадратная FAB-кнопка", &mut s.extera.use_solar_icons);
+    toggle(ui, "Иконки Solar и единый стиль значков", &mut s.extera.use_solar_icons);
+    toggle(ui, "Квадратная кнопка FAB в чатах", &mut s.extera.square_fab);
+    toggle(ui, "Скрыть разделители строк настроек", &mut s.extera.disable_dividers);
     toggle(ui, "Центрировать заголовок шапки", &mut s.extera.center_title);
     toggle(ui, "Скрыть статус в шапке", &mut s.extera.hide_action_bar_status);
+    toggle(ui, "Скрывать номер телефона в профиле", &mut s.extera.hide_phone_number);
     toggle(ui, "Скрывать клавиатуру при прокрутке чата", &mut s.extera.hide_keyboard_on_scroll);
     toggle(ui, "Ускорение загрузки медиа (Speed Boost)", &mut s.extera.upload_speed_boost);
     toggle(ui, "Показывать секунды во времени", &mut s.extera.format_time_with_seconds);
     toggle(ui, "Архив по свайпу вниз", &mut s.extera.archive_on_pull);
+}
+
+fn extera_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
+    let e = &mut s.extera;
+    section(ui, "Внешний вид exteraGram");
+    toggle(ui, "Центрировать заголовок в шапке чата", &mut e.center_title);
+    toggle(ui, "Скрыть статус собеседника в шапке", &mut e.hide_action_bar_status);
+    toggle(ui, "Квадратная плавающая кнопка (FAB)", &mut e.square_fab);
+    toggle(ui, "Убрать полосы-разделители в настройках", &mut e.disable_dividers);
+    toggle(ui, "Иконки Solar", &mut e.use_solar_icons);
+    toggle(ui, "Размытие панелей (Force Blur)", &mut e.force_blur);
+    divider(ui);
+    section(ui, "Чаты и жесты");
+    let dbl_lbl = match e.double_tap_action {
+        1 => "Реакция 👍",
+        2 => "Ответить",
+        3 => "Копировать",
+        4 => "Переслать",
+        5 => "Изменить",
+        _ => "Выкл.",
+    };
+    if value_row(ui, "Двойной клик по сообщению", dbl_lbl, false) {
+        e.double_tap_action = (e.double_tap_action + 1) % 6;
+    }
+    toggle(ui, "Скрывать всплывающие панели при прокрутке", &mut e.hide_keyboard_on_scroll);
+    toggle(ui, "Скрывать кнопку пересылки справа от постов", &mut e.hide_share_button);
+    toggle(ui, "Пауза при сворачивании", &mut e.pause_on_minimize);
+    divider(ui);
+    section(ui, "Общие и приватность");
+    toggle(ui, "Скрывать номер телефона в профиле и настройках", &mut e.hide_phone_number);
+    toggle(ui, "Показывать секунды в штампах времени", &mut e.format_time_with_seconds);
+    toggle(ui, "Точные числа без сокращений", &mut e.disable_number_rounding);
+    let dl_lbl = match e.download_speed_boost {
+        1 => "Среднее",
+        2 => "Максимум",
+        _ => "Выкл.",
+    };
+    if value_row(ui, "Ускорение скачивания медиа", dl_lbl, false) {
+        e.download_speed_boost = (e.download_speed_boost + 1) % 3;
+    }
+    toggle(ui, "Ускорение отправки медиа", &mut e.upload_speed_boost);
+    toggle(ui, "Архив по свайпу вниз", &mut e.archive_on_pull);
+    desc(ui, "Все параметры exteraGram применяются сразу на ПК и Android без перезапуска.");
 }
 
 impl App {
@@ -1921,20 +2039,27 @@ impl App {
                             close = true;
                         }
 
+                        let show_prem = !self.settings.ayu.hide_premium_statuses;
+                        let mask_phone = streamer || self.settings.extera.hide_phone_number;
                         draw_avatar(ui, Pos2::new(top.center().x, top.top() + 58.0), &name, 1, 82.0, me_tex, corners);
                         let p = ui.painter();
                         let ng = p.layout_no_wrap(name.clone(), FontId::proportional(17.5), WHITE);
-                        let has_badge = me_info.emoji_status.is_some() || me_info.verified || me_info.premium;
+                        let has_badge = (show_prem && me_info.emoji_status.is_some())
+                            || me_info.verified
+                            || (show_prem && me_info.premium);
                         let nx = top.center().x - if has_badge { 10.0 } else { 0.0 };
                         p.text(Pos2::new(nx, top.top() + 120.0), Align2::CENTER_CENTER, &name, FontId::proportional(17.5), WHITE);
                         if has_badge {
                             let bc = Pos2::new(nx + ng.size().x * 0.5 + 12.0, top.top() + 120.0);
-                            if let Some(doc_id) = me_info.emoji_status
+                            if show_prem
+                                && let Some(doc_id) = me_info.emoji_status
                                 && let Some(tex) = self.sticker_tex.get(&doc_id)
                             {
                                 egui::Image::new(tex)
                                     .fit_to_exact_size(Vec2::splat(17.0))
                                     .paint_at(ui, Rect::from_center_size(bc, Vec2::splat(17.0)));
+                            } else if me_info.verified {
+                                icons::tg(ui.painter(), "dialogs/dialogs_verified_star", bc, ORANGE);
                             } else {
                                 icons::tg(ui.painter(), "dialogs/dialogs_premium", bc, ORANGE);
                             }
@@ -2022,7 +2147,7 @@ impl App {
                         };
 
                         if !me_info.phone.is_empty() {
-                            field_row(ui, &mask_streamer(&format!("+{}", me_info.phone), streamer), "Мобильный", WHITE, false);
+                            field_row(ui, &mask_streamer(&format!("+{}", me_info.phone), mask_phone), "Мобильный", WHITE, false);
                         }
                         if !me_info.about.is_empty() {
                             field_row(ui, &me_info.about, "О себе", WHITE, false);

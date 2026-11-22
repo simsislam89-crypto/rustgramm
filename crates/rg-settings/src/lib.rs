@@ -228,6 +228,18 @@ pub fn hash_passcode(pin: &str) -> String {
     format!("{h1:016x}{h2:016x}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkMode {
+    /// Обычное окно и значок в системном трее (закрытие сворачивает в трей).
+    #[default]
+    WindowAndTray,
+    /// Работа только из трея (скрыть кнопку окна при сворачивании).
+    TrayOnly,
+    /// Только окно (без значка в трее; закрытие завершает программу).
+    WindowOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -267,6 +279,12 @@ pub struct Settings {
     pub default_scale: bool,
     /// Масштаб интерфейса, проценты (75..=200).
     pub ui_scale: u8,
+    /// Режим окна и системного трея (`tray.cpp`).
+    pub work_mode: WorkMode,
+    /// Автозапуск вместе с Windows (`windows_autostart_task.cpp` / HKCU Run).
+    pub autostart: bool,
+    /// Запускать свёрнутым в трей.
+    pub start_minimized: bool,
 }
 
 impl Default for Settings {
@@ -291,6 +309,9 @@ impl Default for Settings {
             anim_speed: 100,
             default_scale: true,
             ui_scale: 100,
+            work_mode: WorkMode::WindowAndTray,
+            autostart: false,
+            start_minimized: false,
         }
     }
 }

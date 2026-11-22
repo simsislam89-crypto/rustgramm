@@ -24,6 +24,7 @@ grammers-session = "0.12"
 qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
+flate2 = "1"
 
 [target.'cfg(not(windows))'.dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
@@ -33,3 +34,4 @@ wry = { version = "0.57", default-features = false }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = { version = "0.15", default-features = false }
+arboard = "3"

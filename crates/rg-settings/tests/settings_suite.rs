@@ -4,7 +4,7 @@
 
 use rg_settings::{
     AyuSettings, ChannelBottomButton, Filter, LanguageSettings, MenuVisibility, NotifySettings,
-    PeerIdDisplay, SecuritySettings, SendWithoutSound, Settings, TranslationProvider,
+    PeerIdDisplay, SecuritySettings, SendWithoutSound, Settings, TranslationProvider, WorkMode,
     hash_passcode,
 };
 
@@ -487,10 +487,48 @@ fn language_and_security_and_filter_roundtrip() {
             is_regex: false,
             case_sensitive: false,
             enabled: true,
+            dialog_id: None,
             excluded_chats: vec![-1001, 42],
         }],
         ..Settings::default()
     };
     let loaded = Settings::from_json(&s.to_json()).unwrap();
     assert_eq!(loaded, s);
+}
+
+#[test]
+fn work_mode_and_autostart_roundtrip() {
+    for mode in [WorkMode::WindowAndTray, WorkMode::TrayOnly, WorkMode::WindowOnly] {
+        let s = Settings {
+            work_mode: mode,
+            autostart: true,
+            start_minimized: true,
+            ..Settings::default()
+        };
+        let loaded = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(loaded.work_mode, mode);
+        assert!(loaded.autostart);
+        assert!(loaded.start_minimized);
+    }
+}
+
+#[test]
+fn locked_ghost_flags_and_per_dialog_filter_roundtrip() {
+    let mut s = Settings::default();
+    s.ghost.locked_read_messages = true;
+    s.ghost.locked_read_stories = true;
+    s.ghost.locked_online_packets = true;
+    s.ghost.locked_upload_progress = true;
+    s.ghost.locked_offline_after_online = true;
+    s.ghost.set_active(true);
+    s.filters.push(Filter {
+        text: "реклама".to_owned(),
+        dialog_id: Some(-100500),
+        ..Filter::default()
+    });
+    let loaded = Settings::from_json(&s.to_json()).unwrap();
+    assert!(loaded.ghost.send_read_messages);
+    assert!(loaded.ghost.send_read_stories);
+    assert!(loaded.ghost.send_online_packets);
+    assert_eq!(loaded.filters[0].dialog_id, Some(-100500));
 }

@@ -1,9 +1,20 @@
 //! Элементы настроек Telegram Desktop: заголовок раздела, строка-переключатель, пояснение,
 //! строка со значением, разделитель. Размеры сняты с окна AyuGram (строка 40, отступ 20).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Vec2};
 
 use super::theme::*;
+
+static MD3_SWITCHES: AtomicBool = AtomicBool::new(true);
+static HIDE_DIVIDERS: AtomicBool = AtomicBool::new(false);
+
+/// Синхронизирует глобальный стиль переключателей и разделителей настроек.
+pub fn sync_prefs(md3: bool, disable_dividers: bool) {
+    MD3_SWITCHES.store(md3, Ordering::Relaxed);
+    HIDE_DIVIDERS.store(disable_dividers, Ordering::Relaxed);
+}
 
 pub const ROW_H: f32 = 40.0;
 pub const PAD: f32 = 20.0;
@@ -13,6 +24,10 @@ const TRACK_OFF: Color32 = navy(0x4b5866);
 
 /// Полоса-разделитель между группами (как `AddSkip` + `AddDivider`).
 pub fn divider(ui: &mut egui::Ui) {
+    if HIDE_DIVIDERS.load(Ordering::Relaxed) {
+        ui.add_space(2.0);
+        return;
+    }
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, t(SIDEBAR_BG));
 }
@@ -50,17 +65,33 @@ fn row_bg(ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
     }
 }
 
-/// Переключатель Telegram: узкая «таблетка» и круглая ручка.
+/// Переключатель Telegram: классическая «таблетка» или Material Design 3 (`material_switches`).
 fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
-    let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
-    // Ручка и цвет дорожки плавно переезжают при смене значения.
     let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.15);
-    // Ручка едет с замедлением к краю, цвет — линейно (переключатель Telegram, 150 мс).
     let k = if on { ios_spring(lin) } else { 1.0 - ios_spring(1.0 - lin) };
-    let fill = lerp_color(t_btn(TRACK_OFF), t_btn(ORANGE), lin);
-    ui.painter().rect_filled(track, CornerRadius::same(7), fill);
-    let knob = Pos2::new(track.left() + 7.0 + k * (track.width() - 14.0), center.y);
-    ui.painter().circle_filled(knob, 6.0, Color32::WHITE);
+    if MD3_SWITCHES.load(Ordering::Relaxed) {
+        let track = Rect::from_center_size(center, Vec2::new(38.0, 20.0));
+        let off_fill = t_btn(TRACK_OFF).gamma_multiply(0.45);
+        let fill = lerp_color(off_fill, t_btn(ORANGE), lin);
+        ui.painter().rect_filled(track, CornerRadius::same(10), fill);
+        if lin < 0.99 {
+            ui.painter().rect_stroke(
+                track,
+                CornerRadius::same(10),
+                egui::Stroke::new(1.5, t_btn(TRACK_OFF).gamma_multiply(1.0 - lin)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let radius = 5.5 + 1.5 * k;
+        let knob = Pos2::new(track.left() + 10.0 + k * (track.width() - 20.0), center.y);
+        ui.painter().circle_filled(knob, radius, Color32::WHITE);
+    } else {
+        let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
+        let fill = lerp_color(t_btn(TRACK_OFF), t_btn(ORANGE), lin);
+        ui.painter().rect_filled(track, CornerRadius::same(7), fill);
+        let knob = Pos2::new(track.left() + 7.0 + k * (track.width() - 14.0), center.y);
+        ui.painter().circle_filled(knob, 6.0, Color32::WHITE);
+    }
 }
 
 /// Строка с переключателем; возвращает `true`, если значение изменилось.
@@ -280,4 +311,19 @@ pub fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, danger: bool) -> bo
         text_c,
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_prefs_updates_switch_and_divider_flags() {
+        sync_prefs(true, true);
+        assert!(MD3_SWITCHES.load(Ordering::Relaxed));
+        assert!(HIDE_DIVIDERS.load(Ordering::Relaxed));
+        sync_prefs(false, false);
+        assert!(!MD3_SWITCHES.load(Ordering::Relaxed));
+        assert!(!HIDE_DIVIDERS.load(Ordering::Relaxed));
+    }
 }

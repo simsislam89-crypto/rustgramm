@@ -270,6 +270,7 @@ macro_rules! multi_filter_tests {
                         is_regex: false,
                         case_sensitive: false,
                         enabled: true,
+                        dialog_id: None,
                         excluded_chats: vec![777],
                     },
                     Filter {
@@ -277,6 +278,7 @@ macro_rules! multi_filter_tests {
                         is_regex: true,
                         case_sensitive: true,
                         enabled: true,
+                        dialog_id: None,
                         excluded_chats: vec![888],
                     },
                     Filter {
@@ -284,6 +286,7 @@ macro_rules! multi_filter_tests {
                         is_regex: false,
                         case_sensitive: false,
                         enabled: true,
+                        dialog_id: None,
                         excluded_chats: vec![],
                     },
                 ];

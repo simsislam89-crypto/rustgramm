@@ -34,6 +34,71 @@ pub(crate) enum StickerAct {
 }
 
 impl App {
+    /// Горизонтальная полоса историй контактов над вкладками папок (`!disable_stories`).
+    pub(crate) fn stories_strip(&mut self, ui: &mut egui::Ui) {
+        if self.settings.ayu.disable_stories || self.stories.is_empty() {
+            return;
+        }
+        let mut clicked: Option<usize> = None;
+        let mut need_avatar = Vec::new();
+        egui::ScrollArea::horizontal()
+            .id_salt("stories-strip")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    for (idx, st) in self.stories.iter().enumerate() {
+                        if !self.avatars.contains_key(&st.peer_id) && self.avatar_req.insert(st.peer_id) {
+                            need_avatar.push((st.peer, st.peer_id));
+                        }
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(52.0, 62.0), Sense::click());
+                        let center = Pos2::new(rect.center().x, rect.top() + 23.0);
+                        let ring = if st.unread { ORANGE } else { SUBTEXT.gamma_multiply(0.5) };
+                        ui.painter().circle_stroke(center, 20.5, Stroke::new(2.0, ring));
+                        draw_avatar(
+                            ui,
+                            center,
+                            &st.author,
+                            st.peer_id,
+                            36.0,
+                            self.avatars.get(&st.peer_id),
+                            self.settings.ayu.avatar_corners,
+                        );
+                        let short: String = st.author.chars().take(7).collect();
+                        ui.painter().text(
+                            Pos2::new(rect.center().x, rect.bottom() - 8.0),
+                            Align2::CENTER_CENTER,
+                            short,
+                            FontId::proportional(11.0),
+                            if st.unread { WHITE } else { SUBTEXT },
+                        );
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            clicked = Some(idx);
+                        }
+                    }
+                    ui.add_space(6.0);
+                });
+            });
+        for (peer, id) in need_avatar {
+            self.send(Cmd::AvatarPeer(peer, id));
+        }
+        if let Some(idx) = clicked {
+            if self.settings.ayu.suggest_ghost_mode_before_viewing_story && self.settings.ghost.send_read_stories {
+                self.story_ghost_ask = Some(idx);
+            } else {
+                self.story_open = Some(idx);
+                if let Some(st) = self.stories.get_mut(idx) {
+                    st.unread = false;
+                    let (peer, sid) = (st.peer, st.story_id);
+                    self.send(Cmd::ReadStory(peer, sid));
+                }
+            }
+        }
+        let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().rect_filled(line, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+    }
+
     /// Полоса папок под строкой поиска: «Все чаты» и папки пользователя с счётчиками.
     pub(crate) fn folder_tabs(&mut self, ui: &mut egui::Ui) {
         if self.folders.is_empty() {
@@ -43,6 +108,7 @@ impl App {
         if hide_all && self.folder.is_none() {
             self.folder = self.folders.first().map(|f| f.id);
         }
+        let show_cnt = !self.settings.ayu.hide_notification_counters;
         let inc_muted = self.settings.notify.badge_include_muted;
         let count_msgs = self.settings.notify.badge_count_messages;
         let tally = |d: &rg_core::engine::DialogRow| -> i32 {
@@ -74,7 +140,11 @@ impl App {
                     ui.add_space(8.0);
                     for (id, title, unread) in &tabs {
                         let selected = *id == self.folder;
-                        let label = if *unread > 0 { format!("{title}  {unread}") } else { title.clone() };
+                        let label = if show_cnt && *unread > 0 {
+                            format!("{title}  {unread}")
+                        } else {
+                            title.clone()
+                        };
                         let g = ui.painter().layout_no_wrap(
                             label.clone(),
                             FontId::proportional(14.0),

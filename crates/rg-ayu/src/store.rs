@@ -15,6 +15,15 @@ pub struct Saved {
     pub deleted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedAudit {
+    pub msg_id: i32,
+    pub text: String,
+    pub date: i64,
+    pub deleted: bool,
+    pub edits: Vec<(String, i64)>,
+}
+
 /// Граница идентификаторов каналов в формате Bot API (-100…).
 const CHANNEL_BOUND: i64 = -1_000_000_000_000;
 
@@ -224,6 +233,41 @@ impl MessageStore {
             )
             .await
     }
+
+    /// Все сохранённые удалённые или изменённые сообщения чата с историей правок (`ayu/ui/message_history`).
+    pub async fn audit_peer(&self, peer: i64) -> Result<Vec<SavedAudit>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT m.msg_id, m.text, m.date, m.deleted FROM messages m
+                 WHERE m.peer=?1 AND (m.deleted=1 OR EXISTS(
+                     SELECT 1 FROM edits e WHERE e.peer=m.peer AND e.msg_id=m.msg_id
+                 ))
+                 ORDER BY m.date DESC, m.msg_id DESC",
+                params![peer],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let msg_id = i32::try_from(r.get::<i64>(0)?).unwrap_or_default();
+            let text: String = r.get(1)?;
+            let date: i64 = r.get(2)?;
+            let deleted = r.get::<i64>(3)? != 0;
+            let mut erows = self
+                .conn
+                .query(
+                    "SELECT old_text, edited_at FROM edits WHERE peer=?1 AND msg_id=?2 ORDER BY rev",
+                    params![peer, i64::from(msg_id)],
+                )
+                .await?;
+            let mut edits = Vec::new();
+            while let Some(er) = erows.next().await? {
+                edits.push((er.get(0)?, er.get(1)?));
+            }
+            out.push(SavedAudit { msg_id, text, date, deleted, edits });
+        }
+        Ok(out)
+    }
 }
 
 fn row(r: &Row) -> Result<Saved> {
@@ -303,5 +347,21 @@ mod tests {
         let c = s.edit_counts(5).await.unwrap();
         assert_eq!(c.get(&1), Some(&1));
         assert_eq!(c.get(&2), None);
+    }
+
+    #[tokio::test]
+    async fn audit_peer_combines_deleted_and_edited_entries() {
+        let s = MessageStore::in_memory().await.unwrap();
+        s.remember(9, 100, "draft", 10).await.unwrap();
+        s.record_edit(9, 100, "edited", 20).await.unwrap();
+        s.remember(9, 101, "gone", 30).await.unwrap();
+        s.mark_deleted(9, &[101]).await.unwrap();
+        s.remember(9, 102, "untouched", 40).await.unwrap();
+        let audit = s.audit_peer(9).await.unwrap();
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].msg_id, 101);
+        assert!(audit[0].deleted);
+        assert_eq!(audit[1].msg_id, 100);
+        assert_eq!(audit[1].edits, vec![("draft".to_owned(), 20)]);
     }
 }

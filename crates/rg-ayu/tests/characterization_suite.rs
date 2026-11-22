@@ -372,6 +372,7 @@ macro_rules! filter_tests {
                     enabled: true,
                     is_regex: $regex,
                     case_sensitive: $cs,
+                    dialog_id: None,
                     excluded_chats: $excl.to_vec(),
                 };
                 let (set, bad) = FilterSet::build(&[f]);

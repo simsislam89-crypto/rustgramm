@@ -14,6 +14,8 @@ plugins = []
 rg-settings = { path = "../rg-settings" }
 grammers-tl-types = "0.12"
 regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 libsql = { version = "0.10", default-features = false, features = ["core"] }
 
 [dev-dependencies]

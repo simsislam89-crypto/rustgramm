@@ -7,8 +7,9 @@ use grammers_client::SignInError;
 use grammers_client::client::{LoginToken, PasswordToken};
 use rg_ayu::store::MessageStore;
 use rg_core::engine::{
-    AudioTrack, ContactRow, DialogKind, DialogRow, Engine, FolderRow, MessageRow, NotifyScope,
-    PrivacyKeyKind, PrivacyLevel, StickerRow, StickerSetRow,
+    AudioTrack, ContactRow, DialogKind, DialogRow, DiscussionThread, Engine, FolderRow,
+    ForumTopicRow, MessageRow, NotifyScope, PrivacyKeyKind, PrivacyLevel, StickerRow,
+    StickerSetRow, StoryRow,
 };
 use rg_core::{Config, connect_with_updates};
 use rg_settings::Settings;
@@ -49,6 +50,30 @@ pub enum Cmd {
     Send(String, Option<i32>),
     /// Отправить сообщение с пользовательскими Premium-эмодзи `(char_start, char_len, doc_id)`.
     SendRich(String, Vec<(usize, usize, i64)>, Option<i32>),
+    /// Отправить сообщение с произвольным форматированием (жирный, курсив, код, спойлер, цитата, Premium-эмодзи).
+    SendFormatted(String, Vec<rg_core::engine::Entity>, Option<i32>),
+    /// Пакетная пересылка выбранных сообщений в другой чат (`true` — без автора).
+    ForwardBatch(Vec<i32>, usize, bool),
+    /// Журнал удалённых и изменённых сообщений открытого чата.
+    SavedHistory,
+    /// Загрузить `.tgs` анимацию стикера сообщения по ID.
+    TgsMessage(usize, i32),
+    /// Темы супергруппы-форума (`messages.getForumTopics`).
+    ForumTopics(usize),
+    /// Сообщения выбранной темы форума.
+    TopicMessages(usize, i32),
+    /// Комментарии к посту канала (`messages.getDiscussionMessage`).
+    Discussion(usize, i32),
+    /// Отправить комментарий к посту канала в группу обсуждений.
+    SendComment(grammers_session::types::PeerRef, i32, i32, String),
+    /// Загрузить активные истории.
+    LoadStories,
+    /// Отметить историю прочитанной (с проверкой режима призрака).
+    ReadStory(grammers_session::types::PeerRef, i32),
+    /// Установить автоудаление сообщений в открытом чате (сек., 0 — выкл.).
+    SetChatTtl(i32),
+    /// Загрузить закреплённое сообщение для шапки чата.
+    LoadPinned(usize, i32),
     /// Загрузить текстуры пользовательских Premium-эмодзи по `document_id`.
     CustomEmojiDocs(Vec<i64>),
     /// Создать канал/супергруппу (название, описание, broadcast, @username, участники).
@@ -231,6 +256,22 @@ pub enum Ev {
     FetchEnd(i32),
     /// Сообщения, вложения которых уже лежат в кэше.
     Cached(Vec<i32>),
+    /// Журнал сохранённых удалённых и изменённых сообщений чата.
+    SavedHistory(i64, Vec<rg_ayu::store::SavedAudit>),
+    /// Загруженные `.tgs` (gzipped Lottie) байты для стикера/CustomEmoji по `document_id`.
+    TgsDoc(i64, Vec<u8>),
+    /// Загруженные `.tgs` байты анимированного стикера в ленте по `msg_id`.
+    TgsMsg(i32, Vec<u8>),
+    /// Темы форума супергруппы.
+    ForumTopics(i64, Vec<ForumTopicRow>),
+    /// Сообщения выбранной темы форума.
+    TopicMessages(i64, i32, Vec<MessageRow>),
+    /// Загруженная ветка комментариев к посту канала.
+    Discussion(DiscussionThread),
+    /// Активные истории.
+    Stories(Vec<StoryRow>),
+    /// Закреплённое сообщение чата.
+    PinnedMsg(i64, MessageRow),
     Status(String),
     Error(String),
 }
@@ -777,6 +818,130 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 }
                 reload(&engine, &out, d.peer, i).await;
             }
+            Cmd::SendFormatted(text, ents, reply_to) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                if let Err(e) = engine.send_formatted(d.peer, &text, &ents, reply_to).await {
+                    out.err(format!("Не отправлено: {e}"));
+                    continue;
+                }
+                reload(&engine, &out, d.peer, i).await;
+            }
+            Cmd::ForwardBatch(ids, to, no_author) => {
+                let Some(i) = current else { continue };
+                let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to)) else { continue };
+                let n = ids.len();
+                match engine.forward_batch(from.peer, dest.peer, &ids, no_author).await {
+                    Ok(()) => out.send(Ev::Status(format!(
+                        "Переслано сообщений ({n}){}: {}",
+                        if no_author { " без автора" } else { "" },
+                        dest.name
+                    ))),
+                    Err(e) => out.err(format!("Пакетная пересылка: {e}")),
+                }
+            }
+            Cmd::SavedHistory => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let list = engine.audit_peer(&d.peer).await;
+                out.send(Ev::SavedHistory(d.id, list));
+            }
+            Cmd::TgsMessage(i, msg_id) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, limit, peer) = (engine.clone(), out.clone(), avatar_limit.clone(), d.peer);
+                tokio::spawn(async move {
+                    let Ok(_permit) = limit.acquire().await else { return };
+                    if let Ok(Some(bytes)) = eng.tgs_message_bytes(peer, msg_id).await {
+                        out.send(Ev::TgsMsg(msg_id, bytes));
+                    }
+                });
+            }
+            Cmd::ForumTopics(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok(list) = eng.forum_topics(peer).await {
+                        out.send(Ev::ForumTopics(id, list));
+                    }
+                });
+            }
+            Cmd::TopicMessages(i, topic_id) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok(rows) = eng.topic_messages(peer, topic_id, 60).await {
+                        out.send(Ev::TopicMessages(id, topic_id, rows));
+                    }
+                });
+            }
+            Cmd::Discussion(i, post_id) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.discussion_comments(peer, post_id).await {
+                        Ok(Some(th)) => out.send(Ev::Discussion(th)),
+                        Ok(None) => out.err("У этого поста нет обсуждения"),
+                        Err(e) => out.err(format!("Комментарии: {e}")),
+                    }
+                });
+            }
+            Cmd::SendComment(disc_peer, root_msg_id, post_id, text) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                let peer_for_disc = current.and_then(|i| dialogs.get(i)).map(|d| d.peer);
+                tokio::spawn(async move {
+                    if let Err(e) = eng.send_reply(disc_peer, &text, Some(root_msg_id)).await {
+                        out.err(format!("Комментарий: {e}"));
+                        return;
+                    }
+                    if let Some(p) = peer_for_disc
+                        && let Ok(Some(th)) = eng.discussion_comments(p, post_id).await
+                    {
+                        out.send(Ev::Discussion(th));
+                    }
+                });
+            }
+            Cmd::LoadStories => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    if let Ok(st) = eng.stories().await {
+                        out.send(Ev::Stories(st));
+                    }
+                });
+            }
+            Cmd::ReadStory(peer, story_id) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    if let Ok(false) = eng.read_story(peer, story_id).await {
+                        out.send(Ev::Status("Режим призрака: просмотр истории скрыт".into()));
+                    }
+                });
+            }
+            Cmd::SetChatTtl(period) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.set_chat_ttl(d.peer, period).await {
+                    Ok(()) => {
+                        out.send(Ev::Status(if period == 0 {
+                            "Автоудаление отключено".into()
+                        } else {
+                            format!("Автоудаление: {} дн.", period / 86_400)
+                        }));
+                        if let Ok(info) = engine.peer_info(d.peer).await {
+                            out.send(Ev::PeerInfo(d.id, info));
+                        }
+                    }
+                    Err(e) => out.err(format!("Автоудаление: {e}")),
+                }
+            }
+            Cmd::LoadPinned(i, msg_id) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok(Some(m)) = eng.message_row_by_id(peer, msg_id).await {
+                        out.send(Ev::PinnedMsg(id, m));
+                    }
+                });
+            }
             Cmd::CustomEmojiDocs(ids) => {
                 let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
                 tokio::spawn(async move {
@@ -785,6 +950,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             let (e2, o2, lim) = (eng.clone(), out.clone(), limit.clone());
                             tokio::spawn(async move {
                                 let Ok(_permit) = lim.acquire().await else { return };
+                                if row.mime == "application/x-tgsticker"
+                                    && let Ok(Some(bytes)) = e2.tgs_sticker_bytes(&row).await
+                                {
+                                    o2.send(Ev::TgsDoc(row.id, bytes));
+                                }
                                 if let Ok(Some(path)) = e2.sticker_file(&row).await
                                     && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 72)).await
                                 {
@@ -997,6 +1167,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
                 tokio::spawn(async move {
                     let Ok(_permit) = limit.acquire().await else { return };
+                    if row.mime == "application/x-tgsticker"
+                        && let Ok(Some(bytes)) = eng.tgs_sticker_bytes(&row).await
+                    {
+                        out.send(Ev::TgsDoc(doc, bytes));
+                    }
                     if let Ok(Some(path)) = eng.sticker_file(&row).await
                         && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 144)).await
                     {
@@ -1779,6 +1954,20 @@ async fn enter(
         out.send(Ev::Folders(f));
     }
     save_disk_cache(home, cached_me, dialogs, cached_folders);
+    // Подгружаем обзор аккаунта (заблокированные для `hide_from_blocked`, приватность) и истории в фоне.
+    {
+        let eng = engine.clone();
+        let out_acc = out.clone();
+        tokio::spawn(async move {
+            let (acc_res, st_res) = tokio::join!(eng.account_overview(), eng.stories());
+            if let Ok(a) = acc_res {
+                out_acc.send(Ev::Account(Box::new(a)));
+            }
+            if let Ok(st) = st_res {
+                out_acc.send(Ev::Stories(st));
+            }
+        });
+    }
     // Фоновый прогрев кэша истории первых 3 чатов — при клике они откроются мгновенно (0 мс).
     let prefetch: Vec<(grammers_session::types::PeerRef, i64)> = dialogs
         .iter()
