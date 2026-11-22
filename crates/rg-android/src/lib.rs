@@ -11,14 +11,17 @@ pub const WITH_PLUGINS: bool = cfg!(feature = "plugins");
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
+    rg_ui::android_jni::init(app.vm_as_ptr(), app.activity_as_ptr());
     if let Some(dir) = app.internal_data_path() {
         let _ = rg_ui::worker::DATA_DIR.set(dir);
     }
+    rg_ui::android_jni::ensure_runtime_permissions();
     let options = eframe::NativeOptions {
         android_app: Some(app),
         ..Default::default()
     };
     let _ = rg_ui::run(options);
+    rg_ui::android_jni::shutdown_all();
 }
 
 /// На не-Android целях крейт пуст: рабочее пространство собирается целиком.

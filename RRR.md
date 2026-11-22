@@ -867,3 +867,51 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
   - **Улучшенный Mini App + цветные анимированные кнопки ботов (`video.rs`, `lib.rs`, `chat.rs`, `theme.rs`):** JS-бридж `TelegramWebviewProxy` (BackButton, MainButton, expand, close, dynamic header color, внутренний роутинг `t.me/`), палитры кнопок `Primary`/`Danger`/`Success`/`Default`, поддержка `KeyboardButtonStyle.icon`, анимации ховера/нажатия/волны и бегущий shimmer-индикатор ожидания callback.
   - **Плашка автообновления (`updater.rs`, `features_ui.rs`, `worker.rs`):** анонимная проверка новых релизов `simsislam89-crypto/rustgramm` через системный WinHTTP (отключается в «Щит приватности» → `check_updates`), оранжевая плашка сверху с прогрессом загрузки и автоперезапуском на Windows / ссылкой на APK на Android.
 - **Проверки:** `cargo clippy -q --workspace --all-targets -- -D warnings` (Full и Lite) — 0 предупреждений; `cargo check -q -p rg-android` (Full и Lite) — успешно; `cargo test --workspace` — **2118 passed, 0 failed, 0 ignored** (включая `no_foreign_hosts`, `secret`, `calls`, `countries`, `audio_io`, `updater`, `encode_waveform`, `admin_and_banned_rights`); `scripts/make-dist.sh` собрал единый `dist/Rustgramm.exe` (**13 306 880 Б ≈ 12,69 МБ**).
+
+## Этап 29 (2026-11-22, v0.18.0)
+
+Выполнена глубокая оптимизация для больших аккаунтов (5 000+ чатов / 1 000+ участников), реализован шифрованный медиа-поток звонков, нативная Android JNI-интеграция с постоянной подписью APK, встроенный редактор медиа, импорт тем и паков иконок AyuGram, поддержка Telegram Stars / Star Gifts / Business, а также защита от двойного запуска и чистое завершение всех аудиопотоков.
+
+### Что сделано
+
+1. **Оптимизация под 5 000+ чатов и 1 000+ участников, больше потоков (`engine.rs`, `worker.rs`, `lib.rs`)**:
+   - Добавлен потоковый загрузчик `Engine::dialogs_stream(first_batch: 60, max_total: 5000, tx)` через `Ev::DialogsBatch` — первые 60 чатов появляются мгновенно, остальные догружаются пакетами в фоне без фриза UI.
+   - Приоритизирована загрузка аватарок видимых чатов и ограничены фоновые батчи (`request_emoji_statuses` до 120 чатов / макс. 90 за проход, `SenderAvatar` до 24 за батч).
+   - Добавлен кэш фильтрации списка чатов `filtered_cache` и `archived_total_cache` (пересчёт только при смене поколения списка/поиска/папки), виртуализация списка участников через `egui::ScrollArea::show_rows` и постраничная догрузка `Engine::channel_participants_paged` (до 200 за запрос) в `info_ui`.
+   - Пул Tokio увеличен до `4..=12` рабочих потоков (по `available_parallelism`) + `max_blocking_threads(16)`, увеличены лимиты параллельных загрузок медиа (`limit = 12`) и аватаров (`avatar_limit = 32`).
+
+2. **Шифрованный UDP/STUN/Reflector медиа-поток звонков (`calls.rs`, `call_media.rs`, `audio_io.rs`)**:
+   - В `calls.rs` добавлен разбор `PhoneConnection` (`CallEndpoint`, `parse_phone_connections`) и `CallEvent::SignalingData`, возврат эндпоинтов и `shared_key` из `confirm_call` и `derive_incoming_call_emojis`.
+   - Создан модуль `crates/rg-core/src/call_media.rs` (`CallMediaSession`, `CallMediaConfig`, `CallMediaStats`): асинхронный UDP-сокет, RFC 5389 STUN Binding / `XOR-MAPPED-ADDRESS`, кодек голоса 4:1 IMA-ADPCM (16 кГц моно), шифрование/аутентификация кадров поверх AES-256-IGE (`secret.rs`) и `peer_tag`, фильтрация P2P-адресов при включённом `relay_only_privacy` (`privacy_shield.block_activity_telemetry`), живая статистика RTT/пакетов и кнопка mute в `call_window`.
+   - В `audio_io.rs` добавлен полнодуплексный WinMM `CallAudioPump` (микрофон + динамик PCM16 20 мс) с делегированием на `android_jni` для Android.
+
+3. **Глубокая Android JNI-интеграция и постоянный keystore (`android_jni.rs`, `rg_bridge.dex`, `rg-android`, `make-apk.sh`, `release.yml`)**:
+   - Подключён `jni = "0.21"` на Android, добавлены разрешения `RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS`, `POST_NOTIFICATIONS`, `VIBRATE` в `crates/rg-android/Cargo.toml` и инициализация `android_jni::init` + запрос runtime-разрешений в `android_main`.
+   - Собран встроенный helper `crates/rg-ui/assets/rg_bridge.dex` (`scripts/dev/build_android_bridge.py`: `app.rustgramm.RgBridge` с `PickerFragment` для `ACTION_OPEN_DOCUMENT` и `Dialog`/`WebView` с `TelegramWebviewProxy`, пропускающим только `tg://`/`t.me/`).
+   - В `crates/rg-ui/src/android_jni.rs` реализованы нативные `AudioRecord` (запись голосовых), `MediaPlayer` (звонок/уведомления), `NotificationManager` + канал уведомлений, `pick_file` для вложений/историй/тем и встроенный `WebView` для Mini Apps внутри APK.
+   - Обновлены `scripts/make-apk.sh` и `.github/workflows/release.yml` для постоянной подписи APK из `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD` (ключи сгенерированы и загружены в GitHub Secrets), чтобы новые APK ставились поверх установленных без удаления.
+
+4. **Встроенный редактор медиа перед отправкой (`media_editor.rs`, `media.rs`, `engine.rs`, `chat.rs`, `features_ui.rs`)**:
+   - Создан `crates/rg-ui/src/media_editor.rs` (`MediaEditorState`, `render_edited_rgba`, `export_edited_image`, `media_editor_window`): обрезка (кроп), поворот на 90°, зеркалирование по горизонтали, рисование кистью, пиксельное размытие чувствительных данных и откат штрихов, выбор сжатия (Стандарт / HD / Без сжатия PNG), флажок спойлера и таймер самоуничтожения (`ttl_seconds`).
+   - В `media.rs` и `engine.rs` (`SendMediaOptions`, `Engine::send_media_with_options`) добавлена передача `spoiler` и `ttl_seconds` в `InputMediaUploadedPhoto`/`InputMediaUploadedDocument` и отображение в `MediaInfo::describe`.
+
+5. **Импорт тем `.tdesktop-theme` / `.attheme`, палитра и паки иконок (`theme_pack.rs`, `rg-settings`, `theme.rs`, `icons.rs`, `features_ui.rs`)**:
+   - В `rg-settings` добавлена структура `CustomThemeSettings` (`Settings.theme`).
+   - Создан `crates/rg-ui/src/theme_pack.rs`: парсер и экспортёр `.tdesktop-theme` (обычный текст и ZIP-архив с обоями через `flate2`), `.attheme` (включая `WPS` обои) и встроенные пресеты (`builtin_presets`).
+   - В `theme.rs` добавлена `LivePalette` (`sync_custom_theme`, разрешение цветов в `t`/`t2`/`t_btn`/`orange_button_enabled` и обновление `sync_visuals`) и `paint_chat_backdrop_ex` с обоями и ползунком затемнения; в `icons.rs` — `set_icon_pack` для встроенных стилей (`default`, `ayu_bold`, `ayu_minimal`) и пользовательских папок `<RG_HOME>/icon_packs/<name>/`.
+
+6. **Telegram Stars, Подарки (Star Gifts), платные реакции и Бизнес-чаты (`engine_ext.rs`, `engine.rs`, `worker.rs`, `features_ui.rs`, `chat.rs`)**:
+   - В `engine_ext.rs` добавлены `stars_status`, `star_gifts_catalog`, `saved_star_gifts`, `toggle_save_star_gift`, `convert_star_gift`, `send_paid_reaction`, `update_business_work_hours`, `quick_replies`, `send_quick_reply`, `edit_quick_reply_shortcut`, `delete_quick_reply_shortcut`.
+   - В `features_ui.rs` добавлены окна `stars_gifts_window`, `paid_reaction_modal`, `business_window`, а в `chat.rs` — отображение платных звёздных реакций (`paid_reactions`) и быстрых ответов `/shortcut` во всплывающем меню `/`.
+
+7. **Защита от повторного запуска и чистое завершение при выходе (`win.rs`, `audio_io.rs`, `worker.rs`, `lib.rs`)**:
+   - В `win.rs` добавлен `SingleInstanceGuard` и `acquire_single_instance()` на основе Win32 named mutex `Local\Rustgramm-SingleInstance-Mutex`: при попытке открыть второе окно активируется уже запущенное окно `Rustgramm` (с обходом только при `RG_SECOND_INSTANCE` / `RG_DEMO`).
+   - Добавлены `audio_io::stop_all_audio()`, `Cmd::Shutdown` и `App::shutdown_resources()`, вызываемые при `on_exit`, `Drop`, `Ctrl+Q` и выходе из трея — останавливают звонок/UDP-сессию, `CallAudioPump`, диктофон, звонок/уведомления, встроенные `AudioView`/`VideoView`/`MiniAppView` и медиа-воркер.
+
+### Проверки (v0.18.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full, default features) — **0 предупреждений**.
+- `cargo clippy -p rg-ui -p rg-desktop -p rg-android --no-default-features --all-targets -- -D warnings` (Lite) — **0 предупреждений**.
+- `cargo check -p rg-android --features plugins` и `--no-default-features` — **OK**; кросс-проверка `cargo check -p rg-android --target aarch64-linux-android` (Full и Lite, NDK 27) — **OK** (0 ошибок, 0 предупреждений в `android_jni.rs` и `rg-android`).
+- `cargo test --workspace` — **2130 тестов пройдено, 0 провалено, 0 пропущено** (включая `no_foreign_hosts`, тесты `call_media`, `theme_pack`, `media_editor`, `CustomThemeSettings`, `LivePalette` и `set_icon_pack`).
+- `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` собран (**13 702 656 байт**), smoke-запуск `RG_DEMO=1` — **OK** (`smoke_alive=True`).

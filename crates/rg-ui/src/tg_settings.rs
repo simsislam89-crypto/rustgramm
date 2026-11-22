@@ -2156,6 +2156,8 @@ impl App {
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.button_clicked(egui::PointerButton::Extra1));
         let mut edit_account = false;
         let mut show_qr = false;
+        let mut open_stars = false;
+        let mut open_biz = false;
         let mut play_track: Option<rg_core::engine::AudioTrack> = None;
         let mut toggle_audio = false;
 
@@ -2316,13 +2318,24 @@ impl App {
 
                         divider(ui);
                         let (foot, _) = ui.allocate_exact_size(Vec2::new(width, 62.0), Sense::hover());
-                        ui.painter().text(
-                            foot.center(),
-                            Align2::CENTER_CENTER,
-                            "Здесь отображаются ваши истории и музыка профиля.",
-                            FontId::proportional(12.5),
-                            SUBTEXT,
-                        );
+                        let stars_r = Rect::from_min_size(Pos2::new(foot.left() + 14.0, foot.center().y - 17.0), Vec2::new((width - 36.0) * 0.5, 34.0));
+                        let biz_r = Rect::from_min_size(Pos2::new(stars_r.right() + 8.0, foot.center().y - 17.0), Vec2::new((width - 36.0) * 0.5, 34.0));
+                        let sr = ui.interact(stars_r, ui.make_persistent_id("mp-stars-btn"), Sense::click());
+                        ui.painter().rect_filled(stars_r, CornerRadius::same(9), if sr.hovered() { t_btn(ORANGE) } else { t(BUTTON) });
+                        let stars_lbl = match self.stars_summary.as_ref() {
+                            Some(s) => format!("⭐ {} Stars", s.balance),
+                            None => "⭐ Звёзды и Подарки".to_owned(),
+                        };
+                        ui.painter().text(stars_r.center(), Align2::CENTER_CENTER, stars_lbl, FontId::proportional(12.5), Color32::WHITE);
+                        if sr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            open_stars = true;
+                        }
+                        let br = ui.interact(biz_r, ui.make_persistent_id("mp-biz-btn"), Sense::click());
+                        ui.painter().rect_filled(biz_r, CornerRadius::same(9), if br.hovered() { t_btn(ORANGE) } else { t(BUTTON) });
+                        ui.painter().text(biz_r.center(), Align2::CENTER_CENTER, "Бизнес-часы", FontId::proportional(12.5), Color32::WHITE);
+                        if br.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            open_biz = true;
+                        }
                     });
                 paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
             });
@@ -2333,7 +2346,17 @@ impl App {
         if toggle_audio {
             self.toggle_audio_playback();
         }
-        if edit_account {
+        if open_stars {
+            self.tgs.profile_open = false;
+            self.stars_modal_open = true;
+            self.send(Cmd::LoadStarsStatus);
+            self.send(Cmd::LoadSavedGifts(None));
+            self.send(Cmd::LoadStarGiftsCatalog);
+        } else if open_biz {
+            self.tgs.profile_open = false;
+            self.business_open = true;
+            self.send(Cmd::LoadQuickReplies);
+        } else if edit_account {
             self.tgs.profile_open = false;
             self.open_tg_settings();
             self.tgs.page = pg::ACCOUNT;

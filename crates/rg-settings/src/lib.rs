@@ -406,6 +406,60 @@ pub struct Settings {
     pub active_account: u32,
     /// Изолированные профили аккаунтов (у каждого свой отпечаток устройства, сессия и прокси).
     pub accounts: Vec<AccountProfile>,
+    /// Пользовательская тема (`.tdesktop-theme` / `.attheme`), конструктор палитры и пак иконок AyuGram.
+    pub theme: CustomThemeSettings,
+}
+
+/// Настройки импортированной темы (`.tdesktop-theme` / `.attheme`), живой палитры и пака иконок.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomThemeSettings {
+    /// Название активной темы (пусто — стандартная тёмная тема Rustgramm).
+    pub active_theme_name: String,
+    /// Главный акцент (`#RRGGBB`, пусто — оранжевый `#F58220`).
+    pub accent_hex: String,
+    /// Фон окон/панелей (`#RRGGBB`).
+    pub window_bg_hex: String,
+    /// Фон боковой панели и шапок (`#RRGGBB`).
+    pub sidebar_bg_hex: String,
+    /// Фон области чата (`#RRGGBB`).
+    pub chat_bg_hex: String,
+    /// Фон входящих пузырей (`#RRGGBB`).
+    pub msg_in_bg_hex: String,
+    /// Фон исходящих пузырей (`#RRGGBB`).
+    pub msg_out_bg_hex: String,
+    /// Основной цвет текста (`#RRGGBB`).
+    pub text_primary_hex: String,
+    /// Вторичный цвет текста (`#RRGGBB`).
+    pub text_secondary_hex: String,
+    /// Цвет обычных кнопок (`#RRGGBB`).
+    pub button_bg_hex: String,
+    /// Путь к кастомному изображению фона чата.
+    pub wallpaper_path: String,
+    /// Затемнение фона чата (0..=90%).
+    pub wallpaper_dim: u8,
+    /// Набор иконок (`default`, `ayu_bold`, `ayu_minimal`, или имя импортированного пака).
+    pub icon_pack: String,
+}
+
+impl Default for CustomThemeSettings {
+    fn default() -> Self {
+        Self {
+            active_theme_name: String::new(),
+            accent_hex: String::new(),
+            window_bg_hex: String::new(),
+            sidebar_bg_hex: String::new(),
+            chat_bg_hex: String::new(),
+            msg_in_bg_hex: String::new(),
+            msg_out_bg_hex: String::new(),
+            text_primary_hex: String::new(),
+            text_secondary_hex: String::new(),
+            button_bg_hex: String::new(),
+            wallpaper_path: String::new(),
+            wallpaper_dim: 45,
+            icon_pack: "default".to_owned(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -436,6 +490,7 @@ impl Default for Settings {
             privacy_shield: PrivacyShieldSettings::default(),
             active_account: 0,
             accounts: vec![AccountProfile::default()],
+            theme: CustomThemeSettings::default(),
         }
     }
 }
@@ -558,5 +613,19 @@ mod tests {
         assert_eq!(hash_passcode("4242"), hash_passcode("4242"));
         assert_ne!(hash_passcode("4242"), hash_passcode("4243"));
         assert_eq!(hash_passcode("0000").len(), 32);
+    }
+
+    #[test]
+    fn custom_theme_settings_roundtrip_and_defaults() {
+        let mut s = Settings::default();
+        s.theme.active_theme_name = "Night Ayu".to_owned();
+        s.theme.accent_hex = "#FF7A00".to_owned();
+        s.theme.wallpaper_dim = 60;
+        s.theme.icon_pack = "ayu_bold".to_owned();
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.theme, s.theme);
+        let empty = Settings::from_json("{}").unwrap();
+        assert_eq!(empty.theme.icon_pack, "default");
+        assert_eq!(empty.theme.wallpaper_dim, 45);
     }
 }

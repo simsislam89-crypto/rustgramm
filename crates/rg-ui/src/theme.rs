@@ -88,6 +88,164 @@ static BLUR: AtomicBool = AtomicBool::new(true);
 /// Скорость анимаций, проценты (0 — мгновенно).
 static ANIM: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(100);
 
+/// Живая палитра темы (по умолчанию равна стандартным константам, меняется при импорте `.tdesktop-theme`/`.attheme` или в конструкторе).
+#[derive(Clone, Copy)]
+pub struct LivePalette {
+    pub accent: Color32,
+    pub window_bg: Color32,
+    pub sidebar_bg: Color32,
+    pub chat_bg: Color32,
+    pub msg_in_bg: Color32,
+    pub msg_out_bg: Color32,
+    pub text_primary: Color32,
+    pub text_secondary: Color32,
+    pub button_bg: Color32,
+    pub customized: bool,
+}
+
+impl Default for LivePalette {
+    fn default() -> Self {
+        Self {
+            accent: ORANGE,
+            window_bg: WINDOW_BG,
+            sidebar_bg: SIDEBAR_BG,
+            chat_bg: CHAT_BG,
+            msg_in_bg: MSG_IN_BG,
+            msg_out_bg: MSG_OUT_BG,
+            text_primary: WHITE,
+            text_secondary: SUBTEXT,
+            button_bg: BUTTON,
+            customized: false,
+        }
+    }
+}
+
+static LIVE_PALETTE: std::sync::RwLock<LivePalette> = std::sync::RwLock::new(LivePalette {
+    accent: ORANGE,
+    window_bg: WINDOW_BG,
+    sidebar_bg: SIDEBAR_BG,
+    chat_bg: CHAT_BG,
+    msg_in_bg: MSG_IN_BG,
+    msg_out_bg: MSG_OUT_BG,
+    text_primary: WHITE,
+    text_secondary: SUBTEXT,
+    button_bg: BUTTON,
+    customized: false,
+});
+
+static PALETTE_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static VISUAL_PALETTE_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn sync_custom_theme(s: &rg_settings::CustomThemeSettings) {
+    let parse_or = |hex: &str, def: Color32| -> (Color32, bool) {
+        if hex.trim().is_empty() {
+            (def, false)
+        } else if let Some(c) = crate::theme_pack::parse_hex_color(hex) {
+            (c, true)
+        } else {
+            (def, false)
+        }
+    };
+    let (accent, c1) = parse_or(&s.accent_hex, ORANGE);
+    let (window_bg, c2) = parse_or(&s.window_bg_hex, WINDOW_BG);
+    let (sidebar_bg, c3) = parse_or(&s.sidebar_bg_hex, SIDEBAR_BG);
+    let (chat_bg, c4) = parse_or(&s.chat_bg_hex, CHAT_BG);
+    let (msg_in_bg, c5) = parse_or(&s.msg_in_bg_hex, MSG_IN_BG);
+    let (msg_out_bg, c6) = parse_or(&s.msg_out_bg_hex, MSG_OUT_BG);
+    let (text_primary, c7) = parse_or(&s.text_primary_hex, WHITE);
+    let (text_secondary, c8) = parse_or(&s.text_secondary_hex, SUBTEXT);
+    let (button_bg, c9) = parse_or(&s.button_bg_hex, BUTTON);
+    let customized = c1 || c2 || c3 || c4 || c5 || c6 || c7 || c8 || c9;
+    if let Ok(mut g) = LIVE_PALETTE.write() {
+        let next = LivePalette {
+            accent,
+            window_bg,
+            sidebar_bg,
+            chat_bg,
+            msg_in_bg,
+            msg_out_bg,
+            text_primary,
+            text_secondary,
+            button_bg,
+            customized,
+        };
+        if g.accent != next.accent
+            || g.window_bg != next.window_bg
+            || g.sidebar_bg != next.sidebar_bg
+            || g.chat_bg != next.chat_bg
+            || g.msg_in_bg != next.msg_in_bg
+            || g.msg_out_bg != next.msg_out_bg
+            || g.text_primary != next.text_primary
+            || g.text_secondary != next.text_secondary
+            || g.button_bg != next.button_bg
+            || g.customized != next.customized
+        {
+            *g = next;
+            PALETTE_REV.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn resolve_theme_color(c: Color32) -> Color32 {
+    let p = palette();
+    if !p.customized {
+        return c;
+    }
+    if c == WINDOW_BG {
+        p.window_bg
+    } else if c == SIDEBAR_BG {
+        p.sidebar_bg
+    } else if c == CHAT_BG {
+        p.chat_bg
+    } else if c == MSG_IN_BG {
+        p.msg_in_bg
+    } else if c == MSG_OUT_BG {
+        p.msg_out_bg
+    } else if c == BUTTON {
+        p.button_bg
+    } else if c == ORANGE {
+        p.accent
+    } else if c == WHITE {
+        p.text_primary
+    } else if c == SUBTEXT {
+        p.text_secondary
+    } else {
+        c
+    }
+}
+
+pub fn palette() -> LivePalette {
+    LIVE_PALETTE.read().map(|g| *g).unwrap_or_default()
+}
+
+pub fn c_orange() -> Color32 {
+    palette().accent
+}
+pub fn c_window_bg() -> Color32 {
+    palette().window_bg
+}
+pub fn c_sidebar_bg() -> Color32 {
+    palette().sidebar_bg
+}
+pub fn c_chat_bg() -> Color32 {
+    palette().chat_bg
+}
+pub fn c_msg_in() -> Color32 {
+    palette().msg_in_bg
+}
+pub fn c_msg_out() -> Color32 {
+    palette().msg_out_bg
+}
+pub fn c_white() -> Color32 {
+    palette().text_primary
+}
+pub fn c_subtext() -> Color32 {
+    palette().text_secondary
+}
+pub fn c_button() -> Color32 {
+    palette().button_bg
+}
+
 /// Задать скорость анимаций в процентах (0 — выключены, 200 — вдвое быстрее).
 pub fn set_anim_speed(pct: u8) {
     ANIM.store(u16::from(pct.min(200)), Ordering::Relaxed);
@@ -133,11 +291,12 @@ pub fn tint_title() -> Color32 {
 
 /// Фон с учётом прозрачности окна.
 pub fn t(c: Color32) -> Color32 {
-    with_alpha(c, ALPHA.load(Ordering::Relaxed))
+    with_alpha(resolve_theme_color(c), ALPHA.load(Ordering::Relaxed))
 }
 
 /// Фон кнопки с учётом прозрачности окна: альфа кнопки масштабируется вместе с окном.
 pub fn t_btn(c: Color32) -> Color32 {
+    let c = resolve_theme_color(c);
     let a = ALPHA.load(Ordering::Relaxed);
     let out = ((u16::from(c.a()) * u16::from(a)) / 255) as u8;
     with_alpha(c, out)
@@ -145,6 +304,7 @@ pub fn t_btn(c: Color32) -> Color32 {
 
 /// Фон окон и меню: чуть плотнее основного, но тоже становится прозрачнее с ползунком.
 pub fn t2(c: Color32) -> Color32 {
+    let c = resolve_theme_color(c);
     let a = ALPHA.load(Ordering::Relaxed);
     let out = if a >= 245 {
         a
@@ -214,13 +374,42 @@ pub fn paint_glass_rim(p: &egui::Painter, rect: Rect, radius: f32) {
     );
 }
 
-/// Фон области чата: 0 — тёмный, 1 — мягкий градиент, 2 — тонкий узор Telegram.
+/// Фон области чата: 0 — тёмный, 1 — мягкий градиент, 2 — тонкий узор Telegram (+ опциональные обои темы).
 pub fn paint_chat_backdrop(p: &egui::Painter, rect: Rect, style: u8) {
-    p.rect_filled(rect, 0.0, tint_chat());
+    paint_chat_backdrop_ex(p, rect, style, None, 45);
+}
+
+/// Расширенная отрисовка фона чата с поддержкой кастомной картинки обоев из `.tdesktop-theme` / `.attheme`.
+pub fn paint_chat_backdrop_ex(
+    p: &egui::Painter,
+    rect: Rect,
+    style: u8,
+    wallpaper: Option<&egui::TextureHandle>,
+    wallpaper_dim: u8,
+) {
+    let pal = palette();
+    if pal.customized {
+        p.rect_filled(rect, 0.0, t(pal.chat_bg));
+    } else {
+        p.rect_filled(rect, 0.0, tint_chat());
+    }
     let op = opacity_f32();
+    if let Some(tex) = wallpaper {
+        let dim = ((f32::from(wallpaper_dim.min(95)) / 100.0) * 230.0 * op) as u8;
+        p.image(
+            tex.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::from_white_alpha((255.0 * op) as u8),
+        );
+        if dim > 0 {
+            p.rect_filled(rect, 0.0, Color32::from_black_alpha(dim));
+        }
+        return;
+    }
     match style {
         1 => {
-            // Мягкий вертикальный градиент (тёплый тёмно-угольный сверху к глубокому чёрному снизу).
+            let ac = pal.accent;
             let bands = 12;
             let bh = rect.height() / bands as f32;
             for i in 0..bands {
@@ -230,7 +419,7 @@ pub fn paint_chat_backdrop(p: &egui::Painter, rect: Rect, style: u8) {
                     Pos2::new(rect.left(), rect.top() + i as f32 * bh),
                     Vec2::new(rect.width(), bh + 1.0),
                 );
-                p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(245, 140, 56, a));
+                p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), a));
             }
         }
         2 => {
@@ -274,12 +463,16 @@ pub fn orange_button_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, min_s
     let hover = tween(ui.ctx(), ("obtn", resp.id), f32::from(u8::from(enabled && resp.hovered())), 0.12);
     let press = tween(ui.ctx(), ("obtn-p", resp.id), f32::from(u8::from(enabled && resp.is_pointer_button_down_on())), 0.08);
     let draw_r = rect.shrink(press * 1.4);
+    let accent = c_orange();
+    let accent_over = lerp_color(accent, Color32::WHITE, 0.14);
+    let accent_act = lerp_color(accent, Color32::BLACK, 0.15);
+    let accent_dis = lerp_color(accent, Color32::BLACK, 0.55);
     let base = if !enabled {
-        ORANGE_DISABLED
+        accent_dis
     } else if press > 0.35 {
-        lerp_color(ORANGE_OVER, ORANGE_ACTIVE, press)
+        lerp_color(accent_over, accent_act, press)
     } else {
-        lerp_color(ORANGE, ORANGE_OVER, hover)
+        lerp_color(accent, accent_over, hover)
     };
     let fill = t_btn(base);
     let p = ui.painter();
@@ -301,16 +494,22 @@ pub fn orange_button_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, min_s
     }
 }
 
-/// Обновляет глобальный стиль кнопок и окон egui при изменении прозрачности окна.
+/// Обновляет глобальный стиль кнопок и окон egui при изменении прозрачности окна или темы.
 pub fn sync_visuals(ctx: &egui::Context) {
     let a = ALPHA.load(Ordering::Relaxed);
-    if VISUAL_ALPHA.swap(a, Ordering::Relaxed) == a {
+    let pr = PALETTE_REV.load(Ordering::Relaxed);
+    let alpha_changed = VISUAL_ALPHA.swap(a, Ordering::Relaxed) != a;
+    let pal_changed = VISUAL_PALETTE_REV.swap(pr, Ordering::Relaxed) != pr;
+    if !alpha_changed && !pal_changed {
         return;
     }
     let op = f32::from(a) / 255.0;
+    let text_c = c_white();
     ctx.global_style_mut(|s| {
         let v = &mut s.visuals;
         v.window_fill = t2(WINDOW_BG);
+        v.override_text_color = Some(text_c);
+        v.hyperlink_color = c_orange();
         v.extreme_bg_color = Color32::from_rgba_unmultiplied(0, 0, 0, (90.0 * op) as u8);
         v.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, (10.0 * op) as u8);
         let fill = Color32::from_rgba_unmultiplied(255, 255, 255, (18.0 * op) as u8);
@@ -696,5 +895,20 @@ mod tests {
         assert_eq!(mask_streamer("+79991234567", true), "+• ••• ••• •• ••");
         assert_eq!(mask_streamer("@durov", true), "@••••••");
         assert_eq!(mask_streamer("+79991234567", false), "+79991234567");
+    }
+
+    #[test]
+    fn custom_theme_palette_updates_live_colors_and_resets() {
+        let custom = rg_settings::CustomThemeSettings {
+            accent_hex: "#3390EC".to_owned(),
+            window_bg_hex: "#17212B".to_owned(),
+            ..Default::default()
+        };
+        sync_custom_theme(&custom);
+        assert_eq!(c_orange(), Color32::from_rgb(0x33, 0x90, 0xEC));
+        assert_eq!(t(WINDOW_BG), Color32::from_rgb(0x17, 0x21, 0x2B));
+        sync_custom_theme(&rg_settings::CustomThemeSettings::default());
+        assert_eq!(c_orange(), ORANGE);
+        assert_eq!(t(WINDOW_BG), WINDOW_BG);
     }
 }

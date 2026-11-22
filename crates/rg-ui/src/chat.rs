@@ -59,6 +59,8 @@ pub(crate) enum Act {
     PurgeAllDeleted,
     /// Скопировать ссылку `t.me/...` на сообщение или пост канала.
     CopyLink(i32),
+    /// Отправить платную звёздную реакцию (`messages.sendPaidReaction`).
+    PaidReact(i32),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -650,6 +652,31 @@ impl App {
                 if !info.business_hours.is_empty() {
                     row(ui, "settings/timer", &info.business_hours, "Часы работы", false);
                 }
+                if info.stargifts_count > 0 {
+                    row(
+                        ui,
+                        "settings/gift",
+                        &format!("{} подарков Stars", info.stargifts_count),
+                        "Подарки в профиле",
+                        false,
+                    );
+                    if !self.peer_saved_gifts.contains_key(&d.id) && self.saved_gifts_req.insert(d.id) {
+                        cmd_after = Some(Cmd::LoadSavedGifts(Some(i)));
+                    }
+                    if let Some(gifts) = self.peer_saved_gifts.get(&d.id)
+                        && !gifts.is_empty()
+                    {
+                        ui.horizontal_wrapped(|ui| {
+                            for g in gifts.iter().take(6) {
+                                ui.label(
+                                    RichText::new(format!("🎁 {}", g.title))
+                                        .size(11.5)
+                                        .color(ORANGE),
+                                );
+                            }
+                        });
+                    }
+                }
                 if !info.invite_link.is_empty() {
                     row(ui, "menu/link", &info.invite_link, "Ссылка-приглашение", true);
                 }
@@ -783,16 +810,29 @@ impl App {
                         ui.add_space(16.0);
                         ui.vertical_centered(|ui| ui.label(RichText::new("Список участников недоступен или пуст").size(12.5).color(SUBTEXT)));
                     } else {
-                        for c in &members_list {
-                            let (mr, mresp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
-                            if mresp.hovered() {
-                                ui.painter().rect_filled(mr, 0.0, t(WINDOW_OVER));
-                            }
-                            draw_avatar(ui, mr.left_center() + Vec2::new(30.0, 0.0), &c.name, c.id, 34.0, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
-                            ui.painter().text(mr.left_top() + Vec2::new(56.0, 9.0), egui::Align2::LEFT_TOP, &c.name, FontId::proportional(13.5), WHITE);
-                            ui.painter().text(mr.left_top() + Vec2::new(56.0, 27.0), egui::Align2::LEFT_TOP, &c.status, FontId::proportional(11.5), SUBTEXT);
-                            if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                open_contact = Some((c.peer, c.id, c.name.clone()));
+                        let total_m = self.participants_total.get(&d.id).copied().unwrap_or(members_list.len() as i32);
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .id_salt(("info-members", d.id))
+                            .show_rows(ui, 48.0, members_list.len(), |ui, range| {
+                                for row_i in range {
+                                    let c = &members_list[row_i];
+                                    let (mr, mresp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
+                                    if mresp.hovered() {
+                                        ui.painter().rect_filled(mr, 0.0, t(WINDOW_OVER));
+                                    }
+                                    draw_avatar(ui, mr.left_center() + Vec2::new(30.0, 0.0), &c.name, c.id, 34.0, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
+                                    ui.painter().text(mr.left_top() + Vec2::new(56.0, 9.0), egui::Align2::LEFT_TOP, &c.name, FontId::proportional(13.5), WHITE);
+                                    ui.painter().text(mr.left_top() + Vec2::new(56.0, 27.0), egui::Align2::LEFT_TOP, &c.status, FontId::proportional(11.5), SUBTEXT);
+                                    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        open_contact = Some((c.peer, c.id, c.name.clone()));
+                                    }
+                                }
+                            });
+                        if (members_list.len() as i32) < total_m && members_list.len() < 1000 {
+                            ui.add_space(6.0);
+                            if ui.button(format!("Загрузить ещё ({}/{})", members_list.len(), total_m)).clicked() {
+                                cmd_after = Some(Cmd::ParticipantsPaged(i, members_list.len() as i32));
                             }
                         }
                     }
@@ -975,20 +1015,13 @@ impl App {
         self.channel_bottom_bar(ui);
         self.context_bar(ui);
         let s = self.settings.ayu.clone();
-        let has_cmds = self
+        let bot_cmds: Vec<(String, String)> = self
             .selected
             .and_then(|i| self.dialogs.get(i))
             .and_then(|d| self.peer_infos.get(&d.id))
-            .is_some_and(|x| !x.bot_commands.is_empty());
-        let bot_cmds = if has_cmds {
-            self.selected
-                .and_then(|i| self.dialogs.get(i))
-                .and_then(|d| self.peer_infos.get(&d.id))
-                .map(|x| x.bot_commands.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+            .map(|x| x.bot_commands.clone())
+            .unwrap_or_default();
+        let has_cmds = !bot_cmds.is_empty() || !self.quick_replies.is_empty();
         let cur_ttl = self
             .selected
             .and_then(|i| self.dialogs.get(i))
@@ -1033,8 +1066,10 @@ impl App {
                 }
             });
         }
-        // Всплывающий выбор команд бота (`/`).
-        if self.cmd_popup_open && !bot_cmds.is_empty() {
+        // Всплывающий выбор команд бота и быстрых ответов (`/`).
+        if self.cmd_popup_open && has_cmds {
+            let qrs = self.quick_replies.clone();
+            let mut send_qr = None;
             egui::Frame::new()
                 .fill(t2(WINDOW_BG))
                 .corner_radius(egui::CornerRadius::same(10))
@@ -1052,8 +1087,21 @@ impl App {
                                 self.cmd_popup_open = false;
                             }
                         }
+                        for qr in &qrs {
+                            let lbl = format!("⚡ /{} ({})", qr.shortcut, qr.count);
+                            if ui.small_button(lbl).on_hover_text("Отправить быстрый ответ").clicked() {
+                                send_qr = Some(qr.shortcut_id);
+                                self.cmd_popup_open = false;
+                            }
+                        }
                     });
                 });
+            if let Some(sid) = send_qr {
+                self.send(Cmd::SendQuickReply {
+                    shortcut_id: sid,
+                    msg_ids: Vec::new(),
+                });
+            }
         }
         // Всплывающий выбор таймера автоудаления (`field_auto_delete_button`).
         if self.ttl_popup_open {
@@ -1148,7 +1196,6 @@ impl App {
         ui.horizontal(|ui| {
             ui.set_min_height(46.0);
             ui.spacing_mut().item_spacing.x = 4.0;
-            #[cfg(not(target_os = "android"))]
             if s.field_attach_button {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 44.0), Sense::click());
                 icons::attach(ui.painter(), rect.center(), if resp.hovered() { WHITE } else { DIALOG_DATE });
@@ -1477,10 +1524,18 @@ impl App {
         {
             let reply = self.reply.take().map(|(id, _)| id);
             let caption = std::mem::take(&mut self.input);
-            self.send(Cmd::SendFile(path, caption.trim().to_owned(), reply));
+            self.media_editor = Some(super::media_editor::MediaEditorState::open(
+                path,
+                caption.trim().to_owned(),
+                reply,
+            ));
         }
         #[cfg(target_os = "android")]
-        let _ = attach;
+        if attach && self.selected.is_some() {
+            self.android_pick_target = Some(super::AndroidPickTarget::ChatAttach);
+            let dir = crate::worker::home().join("cache").join("picked");
+            crate::android_jni::pick_file("*/*", &dir);
+        }
     }
 
     /// Содержимое панели эмодзи/стикеров/GIF (одно и для правой панели, и для всплывающего окна).
@@ -2331,6 +2386,7 @@ impl App {
             Act::Forward(id) => self.forward = Some(id),
             Act::Pin(id, on) => self.send(Cmd::Pin(id, on)),
             Act::React(id, e) => self.send(Cmd::React(id, e.to_owned())),
+            Act::PaidReact(id) => self.paid_react_msg = Some(id),
             Act::Delete(id) => self.confirm_delete = Some(id),
             Act::Repeat(text) => self.send(Cmd::Send(text, None)),
             Act::Details(id) => {
@@ -2775,12 +2831,22 @@ impl App {
             }
             if save_png && let Some(modal) = &self.shot_modal {
                 #[cfg(not(target_os = "android"))]
-                if let Some(path) = rfd::FileDialog::new()
+                let save_target = rfd::FileDialog::new()
                     .set_file_name("rustgramm_shot.png")
                     .add_filter("PNG", &["png"])
-                    .save_file()
+                    .save_file();
+                #[cfg(target_os = "android")]
+                let save_target = Some(
+                    super::worker::home()
+                        .join("cache")
+                        .join(format!("rustgramm_shot_{}.png", self.now)),
+                );
+                if let Some(path) = save_target
                     && let Some(img) = image::RgbaImage::from_raw(modal.dims.0, modal.dims.1, modal.rgba.clone())
                 {
+                    if let Some(p) = path.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
                     if img.save_with_format(&path, image::ImageFormat::Png).is_ok() {
                         self.status = format!("Снимок сохранён: {}", path.display());
                         close = true;
@@ -3579,6 +3645,17 @@ fn bubble(
                         if m.reactions > 0 && reactions_visible(s) {
                             extra.push(("dialogs/dialogs_reaction", m.reactions.to_string()));
                         }
+                        if m.paid_reactions > 0 {
+                            extra.push(("settings/favorite", format!("⭐{}", m.paid_reactions)));
+                        }
+                        if let Some(mi) = &m.media {
+                            if mi.spoiler {
+                                extra.push(("menu/stealth", "Спойлер".to_owned()));
+                            }
+                            if let Some(ttl) = mi.ttl_seconds {
+                                extra.push(("settings/ttl", format!("{ttl}с")));
+                            }
+                        }
                         if let Some(v) = m.views {
                             extra.push(("history_views", v.to_string()));
                         }
@@ -3894,6 +3971,7 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
         item(ui, "menu/edit", "Изменить", Act::Edit(m.id, m.text.clone()));
     }
     if !m.deleted {
+        item(ui, "settings/favorite", "⭐ Звёздная реакция", Act::PaidReact(m.id));
         item(ui, "menu/select", if env.selected_msgs.contains(&m.id) { "Снять выбор" } else { "Выбрать" }, Act::ToggleSelect(m.id));
         item(ui, "menu/forward", "Переслать", Act::Forward(m.id));
         item(

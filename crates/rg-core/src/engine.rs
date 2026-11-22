@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 
 #[path = "engine_ext.rs"]
 mod ext;
+pub use ext::*;
 
 use grammers_client::Client;
 use grammers_client::update::Update;
@@ -119,6 +120,8 @@ pub struct PeerInfo {
     pub premium: bool,
     pub birthday: String,
     pub business_hours: String,
+    /// Количество сохранённых подарков Telegram Stars в профиле.
+    pub stargifts_count: i32,
     /// Сохранённая музыка в профиле (`UserFull.saved_music` + `users.getSavedMusic`).
     pub saved_music: Vec<AudioTrack>,
     pub forum: bool,
@@ -699,6 +702,9 @@ pub struct MessageRow {
     pub views: Option<i32>,
     /// Число реакций.
     pub reactions: i32,
+    /// Число платных звёздных реакций (`ReactionPaid`).
+    #[serde(default)]
+    pub paid_reactions: i32,
     /// Отправитель (формат Bot API), 0 если неизвестен.
     pub sender_id: i64,
     /// Форматирование текста.
@@ -731,6 +737,7 @@ impl MessageRow {
             edit_date: None,
             views: None,
             reactions: 0,
+            paid_reactions: 0,
             sender_id: 0,
             entities: Vec::new(),
             grouped: None,
@@ -863,6 +870,27 @@ fn raw_media_label(media: Option<&grammers_client::tl::enums::MessageMedia>) -> 
         Some(M::Geo(_) | M::GeoLive(_) | M::Venue(_)) => "📍 Геопозиция".to_owned(),
         Some(M::Contact(_)) => "👤 Контакт".to_owned(),
         _ => String::new(),
+    }
+}
+
+/// Параметры отправки медиа из встроенного редактора (сжатие, спойлер, самоуничтожение).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendMediaOptions {
+    /// Сжимать изображение в стандартное фото Telegram (`false` — отправить документом без сжатия).
+    pub compress: bool,
+    /// Скрыть медиа под спойлером.
+    pub spoiler: bool,
+    /// Таймер самоуничтожения в секундах (`None` — бессрочно).
+    pub ttl_seconds: Option<i32>,
+}
+
+impl Default for SendMediaOptions {
+    fn default() -> Self {
+        Self {
+            compress: true,
+            spoiler: false,
+            ttl_seconds: None,
+        }
     }
 }
 
@@ -1176,63 +1204,43 @@ impl Engine {
         let mut out = Vec::new();
         while out.len() < limit {
             let Some(d) = it.next().await? else { break };
-            let archived = matches!(&d.raw, grammers_client::tl::enums::Dialog::Dialog(x) if x.folder_id == Some(1));
-            let (unread, pinned, muted) = match &d.raw {
-                grammers_client::tl::enums::Dialog::Dialog(x) => (
-                    x.unread_count.max(i32::from(x.unread_mark)),
-                    x.pinned,
-                    matches!(&x.notify_settings, grammers_client::tl::enums::PeerNotifySettings::Settings(s) if s.mute_until.is_some_and(|t| i64::from(t) > now)),
-                ),
-                _ => (0, false, false),
-            };
-            let (emoji_status, verified, premium) = match d.peer() {
-                grammers_client::peer::Peer::User(u) => match &u.raw {
-                    grammers_client::tl::enums::User::User(y) => (
-                        emoji_status_id(y.emoji_status.as_ref()),
-                        y.verified,
-                        y.premium,
-                    ),
-                    _ => (None, false, false),
-                },
-                grammers_client::peer::Peer::Channel(c) => (
-                    emoji_status_id(c.raw.emoji_status.as_ref()),
-                    c.raw.verified,
-                    false,
-                ),
-                _ => (None, false, false),
-            };
-            out.push(DialogRow {
-                peer: d.peer_ref(),
-                id: d.peer_id().bot_api_dialog_id_unchecked(),
-                name: d.peer().name().unwrap_or("Без имени").to_owned(),
-                last: d
-                    .last_message
-                    .as_ref()
-                    .map(dialog_last_preview)
-                    .unwrap_or_default(),
-                date: d.last_message.as_ref().map_or(0, |m| m.date().as_second()),
-                unread,
-                pinned,
-                muted,
-                saved: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.is_self()),
-                archived,
-                kind: match d.peer() {
-                    grammers_client::peer::Peer::User(u) if u.is_bot() => DialogKind::Bot,
-                    grammers_client::peer::Peer::User(_) => DialogKind::User,
-                    grammers_client::peer::Peer::Channel(_) => DialogKind::Channel,
-                    _ => DialogKind::Group,
-                },
-                contact: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.contact()),
-                read_out: match &d.raw {
-                    grammers_client::tl::enums::Dialog::Dialog(x) => x.read_outbox_max_id,
-                    _ => 0,
-                },
-                emoji_status,
-                verified,
-                premium,
-            });
+            out.push(dialog_row_from(&d, now));
         }
         Ok(out)
+    }
+
+    /// Потоковая загрузка большого числа чатов (до 5000+) без тормозов:
+    /// сначала отдаёт первую быструю порцию `first_batch` (видимый экран), затем догружает остальные чанками по 150.
+    pub async fn dialogs_stream(
+        &self,
+        first_batch: usize,
+        max_total: usize,
+        tx: mpsc::Sender<(Vec<DialogRow>, bool)>,
+    ) -> Result<(), grammers_client::InvocationError> {
+        let mut it = self.client.iter_dialogs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let mut batch = Vec::with_capacity(first_batch.max(64));
+        let mut total = 0usize;
+        let mut first_sent = false;
+        while total < max_total {
+            let Some(d) = it.next().await? else { break };
+            batch.push(dialog_row_from(&d, now));
+            total += 1;
+            let threshold = if !first_sent { first_batch.max(20) } else { 150 };
+            if batch.len() >= threshold {
+                first_sent = true;
+                let send_vec = std::mem::replace(&mut batch, Vec::with_capacity(150));
+                if tx.send((send_vec, false)).await.is_err() {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(12)).await;
+            }
+        }
+        let _ = tx.send((batch, true)).await;
+        Ok(())
     }
 
     /// Последние сообщения чата (новые — в конце), с пометками об удалении и правках из хранилища.
@@ -1292,9 +1300,10 @@ impl Engine {
                 if let Some(b) = &full.birthday {
                     info.birthday = fmt_birthday(b);
                 }
-                if full.business_work_hours.is_some() {
-                    info.business_hours = "Открыто".to_owned();
+                if let Some(bh) = &full.business_work_hours {
+                    info.business_hours = format_business_hours(bh);
                 }
+                info.stargifts_count = full.stargifts_count.unwrap_or(0);
                 if let Some(doc) = &full.saved_music
                     && let Some(tr) = audio_track_of(doc)
                 {
@@ -1516,15 +1525,26 @@ impl Engine {
                 .or(h.post_author)
                 .unwrap_or_else(|| "скрытый отправитель".to_owned())
         });
-        let (inline_buttons, reply_keyboard) = match &m.raw {
+        let (inline_buttons, reply_keyboard, paid_reactions, service_text) = match &m.raw {
             grammers_client::tl::enums::Message::Message(x) => {
-                extract_reply_markup(x.reply_markup.as_ref())
+                let (ib, rk) = extract_reply_markup(x.reply_markup.as_ref());
+                (ib, rk, extract_paid_reactions(x.reactions.as_ref()), None)
             }
-            _ => (Vec::new(), Vec::new()),
+            grammers_client::tl::enums::Message::Service(s) => {
+                (Vec::new(), Vec::new(), 0, format_service_action(&s.action))
+            }
+            _ => (Vec::new(), Vec::new(), 0, None),
+        };
+        let text = if m.text().is_empty()
+            && let Some(st) = service_text
+        {
+            st
+        } else {
+            m.text().to_owned()
         };
         MessageRow {
             id: m.id(),
-            text: m.text().to_owned(),
+            text,
             outgoing: m.outgoing(),
             date: m.date().as_second(),
             deleted: false,
@@ -1541,6 +1561,7 @@ impl Engine {
             edit_date: m.edit_date().map(|d| d.as_second()),
             views: m.view_count(),
             reactions: m.reaction_count().unwrap_or(0),
+            paid_reactions,
             sender_id: m
                 .sender_id()
                 .map_or(0, |p| p.bot_api_dialog_id_unchecked()),
@@ -1602,6 +1623,20 @@ impl Engine {
         caption: &str,
         reply_to: Option<i32>,
     ) -> Result<(), BoxErr> {
+        self.send_media_with_options(peer, path, caption, reply_to, SendMediaOptions::default())
+            .await
+    }
+
+    /// Отправить фото/видео/файл с параметрами редактора: сжатие, спойлер и таймер самоуничтожения (`ttl_seconds`).
+    pub async fn send_media_with_options(
+        &self,
+        peer: PeerRef,
+        path: &Path,
+        caption: &str,
+        reply_to: Option<i32>,
+        opts: SendMediaOptions,
+    ) -> Result<(), BoxErr> {
+        use grammers_client::tl;
         let cfg = self.settings();
         let ghost_mode = cfg.ghost;
         self.apply_traffic_jitter().await;
@@ -1610,15 +1645,24 @@ impl Engine {
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .unwrap_or_default();
-        let up = if cfg.privacy_shield.anonymize_filenames {
-            let mut f = tokio::fs::File::open(path).await?;
-            let len = f.metadata().await?.len() as usize;
-            let anon_name = if ext.is_empty() {
+        let orig_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.bin")
+            .to_owned();
+        let send_name = if cfg.privacy_shield.anonymize_filenames {
+            if ext.is_empty() {
                 "file.bin".to_owned()
             } else {
                 format!("file.{ext}")
-            };
-            self.client.upload_stream(&mut f, len, anon_name).await?
+            }
+        } else {
+            orig_name
+        };
+        let up = if cfg.privacy_shield.anonymize_filenames {
+            let mut f = tokio::fs::File::open(path).await?;
+            let len = f.metadata().await?.len() as usize;
+            self.client.upload_stream(&mut f, len, send_name.clone()).await?
         } else {
             self.client.upload_file(path).await?
         };
@@ -1627,10 +1671,52 @@ impl Engine {
             .reply_to(reply_to)
             .silent(ghost_mode.should_send_without_sound())
             .schedule_date(Self::ghost_schedule_time(&ghost_mode));
-        let msg = if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
-            base.photo(up)
-        } else {
+        let is_photo = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp");
+        let msg = if is_photo && opts.compress {
+            if !opts.spoiler && opts.ttl_seconds.is_none() {
+                base.photo(up)
+            } else {
+                base.media(tl::types::InputMediaUploadedPhoto {
+                    spoiler: opts.spoiler,
+                    file: up.raw,
+                    stickers: None,
+                    ttl_seconds: opts.ttl_seconds,
+                    live_photo: false,
+                    video: None,
+                })
+            }
+        } else if !opts.spoiler && opts.ttl_seconds.is_none() && (!is_photo || opts.compress) {
             base.file(up)
+        } else {
+            let mime_type = match ext.as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "webp" => "image/webp",
+                "mp4" => "video/mp4",
+                "webm" => "video/webm",
+                "mov" => "video/quicktime",
+                "gif" => "image/gif",
+                _ => "application/octet-stream",
+            }
+            .to_owned();
+            let attrs = vec![tl::enums::DocumentAttribute::Filename(
+                tl::types::DocumentAttributeFilename {
+                    file_name: send_name,
+                },
+            )];
+            base.media(tl::types::InputMediaUploadedDocument {
+                nosound_video: false,
+                force_file: is_photo && !opts.compress,
+                spoiler: opts.spoiler,
+                file: up.raw,
+                thumb: None,
+                mime_type,
+                attributes: attrs,
+                stickers: None,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: opts.ttl_seconds,
+            })
         };
         self.client.send_message(peer, msg).await?;
         self.send_offline_if_needed(&ghost_mode).await;
@@ -2121,6 +2207,7 @@ impl Engine {
                                 video: c.video,
                                 p2p_allowed: c.p2p_allowed,
                                 relays: c.connections.len(),
+                                endpoints: crate::calls::parse_phone_connections(&c.connections),
                             })),
                             PC::Discarded(c) => Some(Live::PhoneCall(crate::calls::CallEvent::Discarded {
                                 call_id: c.id,
@@ -2130,6 +2217,12 @@ impl Engine {
                             PC::Empty(_) => None,
                         }
                     }
+                    U::PhoneCallSignalingData(s) => Some(Live::PhoneCall(
+                        crate::calls::CallEvent::SignalingData {
+                            call_id: s.phone_call_id,
+                            data: s.data.clone(),
+                        },
+                    )),
                     _ => None,
                 }
             }
@@ -2830,14 +2923,25 @@ impl Engine {
         Ok(())
     }
 
-    /// Список участников канала/супергруппы/группы для панели профиля.
+    /// Список участников канала/супергруппы/группы для панели профиля (с пагинацией до 1000+).
     pub async fn channel_participants(
         &self,
         peer: PeerRef,
         limit: i32,
     ) -> Result<Vec<ContactRow>, grammers_client::InvocationError> {
+        let (rows, _) = self.channel_participants_paged(peer, 0, limit).await?;
+        Ok(rows)
+    }
+
+    /// Постраничная загрузка участников канала/супергруппы (`offset`, `limit` до 200) + общее число.
+    pub async fn channel_participants_paged(
+        &self,
+        peer: PeerRef,
+        offset: i32,
+        limit: i32,
+    ) -> Result<(Vec<ContactRow>, i32), grammers_client::InvocationError> {
         use grammers_client::tl;
-        let users = match tl::enums::InputPeer::from(peer) {
+        let (users, total) = match tl::enums::InputPeer::from(peer) {
             tl::enums::InputPeer::Channel(c) => {
                 let res = self
                     .client
@@ -2847,14 +2951,14 @@ impl Engine {
                             access_hash: c.access_hash,
                         }),
                         filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
-                        offset: 0,
-                        limit: limit.clamp(1, 100),
+                        offset: offset.max(0),
+                        limit: limit.clamp(1, 200),
                         hash: 0,
                     })
                     .await?;
                 match res {
-                    tl::enums::channels::ChannelParticipants::Participants(p) => p.users,
-                    tl::enums::channels::ChannelParticipants::NotModified => Vec::new(),
+                    tl::enums::channels::ChannelParticipants::Participants(p) => (p.users, p.count),
+                    tl::enums::channels::ChannelParticipants::NotModified => (Vec::new(), 0),
                 }
             }
             tl::enums::InputPeer::Chat(c) => {
@@ -2862,11 +2966,12 @@ impl Engine {
                     .client
                     .invoke(&tl::functions::messages::GetFullChat { chat_id: c.chat_id })
                     .await?;
-                f.users
+                let n = f.users.len() as i32;
+                (f.users, n)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), 0),
         };
-        Ok(users
+        let rows = users
             .iter()
             .filter_map(|u| match u {
                 tl::enums::User::User(y) if !y.deleted => {
@@ -2891,7 +2996,8 @@ impl Engine {
                 }
                 _ => None,
             })
-            .collect())
+            .collect();
+        Ok((rows, total))
     }
 
     /// Получить или создать ссылку-приглашение в группу/канал (`messages.exportChatInvite`).
@@ -4507,6 +4613,141 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
             })
         })
         .collect()
+}
+
+fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
+    let archived = matches!(
+        &d.raw,
+        grammers_client::tl::enums::Dialog::Dialog(x) if x.folder_id == Some(1)
+    );
+    let (unread, pinned, muted) = match &d.raw {
+        grammers_client::tl::enums::Dialog::Dialog(x) => (
+            x.unread_count.max(i32::from(x.unread_mark)),
+            x.pinned,
+            matches!(
+                &x.notify_settings,
+                grammers_client::tl::enums::PeerNotifySettings::Settings(s)
+                    if s.mute_until.is_some_and(|t| i64::from(t) > now)
+            ),
+        ),
+        _ => (0, false, false),
+    };
+    let (emoji_status, verified, premium) = match d.peer() {
+        grammers_client::peer::Peer::User(u) => match &u.raw {
+            grammers_client::tl::enums::User::User(y) => (
+                emoji_status_id(y.emoji_status.as_ref()),
+                y.verified,
+                y.premium,
+            ),
+            _ => (None, false, false),
+        },
+        grammers_client::peer::Peer::Channel(c) => (
+            emoji_status_id(c.raw.emoji_status.as_ref()),
+            c.raw.verified,
+            false,
+        ),
+        _ => (None, false, false),
+    };
+    DialogRow {
+        peer: d.peer_ref(),
+        id: d.peer_id().bot_api_dialog_id_unchecked(),
+        name: d.peer().name().unwrap_or("Без имени").to_owned(),
+        last: d
+            .last_message
+            .as_ref()
+            .map(dialog_last_preview)
+            .unwrap_or_default(),
+        date: d.last_message.as_ref().map_or(0, |m| m.date().as_second()),
+        unread,
+        pinned,
+        muted,
+        saved: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.is_self()),
+        archived,
+        kind: match d.peer() {
+            grammers_client::peer::Peer::User(u) if u.is_bot() => DialogKind::Bot,
+            grammers_client::peer::Peer::User(_) => DialogKind::User,
+            grammers_client::peer::Peer::Channel(_) => DialogKind::Channel,
+            _ => DialogKind::Group,
+        },
+        contact: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.contact()),
+        read_out: match &d.raw {
+            grammers_client::tl::enums::Dialog::Dialog(x) => x.read_outbox_max_id,
+            _ => 0,
+        },
+        emoji_status,
+        verified,
+        premium,
+    }
+}
+
+fn format_business_hours(bh: &grammers_client::tl::enums::BusinessWorkHours) -> String {
+    let grammers_client::tl::enums::BusinessWorkHours::Hours(h) = bh;
+    let status = if h.open_now { "Открыто сейчас" } else { "Закрыто" };
+    if let Some(grammers_client::tl::enums::BusinessWeeklyOpen::Open(first)) = h.weekly_open.first() {
+        let sm = first.start_minute.rem_euclid(1440);
+        let em = first.end_minute.rem_euclid(1440);
+        format!(
+            "{status} · {:02}:{:02}–{:02}:{:02} ({})",
+            sm / 60,
+            sm % 60,
+            em / 60,
+            em % 60,
+            h.timezone_id
+        )
+    } else {
+        format!("{status} ({})", h.timezone_id)
+    }
+}
+
+fn extract_paid_reactions(reactions: Option<&grammers_client::tl::enums::MessageReactions>) -> i32 {
+    use grammers_client::tl::enums::{MessageReactions as MR, Reaction as R, ReactionCount as RC};
+    let Some(MR::Reactions(r)) = reactions else {
+        return 0;
+    };
+    r.results
+        .iter()
+        .filter_map(|rc| {
+            let RC::Count(c) = rc;
+            matches!(c.reaction, R::Paid).then_some(c.count)
+        })
+        .sum()
+}
+
+fn format_service_action(action: &grammers_client::tl::enums::MessageAction) -> Option<String> {
+    use grammers_client::tl::enums::{MessageAction as MA, StarGift as SG, TextWithEntities as T};
+    match action {
+        MA::StarGift(g) => {
+            let stars = match &g.gift {
+                SG::Gift(sg) => sg.stars,
+                SG::Unique(_) => 0,
+            };
+            let note = g
+                .message
+                .as_ref()
+                .map(|T::Entities(t)| t.text.trim())
+                .filter(|s| !s.is_empty());
+            Some(match note {
+                Some(txt) => format!("🎁 Подарок ({stars} ★): {txt}"),
+                None => format!("🎁 Подарок Telegram ({stars} ★)"),
+            })
+        }
+        MA::StarGiftUnique(u) => {
+            let title = match &u.gift {
+                SG::Unique(ug) => format!("{} #{}", ug.title, ug.num),
+                SG::Gift(sg) => sg.title.clone().unwrap_or_else(|| "Уникальный подарок".to_owned()),
+            };
+            Some(format!("✨ Коллекционный подарок: {title}"))
+        }
+        MA::PhoneCall(pc) => {
+            let kind = if pc.video { "Видеозвонок" } else { "Звонок" };
+            let reason = crate::calls::discard_reason_label(pc.reason.as_ref());
+            Some(match pc.duration {
+                Some(d) if d > 0 => format!("📞 {kind} ({d} с)"),
+                _ => format!("📞 {kind}: {reason}"),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

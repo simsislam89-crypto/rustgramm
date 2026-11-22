@@ -9,6 +9,8 @@ use grammers_session::types::PeerRef;
 use rg_ayu::ghost;
 use rg_ayu::store::{SecretChatRecord, SecretMessageRecord};
 
+use crate::calls::CallEndpoint;
+
 use super::{
     AdminLogRow, AdminRights, BannedRights, Engine, InviteLinkRow, Live, StoryPrivacy,
 };
@@ -975,13 +977,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Подтверждает исходящий звонок после `PhoneCallAccepted` (`phone.confirmCall`) и возвращает 4 E2E-эмодзи.
+    /// Подтверждает исходящий звонок после `PhoneCallAccepted` (`phone.confirmCall`)
+    /// и возвращает 4 E2E-эмодзи, общий 256-байтный ключ и список эндпоинтов медиа-потока.
     pub async fn confirm_call(
         &self,
         call_id: i64,
         access_hash: i64,
         g_b: &[u8],
-    ) -> Result<[&'static str; 4], String> {
+    ) -> Result<([&'static str; 4], [u8; 256], Vec<CallEndpoint>, bool), String> {
         let (a, g_a, p) = self
             .pending_dh
             .lock()
@@ -990,7 +993,8 @@ impl Engine {
             .ok_or_else(|| "DH-сессия звонка не найдена".to_owned())?;
         let shared = crate::secret::compute_shared_key(g_b, &a, &p)?;
         let fp = crate::secret::key_fingerprint(&shared);
-        self.client
+        let tl::enums::phone::PhoneCall::Call(pc) = self
+            .client
             .invoke(&tl::functions::phone::ConfirmCall {
                 peer: tl::enums::InputPhoneCall::Call(tl::types::InputPhoneCall {
                     id: call_id,
@@ -1002,15 +1006,22 @@ impl Engine {
             })
             .await
             .map_err(|e| format!("Подтверждение звонка: {e}"))?;
-        Ok(crate::calls::call_emojis(&shared, &g_a))
+        let (endpoints, p2p_allowed) = match pc.phone_call {
+            tl::enums::PhoneCall::Call(c) => (
+                crate::calls::parse_phone_connections(&c.connections),
+                c.p2p_allowed,
+            ),
+            _ => (Vec::new(), false),
+        };
+        Ok((crate::calls::call_emojis(&shared, &g_a), shared, endpoints, p2p_allowed))
     }
 
-    /// Вычисляет 4 E2E-эмодзи для принятого входящего звонка (когда пришёл `PhoneCall::Call` с `g_a`).
+    /// Вычисляет 4 E2E-эмодзи и 256-байтный ключ для принятого входящего звонка (когда пришёл `PhoneCall::Call` с `g_a`).
     pub fn derive_incoming_call_emojis(
         &self,
         call_id: i64,
         g_a: &[u8],
-    ) -> Result<[&'static str; 4], String> {
+    ) -> Result<([&'static str; 4], [u8; 256]), String> {
         let (b, _g_b, p) = self
             .pending_dh
             .lock()
@@ -1018,7 +1029,28 @@ impl Engine {
             .and_then(|mut m| m.remove(&call_id))
             .ok_or_else(|| "DH-сессия входящего звонка не найдена".to_owned())?;
         let shared = crate::secret::compute_shared_key(g_a, &b, &p)?;
-        Ok(crate::calls::call_emojis(&shared, g_a))
+        Ok((crate::calls::call_emojis(&shared, g_a), shared))
+    }
+
+    /// Отправляет WebRTC ICE/SDP сигнальные данные в рамках звонка (`phone.sendSignalingData`).
+    pub async fn send_call_signaling(
+        &self,
+        call_id: i64,
+        access_hash: i64,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let _ = self
+            .client
+            .invoke(&tl::functions::phone::SendSignalingData {
+                peer: tl::enums::InputPhoneCall::Call(tl::types::InputPhoneCall {
+                    id: call_id,
+                    access_hash,
+                }),
+                data,
+            })
+            .await
+            .map_err(|e| format!("Сигналинг звонка: {e}"))?;
+        Ok(())
     }
 
     /// Завершает или отклоняет звонок (`phone.discardCall`).
@@ -1053,4 +1085,445 @@ impl Engine {
             .await;
         Ok(())
     }
+
+    // =========================================================================
+    // Telegram Stars, Подарки (Star Gifts), платные реакции и Бизнес-чаты
+    // =========================================================================
+
+    /// Запрашивает баланс Telegram Stars и последние транзакции (`payments.getStarsTransactions`).
+    pub async fn stars_status(&self) -> Result<StarsSummary, String> {
+        let tl::enums::payments::StarsStatus::Status(st) = self
+            .client
+            .invoke(&tl::functions::payments::GetStarsTransactions {
+                inbound: false,
+                outbound: false,
+                ascending: false,
+                ton: false,
+                subscription_id: None,
+                peer: tl::enums::InputPeer::PeerSelf,
+                offset: String::new(),
+                limit: 30,
+            })
+            .await
+            .map_err(|e| format!("Баланс Stars: {e}"))?;
+
+        let (balance, nanos) = stars_amount_parts(&st.balance);
+        let transactions = st
+            .history
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tx| {
+                let tl::enums::StarsTransaction::Transaction(t) = tx;
+                let (amt, _) = stars_amount_parts(&t.amount);
+                let title = t.title.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                    if t.reaction {
+                        "Платная реакция".to_owned()
+                    } else if t.gift {
+                        "Подарок Telegram".to_owned()
+                    } else {
+                        stars_peer_label(&t.peer)
+                    }
+                });
+                StarsTxRow {
+                    id: t.id,
+                    amount: amt,
+                    date: i64::from(t.date),
+                    title,
+                    description: t.description.unwrap_or_default(),
+                    is_gift: t.gift,
+                    is_reaction: t.reaction,
+                }
+            })
+            .collect();
+        Ok(StarsSummary {
+            balance,
+            nanos,
+            transactions,
+        })
+    }
+
+    /// Загружает витрину подарков Telegram Stars (`payments.getStarGifts`).
+    pub async fn star_gifts_catalog(&self) -> Result<Vec<StarGiftItem>, String> {
+        let res = self
+            .client
+            .invoke(&tl::functions::payments::GetStarGifts { hash: 0 })
+            .await
+            .map_err(|e| format!("Каталог подарков: {e}"))?;
+        let tl::enums::payments::StarGifts::Gifts(g) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(g.gifts
+            .into_iter()
+            .map(|gift| match gift {
+                tl::enums::StarGift::Gift(x) => StarGiftItem {
+                    id: x.id,
+                    title: x.title.unwrap_or_else(|| format!("Подарок #{}", x.id)),
+                    stars: x.stars,
+                    convert_stars: x.convert_stars,
+                    limited: x.limited,
+                    sold_out: x.sold_out,
+                    remains: x.availability_remains,
+                    total: x.availability_total,
+                    unique: false,
+                },
+                tl::enums::StarGift::Unique(u) => StarGiftItem {
+                    id: u.id,
+                    title: format!("{} #{}", u.title, u.num),
+                    stars: u.offer_min_stars.map_or(0, i64::from),
+                    convert_stars: 0,
+                    limited: true,
+                    sold_out: false,
+                    remains: Some(u.availability_total - u.availability_issued),
+                    total: Some(u.availability_total),
+                    unique: true,
+                },
+            })
+            .collect())
+    }
+
+    /// Загружает подарки, сохранённые в профиле (`payments.getSavedStarGifts`).
+    pub async fn saved_star_gifts(&self, peer: PeerRef) -> Result<Vec<SavedGiftItem>, String> {
+        let tl::enums::payments::SavedStarGifts::Gifts(res) = self
+            .client
+            .invoke(&tl::functions::payments::GetSavedStarGifts {
+                exclude_unsaved: false,
+                exclude_saved: false,
+                exclude_unlimited: false,
+                exclude_unique: false,
+                sort_by_value: false,
+                exclude_upgradable: false,
+                exclude_unupgradable: false,
+                peer_color_available: false,
+                exclude_hosted: false,
+                peer: tl::enums::InputPeer::from(peer),
+                collection_id: None,
+                offset: String::new(),
+                limit: 40,
+            })
+            .await
+            .map_err(|e| format!("Подарки профиля: {e}"))?;
+
+        Ok(res
+            .gifts
+            .into_iter()
+            .map(|sg| {
+                let tl::enums::SavedStarGift::Gift(x) = sg;
+                let (title, stars, unique) = match &x.gift {
+                    tl::enums::StarGift::Gift(g) => (
+                        g.title.clone().unwrap_or_else(|| "Подарок Telegram".to_owned()),
+                        g.stars,
+                        false,
+                    ),
+                    tl::enums::StarGift::Unique(u) => (format!("{} #{}", u.title, u.num), 0, true),
+                };
+                let message = x
+                    .message
+                    .map(|tl::enums::TextWithEntities::Entities(t)| t.text)
+                    .unwrap_or_default();
+                SavedGiftItem {
+                    msg_id: x.msg_id,
+                    saved_id: x.saved_id,
+                    title,
+                    stars,
+                    convert_stars: x.convert_stars.unwrap_or(0),
+                    date: i64::from(x.date),
+                    message,
+                    unsaved: x.unsaved,
+                    pinned_to_top: x.pinned_to_top,
+                    unique,
+                }
+            })
+            .collect())
+    }
+
+    /// Показывает или скрывает подарок в профиле (`payments.saveStarGift`).
+    pub async fn toggle_save_star_gift(
+        &self,
+        msg_id: Option<i32>,
+        peer: Option<PeerRef>,
+        saved_id: Option<i64>,
+        unsave: bool,
+    ) -> Result<(), String> {
+        let stargift = input_saved_star_gift(msg_id, peer, saved_id)?;
+        let _ = self
+            .client
+            .invoke(&tl::functions::payments::SaveStarGift { unsave, stargift })
+            .await
+            .map_err(|e| format!("Сохранение подарка: {e}"))?;
+        Ok(())
+    }
+
+    /// Обменивает полученный подарок на Telegram Stars (`payments.convertStarGift`).
+    pub async fn convert_star_gift(
+        &self,
+        msg_id: Option<i32>,
+        peer: Option<PeerRef>,
+        saved_id: Option<i64>,
+    ) -> Result<(), String> {
+        let stargift = input_saved_star_gift(msg_id, peer, saved_id)?;
+        let _ = self
+            .client
+            .invoke(&tl::functions::payments::ConvertStarGift { stargift })
+            .await
+            .map_err(|e| format!("Обмен подарка: {e}"))?;
+        Ok(())
+    }
+
+    /// Отправляет платную звёздную реакцию на сообщение/пост (`messages.sendPaidReaction`).
+    pub async fn send_paid_reaction(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        count: i32,
+        anonymous: bool,
+    ) -> Result<(), String> {
+        let count = count.clamp(1, 2500);
+        let privacy = if anonymous {
+            Some(tl::enums::PaidReactionPrivacy::Anonymous)
+        } else {
+            Some(tl::enums::PaidReactionPrivacy::Default)
+        };
+        let _ = self
+            .client
+            .invoke(&tl::functions::messages::SendPaidReaction {
+                peer: tl::enums::InputPeer::from(peer),
+                msg_id,
+                count,
+                random_id: rand_i64(),
+                private: privacy,
+            })
+            .await
+            .map_err(|e| format!("Звёздная реакция: {e}"))?;
+        Ok(())
+    }
+
+    /// Сохраняет или отключает бизнес-часы работы аккаунта (`account.updateBusinessWorkHours`).
+    pub async fn update_business_work_hours(
+        &self,
+        enabled: bool,
+        timezone_id: String,
+        weekly_intervals: Vec<(i32, i32)>,
+    ) -> Result<(), String> {
+        let business_work_hours = if enabled {
+            let weekly_open = weekly_intervals
+                .into_iter()
+                .map(|(start_minute, end_minute)| {
+                    tl::enums::BusinessWeeklyOpen::Open(tl::types::BusinessWeeklyOpen {
+                        start_minute,
+                        end_minute,
+                    })
+                })
+                .collect();
+            Some(tl::enums::BusinessWorkHours::Hours(
+                tl::types::BusinessWorkHours {
+                    open_now: true,
+                    timezone_id: if timezone_id.trim().is_empty() {
+                        "Europe/Moscow".to_owned()
+                    } else {
+                        timezone_id
+                    },
+                    weekly_open,
+                },
+            ))
+        } else {
+            None
+        };
+        let _ = self
+            .client
+            .invoke(&tl::functions::account::UpdateBusinessWorkHours {
+                business_work_hours,
+            })
+            .await
+            .map_err(|e| format!("Бизнес-часы: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает список быстрых ответов Telegram Бизнес (`messages.getQuickReplies`).
+    pub async fn quick_replies(&self) -> Result<Vec<QuickReplyItem>, String> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetQuickReplies { hash: 0 })
+            .await
+            .map_err(|e| format!("Быстрые ответы: {e}"))?;
+        let tl::enums::messages::QuickReplies::Replies(r) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(r.quick_replies
+            .into_iter()
+            .map(|qr| {
+                let tl::enums::QuickReply::Reply(q) = qr;
+                let preview = r
+                    .messages
+                    .iter()
+                    .find_map(|m| match m {
+                        tl::enums::Message::Message(x) if x.id == q.top_message => {
+                            Some(x.message.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                QuickReplyItem {
+                    shortcut_id: q.shortcut_id,
+                    shortcut: q.shortcut,
+                    top_message: q.top_message,
+                    count: q.count,
+                    preview,
+                }
+            })
+            .collect())
+    }
+
+    /// Отправляет быстрый ответ в текущий чат (`messages.sendQuickReplyMessages`).
+    pub async fn send_quick_reply(
+        &self,
+        peer: PeerRef,
+        shortcut_id: i32,
+        msg_ids: Vec<i32>,
+    ) -> Result<(), String> {
+        let ids = if msg_ids.is_empty() { vec![0] } else { msg_ids };
+        let random_id: Vec<i64> = ids.iter().map(|_| rand_i64()).collect();
+        let _ = self
+            .client
+            .invoke(&tl::functions::messages::SendQuickReplyMessages {
+                peer: tl::enums::InputPeer::from(peer),
+                shortcut_id,
+                id: ids,
+                random_id,
+            })
+            .await
+            .map_err(|e| format!("Отправка быстрого ответа: {e}"))?;
+        Ok(())
+    }
+
+    /// Переименовывает ярлык быстрого ответа (`messages.editQuickReplyShortcut`).
+    pub async fn edit_quick_reply_shortcut(
+        &self,
+        shortcut_id: i32,
+        shortcut: &str,
+    ) -> Result<(), String> {
+        let clean = shortcut.trim().trim_start_matches('/').to_owned();
+        if clean.is_empty() {
+            return Err("Введите короткое имя команды".to_owned());
+        }
+        let _ = self
+            .client
+            .invoke(&tl::functions::messages::EditQuickReplyShortcut {
+                shortcut_id,
+                shortcut: clean,
+            })
+            .await
+            .map_err(|e| format!("Быстрый ответ: {e}"))?;
+        Ok(())
+    }
+
+    /// Удаляет ярлык быстрого ответа (`messages.deleteQuickReplyShortcut`).
+    pub async fn delete_quick_reply_shortcut(&self, shortcut_id: i32) -> Result<(), String> {
+        let _ = self
+            .client
+            .invoke(&tl::functions::messages::DeleteQuickReplyShortcut { shortcut_id })
+            .await
+            .map_err(|e| format!("Удаление быстрого ответа: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Строка транзакции Telegram Stars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarsTxRow {
+    pub id: String,
+    pub amount: i64,
+    pub date: i64,
+    pub title: String,
+    pub description: String,
+    pub is_gift: bool,
+    pub is_reaction: bool,
+}
+
+/// Сводка баланса и истории Telegram Stars.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StarsSummary {
+    pub balance: i64,
+    pub nanos: i32,
+    pub transactions: Vec<StarsTxRow>,
+}
+
+/// Подарок из каталога Telegram Stars (`StarGift`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarGiftItem {
+    pub id: i64,
+    pub title: String,
+    pub stars: i64,
+    pub convert_stars: i64,
+    pub limited: bool,
+    pub sold_out: bool,
+    pub remains: Option<i32>,
+    pub total: Option<i32>,
+    pub unique: bool,
+}
+
+/// Подарок, сохранённый в профиле (`SavedStarGift`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedGiftItem {
+    pub msg_id: Option<i32>,
+    pub saved_id: Option<i64>,
+    pub title: String,
+    pub stars: i64,
+    pub convert_stars: i64,
+    pub date: i64,
+    pub message: String,
+    pub unsaved: bool,
+    pub pinned_to_top: bool,
+    pub unique: bool,
+}
+
+/// Элемент быстрого ответа Telegram Бизнес (`/shortcut`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickReplyItem {
+    pub shortcut_id: i32,
+    pub shortcut: String,
+    pub top_message: i32,
+    pub count: i32,
+    pub preview: String,
+}
+
+fn stars_amount_parts(a: &tl::enums::StarsAmount) -> (i64, i32) {
+    match a {
+        tl::enums::StarsAmount::Amount(x) => (x.amount, x.nanos),
+        other => (other.amount(), 0),
+    }
+}
+
+fn stars_peer_label(p: &tl::enums::StarsTransactionPeer) -> String {
+    use tl::enums::StarsTransactionPeer as P;
+    match p {
+        P::AppStore => "App Store".to_owned(),
+        P::PlayMarket => "Google Play".to_owned(),
+        P::PremiumBot => "Premium Bot".to_owned(),
+        P::Fragment => "Fragment".to_owned(),
+        P::Ads => "Telegram Ads".to_owned(),
+        P::Api => "Bot API".to_owned(),
+        P::Peer(_) => "Перевод Stars".to_owned(),
+        P::Unsupported => "Telegram Stars".to_owned(),
+    }
+}
+
+fn input_saved_star_gift(
+    msg_id: Option<i32>,
+    peer: Option<PeerRef>,
+    saved_id: Option<i64>,
+) -> Result<tl::enums::InputSavedStarGift, String> {
+    if let (Some(p), Some(sid)) = (peer, saved_id) {
+        return Ok(tl::enums::InputSavedStarGift::Chat(
+            tl::types::InputSavedStarGiftChat {
+                peer: tl::enums::InputPeer::from(p),
+                saved_id: sid,
+            },
+        ));
+    }
+    if let Some(mid) = msg_id {
+        return Ok(tl::enums::InputSavedStarGift::User(
+            tl::types::InputSavedStarGiftUser { msg_id: mid },
+        ));
+    }
+    Err("Идентификатор подарка не задан".to_owned())
 }

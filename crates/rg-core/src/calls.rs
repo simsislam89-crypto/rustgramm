@@ -20,6 +20,76 @@ pub enum CallState {
     Ended(String),
 }
 
+/// Конечная точка медиа-потока звонка (UDP-рефлектор Telegram или WebRTC STUN/TURN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallEndpoint {
+    pub id: i64,
+    pub ip: String,
+    pub ipv6: String,
+    pub port: u16,
+    pub tcp: bool,
+    pub peer_tag: Vec<u8>,
+    pub is_webrtc: bool,
+    pub stun: bool,
+    pub turn: bool,
+    pub username: String,
+    pub password: String,
+}
+
+impl CallEndpoint {
+    /// Сетевой адрес IPv4 `ip:port`, если задан.
+    pub fn socket_addr_v4(&self) -> Option<std::net::SocketAddr> {
+        let ip: std::net::Ipv4Addr = self.ip.parse().ok()?;
+        (self.port > 0).then(|| std::net::SocketAddr::new(std::net::IpAddr::V4(ip), self.port))
+    }
+
+    /// Человекочитаемое описание транспорта (`Telegram UDP Relay`, `STUN`, `TURN`).
+    pub fn transport_kind(&self) -> &'static str {
+        if self.is_webrtc {
+            if self.turn { "TURN Relay" } else { "STUN P2P" }
+        } else if self.tcp {
+            "Telegram TCP Relay"
+        } else {
+            "Telegram UDP Relay"
+        }
+    }
+}
+
+/// Разбирает TL-список `PhoneConnection` в независимые от MTProto описания эндпоинтов.
+pub fn parse_phone_connections(conns: &[tl::enums::PhoneConnection]) -> Vec<CallEndpoint> {
+    conns
+        .iter()
+        .map(|c| match c {
+            tl::enums::PhoneConnection::Connection(x) => CallEndpoint {
+                id: x.id,
+                ip: x.ip.clone(),
+                ipv6: x.ipv6.clone(),
+                port: u16::try_from(x.port).unwrap_or(0),
+                tcp: x.tcp,
+                peer_tag: x.peer_tag.clone(),
+                is_webrtc: false,
+                stun: false,
+                turn: false,
+                username: String::new(),
+                password: String::new(),
+            },
+            tl::enums::PhoneConnection::Webrtc(x) => CallEndpoint {
+                id: x.id,
+                ip: x.ip.clone(),
+                ipv6: x.ipv6.clone(),
+                port: u16::try_from(x.port).unwrap_or(0),
+                tcp: false,
+                peer_tag: Vec::new(),
+                is_webrtc: true,
+                stun: x.stun,
+                turn: x.turn,
+                username: x.username.clone(),
+                password: x.password.clone(),
+            },
+        })
+        .collect()
+}
+
 /// Входящее или исходящее событие звонка из MTProto (`Update::PhoneCall`).
 #[derive(Debug, Clone)]
 pub enum CallEvent {
@@ -48,11 +118,16 @@ pub enum CallEvent {
         video: bool,
         p2p_allowed: bool,
         relays: usize,
+        endpoints: Vec<CallEndpoint>,
     },
     Discarded {
         call_id: i64,
         reason: String,
         duration: i32,
+    },
+    SignalingData {
+        call_id: i64,
+        data: Vec<u8>,
     },
 }
 

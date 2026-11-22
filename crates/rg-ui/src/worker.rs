@@ -333,6 +333,79 @@ pub enum Cmd {
     CheckUpdates,
     /// Скачать и применить обновление.
     ApplyUpdate(crate::updater::UpdateInfo),
+    /// Отправить фото/видео/файл с параметрами встроенного редактора (сжатие, спойлер, таймер).
+    SendMediaEdited {
+        path: PathBuf,
+        caption: String,
+        reply_to: Option<i32>,
+        opts: rg_core::engine::SendMediaOptions,
+        cleanup_temp: bool,
+    },
+    /// Постраничная догрузка участников большой группы/канала (до 1000+).
+    ParticipantsPaged(usize, i32),
+    /// Запустить нативный UDP/WebRTC медиа-поток для принятого входящего звонка.
+    StartIncomingCallMedia {
+        call_id: i64,
+        g_a: Vec<u8>,
+        endpoints: Vec<rg_core::calls::CallEndpoint>,
+        p2p_allowed: bool,
+        video: bool,
+    },
+    /// Включить/выключить микрофон в активном медиа-потоке звонка.
+    SetCallMuted(bool),
+    /// Обновить статистику RTT/пакетов активного медиа-потока звонка.
+    PollCallStats,
+    /// Отправить WebRTC ICE/SDP сигнальные данные в рамках звонка.
+    SendCallSignaling {
+        call_id: i64,
+        access_hash: i64,
+        data: Vec<u8>,
+    },
+    /// Запросить баланс и историю транзакций Telegram Stars.
+    LoadStarsStatus,
+    /// Загрузить витрину подарков Telegram Stars.
+    LoadStarGiftsCatalog,
+    /// Загрузить подарки в профиле (`None` — свой профиль, `Some(idx)` — диалог).
+    LoadSavedGifts(Option<usize>),
+    /// Скрыть или показать подарок в своём профиле.
+    ToggleSaveStarGift {
+        msg_id: Option<i32>,
+        saved_id: Option<i64>,
+        unsave: bool,
+    },
+    /// Конвертировать подарок в Telegram Stars.
+    ConvertStarGift {
+        msg_id: Option<i32>,
+        saved_id: Option<i64>,
+    },
+    /// Отправить платную звёздную реакцию на сообщение.
+    SendPaidReaction {
+        msg_id: i32,
+        count: i32,
+        anonymous: bool,
+    },
+    /// Обновить бизнес-часы работы аккаунта.
+    UpdateBusinessHours {
+        enabled: bool,
+        timezone: String,
+        weekly: Vec<(i32, i32)>,
+    },
+    /// Загрузить быстрые ответы Telegram Бизнес.
+    LoadQuickReplies,
+    /// Отправить быстрый ответ в открытый чат.
+    SendQuickReply {
+        shortcut_id: i32,
+        msg_ids: Vec<i32>,
+    },
+    /// Изменить короткое имя быстрого ответа.
+    EditQuickReplyShortcut {
+        shortcut_id: i32,
+        shortcut: String,
+    },
+    /// Удалить ярлык быстрого ответа.
+    DeleteQuickReplyShortcut(i32),
+    /// Полное завершение работы (остановка медиа-потока звонка, аудио и сетевого пула).
+    Shutdown,
     Settings(Box<Settings>),
 }
 
@@ -448,6 +521,20 @@ pub enum Ev {
     },
     /// 4 защитных эмодзи E2E для активного звонка.
     CallEmojis([&'static str; 4]),
+    /// Статистика нативного UDP/WebRTC медиа-потока звонка.
+    CallMediaStats(rg_core::call_media::CallMediaStats),
+    /// Потоковая догрузка чатов (до 5000+) без торможения интерфейса.
+    DialogsBatch(Vec<DialogRow>, bool),
+    /// Страница участников группы/канала `(chat_id, rows, offset, total)`.
+    ParticipantsPage(i64, Vec<ContactRow>, i32, i32),
+    /// Баланс и транзакции Telegram Stars.
+    StarsStatus(rg_core::engine::StarsSummary),
+    /// Витрина подарков Telegram Stars.
+    StarGiftsCatalog(Vec<rg_core::engine::StarGiftItem>),
+    /// Подарки в профиле `(peer_id, gifts)`.
+    SavedGifts(i64, Vec<rg_core::engine::SavedGiftItem>),
+    /// Быстрые ответы Telegram Бизнес.
+    QuickReplies(Vec<rg_core::engine::QuickReplyItem>),
     /// Найдена новая версия Rustgramm на GitHub Releases.
     UpdateAvailable(Box<crate::updater::UpdateInfo>),
     /// Прогресс скачивания обновления `(скачано, всего)`.
@@ -735,8 +822,10 @@ fn load_settings(path: &std::path::Path) -> Settings {
 
 pub fn spawn(cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
+        let threads = std::thread::available_parallelism().map_or(6, |n| n.get().clamp(4, 12));
         let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(threads)
+            .max_blocking_threads(16)
             .enable_all()
             .build()
         else {
@@ -900,10 +989,18 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         };
         let engine = Engine::new(connected.client.clone(), settings, store)
             .with_dirs(&home.join("cache"), &home.join("downloads"));
-        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-        // Фото профилей маленькие: качаем много штук одновременно.
-        let avatar_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(24));
+        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(12));
+        // Фото профилей маленькие: качаем много штук одновременно для быстрого отображения 5k+ чатов.
+        let avatar_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
         let mut updates = Some(connected.updates);
+        let (dialog_stream_tx, mut dialog_stream_rx) =
+            tokio::sync::mpsc::channel::<(Vec<DialogRow>, bool)>(64);
+        type ActiveCallMedia = std::sync::Arc<
+            std::sync::Mutex<
+                Option<(rg_core::call_media::CallMediaSession, crate::audio_io::CallAudioPump)>,
+            >,
+        >;
+        let call_media_slot: ActiveCallMedia = std::sync::Arc::default();
 
         let mut login: Option<LoginToken> = None;
         let mut password: Option<PasswordToken> = None;
@@ -932,7 +1029,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         };
         let mut qr_mode = false;
         if authorized {
-            enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await;
+            enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
         } else if cfg!(target_os = "android") {
             qr_mode = false;
             out.send(Ev::Stage(Stage::NeedPhone));
@@ -947,6 +1044,31 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         let switch_now: bool = loop {
         let cmd = tokio::select! {
             c = cmds.recv() => match c { Some(c) => c, None => break false },
+            Some((batch, done)) = dialog_stream_rx.recv() => {
+                if !batch.is_empty() {
+                    let mut known: std::collections::HashSet<i64> = dialogs.iter().map(|d| d.id).collect();
+                    let mut added = Vec::with_capacity(batch.len());
+                    for row in batch {
+                        if known.insert(row.id) {
+                            dialogs.push(row.clone());
+                            added.push(row);
+                        }
+                    }
+                    if !added.is_empty() || done {
+                        out.send(Ev::DialogsBatch(added, done));
+                    }
+                } else if done {
+                    out.send(Ev::DialogsBatch(Vec::new(), true));
+                }
+                if done && !engine.settings().privacy_shield.ephemeral_local_cache {
+                    let h_c = home.clone();
+                    let me_c = cached_me.clone();
+                    let d_c = dialogs.clone();
+                    let f_c = cached_folders.clone();
+                    tokio::task::spawn_blocking(move || save_disk_cache(&h_c, &me_c, &d_c, &f_c));
+                }
+                continue;
+            }
             _ = tick.tick(), if qr_mode => {
                 match rg_core::qr::poll(&connected.client, &*connected.session, cfg.api_id, &cfg.api_hash).await {
                     Ok(rg_core::qr::QrStep::Token { url }) => {
@@ -957,7 +1079,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                     Ok(rg_core::qr::QrStep::Done) => {
                         qr_mode = false;
-                        enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await;
+                        enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
                     }
                     Ok(rg_core::qr::QrStep::NeedPassword(p)) => {
                         qr_mode = false;
@@ -1036,7 +1158,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 .await;
                 out.send(Ev::LoginBusy(false));
                 match res {
-                    Ok(Ok(_)) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
+                    Ok(Ok(_)) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await,
                     Ok(Err(SignInError::PasswordRequired(p))) => {
                         let hint = p.hint().unwrap_or("нет").to_owned();
                         password = Some(p);
@@ -1057,7 +1179,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 .await;
                 out.send(Ev::LoginBusy(false));
                 match res {
-                    Ok(Ok(_)) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
+                    Ok(Ok(_)) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await,
                     Ok(Err(SignInError::InvalidPassword(p))) => {
                         let hint = p.hint().unwrap_or("нет").to_owned();
                         password = Some(p);
@@ -2714,18 +2836,103 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 access_hash,
                 g_b,
             } => {
-                let (eng, out) = (engine.clone(), out.clone());
+                let (eng, out, cms) = (engine.clone(), out.clone(), call_media_slot.clone());
+                let relay_only = eng.settings().privacy_shield.block_activity_telemetry;
                 tokio::spawn(async move {
                     match eng.confirm_call(call_id, access_hash, &g_b).await {
-                        Ok(emojis) => out.send(Ev::CallEmojis(emojis)),
+                        Ok((emojis, shared_key, endpoints, p2p_allowed)) => {
+                            out.send(Ev::CallEmojis(emojis));
+                            if let Ok(mut guard) = cms.lock() {
+                                if let Some((mut old_s, mut old_p)) = guard.take() {
+                                    old_p.stop();
+                                    old_s.stop();
+                                }
+                                let (pb_tx, pb_rx) = tokio::sync::mpsc::channel(32);
+                                if let Ok(sess) = rg_core::call_media::CallMediaSession::start(
+                                    rg_core::call_media::CallMediaConfig {
+                                        shared_key,
+                                        endpoints,
+                                        p2p_allowed,
+                                        is_outgoing: true,
+                                        video: false,
+                                        relay_only_privacy: relay_only,
+                                    },
+                                    pb_tx,
+                                ) && let Some(mic_tx) = sess.sender()
+                                {
+                                    let pump = crate::audio_io::CallAudioPump::start(mic_tx, pb_rx);
+                                    out.send(Ev::CallMediaStats(sess.stats()));
+                                    *guard = Some((sess, pump));
+                                }
+                            }
+                        }
                         Err(e) => out.err(e),
                     }
                 });
             }
             Cmd::DeriveIncomingCallEmojis { call_id, g_a } => {
-                if let Ok(emojis) = engine.derive_incoming_call_emojis(call_id, &g_a) {
+                if let Ok((emojis, _shared)) = engine.derive_incoming_call_emojis(call_id, &g_a) {
                     out.send(Ev::CallEmojis(emojis));
                 }
+            }
+            Cmd::StartIncomingCallMedia {
+                call_id,
+                g_a,
+                endpoints,
+                p2p_allowed,
+                video,
+            } => {
+                let relay_only = engine.settings().privacy_shield.block_activity_telemetry;
+                if let Ok((emojis, shared_key)) = engine.derive_incoming_call_emojis(call_id, &g_a) {
+                    out.send(Ev::CallEmojis(emojis));
+                    if let Ok(mut guard) = call_media_slot.lock() {
+                        if let Some((mut old_s, mut old_p)) = guard.take() {
+                            old_p.stop();
+                            old_s.stop();
+                        }
+                        let (pb_tx, pb_rx) = tokio::sync::mpsc::channel(32);
+                        if let Ok(sess) = rg_core::call_media::CallMediaSession::start(
+                            rg_core::call_media::CallMediaConfig {
+                                shared_key,
+                                endpoints,
+                                p2p_allowed,
+                                is_outgoing: false,
+                                video,
+                                relay_only_privacy: relay_only,
+                            },
+                            pb_tx,
+                        ) && let Some(mic_tx) = sess.sender()
+                        {
+                            let pump = crate::audio_io::CallAudioPump::start(mic_tx, pb_rx);
+                            out.send(Ev::CallMediaStats(sess.stats()));
+                            *guard = Some((sess, pump));
+                        }
+                    }
+                }
+            }
+            Cmd::SetCallMuted(muted) => {
+                if let Ok(guard) = call_media_slot.lock()
+                    && let Some((_, pump)) = guard.as_ref()
+                {
+                    pump.set_muted(muted);
+                }
+            }
+            Cmd::PollCallStats => {
+                if let Ok(guard) = call_media_slot.lock()
+                    && let Some((sess, _)) = guard.as_ref()
+                {
+                    out.send(Ev::CallMediaStats(sess.stats()));
+                }
+            }
+            Cmd::SendCallSignaling {
+                call_id,
+                access_hash,
+                data,
+            } => {
+                let eng = engine.clone();
+                tokio::spawn(async move {
+                    let _ = eng.send_call_signaling(call_id, access_hash, data).await;
+                });
             }
             Cmd::DiscardCall {
                 call_id,
@@ -2734,10 +2941,222 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 video,
                 busy,
             } => {
+                if let Ok(mut guard) = call_media_slot.lock()
+                    && let Some((mut sess, mut pump)) = guard.take()
+                {
+                    pump.stop();
+                    sess.stop();
+                }
                 let eng = engine.clone();
                 tokio::spawn(async move {
                     let _ = eng.discard_call(call_id, access_hash, duration, video, busy).await;
                 });
+            }
+            Cmd::SendMediaEdited {
+                path,
+                caption,
+                reply_to,
+                opts,
+                cleanup_temp,
+            } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                out.send(Ev::Status("Отправка медиа…".into()));
+                match engine
+                    .send_media_with_options(d.peer, &path, &caption, reply_to, opts)
+                    .await
+                {
+                    Ok(()) => {
+                        out.send(Ev::Status(String::new()));
+                        reload(&engine, &out, d.peer, i).await;
+                    }
+                    Err(e) => out.err(format!("Медиа не отправлено: {e}")),
+                }
+                if cleanup_temp {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Cmd::ParticipantsPaged(i, offset) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok((rows, total)) = eng.channel_participants_paged(peer, offset, 200).await {
+                        out.send(Ev::ParticipantsPage(id, rows, offset, total));
+                    }
+                });
+            }
+            Cmd::LoadStarsStatus => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.stars_status().await {
+                        Ok(st) => out.send(Ev::StarsStatus(st)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadStarGiftsCatalog => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.star_gifts_catalog().await {
+                        Ok(list) => out.send(Ev::StarGiftsCatalog(list)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadSavedGifts(idx_opt) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                let target = idx_opt
+                    .and_then(|i| dialogs.get(i))
+                    .map(|d| (d.peer, d.id));
+                tokio::spawn(async move {
+                    let (peer, id) = if let Some(t) = target {
+                        t
+                    } else if let Ok(me) = eng.client.get_me().await {
+                        (
+                            me.to_ref().await.ok().flatten().unwrap_or(grammers_session::types::PeerRef {
+                                id: me.id(),
+                                auth: grammers_session::types::PeerAuth::default(),
+                            }),
+                            me.raw.id(),
+                        )
+                    } else {
+                        return;
+                    };
+                    match eng.saved_star_gifts(peer).await {
+                        Ok(list) => out.send(Ev::SavedGifts(id, list)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ToggleSaveStarGift {
+                msg_id,
+                saved_id,
+                unsave,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.toggle_save_star_gift(msg_id, None, saved_id, unsave).await {
+                        Ok(()) => out.send(Ev::Status(if unsave {
+                            "Подарок скрыт из профиля".to_owned()
+                        } else {
+                            "Подарок закреплён в профиле".to_owned()
+                        })),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ConvertStarGift { msg_id, saved_id } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.convert_star_gift(msg_id, None, saved_id).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Подарок обменян на Telegram Stars".to_owned()));
+                            if let Ok(st) = eng.stars_status().await {
+                                out.send(Ev::StarsStatus(st));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SendPaidReaction {
+                msg_id,
+                count,
+                anonymous,
+            } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.send_paid_reaction(peer, msg_id, count, anonymous).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("Отправлено ⭐ ×{count}")));
+                            reload(&eng, &out, peer, i).await;
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::UpdateBusinessHours {
+                enabled,
+                timezone,
+                weekly,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.update_business_work_hours(enabled, timezone, weekly).await {
+                        Ok(()) => out.send(Ev::Status(if enabled {
+                            "Бизнес-часы работы сохранены".to_owned()
+                        } else {
+                            "Бизнес-часы отключены".to_owned()
+                        })),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadQuickReplies => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.quick_replies().await {
+                        Ok(list) => out.send(Ev::QuickReplies(list)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SendQuickReply {
+                shortcut_id,
+                msg_ids,
+            } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.send_quick_reply(peer, shortcut_id, msg_ids).await {
+                        Ok(()) => reload(&eng, &out, peer, i).await,
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::EditQuickReplyShortcut {
+                shortcut_id,
+                shortcut,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.edit_quick_reply_shortcut(shortcut_id, &shortcut).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("Ярлык /{shortcut} обновлён")));
+                            if let Ok(list) = eng.quick_replies().await {
+                                out.send(Ev::QuickReplies(list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::DeleteQuickReplyShortcut(shortcut_id) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.delete_quick_reply_shortcut(shortcut_id).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Быстрый ответ удалён".to_owned()));
+                            if let Ok(list) = eng.quick_replies().await {
+                                out.send(Ev::QuickReplies(list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::Shutdown => {
+                if let Ok(mut guard) = call_media_slot.lock()
+                    && let Some((mut sess, mut pump)) = guard.take()
+                {
+                    pump.stop();
+                    sess.stop();
+                }
+                connected.pool_handle.quit();
+                break false;
             }
             Cmd::CheckUpdates => {
                 let out_u = out.clone();
@@ -2797,7 +3216,14 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
         }
         };
+        if let Ok(mut guard) = call_media_slot.lock()
+            && let Some((mut sess, mut pump)) = guard.take()
+        {
+            pump.stop();
+            sess.stop();
+        }
         if !switch_now {
+            connected.pool_handle.quit();
             break 'account_loop;
         }
     }
@@ -2837,8 +3263,8 @@ async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerR
     }
 }
 
-/// После входа: параллельно загружаем профиль, чаты, архив и папки, сохраняем дисковый кэш,
-/// запускаем поток обновлений и в фоне прогреваем кэш первых 3 чатов для открытия за 0 мс.
+/// После входа: мгновенно загружаем профиль, первые 60 чатов (для 0-мс старта), архив и папки,
+/// а остальные чаты (до 5000+) догружаем плавным потоком в фоне без нагрузки на интерфейс.
 #[allow(clippy::too_many_arguments)]
 async fn enter(
     engine: &Engine,
@@ -2849,10 +3275,17 @@ async fn enter(
     settings_path: &std::path::Path,
     cached_me: &mut String,
     cached_folders: &mut Vec<FolderRow>,
+    dialog_stream_tx: &tokio::sync::mpsc::Sender<(Vec<DialogRow>, bool)>,
 ) {
-    let (me_res, main_res, arch_res, folders_res) = tokio::join!(
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<DialogRow>, bool)>(64);
+    let eng_stream = engine.clone();
+    let stream_handle = tokio::spawn(async move {
+        let _ = eng_stream.dialogs_stream(60, 5000, tx).await;
+    });
+
+    let (me_res, first_batch, arch_res, folders_res) = tokio::join!(
         engine.client.get_me(),
-        engine.dialogs(300),
+        rx.recv(),
         engine.archived(100),
         engine.folders(),
     );
@@ -2874,7 +3307,9 @@ async fn enter(
             out.send(Ev::Settings(Box::new(s)));
         }
     }
-    if let Ok(mut d) = main_res {
+    let mut stream_done = true;
+    if let Some((mut d, done)) = first_batch {
+        stream_done = done;
         for x in arch_res.unwrap_or_default() {
             if !d.iter().any(|y| y.id == x.id) {
                 d.push(x);
@@ -2882,14 +3317,23 @@ async fn enter(
         }
         *dialogs = d.clone();
         out.send(Ev::Dialogs(d));
-    } else if let Err(e) = main_res {
-        out.err(format!("Чаты: {e}"));
+    }
+    if !stream_done {
+        let fwd_tx = dialog_stream_tx.clone();
+        tokio::spawn(async move {
+            while let Some((batch, done)) = rx.recv().await {
+                if fwd_tx.send((batch, done)).await.is_err() || done {
+                    break;
+                }
+            }
+            drop(stream_handle);
+        });
     }
     if let Ok(f) = folders_res {
         *cached_folders = f.clone();
         out.send(Ev::Folders(f));
     }
-    if !engine.settings().privacy_shield.ephemeral_local_cache {
+    if stream_done && !engine.settings().privacy_shield.ephemeral_local_cache {
         save_disk_cache(home, cached_me, dialogs, cached_folders);
     }
     // Подгружаем обзор аккаунта (заблокированные для `hide_from_blocked`, приватность), истории и секретные чаты в фоне.

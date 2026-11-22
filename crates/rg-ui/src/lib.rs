@@ -1,6 +1,7 @@
 //! Общий интерфейс Rustgramm для ПК и Android в стиле Telegram Desktop (AyuGram v7.2.9),
 //! синий везде заменён на оранжевый. Данные уходят только на серверы Telegram (см. `rg-net`).
 
+pub mod android_jni;
 mod audio_io;
 mod chat;
 mod countries;
@@ -10,6 +11,7 @@ mod frame;
 pub mod icons;
 mod kit;
 mod lottie;
+mod media_editor;
 mod media_ui;
 mod panels;
 mod rich;
@@ -18,6 +20,7 @@ mod shot;
 pub mod stream;
 mod tg_settings;
 pub mod theme;
+pub mod theme_pack;
 mod tray;
 pub mod updater;
 mod win;
@@ -39,6 +42,14 @@ use tokio::sync::mpsc::UnboundedSender;
 pub use worker::{Cmd, Ev, Stage};
 
 use theme::*;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AndroidPickTarget {
+    ChatAttach,
+    Story,
+    Theme,
+}
 
 struct App {
     cmd: UnboundedSender<Cmd>,
@@ -352,6 +363,43 @@ struct App {
     miniapp_opened_at: Option<std::time::Instant>,
     #[cfg(windows)]
     miniapp_expanded: bool,
+    /// Кэш фильтрации списка чатов для O(видимых_строк) при 5000+ чатах.
+    dialogs_gen: u64,
+    filtered_cache_key: (u64, String, bool, Option<i32>),
+    filtered_cache: Vec<usize>,
+    archived_total_cache: usize,
+    /// Общее число участников в супергруппах/каналах (для догрузки по страницам).
+    participants_total: HashMap<i64, i32>,
+    /// Встроенный редактор фото/видео перед отправкой.
+    media_editor: Option<media_editor::MediaEditorState>,
+    /// Цель системного выбора файла через Android Intent.
+    #[allow(dead_code)]
+    android_pick_target: Option<AndroidPickTarget>,
+    /// Живая статистика UDP/WebRTC медиа-потока звонка.
+    call_media_stats: Option<rg_core::call_media::CallMediaStats>,
+    call_stats_tick: Option<std::time::Instant>,
+    /// Telegram Stars, Подарки (Star Gifts) и платные реакции.
+    stars_modal_open: bool,
+    stars_tab: u8,
+    stars_summary: Option<rg_core::engine::StarsSummary>,
+    star_gifts_catalog: Vec<rg_core::engine::StarGiftItem>,
+    my_saved_gifts: Vec<rg_core::engine::SavedGiftItem>,
+    peer_saved_gifts: HashMap<i64, Vec<rg_core::engine::SavedGiftItem>>,
+    saved_gifts_req: HashSet<i64>,
+    paid_react_msg: Option<i32>,
+    paid_react_count: i32,
+    paid_react_anon: bool,
+    /// Telegram Бизнес: часы работы и быстрые ответы.
+    business_open: bool,
+    biz_hours_enabled: bool,
+    biz_timezone: String,
+    biz_start_h: i32,
+    biz_end_h: i32,
+    biz_weekdays_only: bool,
+    quick_replies: Vec<rg_core::engine::QuickReplyItem>,
+    /// Темы `.tdesktop-theme` / `.attheme`, живой конструктор палитры и обои чата.
+    themes_open: bool,
+    wallpaper_tex: Option<(String, egui::TextureHandle)>,
 }
 
 pub(crate) struct ShotModal {
@@ -644,6 +692,34 @@ impl App {
             miniapp_opened_at: None,
             #[cfg(windows)]
             miniapp_expanded: false,
+            dialogs_gen: 0,
+            filtered_cache_key: (u64::MAX, String::new(), false, None),
+            filtered_cache: Vec::new(),
+            archived_total_cache: 0,
+            participants_total: HashMap::new(),
+            media_editor: None,
+            android_pick_target: None,
+            call_media_stats: None,
+            call_stats_tick: None,
+            stars_modal_open: false,
+            stars_tab: 0,
+            stars_summary: None,
+            star_gifts_catalog: Vec::new(),
+            my_saved_gifts: Vec::new(),
+            peer_saved_gifts: HashMap::new(),
+            saved_gifts_req: HashSet::new(),
+            paid_react_msg: None,
+            paid_react_count: 10,
+            paid_react_anon: false,
+            business_open: false,
+            biz_hours_enabled: true,
+            biz_timezone: "Europe/Moscow".to_owned(),
+            biz_start_h: 9,
+            biz_end_h: 18,
+            biz_weekdays_only: true,
+            quick_replies: Vec::new(),
+            themes_open: false,
+            wallpaper_tex: None,
         }
     }
 
@@ -829,7 +905,10 @@ impl App {
                         call_id,
                         access_hash,
                         g_a_or_b,
+                        video,
+                        p2p_allowed,
                         relays,
+                        endpoints,
                         ..
                     } => {
                         audio_io::stop_ringtone();
@@ -848,11 +927,19 @@ impl App {
                             false
                         };
                         if derive_incoming {
-                            self.send(Cmd::DeriveIncomingCallEmojis { call_id, g_a: g_a_or_b });
+                            self.send(Cmd::StartIncomingCallMedia {
+                                call_id,
+                                g_a: g_a_or_b,
+                                endpoints,
+                                p2p_allowed,
+                                video,
+                            });
                         }
                     }
+                    CallEvent::SignalingData { .. } => {}
                     CallEvent::Discarded { call_id, reason, duration } => {
                         audio_io::stop_ringtone();
+                        self.call_media_stats = None;
                         if let Some(c) = self.active_call.as_mut()
                             && (c.call_id == 0 || c.call_id == call_id)
                         {
@@ -1237,22 +1324,78 @@ impl App {
         });
     }
 
-    /// Пакетно запрашивает текстуры всех пользовательских Premium-эмодзи статусов из списка чатов.
+    /// Пакетно запрашивает текстуры пользовательских Premium-эмодзи статусов из видимой верхушки списка чатов.
     fn request_emoji_statuses(&mut self) {
         let mut ids: Vec<i64> = Vec::new();
-        for d in &self.dialogs {
+        for d in self.dialogs.iter().take(120) {
             if let Some(doc_id) = d.emoji_status
                 && !self.sticker_tex.contains_key(&doc_id)
                 && self.custom_emoji_req.insert(doc_id)
             {
                 ids.push(doc_id);
+                if ids.len() >= 90 {
+                    break;
+                }
             }
         }
         if !ids.is_empty() {
-            for chunk in ids.chunks(90) {
-                self.send(Cmd::CustomEmojiDocs(chunk.to_vec()));
+            self.send(Cmd::CustomEmojiDocs(ids));
+        }
+    }
+
+    /// Импортирует тему `.tdesktop-theme`/`.attheme` и применяет её палитру и обои.
+    pub(crate) fn apply_imported_theme(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        match theme_pack::import_theme_file(path) {
+            Ok(imp) => {
+                let icon_pack = self.settings.theme.icon_pack.clone();
+                self.settings.theme = imp.settings;
+                self.settings.theme.icon_pack = icon_pack;
+                if let Some((wp_name, wp_bytes)) = imp.wallpaper_bytes {
+                    let themes_dir = worker::home().join("themes");
+                    let _ = std::fs::create_dir_all(&themes_dir);
+                    let dst = themes_dir.join(wp_name);
+                    if std::fs::write(&dst, wp_bytes).is_ok() {
+                        self.settings.theme.wallpaper_path = dst.to_string_lossy().into_owned();
+                    }
+                }
+                self.wallpaper_tex = None;
+                sync_custom_theme(&self.settings.theme);
+                self.status = format!("Применена тема «{}»", self.settings.theme.active_theme_name);
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                self.error = e;
+                self.error_at = self.now;
             }
         }
+    }
+
+    /// Полная остановка аудио, микрофона, WebView, звонков и трея при закрытии приложения.
+    pub(crate) fn shutdown_resources(&mut self) {
+        audio_io::stop_all_audio();
+        if let Some(rec) = self.voice_rec.take() {
+            rec.cancel();
+        }
+        #[cfg(windows)]
+        {
+            if let Some(v) = self.audio_view.take() {
+                v.stop();
+            }
+            if let Some(v) = self.player.take() {
+                v.stop();
+            }
+            if let Some(v) = self.inline_gif.take() {
+                v.stop();
+            }
+            if let Some(v) = self.miniapp_view.take() {
+                v.stop();
+            }
+        }
+        android_jni::shutdown_all();
+        if let Some(mut t) = self.tray.take() {
+            t.shutdown();
+        }
+        self.send(Cmd::Shutdown);
     }
 
     /// Просмотрщик ролика: локальный файл или потоковый адрес `127.0.0.1`, закрытие по Esc/крестику/клику.
@@ -1420,11 +1563,17 @@ impl App {
     }
 
     fn request_previews(&mut self, idx: usize, rows: &[MessageRow]) {
-        // В группах подгружаем аватарки отправителей (по одному запросу на человека).
+        // В больших группах (1000+ участников) подгружаем аватарки порциями (≤ 24 уникальных),
+        // чтобы открытие чата не создавало лавину сетевых запросов.
         if self.dialogs.get(idx).is_some_and(|d| d.id < 0) {
+            let mut sent_av = 0usize;
             for r in rows.iter().rev().filter(|r| !r.outgoing && r.sender_id != 0) {
                 if self.contact_av_req.insert(r.sender_id) && !self.avatars.contains_key(&r.sender_id) {
                     let _ = self.cmd.send(Cmd::SenderAvatar(r.id, r.sender_id));
+                    sent_av += 1;
+                    if sent_av >= 24 {
+                        break;
+                    }
                 }
             }
         }
@@ -1712,12 +1861,10 @@ impl App {
                 }
             };
         }
-        // Ctrl+Q — полное завершение приложения (с закрытием системного трея).
+        // Ctrl+Q — полное завершение приложения (с остановкой аудио, звонков и системного трея).
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
             self.quitting = true;
-            if let Some(mut t) = self.tray.take() {
-                t.shutdown();
-            }
+            self.shutdown_resources();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -1805,6 +1952,7 @@ impl App {
                     }
                     tray::TrayEvent::Quit => {
                         self.quitting = true;
+                        self.shutdown_resources();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
@@ -1902,10 +2050,26 @@ impl App {
                     // Открытый чат ищем по идентификатору: порядок строк мог измениться.
                     let keep = self.selected.and_then(|i| self.dialogs.get(i)).map(|x| x.id);
                     self.dialogs = d;
+                    self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
                     if let Some(id) = keep {
                         self.selected = self.dialogs.iter().position(|x| x.id == id);
                     }
                     self.request_emoji_statuses();
+                }
+                Ev::DialogsBatch(batch, _done) => {
+                    if !batch.is_empty() {
+                        let mut known: HashSet<i64> = self.dialogs.iter().map(|d| d.id).collect();
+                        let mut added = false;
+                        for row in batch {
+                            if known.insert(row.id) {
+                                self.dialogs.push(row);
+                                added = true;
+                            }
+                        }
+                        if added {
+                            self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+                        }
+                    }
                 }
                 Ev::Folders(f) => {
                     if self.folder.is_some_and(|id| !f.iter().any(|x| x.id == id)) {
@@ -1938,6 +2102,8 @@ impl App {
                     if let Some(v) = self.audio_view.take() {
                         v.stop();
                     }
+                    #[cfg(target_os = "android")]
+                    android_jni::play_file(&path, false, self.audio_vol);
                     self.audio_stream = None;
                     self.audio_path = Some(path);
                     self.audio_title = title;
@@ -1968,6 +2134,19 @@ impl App {
                 }
                 Ev::Participants(id, list) => {
                     self.participants.insert(id, list);
+                }
+                Ev::ParticipantsPage(id, rows, offset, total) => {
+                    self.participants_total.insert(id, total);
+                    if offset == 0 {
+                        self.participants.insert(id, rows);
+                    } else {
+                        let entry = self.participants.entry(id).or_default();
+                        for r in rows {
+                            if !entry.iter().any(|x| x.id == r.id) {
+                                entry.push(r);
+                            }
+                        }
+                    }
                 }
                 Ev::InviteLink(id, link) => {
                     ctx.copy_text(link.clone());
@@ -2104,10 +2283,15 @@ impl App {
                     self.reset_chat_state();
                     self.selected = None;
                     self.dialogs.clear();
+                    self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
                     self.folders.clear();
                     self.avatars.clear();
                     self.avatar_req.clear();
                     self.peer_infos.clear();
+                    self.participants.clear();
+                    self.participants_total.clear();
+                    self.peer_saved_gifts.clear();
+                    self.saved_gifts_req.clear();
                     self.history_cache.clear();
                     self.me.clear();
                     self.stage = Stage::Starting;
@@ -2216,6 +2400,11 @@ impl App {
                 Ev::Settings(s) => {
                     self.settings = *s;
                     self.plugins.sync_disabled(&self.settings.disabled_plugins);
+                    theme::sync_custom_theme(&self.settings.theme);
+                    icons::set_icon_pack(
+                        &self.settings.theme.icon_pack,
+                        Some(&worker::home().join("icon_packs")),
+                    );
                     if !self.passcode_checked {
                         self.passcode_checked = true;
                         if !self.settings.security.passcode_hash.is_empty() {
@@ -2267,6 +2456,26 @@ impl App {
                             c.connected_at = Some(std::time::Instant::now());
                         }
                     }
+                }
+                Ev::CallMediaStats(st) => {
+                    self.call_media_stats = Some(st);
+                }
+                Ev::StarsStatus(st) => {
+                    self.stars_summary = Some(st);
+                }
+                Ev::StarGiftsCatalog(list) => {
+                    self.star_gifts_catalog = list;
+                }
+                Ev::SavedGifts(pid, list) => {
+                    let is_mine = self.dialogs.iter().find(|d| d.saved).is_some_and(|d| d.id == pid)
+                        || self.tgs.account.as_ref().is_some_and(|a| a.me.id == pid);
+                    if is_mine {
+                        self.my_saved_gifts = list.clone();
+                    }
+                    self.peer_saved_gifts.insert(pid, list);
+                }
+                Ev::QuickReplies(list) => {
+                    self.quick_replies = list;
                 }
                 Ev::UpdateAvailable(info) => {
                     self.update_available = Some(*info);
@@ -2782,23 +2991,28 @@ impl App {
         let mut open_global: Option<(grammers_session::types::PeerRef, i64, String)> = None;
         let mut dact: Option<(usize, DialogAct)> = None;
         let mut toggle_archive = false;
-        let archived_total = self.dialogs.iter().filter(|d| d.archived).count();
         let in_archive = self.in_archive;
         let active_folder = self.folders.iter().find(|f| Some(f.id) == self.folder).cloned();
-        // Быстрая фильтрация индексов для виртуализации списка (`show_rows`: рисуем только видимые ~14 строк).
-        let filtered: Vec<usize> = self
-            .dialogs
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| {
-                let in_scope = match &active_folder {
-                    Some(f) if !in_archive => folder_matches(f, d),
-                    _ => d.archived == in_archive,
-                };
-                in_scope && (needle.is_empty() || d.name.to_lowercase().contains(&needle))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let cache_key = (self.dialogs_gen, needle.clone(), in_archive, self.folder);
+        if self.filtered_cache_key != cache_key {
+            self.filtered_cache_key = cache_key;
+            self.archived_total_cache = self.dialogs.iter().filter(|d| d.archived).count();
+            self.filtered_cache = self
+                .dialogs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| {
+                    let in_scope = match &active_folder {
+                        Some(f) if !in_archive => folder_matches(f, d),
+                        _ => d.archived == in_archive,
+                    };
+                    in_scope && (needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                })
+                .map(|(i, _)| i)
+                .collect();
+        }
+        let archived_total = self.archived_total_cache;
+        let filtered = &self.filtered_cache;
         if in_archive {
             if archive_header(ui) {
                 toggle_archive = true;
@@ -3097,7 +3311,9 @@ fn notify_toast(title: &str, body: &str) {
             .creation_flags(0x0800_0000)
             .spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    crate::android_jni::show_notification(1001, title, body);
+    #[cfg(all(not(windows), not(target_os = "android")))]
     let _ = (title, body);
 }
 
@@ -3385,13 +3601,46 @@ impl eframe::App for App {
                     }),
             )
             .show(ui, |ui| {
-                paint_chat_backdrop(ui.painter(), ui.max_rect(), bg_style);
+                let wp_path = self.settings.theme.wallpaper_path.clone();
+                if !wp_path.is_empty() && self.wallpaper_tex.as_ref().is_none_or(|(p, _)| p != &wp_path) {
+                    if let Ok(bytes) = std::fs::read(&wp_path)
+                        && let Ok(img) = image::load_from_memory(&bytes)
+                    {
+                        let rgba = img.thumbnail(1920, 1920).to_rgba8();
+                        let ci = egui::ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        );
+                        let tex = ctx.load_texture("rg-wallpaper", ci, egui::TextureOptions::LINEAR);
+                        self.wallpaper_tex = Some((wp_path, tex));
+                    } else {
+                        self.wallpaper_tex = None;
+                    }
+                }
+                let wp_tex = self.wallpaper_tex.as_ref().map(|(_, t)| t);
+                paint_chat_backdrop_ex(
+                    ui.painter(),
+                    ui.max_rect(),
+                    bg_style,
+                    wp_tex,
+                    self.settings.theme.wallpaper_dim,
+                );
                 self.messages_ui(ui);
             });
         if narrow {
             self.emoji_window(&ctx);
         }
         self.render_modals(&ctx, frame);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown_resources();
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.shutdown_resources();
     }
 }
 
@@ -3412,6 +3661,53 @@ impl App {
         self.calls_history_window(ctx);
         self.secret_chats_window(ctx);
         self.admin_window(ctx);
+        self.stars_gifts_window(ctx);
+        self.paid_reaction_modal(ctx);
+        self.business_window(ctx);
+        self.themes_window(ctx);
+        if let Some((path, caption, reply_to, opts)) =
+            media_editor::media_editor_window(ctx, &mut self.media_editor, &worker::home().join("cache"))
+        {
+            let cleanup_temp = path
+                .parent()
+                .is_some_and(|p| p.ends_with("edited"));
+            self.send(Cmd::SendMediaEdited {
+                path,
+                caption,
+                reply_to,
+                opts,
+                cleanup_temp,
+            });
+        }
+        #[cfg(target_os = "android")]
+        {
+            if let Some(picked) = android_jni::poll_picked_file() {
+                match self.android_pick_target.take() {
+                    Some(AndroidPickTarget::Story) => {
+                        self.story_file_path = picked.to_string_lossy().into_owned();
+                    }
+                    Some(AndroidPickTarget::Theme) => {
+                        self.apply_imported_theme(ctx, &picked);
+                        self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                    }
+                    _ => {
+                        let reply = self.reply.take().map(|(id, _)| id);
+                        let caption = std::mem::take(&mut self.input);
+                        self.media_editor = Some(media_editor::MediaEditorState::open(
+                            picked,
+                            caption.trim().to_owned(),
+                            reply,
+                        ));
+                    }
+                }
+            }
+            if let Some(tgu) = android_jni::poll_pending_link() {
+                if let Some(parsed) = rg_core::engine::parse_tg_link(&tgu) {
+                    self.send(Cmd::OpenTgLink(parsed));
+                }
+                self.miniapp_modal = None;
+            }
+        }
         self.toasts_overlay(ctx);
         #[cfg(windows)]
         {
@@ -3420,7 +3716,14 @@ impl App {
             self.audio_overlay(ctx, frame);
             self.miniapp_overlay(ctx, frame);
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "android")]
+        {
+            let _ = frame;
+            if let Some((title, url)) = self.miniapp_modal.take() {
+                android_jni::open_webview(&url, &title, self.settings.ayu.spoof_webview_as_android);
+            }
+        }
+        #[cfg(all(not(windows), not(target_os = "android")))]
         {
             let _ = frame;
             self.miniapp_fallback_window(ctx);
@@ -3628,7 +3931,7 @@ impl App {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "android")))]
     fn miniapp_fallback_window(&mut self, ctx: &egui::Context) {
         let Some((title, url)) = self.miniapp_modal.clone() else { return };
         let mut open = true;
@@ -3697,6 +4000,9 @@ pub fn run_desktop() -> eframe::Result {
     if let Some(mode) = std::env::var_os("RG_DEMO") {
         return run_demo(&mode.to_string_lossy());
     }
+    let Some(_single_instance): Option<win::SingleInstanceGuard> = win::acquire_single_instance() else {
+        return Ok(());
+    };
     std::thread::spawn(|| win::dress_window("Rustgramm"));
     run(native_options())
 }

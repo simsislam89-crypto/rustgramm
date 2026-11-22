@@ -54,6 +54,12 @@ pub struct MediaInfo {
     /// Есть ли миниатюра, которую можно скачать для предпросмотра.
     pub has_thumb: bool,
     pub mime: String,
+    /// Скрыто под спойлером перед просмотром.
+    #[serde(default)]
+    pub spoiler: bool,
+    /// Таймер самоуничтожения медиа, секунды (`Some(N)` — исчезающее медиа).
+    #[serde(default)]
+    pub ttl_seconds: Option<i32>,
 }
 
 impl MediaInfo {
@@ -67,6 +73,8 @@ impl MediaInfo {
             waveform: Vec::new(),
             has_thumb: false,
             mime: String::new(),
+            spoiler: false,
+            ttl_seconds: None,
         }
     }
 
@@ -142,7 +150,12 @@ pub fn ext_for_mime(mime: &str) -> &'static str {
 pub fn describe(media: &Media) -> MediaInfo {
     use grammers_client::tl;
     match media {
-        Media::Photo(p) => MediaInfo::basic(MediaKind::Photo, "Фото", p.size().map_or(0, |s| s as u64)),
+        Media::Photo(p) => {
+            let mut info = MediaInfo::basic(MediaKind::Photo, "Фото", p.size().map_or(0, |s| s as u64));
+            info.spoiler = p.raw.spoiler;
+            info.ttl_seconds = p.raw.ttl_seconds;
+            info
+        }
         Media::Sticker(s) => {
             let mime = s.document.mime_type().unwrap_or_default().to_owned();
             let emoji = s.raw_attrs.alt.clone();
@@ -215,6 +228,8 @@ pub fn describe(media: &Media) -> MediaInfo {
             info.waveform = waveform;
             info.has_thumb = !d.thumbs().is_empty();
             info.mime = mime;
+            info.spoiler = d.raw.spoiler;
+            info.ttl_seconds = d.raw.ttl_seconds;
             info
         }
         Media::Contact(c) => other(&format!(

@@ -35,3 +35,6 @@ wry = { version = "0.57", default-features = false }
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = { version = "0.15", default-features = false }
 arboard = "3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

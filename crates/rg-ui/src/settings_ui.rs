@@ -230,6 +230,15 @@ impl App {
                 if item(ui, icons::Ico::Ghost, "Секретные чаты (E2E)") {
                     act = Some("secret");
                 }
+                if item(ui, icons::Ico::Saved, "Звёзды и Подарки ⭐") {
+                    act = Some("stars");
+                }
+                if item(ui, icons::Ico::Folder, "Telegram Бизнес") {
+                    act = Some("business");
+                }
+                if item(ui, icons::Ico::Moon, "Темы и иконки AyuGram") {
+                    act = Some("themes");
+                }
                 if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
                     act = Some("saved");
                 }
@@ -341,6 +350,22 @@ impl App {
                 self.drawer_open = false;
                 self.secret_open = true;
                 self.send(Cmd::LoadSecretChats);
+            }
+            Some("stars") => {
+                self.drawer_open = false;
+                self.stars_modal_open = true;
+                self.send(Cmd::LoadStarsStatus);
+                self.send(Cmd::LoadSavedGifts(None));
+                self.send(Cmd::LoadStarGiftsCatalog);
+            }
+            Some("business") => {
+                self.drawer_open = false;
+                self.business_open = true;
+                self.send(Cmd::LoadQuickReplies);
+            }
+            Some("themes") => {
+                self.drawer_open = false;
+                self.themes_open = true;
             }
             Some("check_updates") => {
                 self.drawer_open = false;

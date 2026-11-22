@@ -4,12 +4,38 @@
 //! (контакты, призрак, «Прочитать на сервере», три точки): они нарисованы линиями.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use eframe::egui::{self, Color32, Context, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 
 const ATLAS_PNG: &[u8] = include_bytes!("../assets/icons.png");
 const ATLAS_IDX: &str = include_str!("../assets/icons.idx");
+
+/// Стиль/пак иконок AyuGram: стандартный, жирный, минималистичный или пользовательский из папки.
+static ACTIVE_PACK: RwLock<Option<String>> = RwLock::new(None);
+static CUSTOM_PACK_DIR: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
+
+/// Устанавливает активный пак иконок (`default`, `ayu_bold`, `ayu_minimal`, или имя папки в `<RG_HOME>/icon_packs/`).
+pub fn set_icon_pack(pack: &str, packs_root: Option<&std::path::Path>) {
+    let clean = pack.trim().to_owned();
+    if let Ok(mut g) = ACTIVE_PACK.write() {
+        *g = (!clean.is_empty() && clean != "default").then(|| clean.clone());
+    }
+    if let Ok(mut d) = CUSTOM_PACK_DIR.write() {
+        *d = packs_root.and_then(|root| {
+            let p = root.join(&clean);
+            p.is_dir().then_some(p)
+        });
+    }
+}
+
+pub fn active_icon_pack() -> String {
+    ACTIVE_PACK
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| "default".to_owned())
+}
 
 #[derive(Clone)]
 struct Atlas {
@@ -74,10 +100,55 @@ pub fn tg(p: &Painter, name: &str, c: Pos2, color: Color32) {
     }
 }
 
-/// То же, но с заданным размером (масштаб картинки).
+/// То же, но с заданным размером (масштаб картинки + поддержка паков иконок AyuGram).
 pub fn tg_sized(p: &Painter, name: &str, c: Pos2, size: Vec2, color: Color32) {
+    let pack = active_icon_pack();
+    if let Ok(guard) = CUSTOM_PACK_DIR.read()
+        && let Some(dir) = guard.as_ref()
+    {
+        let key = format!("rg-custom-ico:{pack}:{name}");
+        #[allow(deprecated)]
+        let icon_id = egui::Id::new(&key);
+        let cached: Option<Option<egui::TextureHandle>> = p.ctx().data(|d| d.get_temp(icon_id));
+        let tex_opt = match cached {
+            Some(v) => v,
+            None => {
+                let candidate = dir.join(format!("{}.png", name.replace('/', "_")));
+                let candidate_nested = dir.join(format!("{name}.png"));
+                let loaded = std::fs::read(&candidate)
+                    .or_else(|_| std::fs::read(&candidate_nested))
+                    .ok()
+                    .and_then(|b| image::load_from_memory(&b).ok())
+                    .map(|im| {
+                        let rgba = im.to_rgba8();
+                        let ci = egui::ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        );
+                        p.ctx().load_texture(&key, ci, egui::TextureOptions::LINEAR)
+                    });
+                p.ctx().data_mut(|d| d.insert_temp(icon_id, loaded.clone()));
+                loaded
+            }
+        };
+        if let Some(tex) = tex_opt {
+            let min = Pos2::new(c.x - size.x / 2.0, c.y - size.y / 2.0);
+            p.image(
+                tex.id(),
+                Rect::from_min_size(min, size),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                color,
+            );
+            return;
+        }
+    }
     let (Some(r), Some(a)) = (index().get(name), atlas(p.ctx())) else {
         return;
+    };
+    let size = match pack.as_str() {
+        "ayu_bold" => size * 1.08,
+        "ayu_minimal" => size * 0.90,
+        _ => size,
     };
     let ppp = p.ctx().pixels_per_point();
     let snap = |v: f32| (v * ppp).round() / ppp;
@@ -87,6 +158,9 @@ pub fn tg_sized(p: &Painter, name: &str, c: Pos2, size: Vec2, color: Color32) {
         Pos2::new((r[0] + r[2]) / a.size[0], (r[1] + r[3]) / a.size[1]),
     );
     p.image(a.tex.id(), Rect::from_min_size(min, size), uv, color);
+    if pack == "ayu_bold" {
+        p.image(a.tex.id(), Rect::from_min_size(min + Vec2::new(0.45, 0.0), size), uv, color.gamma_multiply(0.45));
+    }
 }
 
 /// Три полосы: главное меню.
@@ -327,5 +401,15 @@ mod tests {
             assert!(native_size(n).is_some(), "нет значка {n}");
         }
         assert_eq!(native_size("menu/profile"), Some(Vec2::splat(24.0)));
+    }
+
+    #[test]
+    fn icon_pack_switching_and_reset() {
+        set_icon_pack("ayu_bold", None);
+        assert_eq!(active_icon_pack(), "ayu_bold");
+        set_icon_pack("ayu_minimal", None);
+        assert_eq!(active_icon_pack(), "ayu_minimal");
+        set_icon_pack("default", None);
+        assert_eq!(active_icon_pack(), "default");
     }
 }

@@ -5,11 +5,13 @@
 //! - Запись голосовых сообщений с микрофона (WinMM `waveIn*`, 16 кГц 16-бит mono PCM)
 //!   с расчётом живого уровня громкости и 5-битной волны Telegram (`waveform`).
 
+#[cfg(not(target_os = "android"))]
 use std::path::Path;
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(not(target_os = "android"))]
 use std::time::Instant;
 
 /// Упаковывает 16-битные моно PCM-сэмплы в стандартный RIFF WAVE файл.
@@ -182,6 +184,19 @@ mod win_audio {
         fn waveInStop(hwi: *mut c_void) -> u32;
         fn waveInReset(hwi: *mut c_void) -> u32;
         fn waveInClose(hwi: *mut c_void) -> u32;
+        fn waveOutOpen(
+            phwo: *mut *mut c_void,
+            u_device_id: u32,
+            pwfx: *const WaveFormatEx,
+            dw_callback: usize,
+            dw_instance: usize,
+            fdw_open: u32,
+        ) -> u32;
+        fn waveOutPrepareHeader(hwo: *mut c_void, pwh: *mut WaveHdr, cbwh: u32) -> u32;
+        fn waveOutUnprepareHeader(hwo: *mut c_void, pwh: *mut WaveHdr, cbwh: u32) -> u32;
+        fn waveOutWrite(hwo: *mut c_void, pwh: *mut WaveHdr, cbwh: u32) -> u32;
+        fn waveOutReset(hwo: *mut c_void) -> u32;
+        fn waveOutClose(hwo: *mut c_void) -> u32;
     }
 
     // Держим последний WAV-буфер живым, пока `PlaySoundW(SND_ASYNC | SND_MEMORY)` его проигрывает.
@@ -233,6 +248,195 @@ mod win_audio {
     pub fn stop_ringtone() {
         unsafe {
             PlaySoundW(std::ptr::null(), std::ptr::null_mut(), 0);
+        }
+    }
+
+    pub fn stop_all_audio() {
+        stop_ringtone();
+        if let Some(slot) = ACTIVE_SOUND.get()
+            && let Ok(mut guard) = slot.lock()
+        {
+            guard.clear();
+        }
+    }
+
+    /// Полнодуплексный аудиопоток звонка (16 кГц моно PCM16, 20-мс кадры по 320 сэмплов) через WinMM.
+    pub struct CallAudioPump {
+        stop_flag: Arc<AtomicBool>,
+        muted: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CallAudioPump {
+        pub fn start(
+            tx_mic: tokio::sync::mpsc::Sender<Vec<i16>>,
+            mut rx_spk: tokio::sync::mpsc::Receiver<Vec<i16>>,
+        ) -> Self {
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let muted = Arc::new(AtomicBool::new(false));
+            let sf = stop_flag.clone();
+            let mt = muted.clone();
+            let handle = std::thread::Builder::new()
+                .name("rg-call-audio".into())
+                .spawn(move || {
+                    const SR: u32 = 16_000;
+                    const FRAME: usize = 320; // 20 мс
+                    let fmt = WaveFormatEx {
+                        w_format_tag: WAVE_FORMAT_PCM,
+                        n_channels: 1,
+                        n_samples_per_sec: SR,
+                        n_avg_bytes_per_sec: SR * 2,
+                        n_block_align: 2,
+                        w_bits_per_sample: 16,
+                        cb_size: 0,
+                    };
+                    let mut hwi: *mut c_void = std::ptr::null_mut();
+                    let in_ok = unsafe { waveInOpen(&mut hwi, WAVE_MAPPER, &fmt, 0, 0, 0) } == 0 && !hwi.is_null();
+                    let mut hwo: *mut c_void = std::ptr::null_mut();
+                    let out_ok = unsafe { waveOutOpen(&mut hwo, WAVE_MAPPER, &fmt, 0, 0, 0) } == 0 && !hwo.is_null();
+
+                    let hdr_size = std::mem::size_of::<WaveHdr>() as u32;
+                    let mut in_bufs: Vec<Box<[u8]>> = (0..4).map(|_| vec![0u8; FRAME * 2].into_boxed_slice()).collect();
+                    let mut in_hdrs: Vec<Box<WaveHdr>> = in_bufs
+                        .iter_mut()
+                        .map(|b| {
+                            Box::new(WaveHdr {
+                                lp_data: b.as_mut_ptr(),
+                                dw_buffer_length: b.len() as u32,
+                                dw_bytes_recorded: 0,
+                                dw_user: 0,
+                                dw_flags: 0,
+                                dw_loops: 0,
+                                lp_next: std::ptr::null_mut(),
+                                reserved: 0,
+                            })
+                        })
+                        .collect();
+                    if in_ok {
+                        for h in &mut in_hdrs {
+                            unsafe {
+                                waveInPrepareHeader(hwi, h.as_mut(), hdr_size);
+                                waveInAddBuffer(hwi, h.as_mut(), hdr_size);
+                            }
+                        }
+                        unsafe {
+                            waveInStart(hwi);
+                        }
+                    }
+
+                    let mut out_bufs: Vec<Box<[u8]>> = (0..4).map(|_| vec![0u8; FRAME * 2].into_boxed_slice()).collect();
+                    let mut out_hdrs: Vec<Box<WaveHdr>> = out_bufs
+                        .iter_mut()
+                        .map(|b| {
+                            Box::new(WaveHdr {
+                                lp_data: b.as_mut_ptr(),
+                                dw_buffer_length: b.len() as u32,
+                                dw_bytes_recorded: 0,
+                                dw_user: 0,
+                                dw_flags: WHDR_DONE,
+                                dw_loops: 0,
+                                lp_next: std::ptr::null_mut(),
+                                reserved: 0,
+                            })
+                        })
+                        .collect();
+                    let mut out_idx = 0usize;
+
+                    while !sf.load(Ordering::Relaxed) {
+                        if in_ok {
+                            for h in &mut in_hdrs {
+                                let flags = unsafe { std::ptr::read_volatile(&h.dw_flags) };
+                                if (flags & WHDR_DONE) != 0 {
+                                    let bytes = unsafe { std::ptr::read_volatile(&h.dw_bytes_recorded) } as usize;
+                                    if bytes >= 2 && !mt.load(Ordering::Relaxed) {
+                                        let slice = unsafe { std::slice::from_raw_parts(h.lp_data, bytes) };
+                                        let pcm: Vec<i16> = slice
+                                            .as_chunks::<2>()
+                                            .0
+                                            .iter()
+                                            .map(|&[lo, hi]| i16::from_le_bytes([lo, hi]))
+                                            .collect();
+                                        let _ = tx_mic.try_send(pcm);
+                                    }
+                                    h.dw_bytes_recorded = 0;
+                                    unsafe {
+                                        waveInAddBuffer(hwi, h.as_mut(), hdr_size);
+                                    }
+                                }
+                            }
+                        }
+                        if out_ok {
+                            while let Ok(pcm) = rx_spk.try_recv() {
+                                let slot = out_idx % out_hdrs.len();
+                                out_idx = out_idx.wrapping_add(1);
+                                let h = &mut out_hdrs[slot];
+                                let buf = &mut out_bufs[slot];
+                                let copy_samples = pcm.len().min(FRAME);
+                                for (i, &s) in pcm[..copy_samples].iter().enumerate() {
+                                    let [lo, hi] = s.to_le_bytes();
+                                    buf[i * 2] = lo;
+                                    buf[i * 2 + 1] = hi;
+                                }
+                                let byte_len = (copy_samples * 2) as u32;
+                                if byte_len > 0 {
+                                    unsafe {
+                                        if (std::ptr::read_volatile(&h.dw_flags) & 0x02) != 0 {
+                                            waveOutUnprepareHeader(hwo, h.as_mut(), hdr_size);
+                                        }
+                                        h.dw_buffer_length = byte_len;
+                                        h.dw_flags = 0;
+                                        waveOutPrepareHeader(hwo, h.as_mut(), hdr_size);
+                                        waveOutWrite(hwo, h.as_mut(), hdr_size);
+                                    }
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+
+                    if in_ok {
+                        unsafe {
+                            waveInStop(hwi);
+                            waveInReset(hwi);
+                            for h in &mut in_hdrs {
+                                waveInUnprepareHeader(hwi, h.as_mut(), hdr_size);
+                            }
+                            waveInClose(hwi);
+                        }
+                    }
+                    if out_ok {
+                        unsafe {
+                            waveOutReset(hwo);
+                            for h in &mut out_hdrs {
+                                waveOutUnprepareHeader(hwo, h.as_mut(), hdr_size);
+                            }
+                            waveOutClose(hwo);
+                        }
+                    }
+                })
+                .ok();
+            Self {
+                stop_flag,
+                muted,
+                handle,
+            }
+        }
+
+        pub fn set_muted(&self, m: bool) {
+            self.muted.store(m, Ordering::Relaxed);
+        }
+
+        pub fn stop(&mut self) {
+            self.stop_flag.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    impl Drop for CallAudioPump {
+        fn drop(&mut self) {
+            self.stop();
         }
     }
 
@@ -425,13 +629,62 @@ mod win_audio {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
+mod win_audio {
+    use super::*;
+
+    pub fn play_notify_chime(volume: u8) {
+        if volume == 0 {
+            return;
+        }
+        let v = f32::from(volume.min(100)) / 100.0;
+        let wav = generate_chime_wav(v);
+        crate::android_jni::play_wav_bytes(&wav, false, v);
+    }
+
+    pub fn play_ringtone(volume: u8) {
+        if volume == 0 {
+            return;
+        }
+        let v = f32::from(volume.min(100)) / 100.0;
+        let wav = generate_ringtone_wav(v);
+        crate::android_jni::play_wav_bytes(&wav, true, v);
+    }
+
+    pub fn stop_ringtone() {
+        crate::android_jni::stop_audio();
+    }
+
+    pub fn stop_all_audio() {
+        crate::android_jni::stop_audio();
+    }
+
+    pub type VoiceRecorder = crate::android_jni::AndroidVoiceRecorder;
+
+    pub struct CallAudioPump;
+    impl CallAudioPump {
+        pub fn start(
+            _tx_mic: tokio::sync::mpsc::Sender<Vec<i16>>,
+            mut rx_spk: tokio::sync::mpsc::Receiver<Vec<i16>>,
+        ) -> Self {
+            std::thread::spawn(move || {
+                while rx_spk.blocking_recv().is_some() {}
+            });
+            Self
+        }
+        pub fn set_muted(&self, _m: bool) {}
+        pub fn stop(&mut self) {}
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "android")))]
 mod win_audio {
     use super::*;
 
     pub fn play_notify_chime(_volume: u8) {}
     pub fn play_ringtone(_volume: u8) {}
     pub fn stop_ringtone() {}
+    pub fn stop_all_audio() {}
 
     pub struct VoiceRecorder {
         started: Instant,
@@ -439,7 +692,7 @@ mod win_audio {
 
     impl VoiceRecorder {
         pub fn start() -> Result<Self, String> {
-            Err("Запись микрофона на Android требует Android AudioRecord JNI (доступно на Windows ПК)".to_owned())
+            Err("Запись микрофона не поддерживается на этой платформе".to_owned())
         }
         pub fn elapsed_secs(&self) -> f32 {
             self.started.elapsed().as_secs_f32()
@@ -455,9 +708,25 @@ mod win_audio {
         }
         pub fn cancel(self) {}
     }
+
+    pub struct CallAudioPump;
+    impl CallAudioPump {
+        pub fn start(
+            _tx_mic: tokio::sync::mpsc::Sender<Vec<i16>>,
+            mut rx_spk: tokio::sync::mpsc::Receiver<Vec<i16>>,
+        ) -> Self {
+            std::thread::spawn(move || {
+                while rx_spk.blocking_recv().is_some() {}
+            });
+            Self
+        }
+        pub fn set_muted(&self, _m: bool) {}
+        pub fn stop(&mut self) {}
+    }
 }
 
-pub use win_audio::{VoiceRecorder, play_notify_chime, play_ringtone, stop_ringtone};
+#[allow(unused_imports)]
+pub use win_audio::{CallAudioPump, VoiceRecorder, play_notify_chime, play_ringtone, stop_all_audio, stop_ringtone};
 
 #[cfg(test)]
 mod tests {

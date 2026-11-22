@@ -609,6 +609,65 @@ mod imp {
         let _ = unsafe { FlashWindowEx(&raw const info) };
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(sec: *const c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    /// Удерживает именованный мьютекс Windows, запрещая одновременный запуск двух копий Rustgramm.
+    pub struct SingleInstanceGuard(*mut c_void);
+
+    // SAFETY: хэндл мьютекса закрывается только при Drop в конце жизни процесса.
+    unsafe impl Send for SingleInstanceGuard {}
+
+    impl Drop for SingleInstanceGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Проверяет, запущен ли уже другой экземпляр Rustgramm. Если да — фокусирует его окно и возвращает `None`.
+    pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+        if std::env::var_os("RG_SECOND_INSTANCE").is_some() || std::env::var_os("RG_DEMO").is_some() {
+            return Some(SingleInstanceGuard(std::ptr::null_mut()));
+        }
+        let name = wide("Local\\Rustgramm-SingleInstance-Mutex");
+        // SAFETY: `name` нуль-терминирован в UTF-16.
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Some(SingleInstanceGuard(std::ptr::null_mut()));
+        }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ALREADY_EXISTS {
+            unsafe {
+                CloseHandle(handle);
+            }
+            let wtitle = wide("Rustgramm");
+            let hwnd = unsafe { FindWindowW(std::ptr::null(), wtitle.as_ptr()) };
+            if !hwnd.is_null() {
+                unsafe {
+                    ShowWindow(hwnd, SW_SHOW);
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    BringWindowToTop(hwnd);
+                    SetForegroundWindow(hwnd);
+                }
+            }
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+
     /// Проигрывает чистый двухтоновый WAV-звук уведомления через WinMM (работает даже при отключённых системных звуках Windows).
     pub fn play_notify_sound(volume: u8) {
         crate::audio_io::play_notify_chime(volume);
@@ -619,9 +678,9 @@ mod imp {
 pub(crate) use imp::{DestroyIcon, rgba_to_hicon, wide};
 #[cfg(windows)]
 pub use imp::{
-    autostart_enabled, dress_window, flash_taskbar, hide_to_tray, is_window_visible, play_notify_sound,
-    register_tg_url_scheme, set_autostart, set_capture_excluded, set_window_blur, set_window_icon,
-    show_from_tray,
+    SingleInstanceGuard, acquire_single_instance, autostart_enabled, dress_window, flash_taskbar,
+    hide_to_tray, is_window_visible, play_notify_sound, register_tg_url_scheme, set_autostart,
+    set_capture_excluded, set_window_blur, set_window_icon, show_from_tray,
 };
 
 #[cfg(not(windows))]
@@ -654,6 +713,12 @@ pub fn register_tg_url_scheme() -> Result<(), String> {
 }
 #[cfg(not(windows))]
 pub fn flash_taskbar() {}
+#[cfg(not(windows))]
+pub struct SingleInstanceGuard;
+#[cfg(not(windows))]
+pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    Some(SingleInstanceGuard)
+}
 #[cfg(not(windows))]
 pub fn play_notify_sound(_volume: u8) {}
 

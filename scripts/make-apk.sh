@@ -15,17 +15,26 @@ if [ -z "${RG_BUILTIN_API_ID:-}" ] && [ -f .rg/api.keys ]; then
 fi
 export RG_BUILTIN_API_ID RG_BUILTIN_API_HASH
 
-# Ключ подписи создаётся один раз и хранится только у вас (.rg/ в .gitignore).
+# Постоянный ключ подписи: в CI декодируется из секрета ANDROID_KEYSTORE_BASE64,
+# а локально создаётся один раз в .rg/ (в .gitignore), чтобы APK обновлялись поверх без удаления.
 KS=".rg/rustgramm.jks"
 PASS_FILE=".rg/keystore.pass"
+mkdir -p .rg
+if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+  printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d ' \r\n' | base64 -d > "$KS"
+fi
 if [ ! -f "$KS" ]; then
-  mkdir -p .rg
   head -c 24 /dev/urandom | base64 | tr -d '/+=\n' > "$PASS_FILE"
   keytool -genkeypair -keystore "$KS" -storepass "$(cat "$PASS_FILE")" -keypass "$(cat "$PASS_FILE")" \
     -alias rustgramm -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Rustgramm"
 fi
+KS_PASS="${ANDROID_KEYSTORE_PASSWORD:-}"
+if [ -z "$KS_PASS" ] && [ -f "$PASS_FILE" ]; then
+  KS_PASS="$(cat "$PASS_FILE")"
+fi
+KS_ALIAS="${ANDROID_KEY_ALIAS:-rustgramm}"
+KEY_PASS="${ANDROID_KEY_PASSWORD:-$KS_PASS}"
 export CARGO_APK_RELEASE_KEYSTORE="$PWD/$KS"
-KS_PASS="$(cat "$PASS_FILE")"
 export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$KS_PASS"
 
 BUILD_TOOLS="$(ls -d "${ANDROID_HOME}"/build-tools/* | sort -V | tail -n 1)"
@@ -40,7 +49,8 @@ align_and_sign() {
   "$APKSIGNER" sign \
     --ks "$KS" \
     --ks-pass "pass:${KS_PASS}" \
-    --ks-key-alias rustgramm \
+    --ks-key-alias "$KS_ALIAS" \
+    --key-pass "pass:${KEY_PASS}" \
     --v1-signing-enabled true \
     --v2-signing-enabled true \
     --v3-signing-enabled true \

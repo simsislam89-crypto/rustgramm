@@ -41,6 +41,19 @@ launch_mode = "singleTask"
 orientation = "unspecified"
 window_soft_input_mode = "adjustResize"
 
-# Единственное разрешение — сеть. Ни аналитики, ни геолокации, ни контактов, ни телефона.
+# Разрешения только для работы клиента Telegram: сеть, микрофон для голосовых/звонков,
+# маршрутизация звука звонка, уведомления и вибрация. Ни геолокации, ни контактов, ни аналитики.
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MODIFY_AUDIO_SETTINGS"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.POST_NOTIFICATIONS"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.VIBRATE"

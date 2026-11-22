@@ -175,9 +175,15 @@ impl App {
                 #[cfg(target_os = "android")]
                 {
                     ui.add_space(4.0);
+                    if orange_button(ui, "Выбрать из галереи…", Vec2::new(200.0, 32.0)).clicked() {
+                        self.android_pick_target = Some(super::AndroidPickTarget::Story);
+                        let dir = crate::worker::home().join("cache").join("picked");
+                        crate::android_jni::pick_file("image/* video/*", &dir);
+                    }
+                    ui.add_space(4.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.story_file_path)
-                            .hint_text("Путь к фото/видео (/sdcard/DCIM/...)")
+                            .hint_text("Или введите путь (/sdcard/DCIM/...)")
                             .desired_width(360.0),
                     );
                 }
@@ -312,6 +318,25 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&call.peer_name).size(18.0).strong().color(WHITE));
                     ui.label(RichText::new(&status_txt).size(13.0).color(if call.state == CallState::Active { GREEN } else { SUBTEXT }));
+                    if call.state == CallState::Active {
+                        if let Some(st) = &self.call_media_stats {
+                            let net_line = if st.connected {
+                                format!(
+                                    "{} · {} мс · ↑{} / ↓{} пак.",
+                                    st.transport_label, st.rtt_ms, st.tx_packets, st.rx_packets
+                                )
+                            } else if !st.last_error.is_empty() {
+                                st.last_error.clone()
+                            } else {
+                                format!("{} · соединение… (↑{} пак.)", st.transport_label, st.tx_packets)
+                            };
+                            ui.label(RichText::new(net_line).size(11.0).color(if st.connected { GREEN } else { SUBTEXT }));
+                        }
+                        if self.call_stats_tick.is_none_or(|t| t.elapsed().as_millis() >= 900) {
+                            self.call_stats_tick = Some(std::time::Instant::now());
+                            self.send(Cmd::PollCallStats);
+                        }
+                    }
                     if let Some(em) = call.emojis {
                         ui.add_space(8.0);
                         egui::Frame::new()
@@ -370,6 +395,8 @@ impl App {
                             _ => {
                                 if ui.button(if call.muted { "Микр. выкл" } else { "Микрофон" }).clicked() {
                                     call.muted = !call.muted;
+                                    self.send(Cmd::SetCallMuted(call.muted));
+                                    self.active_call = Some(call.clone());
                                 }
                                 if call.video && ui.button(if call.camera_on { "Камера вкл" } else { "Камера выкл" }).clicked() {
                                     call.camera_on = !call.camera_on;
@@ -943,6 +970,531 @@ impl App {
             self.admin_modal = None;
         } else {
             self.admin_modal = Some(st);
+        }
+    }
+
+    // =========================================================================
+    // 6. Telegram Stars и Подарки (Star Gifts)
+    // =========================================================================
+
+    #[allow(deprecated)]
+    pub(crate) fn stars_gifts_window(&mut self, ctx: &egui::Context) {
+        if !self.stars_modal_open {
+            return;
+        }
+        let mut open = true;
+        let mut cmds = Vec::new();
+        egui::Window::new("Telegram Stars и Подарки")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(470.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                // Карточка баланса
+                egui::Frame::new()
+                    .fill(t(SIDEBAR_BG))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let bal = self.stars_summary.as_ref().map_or(0, |s| s.balance);
+                            ui.label(RichText::new(format!("⭐ {bal} Telegram Stars")).size(18.0).strong().color(ORANGE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Обновить").clicked() {
+                                    cmds.push(Cmd::LoadStarsStatus);
+                                    cmds.push(Cmd::LoadStarGiftsCatalog);
+                                    cmds.push(Cmd::LoadSavedGifts(None));
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for (t_idx, lbl) in [(0u8, "Транзакции"), (1, "Мои подарки"), (2, "Каталог подарков")] {
+                        if ui.selectable_label(self.stars_tab == t_idx, lbl).clicked() {
+                            self.stars_tab = t_idx;
+                            match t_idx {
+                                0 => cmds.push(Cmd::LoadStarsStatus),
+                                1 => cmds.push(Cmd::LoadSavedGifts(None)),
+                                _ => cmds.push(Cmd::LoadStarGiftsCatalog),
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(330.0).id_salt("stars-scroll").show(ui, |ui| {
+                    match self.stars_tab {
+                        0 => {
+                            let Some(sum) = self.stars_summary.as_ref() else {
+                                ui.label(RichText::new("Загрузка баланса и операций…").color(SUBTEXT));
+                                return;
+                            };
+                            if sum.transactions.is_empty() {
+                                ui.label(RichText::new("Операций Telegram Stars пока нет").color(SUBTEXT));
+                            }
+                            for tx in &sum.transactions {
+                                egui::Frame::new()
+                                    .fill(t(SIDEBAR_BG))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&tx.title).strong().color(WHITE));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let sign = if tx.amount >= 0 { "+" } else { "" };
+                                                let col = if tx.amount >= 0 { GREEN } else { ORANGE };
+                                                ui.label(RichText::new(format!("{sign}{} ⭐", tx.amount)).strong().color(col));
+                                            });
+                                        });
+                                        if !tx.description.is_empty() {
+                                            ui.label(RichText::new(&tx.description).size(11.5).color(SUBTEXT));
+                                        }
+                                        ui.label(RichText::new(full_date(tx.date)).size(11.0).color(SUBTEXT));
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        }
+                        1 => {
+                            if self.my_saved_gifts.is_empty() {
+                                ui.label(RichText::new("У вас пока нет сохранённых подарков").color(SUBTEXT));
+                            }
+                            for g in &self.my_saved_gifts {
+                                egui::Frame::new()
+                                    .fill(t(SIDEBAR_BG))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!("🎁 {}", g.title)).strong().color(WHITE));
+                                            if g.stars > 0 {
+                                                ui.label(RichText::new(format!("{} ⭐", g.stars)).color(ORANGE));
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if g.convert_stars > 0
+                                                    && ui.small_button(format!("Обменять ({} ⭐)", g.convert_stars)).clicked()
+                                                {
+                                                    cmds.push(Cmd::ConvertStarGift {
+                                                        msg_id: g.msg_id,
+                                                        saved_id: g.saved_id,
+                                                    });
+                                                }
+                                                let lbl = if g.unsaved { "Показать в профиле" } else { "Скрыть" };
+                                                if ui.small_button(lbl).clicked() {
+                                                    cmds.push(Cmd::ToggleSaveStarGift {
+                                                        msg_id: g.msg_id,
+                                                        saved_id: g.saved_id,
+                                                        unsave: !g.unsaved,
+                                                    });
+                                                }
+                                            });
+                                        });
+                                        if !g.message.is_empty() {
+                                            ui.label(RichText::new(&g.message).size(12.0).color(SUBTEXT));
+                                        }
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        }
+                        _ => {
+                            if self.star_gifts_catalog.is_empty() {
+                                ui.label(RichText::new("Загрузка каталога подарков…").color(SUBTEXT));
+                            }
+                            for g in &self.star_gifts_catalog {
+                                egui::Frame::new()
+                                    .fill(t(SIDEBAR_BG))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let badge = if g.unique { "✨" } else { "🎁" };
+                                            ui.label(RichText::new(format!("{badge} {}", g.title)).strong().color(WHITE));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(format!("{} ⭐", g.stars)).strong().color(ORANGE));
+                                            });
+                                        });
+                                        if let (Some(rem), Some(tot)) = (g.remains, g.total) {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Лимитированный: осталось {rem} из {tot}{}",
+                                                    if g.sold_out { " (распродан)" } else { "" }
+                                                ))
+                                                .size(11.5)
+                                                .color(SUBTEXT),
+                                            );
+                                        }
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        }
+                    }
+                });
+            });
+        for c in cmds {
+            self.send(c);
+        }
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.stars_modal_open = false;
+        }
+    }
+
+    // =========================================================================
+    // 7. Платная звёздная реакция (`messages.sendPaidReaction`)
+    // =========================================================================
+
+    #[allow(deprecated)]
+    pub(crate) fn paid_reaction_modal(&mut self, ctx: &egui::Context) {
+        let Some(msg_id) = self.paid_react_msg else {
+            return;
+        };
+        let mut open = true;
+        let mut send_now = false;
+        egui::Window::new("Звёздная реакция ⭐")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Выберите количество Telegram Stars:").color(WHITE));
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for amt in [1, 5, 10, 25, 50, 100] {
+                        if ui
+                            .selectable_label(self.paid_react_count == amt, format!("⭐ {amt}"))
+                            .clicked()
+                        {
+                            self.paid_react_count = amt;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.paid_react_anon, "Отправить анонимно (скрыть имя)");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if orange_button(
+                        ui,
+                        &format!("Отправить ⭐ {}", self.paid_react_count),
+                        Vec2::new(165.0, 34.0),
+                    )
+                    .clicked()
+                    {
+                        send_now = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.paid_react_msg = None;
+                    }
+                });
+            });
+        if send_now {
+            self.send(Cmd::SendPaidReaction {
+                msg_id,
+                count: self.paid_react_count,
+                anonymous: self.paid_react_anon,
+            });
+            self.paid_react_msg = None;
+        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.paid_react_msg = None;
+        }
+    }
+
+    // =========================================================================
+    // 8. Telegram Бизнес: рабочие часы и быстрые ответы (`/shortcut`)
+    // =========================================================================
+
+    #[allow(deprecated)]
+    pub(crate) fn business_window(&mut self, ctx: &egui::Context) {
+        if !self.business_open {
+            return;
+        }
+        let mut open = true;
+        let mut cmds = Vec::new();
+        egui::Window::new("Telegram Бизнес — часы работы и быстрые ответы")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(450.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                ui.label(RichText::new("Часы работы").strong().color(ORANGE));
+                ui.checkbox(&mut self.biz_hours_enabled, "Показывать график работы в профиле");
+                if self.biz_hours_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Часовой пояс:");
+                        ui.add(egui::TextEdit::singleline(&mut self.biz_timezone).desired_width(170.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Начало (час):");
+                        ui.add(egui::DragValue::new(&mut self.biz_start_h).range(0..=23));
+                        ui.label("Конец (час):");
+                        ui.add(egui::DragValue::new(&mut self.biz_end_h).range(1..=24));
+                        ui.checkbox(&mut self.biz_weekdays_only, "Пн–Пт");
+                    });
+                }
+                ui.add_space(4.0);
+                if orange_button(ui, "Сохранить часы работы", Vec2::new(200.0, 32.0)).clicked() {
+                    let mut intervals = Vec::new();
+                    let days = if self.biz_weekdays_only { 5 } else { 7 };
+                    let s_m = (self.biz_start_h.clamp(0, 23)) * 60;
+                    let e_m = (self.biz_end_h.clamp(1, 24)) * 60;
+                    for day in 0..days {
+                        let base = day * 1440;
+                        intervals.push((base + s_m, base + e_m.max(s_m + 60)));
+                    }
+                    cmds.push(Cmd::UpdateBusinessHours {
+                        enabled: self.biz_hours_enabled,
+                        timezone: self.biz_timezone.clone(),
+                        weekly: intervals,
+                    });
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Быстрые ответы (/ярлык)").strong().color(ORANGE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Обновить").clicked() {
+                            cmds.push(Cmd::LoadQuickReplies);
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(210.0).id_salt("biz-qr").show(ui, |ui| {
+                    if self.quick_replies.is_empty() {
+                        ui.label(
+                            RichText::new("Быстрых ответов нет (настраиваются в Telegram Business)")
+                                .size(12.0)
+                                .color(SUBTEXT),
+                        );
+                    }
+                    for qr in &self.quick_replies {
+                        egui::Frame::new()
+                            .fill(t(SIDEBAR_BG))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("/{}", qr.shortcut)).strong().color(ORANGE));
+                                    ui.label(RichText::new(format!("({} сообщ.)", qr.count)).size(11.5).color(SUBTEXT));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button(RichText::new("Удалить").color(DANGER)).clicked() {
+                                            cmds.push(Cmd::DeleteQuickReplyShortcut(qr.shortcut_id));
+                                        }
+                                        if self.selected.is_some()
+                                            && ui.small_button("Отправить в чат").clicked()
+                                        {
+                                            cmds.push(Cmd::SendQuickReply {
+                                                shortcut_id: qr.shortcut_id,
+                                                msg_ids: Vec::new(),
+                                            });
+                                        }
+                                    });
+                                });
+                                if !qr.preview.is_empty() {
+                                    ui.label(RichText::new(&qr.preview).size(12.0).color(WHITE));
+                                }
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+        for c in cmds {
+            self.send(c);
+        }
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.business_open = false;
+        }
+    }
+
+    // =========================================================================
+    // 9. Темы `.tdesktop-theme` / `.attheme`, живой конструктор палитры и паки иконок AyuGram
+    // =========================================================================
+
+    #[allow(deprecated)]
+    pub(crate) fn themes_window(&mut self, ctx: &egui::Context) {
+        if !self.themes_open {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        #[allow(unused_mut)]
+        let mut picked_theme_path: Option<std::path::PathBuf> = None;
+        #[allow(unused_mut)]
+        let mut picked_wp_path: Option<std::path::PathBuf> = None;
+        #[allow(unused_mut)]
+        let mut export_path: Option<std::path::PathBuf> = None;
+
+        egui::Window::new("Темы, палитра и иконки AyuGram")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(470.0);
+                egui::ScrollArea::vertical().max_height(520.0).id_salt("themes-scroll").show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        #[cfg(not(target_os = "android"))]
+                        if orange_button(ui, "Импорт .tdesktop-theme / .attheme", Vec2::new(250.0, 32.0)).clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Темы Telegram", &["tdesktop-theme", "attheme"])
+                                .pick_file()
+                        {
+                            picked_theme_path = Some(p);
+                        }
+                        #[cfg(target_os = "android")]
+                        if orange_button(ui, "Импорт темы с телефона", Vec2::new(220.0, 32.0)).clicked() {
+                            self.android_pick_target = Some(super::AndroidPickTarget::Theme);
+                            let dir = crate::worker::home().join("themes");
+                            crate::android_jni::pick_file("*/*", &dir);
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        if ui.button("Экспорт").clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .set_file_name("rustgramm.tdesktop-theme")
+                                .save_file()
+                        {
+                            export_path = Some(p);
+                        }
+                        if ui.button("Сброс").clicked() {
+                            self.settings.theme = rg_settings::CustomThemeSettings::default();
+                            self.wallpaper_tex = None;
+                            changed = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Готовые пресеты").strong().color(ORANGE));
+                    ui.horizontal_wrapped(|ui| {
+                        for (title, preset) in crate::theme_pack::builtin_presets() {
+                            let active = self.settings.theme.active_theme_name == preset.active_theme_name;
+                            if ui.selectable_label(active, title).clicked() {
+                                let wp = self.settings.theme.wallpaper_path.clone();
+                                let dim = self.settings.theme.wallpaper_dim;
+                                let ip = self.settings.theme.icon_pack.clone();
+                                self.settings.theme = preset;
+                                self.settings.theme.wallpaper_path = wp;
+                                self.settings.theme.wallpaper_dim = dim;
+                                self.settings.theme.icon_pack = ip;
+                                changed = true;
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Живой конструктор палитры").strong().color(ORANGE));
+                    let mut color_row = |ui: &mut egui::Ui, label: &str, hex: &mut String, def: Color32| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(label).size(12.5).color(WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let mut c = crate::theme_pack::parse_hex_color(hex).unwrap_or(def);
+                                if ui.color_edit_button_srgba(&mut c).changed() {
+                                    *hex = crate::theme_pack::color_to_hex(c);
+                                    changed = true;
+                                }
+                            });
+                        });
+                    };
+                    color_row(ui, "Главный акцент", &mut self.settings.theme.accent_hex, ORANGE);
+                    color_row(ui, "Фон окон и карточек", &mut self.settings.theme.window_bg_hex, WINDOW_BG);
+                    color_row(ui, "Панель списка чатов", &mut self.settings.theme.sidebar_bg_hex, SIDEBAR_BG);
+                    color_row(ui, "Фон ленты сообщений", &mut self.settings.theme.chat_bg_hex, CHAT_BG);
+                    color_row(ui, "Входящий пузырь", &mut self.settings.theme.msg_in_bg_hex, MSG_IN_BG);
+                    color_row(ui, "Исходящий пузырь", &mut self.settings.theme.msg_out_bg_hex, MSG_OUT_BG);
+                    color_row(ui, "Основной текст", &mut self.settings.theme.text_primary_hex, WHITE);
+                    color_row(ui, "Вторичный текст", &mut self.settings.theme.text_secondary_hex, SUBTEXT);
+
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Кастомный фон чата").strong().color(ORANGE));
+                    ui.horizontal(|ui| {
+                        #[cfg(not(target_os = "android"))]
+                        if ui.button("Выбрать картинку фона…").clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Изображения", &["jpg", "jpeg", "png", "webp"])
+                                .pick_file()
+                        {
+                            picked_wp_path = Some(p);
+                        }
+                        if !self.settings.theme.wallpaper_path.is_empty() && ui.button("Убрать фон").clicked() {
+                            self.settings.theme.wallpaper_path.clear();
+                            self.wallpaper_tex = None;
+                            changed = true;
+                        }
+                    });
+                    let mut dim = self.settings.theme.wallpaper_dim;
+                    if ui.add(egui::Slider::new(&mut dim, 0..=90).text("Затемнение фона (%)")).changed() {
+                        self.settings.theme.wallpaper_dim = dim;
+                        changed = true;
+                    }
+
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Пак иконок AyuGram").strong().color(ORANGE));
+                    ui.horizontal_wrapped(|ui| {
+                        for (id, lbl) in [
+                            ("default", "Стандартный"),
+                            ("ayu_bold", "AyuGram Bold"),
+                            ("ayu_minimal", "AyuGram Minimal"),
+                        ] {
+                            if ui
+                                .selectable_label(self.settings.theme.icon_pack == id, lbl)
+                                .clicked()
+                            {
+                                self.settings.theme.icon_pack = id.to_owned();
+                                changed = true;
+                            }
+                        }
+                    });
+                    // Пользовательские паки из `<RG_HOME>/icon_packs/<name>/`
+                    let packs_dir = crate::worker::home().join("icon_packs");
+                    if let Ok(rd) = std::fs::read_dir(&packs_dir) {
+                        ui.horizontal_wrapped(|ui| {
+                            for entry in rd.flatten() {
+                                if entry.path().is_dir()
+                                    && let Some(name) = entry.file_name().to_str()
+                                    && ui
+                                        .selectable_label(self.settings.theme.icon_pack == name, format!("📁 {name}"))
+                                        .clicked()
+                                {
+                                    self.settings.theme.icon_pack = name.to_owned();
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+
+        if let Some(p) = picked_theme_path {
+            self.apply_imported_theme(ctx, &p);
+            changed = true;
+        }
+        if let Some(wp) = picked_wp_path {
+            let themes_dir = crate::worker::home().join("themes");
+            let _ = std::fs::create_dir_all(&themes_dir);
+            let ext = wp.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+            let dst = themes_dir.join(format!("custom_wallpaper.{ext}"));
+            if std::fs::copy(&wp, &dst).is_ok() {
+                self.settings.theme.wallpaper_path = dst.to_string_lossy().into_owned();
+                self.wallpaper_tex = None;
+                changed = true;
+            }
+        }
+        if let Some(ep) = export_path {
+            let txt = crate::theme_pack::export_tdesktop_colors(&self.settings.theme);
+            if std::fs::write(&ep, txt).is_ok() {
+                self.status = "Тема экспортирована в .tdesktop-theme".to_owned();
+            }
+        }
+        if changed {
+            sync_custom_theme(&self.settings.theme);
+            crate::icons::set_icon_pack(
+                &self.settings.theme.icon_pack,
+                Some(&crate::worker::home().join("icon_packs")),
+            );
+            self.send(Cmd::Settings(Box::new(self.settings.clone())));
+        }
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.themes_open = false;
         }
     }
 }
