@@ -255,6 +255,8 @@ pub struct PrivacyShieldSettings {
     pub anonymize_filenames: bool,
     /// Анти-корреляция аккаунтов (уникальный отпечаток устройства, раздельная сессия и разрыв старого соединения перед сменой).
     pub anti_correlation_accounts: bool,
+    /// Проверять выход новых версий Rustgramm на GitHub (без отправки личных данных).
+    pub check_updates: bool,
 }
 
 impl Default for PrivacyShieldSettings {
@@ -265,6 +267,7 @@ impl Default for PrivacyShieldSettings {
             ephemeral_local_cache: false,
             anonymize_filenames: true,
             anti_correlation_accounts: true,
+            check_updates: true,
         }
     }
 }
@@ -301,14 +304,14 @@ impl AccountProfile {
     /// Создаёт изолированный профиль с уникальным отпечатком устройства (`device_model`, `system_version`, `app_version`).
     pub fn isolated(slot: u32, label: String, proxy_url: String, entropy: u64) -> Self {
         const MODELS: &[(&str, &str, &str)] = &[
-            ("Desktop PC", "Windows 11 x64", "5.8.2 x64"),
-            ("ThinkPad X1 Carbon Gen 11", "Windows 10 Pro 22H2", "5.7.5 x64"),
-            ("ASUS ROG Zephyrus G14", "Windows 11 23H2", "5.9.0 x64"),
-            ("Dell XPS 15 9530", "Windows 11 Pro 24H2", "5.8.3 x64"),
-            ("HP EliteBook 840 G10", "Windows 10 Enterprise", "5.6.9 x64"),
-            ("MSI Prestige 16 Studio", "Windows 11 Home 23H2", "5.8.1 x64"),
-            ("Lenovo Legion Slim 5", "Windows 11 22H2", "5.7.8 x64"),
-            ("Acer Swift Edge 16", "Windows 10 22H2", "5.8.0 x64"),
+            ("Desktop PC", "Windows 11 x64", "5.14.3 x64"),
+            ("ThinkPad X1 Carbon Gen 11", "Windows 10 Pro 22H2", "5.13.1 x64"),
+            ("ASUS ROG Zephyrus G14", "Windows 11 23H2", "5.14.2 x64"),
+            ("Dell XPS 15 9530", "Windows 11 Pro 24H2", "5.14.0 x64"),
+            ("HP EliteBook 840 G10", "Windows 10 Enterprise", "5.12.3 x64"),
+            ("MSI Prestige 16 Studio", "Windows 11 Home 23H2", "5.13.4 x64"),
+            ("Lenovo Legion Slim 5", "Windows 11 22H2", "5.14.1 x64"),
+            ("Acer Swift Edge 16", "Windows 10 22H2", "5.13.2 x64"),
         ];
         let mix = (u64::from(slot).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ entropy) as usize;
         let (dev, sys, ver) = MODELS[mix % MODELS.len()];

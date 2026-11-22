@@ -1,8 +1,12 @@
 //! Движок: высокоуровневые операции клиента с режимом призрака и локальным хранилищем.
 //! Любая служебная отправка («прочитано») проходит через политику `rg-ayu::ghost`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+#[path = "engine_ext.rs"]
+mod ext;
 
 use grammers_client::Client;
 use grammers_client::update::Update;
@@ -153,8 +157,11 @@ pub enum BotBtnKind {
 pub struct BotButton {
     pub text: String,
     pub kind: BotBtnKind,
-    /// Стиль кнопки: 0 — обычный, 1 — primary (оранжевый), 2 — danger (красный), 3 — success (зелёный).
+    /// Стиль кнопки: 0 — обычный, 1 — primary (синий/акцент), 2 — danger (красный), 3 — success (зелёный).
     pub style: u8,
+    /// Необязательный `document_id` пользовательского эмодзи-значка кнопки (`KeyboardButtonStyle.icon`).
+    #[serde(default)]
+    pub icon_id: Option<i64>,
 }
 
 /// Внутренняя ссылка Telegram (`tg://...`, `https://t.me/...`, `@username`), обрабатываемая внутри клиента без браузера.
@@ -383,6 +390,178 @@ pub enum Fetched {
     Missing,
 }
 
+/// Приватность публикуемой истории (`stories.sendStory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryPrivacy {
+    Everyone,
+    Contacts,
+    CloseFriends,
+    OnlyMe,
+}
+
+/// Гранулярные права администратора группы/канала (`channels.editAdmin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdminRights {
+    pub change_info: bool,
+    pub post_messages: bool,
+    pub edit_messages: bool,
+    pub delete_messages: bool,
+    pub ban_users: bool,
+    pub invite_users: bool,
+    pub pin_messages: bool,
+    pub add_admins: bool,
+    pub anonymous: bool,
+    pub manage_call: bool,
+    pub manage_topics: bool,
+}
+
+impl AdminRights {
+    /// Полный набор прав администратора (кроме «анонимность» и «добавление админов»).
+    pub fn standard_moderator() -> Self {
+        Self {
+            change_info: true,
+            post_messages: true,
+            edit_messages: true,
+            delete_messages: true,
+            ban_users: true,
+            invite_users: true,
+            pin_messages: true,
+            add_admins: false,
+            anonymous: false,
+            manage_call: true,
+            manage_topics: true,
+        }
+    }
+
+    /// Преобразование в TL `ChatAdminRights`.
+    pub fn to_tl(self) -> grammers_client::tl::enums::ChatAdminRights {
+        use grammers_client::tl;
+        tl::enums::ChatAdminRights::Rights(tl::types::ChatAdminRights {
+            change_info: self.change_info,
+            post_messages: self.post_messages,
+            edit_messages: self.edit_messages,
+            delete_messages: self.delete_messages,
+            ban_users: self.ban_users,
+            invite_users: self.invite_users,
+            pin_messages: self.pin_messages,
+            add_admins: self.add_admins,
+            anonymous: self.anonymous,
+            manage_call: self.manage_call,
+            other: true,
+            manage_topics: self.manage_topics,
+            post_stories: self.post_messages,
+            edit_stories: self.edit_messages,
+            delete_stories: self.delete_messages,
+            manage_direct_messages: false,
+            manage_ranks: false,
+            manage_linked_peers: false,
+            manage_welcome_messages: false,
+        })
+    }
+}
+
+/// Ограничения участника или общие права группы (`channels.editBanned` / `messages.editChatDefaultBannedRights`).
+/// `true` означает ЗАПРЕЩЕНО (семантика Telegram `ChatBannedRights`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BannedRights {
+    pub view_messages: bool,
+    pub send_messages: bool,
+    pub send_media: bool,
+    pub send_stickers: bool,
+    pub send_polls: bool,
+    pub embed_links: bool,
+    pub change_info: bool,
+    pub invite_users: bool,
+    pub pin_messages: bool,
+    pub manage_topics: bool,
+    /// UNIX-время окончания ограничения (`0` — навсегда).
+    pub until_date: i32,
+}
+
+impl BannedRights {
+    /// Полный бан (исключение из группы/канала).
+    pub fn full_ban() -> Self {
+        Self {
+            view_messages: true,
+            send_messages: true,
+            send_media: true,
+            send_stickers: true,
+            send_polls: true,
+            embed_links: true,
+            change_info: true,
+            invite_users: true,
+            pin_messages: true,
+            manage_topics: true,
+            until_date: 0,
+        }
+    }
+
+    /// Мут (запрет писать сообщения и медиа) до `until_date`.
+    pub fn mute(until_date: i32) -> Self {
+        Self {
+            send_messages: true,
+            send_media: true,
+            send_stickers: true,
+            send_polls: true,
+            embed_links: true,
+            until_date,
+            ..Self::default()
+        }
+    }
+
+    /// Преобразование в TL `ChatBannedRights`.
+    pub fn to_tl(self) -> grammers_client::tl::enums::ChatBannedRights {
+        use grammers_client::tl;
+        tl::enums::ChatBannedRights::Rights(tl::types::ChatBannedRights {
+            view_messages: self.view_messages,
+            send_messages: self.send_messages,
+            send_media: self.send_media,
+            send_stickers: self.send_stickers,
+            send_gifs: self.send_stickers,
+            send_games: self.send_stickers,
+            send_inline: self.send_stickers,
+            embed_links: self.embed_links,
+            send_polls: self.send_polls,
+            change_info: self.change_info,
+            invite_users: self.invite_users,
+            pin_messages: self.pin_messages,
+            manage_topics: self.manage_topics,
+            send_photos: self.send_media,
+            send_videos: self.send_media,
+            send_roundvideos: self.send_media,
+            send_audios: self.send_media,
+            send_voices: self.send_media,
+            send_docs: self.send_media,
+            send_plain: self.send_messages,
+            edit_rank: false,
+            send_reactions: self.send_messages,
+            manage_linked_peers: false,
+            until_date: self.until_date,
+        })
+    }
+}
+
+/// Запись журнала недавних действий канала/группы (`channels.getAdminLog`).
+#[derive(Debug, Clone)]
+pub struct AdminLogRow {
+    pub id: i64,
+    pub date: i32,
+    pub actor: String,
+    pub summary: String,
+}
+
+/// Ссылка-приглашение группы/канала (`messages.getExportedChatInvites`).
+#[derive(Debug, Clone)]
+pub struct InviteLinkRow {
+    pub link: String,
+    pub title: String,
+    pub usage: i32,
+    pub usage_limit: Option<i32>,
+    pub expire_date: Option<i32>,
+    pub revoked: bool,
+    pub request_needed: bool,
+}
+
 /// Событие потока обновлений для открытого чата и списка.
 #[derive(Debug, Clone)]
 pub enum Live {
@@ -394,6 +573,12 @@ pub enum Live {
     ReadOutbox(i64, i32),
     /// Собеседник печатает, записывает голосовое или отправляет файл (ключ чата, текст; пусто — закончил).
     Typing(i64, String),
+    /// Событие голосового/видеозвонка (`Update::PhoneCall`).
+    PhoneCall(crate::calls::CallEvent),
+    /// Обновление состояния секретного чата (`Update::Encryption`).
+    SecretChatUpdate(rg_ayu::store::SecretChatRecord),
+    /// Новое расшифрованное сообщение секретного чата (`Update::NewEncryptedMessage`).
+    SecretMsg(rg_ayu::store::SecretMessageRecord),
 }
 
 /// Тип чата для фильтров папок.
@@ -555,12 +740,16 @@ impl MessageRow {
     }
 }
 
+type PendingDhMap = Arc<std::sync::Mutex<HashMap<i64, (Vec<u8>, Vec<u8>, Vec<u8>)>>>;
+
 #[derive(Clone)]
 pub struct Engine {
     pub client: Client,
     pub settings: Arc<RwLock<Settings>>,
     store: Arc<MessageStore>,
     dirs: Arc<Dirs>,
+    /// Незавершённые обмены DH для секретных чатов и звонков: `id -> (our_exp, our_pub, dh_p)`.
+    pending_dh: PendingDhMap,
 }
 
 /// Каталоги кэша предпросмотров и загрузок.
@@ -684,6 +873,7 @@ impl Engine {
             settings: Arc::new(RwLock::new(settings)),
             store: Arc::new(store),
             dirs: Arc::new(Dirs::default()),
+            pending_dh: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1903,6 +2093,43 @@ impl Engine {
                             other => typing_label(other).to_owned(),
                         },
                     )),
+                    U::PhoneCall(pc) => {
+                        use grammers_client::tl::enums::PhoneCall as PC;
+                        match &pc.phone_call {
+                            PC::Requested(c) => Some(Live::PhoneCall(crate::calls::CallEvent::Incoming {
+                                call_id: c.id,
+                                access_hash: c.access_hash,
+                                admin_id: c.admin_id,
+                                video: c.video,
+                                g_a_hash: c.g_a_hash.clone(),
+                            })),
+                            PC::Waiting(c) => Some(Live::PhoneCall(crate::calls::CallEvent::Waiting {
+                                call_id: c.id,
+                                access_hash: c.access_hash,
+                                received: c.receive_date.is_some(),
+                            })),
+                            PC::Accepted(c) => Some(Live::PhoneCall(crate::calls::CallEvent::Accepted {
+                                call_id: c.id,
+                                access_hash: c.access_hash,
+                                g_b: c.g_b.clone(),
+                            })),
+                            PC::Call(c) => Some(Live::PhoneCall(crate::calls::CallEvent::Active {
+                                call_id: c.id,
+                                access_hash: c.access_hash,
+                                g_a_or_b: c.g_a_or_b.clone(),
+                                key_fingerprint: c.key_fingerprint,
+                                video: c.video,
+                                p2p_allowed: c.p2p_allowed,
+                                relays: c.connections.len(),
+                            })),
+                            PC::Discarded(c) => Some(Live::PhoneCall(crate::calls::CallEvent::Discarded {
+                                call_id: c.id,
+                                reason: crate::calls::discard_reason_label(c.reason.as_ref()).to_owned(),
+                                duration: c.duration.unwrap_or(0),
+                            })),
+                            PC::Empty(_) => None,
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -4110,13 +4337,22 @@ impl Engine {
     }
 }
 
-fn button_style_code(style: Option<&grammers_client::tl::enums::KeyboardButtonStyle>) -> u8 {
+fn button_style_info(style: Option<&grammers_client::tl::enums::KeyboardButtonStyle>) -> (u8, Option<i64>) {
     use grammers_client::tl::enums::KeyboardButtonStyle as S;
     match style {
-        Some(S::Style(s)) if s.bg_primary => 1,
-        Some(S::Style(s)) if s.bg_danger => 2,
-        Some(S::Style(s)) if s.bg_success => 3,
-        _ => 0,
+        Some(S::Style(s)) => {
+            let code = if s.bg_primary {
+                1
+            } else if s.bg_danger {
+                2
+            } else if s.bg_success {
+                3
+            } else {
+                0
+            };
+            (code, s.icon)
+        }
+        None => (0, None),
     }
 }
 
@@ -4138,7 +4374,7 @@ fn extract_reply_markup(
             for KIBR::Row(row) in &im.rows {
                 let mut r = Vec::new();
                 for KIB::Button(b) in &row.buttons {
-                    let style = button_style_code(b.style.as_ref());
+                    let (style, icon_id) = button_style_info(b.style.as_ref());
                     let kind = match &b.r#type {
                         IBT::Callback(c) => BotBtnKind::Callback(c.data.clone()),
                         IBT::Url(u) => BotBtnKind::Url(u.url.clone()),
@@ -4159,6 +4395,7 @@ fn extract_reply_markup(
                         text: b.text.clone(),
                         kind,
                         style,
+                        icon_id,
                     });
                 }
                 if !r.is_empty() {
@@ -4170,7 +4407,7 @@ fn extract_reply_markup(
             for KBR::Row(row) in &km.rows {
                 let mut r = Vec::new();
                 for KB::Button(b) in &row.buttons {
-                    let style = button_style_code(b.style.as_ref());
+                    let (style, icon_id) = button_style_info(b.style.as_ref());
                     let kind = match &b.r#type {
                         BT::SimpleWebView(w) => BotBtnKind::WebView {
                             url: w.url.clone(),
@@ -4182,6 +4419,7 @@ fn extract_reply_markup(
                         text: b.text.clone(),
                         kind,
                         style,
+                        icon_id,
                     });
                 }
                 if !r.is_empty() {
@@ -4699,5 +4937,31 @@ mod tests {
         assert_eq!(reply2[0][0].text, "Профиль");
         assert_eq!(reply2[0][0].kind, BotBtnKind::Text);
         assert!(matches!(reply2[0][1].kind, BotBtnKind::WebView { simple: true, .. }));
+    }
+
+    #[test]
+    fn admin_and_banned_rights_convert_to_tl_and_button_styles_preserve_icon() {
+        let adm = AdminRights::standard_moderator();
+        let grammers_client::tl::enums::ChatAdminRights::Rights(tl_adm) = adm.to_tl();
+        assert!(tl_adm.delete_messages && tl_adm.ban_users && tl_adm.pin_messages);
+        assert!(!tl_adm.add_admins && !tl_adm.anonymous);
+
+        let ban = BannedRights::full_ban();
+        let grammers_client::tl::enums::ChatBannedRights::Rights(tl_ban) = ban.to_tl();
+        assert!(tl_ban.view_messages && tl_ban.send_messages && tl_ban.until_date == 0);
+
+        let mute = BannedRights::mute(1_700_000_000);
+        let grammers_client::tl::enums::ChatBannedRights::Rights(tl_mute) = mute.to_tl();
+        assert!(!tl_mute.view_messages && tl_mute.send_messages && tl_mute.until_date == 1_700_000_000);
+
+        let st = grammers_client::tl::enums::KeyboardButtonStyle::Style(
+            grammers_client::tl::types::KeyboardButtonStyle {
+                bg_primary: false,
+                bg_danger: false,
+                bg_success: true,
+                icon: Some(54321),
+            },
+        );
+        assert_eq!(button_style_info(Some(&st)), (3, Some(54321)));
     }
 }

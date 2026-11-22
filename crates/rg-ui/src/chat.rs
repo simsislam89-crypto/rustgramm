@@ -96,6 +96,8 @@ struct Env<'a> {
     clip_rect: Rect,
     /// Выбранные сообщения (режим множественного выделения).
     selected_msgs: &'a std::collections::HashSet<i32>,
+    /// Активное ожидание ответа callback-кнопки бота `(msg_id, btn_text, clicked_at)`.
+    bot_btn_pending: Option<(i32, &'a str, f64)>,
     /// Подсветить целевое сообщение после перехода к реплаю/поиску.
     highlight_msg: Option<i32>,
     /// Можно ли скопировать публичную/приватную ссылку `t.me/` на сообщение в этом чате.
@@ -343,6 +345,30 @@ impl App {
                         self.found = None;
                     }
                 }
+                // Кнопки аудио- и видеозвонка в шапке личного чата (как в Telegram/AyuGram).
+                if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)).cloned()
+                    && d.kind == rg_core::engine::DialogKind::User
+                    && !d.saved
+                {
+                    let (vr, vresp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+                    let vh = tween(ui.ctx(), ("hdr-vcall", d.id), f32::from(u8::from(vresp.hovered())), 0.12);
+                    if vh > 0.02 {
+                        ui.painter().circle_filled(vr.center(), 18.0, t(WINDOW_OVER).gamma_multiply(vh));
+                    }
+                    icons::tg_sized(ui.painter(), "menu/video_call", vr.center(), Vec2::splat(18.0), lerp_color(DIALOG_DATE, WHITE, vh));
+                    if vresp.on_hover_text("Видеозвонок").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.initiate_call(d.peer, d.id, d.name.clone(), true);
+                    }
+                    let (cr, cresp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+                    let ch = tween(ui.ctx(), ("hdr-acall", d.id), f32::from(u8::from(cresp.hovered())), 0.12);
+                    if ch > 0.02 {
+                        ui.painter().circle_filled(cr.center(), 18.0, t(WINDOW_OVER).gamma_multiply(ch));
+                    }
+                    icons::tg_sized(ui.painter(), "menu/phone_call", cr.center(), Vec2::splat(18.0), lerp_color(DIALOG_DATE, WHITE, ch));
+                    if cresp.on_hover_text("Позвонить").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.initiate_call(d.peer, d.id, d.name.clone(), false);
+                    }
+                }
             });
         });
     }
@@ -389,6 +415,9 @@ impl App {
         let mut toggle_audio = false;
         let mut start_invite = false;
         let mut start_search = false;
+        let mut start_call_video: Option<bool> = None;
+        let mut start_secret = false;
+        let mut open_admin = false;
         let mut info_tab = self.info_tab;
         let cur_audio_title = self.audio_title.clone();
         let cur_audio_playing = self.audio_is_playing();
@@ -470,7 +499,14 @@ impl App {
                         (if d.muted { "menu/unmute" } else { "menu/mute" }, if d.muted { "Звук" } else { "Тихо" }, 1),
                         ("menu/search", "Поиск", 2),
                         ("menu/add", "Люди", 3),
-                        ("menu/link", "Ссылка", 4),
+                        ("menu/settings", "Админ", 8),
+                    ]
+                } else if d.kind == rg_core::engine::DialogKind::User && !d.saved {
+                    vec![
+                        ("menu/phone_call", "Звонок", 6),
+                        ("menu/video_call", "Видео", 7),
+                        (if d.muted { "menu/unmute" } else { "menu/mute" }, if d.muted { "Звук" } else { "Тихо" }, 1),
+                        ("settings/lock", "E2E", 9),
                     ]
                 } else {
                     vec![
@@ -488,7 +524,7 @@ impl App {
                     let h = tween(ui.ctx(), ("pqa", d.id, *code), f32::from(u8::from(bresp.hovered())), 0.12);
                     let fill = lerp_color(t(WINDOW_OVER), t_btn(ORANGE), h * 0.45);
                     ui.painter().rect_filled(br, egui::CornerRadius::same(10), fill);
-                    let col = if *code == 5 && blocked { DANGER } else if h > 0.4 { Color32::WHITE } else { ORANGE };
+                    let col = if *code == 5 && blocked { DANGER } else if *code == 9 { GREEN } else if h > 0.4 { Color32::WHITE } else { ORANGE };
                     icons::tg(ui.painter(), ico, Pos2::new(br.center().x, br.top() + 18.0), col);
                     ui.painter().text(
                         Pos2::new(br.center().x, br.bottom() - 12.0),
@@ -504,6 +540,10 @@ impl App {
                             3 => start_invite = true,
                             4 => cmd_after = Some(Cmd::ExportInvite(i)),
                             5 => cmd_after = Some(Cmd::BlockPeer(i, !blocked)),
+                            6 => start_call_video = Some(false),
+                            7 => start_call_video = Some(true),
+                            8 => open_admin = true,
+                            9 => start_secret = true,
                             _ => {}
                         }
                     }
@@ -792,6 +832,35 @@ impl App {
         if let Some(mid) = open_save {
             self.send(Cmd::Download(mid));
         }
+        if let Some(video) = start_call_video {
+            self.initiate_call(d.peer, d.id, d.name.clone(), video);
+        }
+        if start_secret {
+            self.secret_open = true;
+            self.send(Cmd::StartSecretChat(d.peer, d.name.clone()));
+        }
+        if open_admin {
+            self.admin_log.clear();
+            self.admin_invites.clear();
+            self.admin_modal = Some(super::features_ui::AdminModalState {
+                peer: d.peer,
+                chat_id: d.id,
+                title: d.name.clone(),
+                tab: 0,
+                selected_user: None,
+                admin_rights: rg_core::engine::AdminRights::standard_moderator(),
+                admin_rank: String::new(),
+                default_rights: rg_core::engine::BannedRights::default(),
+                mute_preset: 1,
+                log_query: String::new(),
+                invite_title: String::new(),
+                invite_limit: String::new(),
+                invite_request: false,
+            });
+            self.send(Cmd::Participants(i));
+            self.send(Cmd::AdminLoadLog { peer: d.peer, query: String::new() });
+            self.send(Cmd::AdminLoadInvites(d.peer));
+        }
         if let Some(u) = open_url {
             self.apply(ui.ctx(), Act::OpenUrl(u));
         }
@@ -1006,6 +1075,75 @@ impl App {
                     });
                 });
         }
+        // Живая полноширинная панель записи голосового сообщения (заменяет строку ввода во время записи).
+        if let Some(rec) = self.voice_rec.as_ref() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            let secs = rec.elapsed_secs();
+            let level = rec.live_level();
+            let bars = rec.recent_bars();
+            let mut cancel_rec = false;
+            let mut send_rec = false;
+            ui.horizontal(|ui| {
+                ui.set_min_height(46.0);
+                ui.add_space(6.0);
+                let pulse = ((ui.input(|i| i.time) * 5.0).sin() as f32 * 0.5 + 0.5).clamp(0.25, 1.0);
+                let (dr, _) = ui.allocate_exact_size(Vec2::new(18.0, 32.0), Sense::hover());
+                ui.painter().circle_filled(dr.center(), 5.0 + level * 2.5, DANGER.gamma_multiply(pulse));
+                ui.label(
+                    RichText::new(format!("{:02}:{:02}", (secs as u32) / 60, (secs as u32) % 60))
+                        .monospace()
+                        .strong()
+                        .size(14.5)
+                        .color(WHITE),
+                );
+                let wave_w = (ui.available_width() - 190.0).clamp(60.0, 380.0);
+                let (wr, _) = ui.allocate_exact_size(Vec2::new(wave_w, 30.0), Sense::hover());
+                let count = ((wave_w / 5.0) as usize).clamp(10, 64);
+                for idx in 0..count {
+                    let v = bars
+                        .get(bars.len().saturating_sub(count) + idx)
+                        .copied()
+                        .unwrap_or(0.08);
+                    let h = (4.0 + v * 24.0).min(26.0);
+                    let x = wr.left() + idx as f32 * (wave_w / count as f32) + 2.0;
+                    ui.painter().line_segment(
+                        [Pos2::new(x, wr.center().y - h * 0.5), Pos2::new(x, wr.center().y + h * 0.5)],
+                        egui::Stroke::new(2.5, ORANGE),
+                    );
+                }
+                if ui.button("Отмена").clicked() {
+                    cancel_rec = true;
+                }
+                if orange_button(ui, "Отправить", Vec2::new(98.0, 32.0)).clicked() {
+                    send_rec = true;
+                }
+            });
+            if cancel_rec {
+                if let Some(r) = self.voice_rec.take() {
+                    r.cancel();
+                }
+            } else if send_rec && let Some(r) = self.voice_rec.take() {
+                let dest = super::worker::home()
+                    .join("cache")
+                    .join(format!("voice_{}.wav", self.now));
+                match r.finish_to_wav(&dest) {
+                    Ok((dur, peaks)) => {
+                        let reply_to = self.reply.take().map(|(id, _)| id);
+                        self.send(Cmd::SendVoice {
+                            path: dest,
+                            duration: dur,
+                            waveform: peaks,
+                            reply_to,
+                        });
+                    }
+                    Err(e) => {
+                        self.error = e;
+                        self.error_at = self.now;
+                    }
+                }
+            }
+            return;
+        }
         let mut attach = false;
         ui.horizontal(|ui| {
             ui.set_min_height(46.0);
@@ -1193,8 +1331,9 @@ impl App {
             }
             let (srect, sresp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
             let active = !self.input.trim().is_empty();
+            let mic_mode = !active && self.editing.is_none() && self.voice_rec.is_none();
             let send_k = tween(ui.ctx(), "send-active", f32::from(u8::from(active)), 0.14);
-            let send_h = tween(ui.ctx(), "send-hover", f32::from(u8::from(active && sresp.hovered())), 0.12);
+            let send_h = tween(ui.ctx(), "send-hover", f32::from(u8::from(sresp.hovered())), 0.12);
             if send_k > 0.02 {
                 let r_btn = 16.5 + 1.2 * send_h;
                 let base = lerp_color(ORANGE, ORANGE_OVER, send_h);
@@ -1205,10 +1344,36 @@ impl App {
                     (f32::from(t_btn(base).a()) * send_k) as u8,
                 );
                 ui.painter().circle_filled(srect.center(), r_btn, fill);
+            } else if mic_mode && send_h > 0.02 {
+                ui.painter().circle_filled(srect.center(), 17.0, t(WINDOW_OVER).gamma_multiply(send_h));
             }
-            let arrow_c = if active { Color32::WHITE } else { DIALOG_DATE };
-            icons::send(ui.painter(), srect.center(), arrow_c);
-            let sresp = if active { sresp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { sresp };
+            if mic_mode {
+                let mc = lerp_color(DIALOG_DATE, ORANGE, send_h);
+                let c = srect.center();
+                // Векторный микрофон (чёткий на любом DPI без квадратов).
+                let cap = Rect::from_center_size(Pos2::new(c.x, c.y - 3.0), Vec2::new(8.0, 12.0));
+                ui.painter().rect_filled(cap, egui::CornerRadius::same(4), mc);
+                ui.painter().line_segment([Pos2::new(c.x - 6.5, c.y - 1.0), Pos2::new(c.x - 6.5, c.y + 3.0)], egui::Stroke::new(1.6, mc));
+                ui.painter().line_segment([Pos2::new(c.x + 6.5, c.y - 1.0), Pos2::new(c.x + 6.5, c.y + 3.0)], egui::Stroke::new(1.6, mc));
+                ui.painter().line_segment([Pos2::new(c.x - 6.5, c.y + 3.0), Pos2::new(c.x + 6.5, c.y + 3.0)], egui::Stroke::new(1.6, mc));
+                ui.painter().line_segment([Pos2::new(c.x, c.y + 3.0), Pos2::new(c.x, c.y + 8.0)], egui::Stroke::new(1.6, mc));
+                ui.painter().line_segment([Pos2::new(c.x - 4.0, c.y + 8.0), Pos2::new(c.x + 4.0, c.y + 8.0)], egui::Stroke::new(1.6, mc));
+            } else {
+                let arrow_c = if active { Color32::WHITE } else { DIALOG_DATE };
+                icons::send(ui.painter(), srect.center(), arrow_c);
+            }
+            let sresp = sresp
+                .on_hover_text(if mic_mode { "Записать голосовое сообщение" } else { "Отправить" })
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if mic_mode && sresp.clicked() && self.selected.is_some() {
+                match super::audio_io::VoiceRecorder::start() {
+                    Ok(rec) => self.voice_rec = Some(rec),
+                    Err(e) => {
+                        self.error = e;
+                        self.error_at = self.now;
+                    }
+                }
+            }
             if (sresp.clicked() || enter) && active && self.selected.is_some() {
                 let lead = self.input.chars().take_while(|c| c.is_whitespace()).count();
                 let raw_text = self.input.trim().to_owned();
@@ -1246,13 +1411,19 @@ impl App {
                 r.request_focus();
             }
         });
-        // Реплай-клавиатура бота под строкой ввода (`ReplyKeyboardMarkup`).
-        if self.bot_keyboard_open
+        // Реплай-клавиатура бота под строкой ввода (`ReplyKeyboardMarkup`) с цветами и плавными анимациями.
+        let kb_k = tween(
+            ui.ctx(),
+            "bot-reply-kb",
+            f32::from(u8::from(self.bot_keyboard_open && reply_kb.is_some())),
+            0.18,
+        );
+        if kb_k > 0.02
             && let Some(rows) = reply_kb
         {
-            ui.add_space(4.0);
+            ui.add_space(4.0 * kb_k);
             let avail_w = (ui.available_width() - 8.0).max(120.0);
-            for row in &rows {
+            for (r_i, row) in rows.iter().enumerate() {
                 if row.is_empty() {
                     continue;
                 }
@@ -1261,34 +1432,38 @@ impl App {
                 let bw = ((avail_w - gap * (cols - 1.0).max(0.0)) / cols).max(48.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    for btn in row {
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(bw, 34.0), Sense::click());
-                        let fill = match btn.style {
-                            1 => t_btn(ORANGE),
-                            2 => DANGER.gamma_multiply(0.75),
-                            3 => GREEN.gamma_multiply(0.7),
-                            _ if resp.hovered() => t(WINDOW_OVER),
-                            _ => t(SERVICE_BG),
-                        };
-                        ui.painter().rect_filled(rect, egui::CornerRadius::same(8), fill);
+                    for (c_i, btn) in row.iter().enumerate() {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(bw, 36.0 * kb_k), Sense::click());
+                        let hk = tween(ui.ctx(), ("rkb-h", r_i, c_i), f32::from(u8::from(resp.hovered())), 0.12);
+                        let pk = tween(ui.ctx(), ("rkb-p", r_i, c_i), f32::from(u8::from(resp.is_pointer_button_down_on())), 0.08);
+                        let draw_r = rect.shrink(pk * 1.4);
+                        let (base_fill, hover_fill, border_c) = bot_btn_palette(btn.style);
+                        let fill = lerp_color(base_fill, hover_fill, hk).gamma_multiply(kb_k);
+                        ui.painter().rect_filled(draw_r, egui::CornerRadius::same(9), fill);
+                        ui.painter().rect_stroke(
+                            draw_r,
+                            egui::CornerRadius::same(9),
+                            egui::Stroke::new(1.0, border_c.gamma_multiply(0.5 + hk * 0.5)),
+                            egui::StrokeKind::Inside,
+                        );
                         let suffix = match &btn.kind {
                             rg_core::engine::BotBtnKind::WebView { .. } => " ↗",
                             _ => "",
                         };
-                        let text_clip = rect.shrink2(Vec2::new(6.0, 2.0));
+                        let text_clip = draw_r.shrink2(Vec2::new(6.0, 2.0));
                         ui.painter().with_clip_rect(text_clip).text(
-                            rect.center(),
+                            draw_r.center(),
                             egui::Align2::CENTER_CENTER,
                             format!("{}{suffix}", short(&btn.text, 28)),
                             FontId::proportional(13.5),
-                            WHITE,
+                            Color32::WHITE.gamma_multiply(kb_k),
                         );
                         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             bot_act = Some(Act::BotBtn(0, btn.text.clone(), btn.kind.clone()));
                         }
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(4.0 * kb_k);
             }
         }
         if let Some(a) = bot_act {
@@ -1666,24 +1841,46 @@ impl App {
         let clip_rect = ui.clip_rect();
         // Быстрый скролл при нажатии колёсика мыши (Middle Click Auto-Scroll) и ускорение колеса (Shift/Alt/Middle ×3.5).
         let ptr_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
-        let mid_clicked = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+        let mid_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
         let mid_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let mid_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
         let any_other_click = ui.input(|i| {
             i.pointer.button_clicked(egui::PointerButton::Primary)
                 || i.pointer.button_clicked(egui::PointerButton::Secondary)
                 || i.key_pressed(egui::Key::Escape)
         });
-        if mid_clicked
+        // Автоскролл работает И при зажатии колёсика мыши (hold + drag), И при клике (toggle).
+        if mid_pressed
             && let Some(p) = ptr_pos
             && clip_rect.contains(p)
         {
-            if self.autoscroll_anchor.is_some() {
+            if self.autoscroll_anchor.is_some() && !self.autoscroll_holding {
                 self.autoscroll_anchor = None;
+                self.autoscroll_holding = false;
+                self.autoscroll_dragged = false;
             } else {
                 self.autoscroll_anchor = Some(p);
+                self.autoscroll_holding = true;
+                self.autoscroll_dragged = false;
+            }
+        }
+        if self.autoscroll_holding
+            && mid_down
+            && let (Some(anchor), Some(cur)) = (self.autoscroll_anchor, ptr_pos)
+            && (cur - anchor).length() > 7.0
+        {
+            self.autoscroll_dragged = true;
+        }
+        if mid_released && self.autoscroll_holding {
+            self.autoscroll_holding = false;
+            if self.autoscroll_dragged {
+                self.autoscroll_anchor = None;
+                self.autoscroll_dragged = false;
             }
         } else if any_other_click {
             self.autoscroll_anchor = None;
+            self.autoscroll_holding = false;
+            self.autoscroll_dragged = false;
         }
         let fast_wheel_delta = ui.input(|i| {
             if (i.modifiers.shift || i.modifiers.alt || mid_down) && i.smooth_scroll_delta.y.abs() > 0.1 {
@@ -1694,9 +1891,11 @@ impl App {
         });
         let autoscroll_dy = if let (Some(anchor), Some(cur)) = (self.autoscroll_anchor, ptr_pos) {
             let diff = anchor.y - cur.y;
-            if diff.abs() > 6.0 {
+            if diff.abs() > 5.0 {
                 ui.ctx().request_repaint();
-                diff * 0.24
+                let sign = diff.signum();
+                let mag = (diff.abs() - 5.0).powf(1.12) * 0.28;
+                sign * mag.min(95.0)
             } else {
                 0.0
             }
@@ -1770,6 +1969,11 @@ impl App {
                 show_translate: self.settings.language.show_translate_button,
                 clip_rect,
                 selected_msgs: &self.selected_msgs,
+                bot_btn_pending: self
+                    .bot_btn_pending
+                    .as_ref()
+                    .filter(|(_, _, t0)| now_t - *t0 < 6.0)
+                    .map(|(mid, lbl, t0)| (*mid, lbl.as_str(), *t0)),
                 highlight_msg: active_highlight,
                 can_copy_link,
                 avail: cur_avail,
@@ -1935,32 +2139,36 @@ impl App {
                 self.scroll_to = self.messages.last().map(|m| m.id);
             }
         }
-        // Отрисовка якоря быстрого скролла колёсиком мыши (Middle Click Auto-Scroll).
+        // Отрисовка автоскролла колёсиком мыши: иконка прикреплена прямо к курсору (`cur`), а не застывает в воздухе.
         if let Some(anchor) = self.autoscroll_anchor {
             let p = ui.painter();
-            if let Some(cur) = ptr_pos {
-                p.line_segment(
-                    [anchor, Pos2::new(anchor.x, cur.y)],
-                    egui::Stroke::new(1.5, t_btn(ORANGE).gamma_multiply(0.55)),
-                );
-            }
-            p.circle_filled(anchor, 16.0, t2(WINDOW_BG));
-            p.circle_stroke(anchor, 16.0, egui::Stroke::new(1.5, t_btn(ORANGE)));
-            p.circle_filled(anchor, 3.0, t_btn(ORANGE));
+            let badge_pos = ptr_pos.unwrap_or(anchor);
+            let dy = badge_pos.y - anchor.y;
+            // Тонкая точка-ориентир старта и направляющая линия к курсору.
+            p.circle_filled(anchor, 3.5, t_btn(ORANGE).gamma_multiply(0.65));
+            p.line_segment(
+                [anchor, badge_pos],
+                egui::Stroke::new(1.2, t_btn(ORANGE).gamma_multiply(0.45)),
+            );
+            // Круглый значок автоскролла, движущийся вместе с курсором.
+            p.circle_filled(badge_pos, 15.0, t2(WINDOW_BG));
+            p.circle_stroke(badge_pos, 15.0, egui::Stroke::new(1.6, t_btn(ORANGE)));
+            p.circle_filled(badge_pos, 2.8, t_btn(ORANGE));
             p.text(
-                Pos2::new(anchor.x, anchor.y - 9.0),
+                Pos2::new(badge_pos.x, badge_pos.y - 8.5),
                 egui::Align2::CENTER_CENTER,
                 "▲",
-                FontId::proportional(8.0),
-                WHITE,
+                FontId::proportional(8.5),
+                if dy < -5.0 { ORANGE } else { WHITE },
             );
             p.text(
-                Pos2::new(anchor.x, anchor.y + 9.0),
+                Pos2::new(badge_pos.x, badge_pos.y + 8.5),
                 egui::Align2::CENTER_CENTER,
                 "▼",
-                FontId::proportional(8.0),
-                WHITE,
+                FontId::proportional(8.5),
+                if dy > 5.0 { ORANGE } else { WHITE },
             );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         }
         // Достигли верха — просим более старую историю.
         if !searching && out.state.clamped_offset().y <= 4.0 && out.content_size.y > out.inner_rect.height() {
@@ -2256,6 +2464,7 @@ impl App {
                     }
                     K::Callback(data) => {
                         if let Some(idx) = self.selected {
+                            self.bot_btn_pending = Some((msg_id, label, ctx.input(|i| i.time)));
                             self.send(Cmd::BotCallback(idx, msg_id, data));
                         }
                     }
@@ -2713,18 +2922,50 @@ impl App {
                 self.story_ghost_ask = None;
             }
         }
-        // Просмотрщик активных историй.
+        // Просмотрщик активных историй (с загрузкой медиа, прогресс-барами, реакциями и быстрым ответом).
         if let Some(idx) = self.story_open {
             let mut next_idx = Some(idx);
             let mut open = true;
+            let mut react_emoji: Option<&'static str> = None;
+            let mut reply_send: Option<String> = None;
             if let Some(st) = self.stories.get(idx).cloned() {
+                if self.story_media_req.insert(st.story_id) {
+                    self.send(Cmd::LoadStoryMedia(st.peer, st.story_id));
+                }
+                let elapsed = self
+                    .story_opened_at
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed()
+                    .as_secs_f32();
+                let progress = (elapsed / 8.0).clamp(0.0, 1.0);
+                if progress < 1.0 {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
                 egui::Window::new(format!("История · {}", st.author))
                     .open(&mut open)
                     .collapsible(false)
                     .resizable(false)
-                    .default_width(380.0)
+                    .default_width(400.0)
                     .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ctx, |ui| {
+                        // Полоски прогресса историй сверху (как в Telegram).
+                        let total_s = self.stories.len().max(1);
+                        let (pr_rect, _) = ui.allocate_exact_size(Vec2::new(360.0, 4.0), Sense::hover());
+                        let gap = 3.0;
+                        let seg_w = ((pr_rect.width() - gap * (total_s as f32 - 1.0)) / total_s as f32).max(6.0);
+                        for s_i in 0..total_s {
+                            let seg = Rect::from_min_size(
+                                Pos2::new(pr_rect.left() + s_i as f32 * (seg_w + gap), pr_rect.top()),
+                                Vec2::new(seg_w, 3.0),
+                            );
+                            ui.painter().rect_filled(seg, egui::CornerRadius::same(2), Color32::from_white_alpha(45));
+                            let fill_f = if s_i < idx { 1.0 } else if s_i == idx { progress } else { 0.0 };
+                            if fill_f > 0.0 {
+                                let filled = Rect::from_min_size(seg.min, Vec2::new(seg_w * fill_f, 3.0));
+                                ui.painter().rect_filled(filled, egui::CornerRadius::same(2), ORANGE);
+                            }
+                        }
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             draw_avatar(
                                 ui,
@@ -2740,27 +2981,81 @@ impl App {
                                 ui.label(RichText::new(&st.author).strong().color(WHITE));
                                 ui.label(RichText::new(full_date(i64::from(st.date))).size(11.5).color(SUBTEXT));
                             });
-                        });
-                        ui.add_space(10.0);
-                        egui::Frame::new()
-                            .fill(t(SIDEBAR_BG))
-                            .corner_radius(egui::CornerRadius::same(12))
-                            .inner_margin(egui::Margin::same(14))
-                            .show(ui, |ui| {
-                                ui.set_min_width(330.0);
-                                let body = if st.caption.is_empty() {
-                                    "Медиа-история Telegram"
-                                } else {
-                                    st.caption.as_str()
-                                };
-                                ui.label(RichText::new(body).size(15.0).color(WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("+ Моя история").clicked() {
+                                    self.story_composer_open = true;
+                                }
                             });
-                        ui.add_space(10.0);
+                        });
+                        ui.add_space(8.0);
+                        if let Some(tex) = self.story_textures.get(&st.story_id) {
+                            let sz = tex.size_vec2();
+                            let scale = (360.0 / sz.x).min(380.0 / sz.y).min(1.0);
+                            ui.vertical_centered(|ui| {
+                                ui.add(
+                                    egui::Image::new(tex)
+                                        .fit_to_exact_size(sz * scale)
+                                        .corner_radius(12.0),
+                                );
+                            });
+                            ui.add_space(6.0);
+                        }
+                        if !st.caption.is_empty() || !self.story_textures.contains_key(&st.story_id) {
+                            egui::Frame::new()
+                                .fill(t(SIDEBAR_BG))
+                                .corner_radius(egui::CornerRadius::same(12))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(340.0);
+                                    let body = if st.caption.is_empty() {
+                                        "Загрузка медиа истории…"
+                                    } else {
+                                        st.caption.as_str()
+                                    };
+                                    ui.label(RichText::new(body).size(14.0).color(WHITE));
+                                });
+                        }
+                        ui.add_space(8.0);
+                        // Быстрые реакции на историю (`stories.sendReaction`).
                         ui.horizontal(|ui| {
-                            if idx > 0 && ui.button("← Предыдущая").clicked() {
+                            ui.label(RichText::new("Реакция:").size(12.0).color(SUBTEXT));
+                            for e in ["❤", "🔥", "👍", "😂", "😮"] {
+                                let img = self.emoji.as_ref().and_then(|em| em.image(e.chars().next()?, 20.0));
+                                let clicked = match img {
+                                    Some(img) => ui.add(img.sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked(),
+                                    None => ui.small_button(e).clicked(),
+                                };
+                                if clicked {
+                                    react_emoji = Some(e);
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.story_reply_text)
+                                    .hint_text("Ответить на историю…")
+                                    .desired_width(250.0),
+                            );
+                            if (orange_button(ui, "Отпр.", Vec2::new(72.0, 26.0)).clicked()
+                                || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                                && !self.story_reply_text.trim().is_empty()
+                            {
+                                reply_send = Some(std::mem::take(&mut self.story_reply_text));
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if idx > 0
+                                && (ui.button("← Предыдущая").clicked()
+                                    || ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)))
+                            {
                                 next_idx = Some(idx - 1);
                             }
-                            if idx + 1 < self.stories.len() && orange_button(ui, "Следующая →", Vec2::new(130.0, 30.0)).clicked() {
+                            if idx + 1 < self.stories.len()
+                                && (orange_button(ui, "Следующая →", Vec2::new(130.0, 30.0)).clicked()
+                                    || ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)))
+                            {
                                 next_idx = Some(idx + 1);
                             }
                             if ui.button("Закрыть").clicked() {
@@ -2768,24 +3063,43 @@ impl App {
                             }
                         });
                     });
+                if let Some(em) = react_emoji {
+                    self.send(Cmd::ReactStory(st.peer, st.story_id, em.to_owned()));
+                }
+                if let Some(reply_txt) = reply_send
+                    && let Some(pos) = self.dialogs.iter().position(|d| d.id == st.peer_id)
+                {
+                    self.open_dialog(pos);
+                    self.send(Cmd::Send(format!("Ответ на историю: {reply_txt}"), None));
+                    self.status = "Ответ на историю отправлен".to_owned();
+                }
                 if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.story_open = None;
+                    self.story_opened_at = None;
                 } else {
-                    if next_idx != Some(idx)
-                        && let Some(ni) = next_idx
-                        && let Some(ns) = self.stories.get_mut(ni)
-                        && ns.unread
-                    {
-                        ns.unread = false;
-                        if self.settings.ghost.send_read_stories {
-                            let (peer, sid) = (ns.peer, ns.story_id);
-                            self.send(Cmd::ReadStory(peer, sid));
+                    if next_idx != Some(idx) {
+                        self.story_opened_at = Some(std::time::Instant::now());
+                        if let Some(ni) = next_idx {
+                            let info = self.stories.get_mut(ni).map(|ns| {
+                                let was_unread = ns.unread;
+                                ns.unread = false;
+                                (ns.peer, ns.story_id, was_unread)
+                            });
+                            if let Some((peer, sid, was_unread)) = info {
+                                if was_unread && self.settings.ghost.send_read_stories {
+                                    self.send(Cmd::ReadStory(peer, sid));
+                                }
+                                if self.story_media_req.insert(sid) {
+                                    self.send(Cmd::LoadStoryMedia(peer, sid));
+                                }
+                            }
                         }
                     }
                     self.story_open = next_idx;
                 }
             } else {
                 self.story_open = None;
+                self.story_opened_at = None;
             }
         }
         // Комментарии к посту канала (`messages.getDiscussionMessage` + `messages.getReplies`).
@@ -3111,7 +3425,7 @@ fn bubble(
         let mut meta = time_label(m.date, env.format_secs);
         if edited {
             let mark = if s.replace_bottom_info_with_icons {
-                "✎"
+                "ред."
             } else if s.edited_mark.is_empty() {
                 "изм."
             } else {
@@ -3400,48 +3714,92 @@ fn bubble(
         }
         egui::Popup::context_menu(&resp).show(|ui| menu(ui, m, env, acts));
     });
-    // Инлайн-кнопки бота прямо под пузырём сообщения (`ReplyInlineMarkup`).
+    // Инлайн-кнопки бота прямо под пузырём сообщения (`ReplyInlineMarkup`) с цветами Telegram и живыми анимациями.
     if !m.inline_buttons.is_empty() && !m.deleted {
-        let total_w = (bubble_w + 2.0 * MSG_PAD_X).max(210.0).min(env.avail * 0.82);
+        let total_w = (bubble_w + 2.0 * MSG_PAD_X).max(220.0).min(env.avail * 0.84);
         let left_pad = if env.group && !m.outgoing { 46.0 } else { 6.0 };
         for (r_idx, row) in m.inline_buttons.iter().enumerate() {
             if row.is_empty() {
                 continue;
             }
-            ui.add_space(3.0);
+            ui.add_space(4.0);
             ui.with_layout(layout, |ui| {
                 ui.add_space(left_pad);
                 let cols = row.len() as f32;
-                let gap = 4.0;
-                let bw = ((total_w - gap * (cols - 1.0).max(0.0)) / cols).max(44.0);
+                let gap = 5.0;
+                let bw = ((total_w - gap * (cols - 1.0).max(0.0)) / cols).max(46.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for (c_idx, btn) in row.iter().enumerate() {
-                        let (brect, bresp) = ui.allocate_exact_size(Vec2::new(bw, 32.0), Sense::click());
-                        let bfill = match btn.style {
-                            1 => t_btn(ORANGE),
-                            2 => DANGER.gamma_multiply(0.75),
-                            3 => GREEN.gamma_multiply(0.7),
-                            _ if bresp.hovered() => t(WINDOW_OVER),
-                            _ => t(SERVICE_BG),
-                        };
-                        ui.painter().rect_filled(brect, egui::CornerRadius::same(8), bfill);
-                        let badge = match &btn.kind {
+                        let (brect, bresp) = ui.allocate_exact_size(Vec2::new(bw, 34.0), Sense::click());
+                        let hk = tween(ui.ctx(), ("ibtn-h", m.id, r_idx, c_idx), f32::from(u8::from(bresp.hovered())), 0.12);
+                        let pk = tween(ui.ctx(), ("ibtn-p", m.id, r_idx, c_idx), f32::from(u8::from(bresp.is_pointer_button_down_on())), 0.08);
+                        let draw_r = brect.shrink(pk * 1.4);
+                        let (base_fill, hover_fill, border_c) = bot_btn_palette(btn.style);
+                        let bfill = lerp_color(base_fill, hover_fill, hk);
+                        ui.painter().rect_filled(draw_r, egui::CornerRadius::same(9), bfill);
+                        ui.painter().rect_stroke(
+                            draw_r,
+                            egui::CornerRadius::same(9),
+                            egui::Stroke::new(1.0, border_c.gamma_multiply(0.45 + hk * 0.55)),
+                            egui::StrokeKind::Inside,
+                        );
+                        // Анимация бегущего блика ожидания, пока бот обрабатывает callback.
+                        let is_pending = env
+                            .bot_btn_pending
+                            .is_some_and(|(pmid, plbl, _)| pmid == m.id && plbl == btn.text);
+                        if is_pending {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(32));
+                            let phase = ((env.time * 1.8) % 1.0) as f32;
+                            let sw = draw_r.width() * 0.35;
+                            let sx = draw_r.left() - sw + phase * (draw_r.width() + sw);
+                            let shimmer = Rect::from_min_size(Pos2::new(sx, draw_r.top()), Vec2::new(sw, draw_r.height()));
+                            ui.painter()
+                                .with_clip_rect(draw_r)
+                                .rect_filled(shimmer, egui::CornerRadius::same(6), Color32::from_white_alpha(52));
+                        }
+                        // Волна-подсветка при нажатии.
+                        if pk > 0.05 {
+                            let rad = draw_r.width() * 0.55 * pk;
+                            ui.painter()
+                                .with_clip_rect(draw_r)
+                                .circle_filled(draw_r.center(), rad, Color32::from_white_alpha((34.0 * pk) as u8));
+                        }
+                        // Значок действия в правом верхнем углу кнопки (как в Telegram).
+                        let corner_mark = match &btn.kind {
                             rg_core::engine::BotBtnKind::Url(_)
-                            | rg_core::engine::BotBtnKind::WebView { .. } => " ↗",
-                            rg_core::engine::BotBtnKind::SwitchInline { .. } => " ↪",
-                            _ => "",
+                            | rg_core::engine::BotBtnKind::WebView { .. } => Some("↗"),
+                            rg_core::engine::BotBtnKind::SwitchInline { .. } => Some("↪"),
+                            rg_core::engine::BotBtnKind::Copy(_) => Some("⧉"),
+                            _ => None,
                         };
-                        let max_chars = ((bw / 7.5) as usize).clamp(4, 34);
-                        let lbl = format!("{}{badge}", short(&btn.text, max_chars));
-                        ui.painter().with_clip_rect(brect.shrink2(Vec2::new(4.0, 2.0))).text(
-                            brect.center(),
+                        if let Some(mk) = corner_mark {
+                            ui.painter().text(
+                                Pos2::new(draw_r.right() - 7.0, draw_r.top() + 8.0),
+                                egui::Align2::CENTER_CENTER,
+                                mk,
+                                FontId::proportional(10.0),
+                                Color32::from_white_alpha(180),
+                            );
+                        }
+                        // Необязательный пользовательский эмодзи-значок кнопки (`KeyboardButtonStyle.icon`).
+                        let mut text_center = draw_r.center();
+                        if let Some(icon_id) = btn.icon_id
+                            && let Some(tex) = env.custom_tex.get(&icon_id)
+                        {
+                            let ir = Rect::from_center_size(Pos2::new(draw_r.left() + 16.0, draw_r.center().y), Vec2::splat(16.0));
+                            egui::Image::new(tex).fit_to_exact_size(ir.size()).paint_at(ui, ir);
+                            text_center.x += 8.0;
+                        }
+                        let max_chars = ((bw / 7.2) as usize).clamp(4, 34);
+                        let lbl = short(&btn.text, max_chars);
+                        ui.painter().with_clip_rect(draw_r.shrink2(Vec2::new(8.0, 2.0))).text(
+                            text_center,
                             egui::Align2::CENTER_CENTER,
                             lbl,
                             FontId::proportional(13.0),
                             Color32::WHITE,
                         );
-                        let _ = (r_idx, c_idx);
                         if bresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             acts.push(Act::BotBtn(m.id, btn.text.clone(), btn.kind.clone()));
                         }
@@ -3449,6 +3807,36 @@ fn bubble(
                 });
             });
         }
+    }
+}
+
+/// Палитра цветов кнопок бота (`(обычный_фон, фон_наведения, кромка)`) по `KeyboardButtonStyle`.
+pub(crate) fn bot_btn_palette(style: u8) -> (Color32, Color32, Color32) {
+    match style {
+        // Primary — фирменный синий Telegram.
+        1 => (
+            Color32::from_rgba_unmultiplied(46, 139, 230, 220),
+            Color32::from_rgba_unmultiplied(64, 156, 245, 245),
+            Color32::from_rgba_unmultiplied(120, 190, 255, 160),
+        ),
+        // Danger — красный.
+        2 => (
+            Color32::from_rgba_unmultiplied(216, 68, 68, 215),
+            Color32::from_rgba_unmultiplied(235, 84, 84, 242),
+            Color32::from_rgba_unmultiplied(255, 145, 145, 150),
+        ),
+        // Success — зелёный.
+        3 => (
+            Color32::from_rgba_unmultiplied(42, 166, 94, 215),
+            Color32::from_rgba_unmultiplied(56, 188, 112, 242),
+            Color32::from_rgba_unmultiplied(130, 235, 170, 150),
+        ),
+        // Обычная стеклянная кнопка.
+        _ => (
+            t(SERVICE_BG),
+            t(WINDOW_OVER),
+            Color32::from_white_alpha(48),
+        ),
     }
 }
 

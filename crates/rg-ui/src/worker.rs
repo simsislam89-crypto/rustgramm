@@ -226,6 +226,113 @@ pub enum Cmd {
     PurgeAllDeleted,
     /// Удалить дополнительный изолированный слот аккаунта (`slot > 0`).
     RemoveAccountSlot(u32),
+    /// Вернуться с ввода кода/пароля обратно к вводу номера телефона.
+    BackToPhone,
+    /// Опубликовать свою историю (фото или видео).
+    PublishStory {
+        path: PathBuf,
+        caption: String,
+        privacy: rg_core::engine::StoryPrivacy,
+        period_secs: i32,
+        pinned: bool,
+        noforwards: bool,
+    },
+    /// Поставить реакцию на историю.
+    ReactStory(grammers_session::types::PeerRef, i32, String),
+    /// Загрузить медиа истории для просмотрщика.
+    LoadStoryMedia(grammers_session::types::PeerRef, i32),
+    /// Отправить записанное голосовое сообщение.
+    SendVoice {
+        path: PathBuf,
+        duration: u32,
+        waveform: Vec<u8>,
+        reply_to: Option<i32>,
+    },
+    /// Назначить или снять администратора группы/канала.
+    AdminEditAdmin {
+        peer: grammers_session::types::PeerRef,
+        user: grammers_session::types::PeerRef,
+        rights: rg_core::engine::AdminRights,
+        rank: String,
+    },
+    /// Забанить, замутить или разбанить участника.
+    AdminEditBanned {
+        peer: grammers_session::types::PeerRef,
+        user: grammers_session::types::PeerRef,
+        rights: rg_core::engine::BannedRights,
+    },
+    /// Изменить общие права участников группы по умолчанию.
+    AdminEditDefaultRights {
+        peer: grammers_session::types::PeerRef,
+        rights: rg_core::engine::BannedRights,
+    },
+    /// Загрузить журнал действий администраторов.
+    AdminLoadLog {
+        peer: grammers_session::types::PeerRef,
+        query: String,
+    },
+    /// Загрузить пригласительные ссылки группы/канала.
+    AdminLoadInvites(grammers_session::types::PeerRef),
+    /// Создать пригласительную ссылку.
+    AdminCreateInvite {
+        peer: grammers_session::types::PeerRef,
+        title: String,
+        expire_date: Option<i32>,
+        usage_limit: Option<i32>,
+        request_needed: bool,
+    },
+    /// Отозвать пригласительную ссылку.
+    AdminRevokeInvite {
+        peer: grammers_session::types::PeerRef,
+        link: String,
+    },
+    /// Загрузить локальный список секретных чатов E2E.
+    LoadSecretChats,
+    /// Создать новый секретный чат E2E с пользователем.
+    StartSecretChat(grammers_session::types::PeerRef, String),
+    /// Открыть секретный чат и загрузить его расшифрованную историю.
+    OpenSecretChat(i32),
+    /// Отправить E2E-сообщение в секретный чат.
+    SendSecretText(i32, String),
+    /// Задать таймер самоуничтожения в секретном чате.
+    SetSecretTtl(i32, i32),
+    /// Завершить и удалить секретный чат.
+    DiscardSecretChat(i32),
+    /// Начать голосовой или видеозвонок.
+    StartCall {
+        peer: grammers_session::types::PeerRef,
+        name: String,
+        video: bool,
+    },
+    /// Принять входящий звонок.
+    AcceptCall {
+        call_id: i64,
+        access_hash: i64,
+        video: bool,
+    },
+    /// Подтвердить исходящий звонок после ответа собеседника.
+    ConfirmCall {
+        call_id: i64,
+        access_hash: i64,
+        g_b: Vec<u8>,
+    },
+    /// Вычислить 4 E2E-эмодзи для принятого входящего звонка.
+    DeriveIncomingCallEmojis {
+        call_id: i64,
+        g_a: Vec<u8>,
+    },
+    /// Завершить или отклонить звонок.
+    DiscardCall {
+        call_id: i64,
+        access_hash: i64,
+        duration: i32,
+        video: bool,
+        busy: bool,
+    },
+    /// Проверить наличие новой версии Rustgramm на GitHub Releases.
+    CheckUpdates,
+    /// Скачать и применить обновление.
+    ApplyUpdate(crate::updater::UpdateInfo),
     Settings(Box<Settings>),
 }
 
@@ -320,6 +427,33 @@ pub enum Ev {
     LocalPurgedAll(i64),
     /// Бесшовное переключение слота аккаунта без перезапуска процесса (для Android и ПК).
     ResetSession,
+    /// Индикатор сетевой операции на экране входа (отправка/проверка кода).
+    LoginBusy(bool),
+    /// Картинка истории для просмотрщика (`story_id`).
+    StoryImage(i32, Box<eframe::egui::ColorImage>),
+    /// Записи журнала действий группы/канала.
+    AdminLog(Vec<rg_core::engine::AdminLogRow>),
+    /// Пригласительные ссылки группы/канала.
+    AdminInvites(Vec<rg_core::engine::InviteLinkRow>),
+    /// Список локальных секретных чатов E2E.
+    SecretChats(Vec<rg_ayu::store::SecretChatRecord>),
+    /// Сообщения выбранного секретного чата.
+    SecretMessages(i32, Vec<rg_ayu::store::SecretMessageRecord>),
+    /// Исходящий звонок инициирован на сервере Telegram.
+    CallStarted {
+        call_id: i64,
+        access_hash: i64,
+        peer_name: String,
+        video: bool,
+    },
+    /// 4 защитных эмодзи E2E для активного звонка.
+    CallEmojis([&'static str; 4]),
+    /// Найдена новая версия Rustgramm на GitHub Releases.
+    UpdateAvailable(Box<crate::updater::UpdateInfo>),
+    /// Прогресс скачивания обновления `(скачано, всего)`.
+    UpdateProgress(u64, u64),
+    /// Обновление скачано и готово к перезапуску / открытию.
+    UpdateReady(String),
     Status(String),
     Error(String),
 }
@@ -633,6 +767,23 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let root_home = home();
     let settings_path = root_home.join("settings.json");
 
+    // Однократная анонимная проверка обновлений GitHub Releases при старте (если разрешено в настройках).
+    {
+        let initial_s = load_settings(&settings_path);
+        if initial_s.privacy_shield.check_updates {
+            let out_upd = out.clone();
+            tokio::spawn(async move {
+                let res = tokio::task::spawn_blocking(|| {
+                    crate::updater::check_latest_release(env!("CARGO_PKG_VERSION"))
+                })
+                .await;
+                if let Ok(Ok(Some(info))) = res {
+                    out_upd.send(Ev::UpdateAvailable(Box::new(info)));
+                }
+            });
+        }
+    }
+
     'account_loop: loop {
         let mut settings = load_settings(&settings_path);
         if settings.accounts.is_empty() {
@@ -763,7 +914,22 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         let fetches: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
             std::sync::Arc::default();
 
-        let authorized = connected.client.is_authorized().await.unwrap_or(false);
+        let authorized = match tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            connected.client.is_authorized(),
+        )
+        .await
+        {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(e)) => {
+                out.err(format!("Связь с Telegram: {e}"));
+                false
+            }
+            Err(_) => {
+                out.err("Сервер Telegram не отвечает — проверьте интернет/VPN или прокси в «НАСТРОЙКИ»");
+                false
+            }
+        };
         let mut qr_mode = false;
         if authorized {
             enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await;
@@ -808,53 +974,98 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         match cmd {
             Cmd::Keys(..) => {}
             Cmd::Proxy(url) => {
-                // Прокси вступает в силу при следующем запуске; принимается только socks5.
-                if url.is_empty() || url.starts_with("socks5://") {
-                    let _ = std::fs::write(home.join("proxy.txt"), url);
+                let trimmed = url.trim().to_owned();
+                if trimmed.is_empty() || trimmed.starts_with("socks5://") {
+                    let _ = std::fs::write(home.join("proxy.txt"), &trimmed);
+                    out.send(Ev::Status(if trimmed.is_empty() {
+                        "Прокси отключён — переподключение…".to_owned()
+                    } else {
+                        "Прокси сохранён — переподключение…".to_owned()
+                    }));
+                    connected.pool_handle.quit();
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    out.send(Ev::ResetSession);
+                    break true;
                 } else {
                     out.err("Допустим только адрес вида socks5://host:port");
                 }
             }
-            Cmd::UsePhone => {
+            Cmd::UsePhone | Cmd::BackToPhone => {
                 qr_mode = false;
+                login = None;
+                password = None;
+                out.send(Ev::LoginBusy(false));
                 out.send(Ev::Stage(Stage::NeedPhone));
             }
             Cmd::UseQr => {
                 qr_mode = true;
                 last_url.clear();
+                out.send(Ev::LoginBusy(false));
                 out.send(Ev::Stage(Stage::Qr(String::new())));
             }
-            Cmd::RequestCode(phone) => match connected.client.request_login_code(&phone, &cfg.api_hash).await {
-                Ok(t) => {
-                    login = Some(t);
-                    out.send(Ev::Stage(Stage::NeedCode));
+            Cmd::RequestCode(phone) => {
+                out.send(Ev::LoginBusy(true));
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    connected.client.request_login_code(&phone, &cfg.api_hash),
+                )
+                .await;
+                out.send(Ev::LoginBusy(false));
+                match res {
+                    Ok(Ok(t)) => {
+                        login = Some(t);
+                        out.send(Ev::Stage(Stage::NeedCode));
+                    }
+                    Ok(Err(e)) => out.err(friendly_login_error(&e.to_string())),
+                    Err(_) => out.err(
+                        "Сервер Telegram не ответил за 25 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «НАСТРОЙКИ»",
+                    ),
                 }
-                Err(e) => out.err(format!("Код не отправлен: {e}")),
-            },
+            }
             Cmd::Code(code) => {
-                let Some(t) = login.as_ref() else { continue };
-                match connected.client.sign_in(t, &code).await {
-                    Ok(_) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
-                    Err(SignInError::PasswordRequired(p)) => {
+                let Some(t) = login.as_ref() else {
+                    out.err("Сессия кода устарела — введите номер телефона заново");
+                    out.send(Ev::Stage(Stage::NeedPhone));
+                    continue;
+                };
+                out.send(Ev::LoginBusy(true));
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    connected.client.sign_in(t, code.trim()),
+                )
+                .await;
+                out.send(Ev::LoginBusy(false));
+                match res {
+                    Ok(Ok(_)) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
+                    Ok(Err(SignInError::PasswordRequired(p))) => {
                         let hint = p.hint().unwrap_or("нет").to_owned();
                         password = Some(p);
                         out.send(Ev::Stage(Stage::NeedPassword(hint)));
                     }
-                    Err(SignInError::InvalidCode) => out.err("Неверный код"),
-                    Err(e) => out.err(format!("Вход не удался: {e}")),
+                    Ok(Err(SignInError::InvalidCode)) => out.err("Неверный код — проверьте цифры из сообщения Telegram"),
+                    Ok(Err(e)) => out.err(friendly_login_error(&e.to_string())),
+                    Err(_) => out.err("Таймаут проверки кода — попробуйте снова"),
                 }
             }
             Cmd::Password(pw) => {
                 let Some(p) = password.take() else { continue };
-                match connected.client.check_password(p, pw.trim()).await {
-                    Ok(_) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
-                    Err(SignInError::InvalidPassword(p)) => {
+                out.send(Ev::LoginBusy(true));
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    connected.client.check_password(p, pw.trim()),
+                )
+                .await;
+                out.send(Ev::LoginBusy(false));
+                match res {
+                    Ok(Ok(_)) => enter(&engine, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders).await,
+                    Ok(Err(SignInError::InvalidPassword(p))) => {
                         let hint = p.hint().unwrap_or("нет").to_owned();
                         password = Some(p);
                         out.send(Ev::Stage(Stage::NeedPassword(hint)));
-                        out.err("Неверный пароль");
+                        out.err("Неверный облачный пароль");
                     }
-                    Err(e) => out.err(format!("Вход не удался: {e}")),
+                    Ok(Err(e)) => out.err(friendly_login_error(&e.to_string())),
+                    Err(_) => out.err("Таймаут проверки облачного пароля"),
                 }
             }
             Cmd::Open(i) => {
@@ -2267,6 +2478,313 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     break true;
                 }
             }
+            Cmd::PublishStory {
+                path,
+                caption,
+                privacy,
+                period_secs,
+                pinned,
+                noforwards,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    out.send(Ev::Status("Публикация истории…".to_owned()));
+                    match eng
+                        .send_story(&path, &caption, privacy, period_secs, pinned, noforwards)
+                        .await
+                    {
+                        Ok(()) => {
+                            out.send(Ev::Status("История опубликована".to_owned()));
+                            if let Ok(st) = eng.stories().await {
+                                out.send(Ev::Stories(st));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ReactStory(peer, story_id, emoji) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.react_story(peer, story_id, &emoji).await {
+                        Ok(()) => out.send(Ev::Status(format!("Реакция {emoji} отправлена"))),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadStoryMedia(peer, story_id) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    if let Ok(Some(path)) = eng.story_media_path(peer, story_id).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode(&path)).await
+                    {
+                        out.send(Ev::StoryImage(story_id, Box::new(img)));
+                    }
+                });
+            }
+            Cmd::SendVoice {
+                path,
+                duration,
+                waveform,
+                reply_to,
+            } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    out.send(Ev::Status("Отправка голосового…".to_owned()));
+                    let res = eng.send_voice(peer, &path, duration, &waveform, reply_to).await;
+                    let _ = std::fs::remove_file(&path);
+                    match res {
+                        Ok(()) => {
+                            out.send(Ev::Status("Голосовое отправлено".to_owned()));
+                            reload(&eng, &out, peer, i).await;
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminEditAdmin { peer, user, rights, rank } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.edit_admin(peer, user, rights, &rank).await {
+                        Ok(()) => out.send(Ev::Status("Права администратора обновлены".to_owned())),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminEditBanned { peer, user, rights } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.edit_banned(peer, user, rights).await {
+                        Ok(()) => out.send(Ev::Status("Ограничения участника обновлены".to_owned())),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminEditDefaultRights { peer, rights } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.edit_default_banned_rights(peer, rights).await {
+                        Ok(()) => out.send(Ev::Status("Общие права группы сохранены".to_owned())),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminLoadLog { peer, query } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.admin_log(peer, &query, 50).await {
+                        Ok(rows) => out.send(Ev::AdminLog(rows)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminLoadInvites(peer) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.chat_invites(peer).await {
+                        Ok(rows) => out.send(Ev::AdminInvites(rows)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminCreateInvite {
+                peer,
+                title,
+                expire_date,
+                usage_limit,
+                request_needed,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng
+                        .create_invite(peer, &title, expire_date, usage_limit, request_needed)
+                        .await
+                    {
+                        Ok(inv) => {
+                            out.send(Ev::Status(format!("Создана ссылка: {}", inv.link)));
+                            if let Ok(rows) = eng.chat_invites(peer).await {
+                                out.send(Ev::AdminInvites(rows));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AdminRevokeInvite { peer, link } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.revoke_invite(peer, &link).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Ссылка отозвана".to_owned()));
+                            if let Ok(rows) = eng.chat_invites(peer).await {
+                                out.send(Ev::AdminInvites(rows));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadSecretChats => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    out.send(Ev::SecretChats(eng.secret_chats().await));
+                });
+            }
+            Cmd::StartSecretChat(peer, name) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.request_secret_chat(peer, &name).await {
+                        Ok(rec) => {
+                            out.send(Ev::Status(format!("Запрос секретного чата отправлен: {}", rec.peer_name)));
+                            out.send(Ev::SecretChats(eng.secret_chats().await));
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::OpenSecretChat(chat_id) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    out.send(Ev::SecretMessages(chat_id, eng.secret_messages(chat_id).await));
+                });
+            }
+            Cmd::SendSecretText(chat_id, text) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.send_secret_text(chat_id, &text).await {
+                        Ok(_) => out.send(Ev::SecretMessages(chat_id, eng.secret_messages(chat_id).await)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SetSecretTtl(chat_id, ttl_secs) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.set_secret_chat_ttl(chat_id, ttl_secs).await {
+                        Ok(()) => {
+                            out.send(Ev::SecretChats(eng.secret_chats().await));
+                            out.send(Ev::Status(if ttl_secs == 0 {
+                                "Таймер самоуничтожения отключён".to_owned()
+                            } else {
+                                format!("Таймер самоуничтожения: {ttl_secs} с")
+                            }));
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::DiscardSecretChat(chat_id) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    let _ = eng.discard_secret_chat(chat_id).await;
+                    out.send(Ev::SecretChats(eng.secret_chats().await));
+                    out.send(Ev::Status("Секретный чат завершён и стёрт".to_owned()));
+                });
+            }
+            Cmd::StartCall { peer, name, video } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.start_call(peer, video).await {
+                        Ok((call_id, access_hash)) => out.send(Ev::CallStarted {
+                            call_id,
+                            access_hash,
+                            peer_name: name,
+                            video,
+                        }),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::AcceptCall {
+                call_id,
+                access_hash,
+                video: _,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = eng.accept_call(call_id, access_hash).await {
+                        out.err(e);
+                    }
+                });
+            }
+            Cmd::ConfirmCall {
+                call_id,
+                access_hash,
+                g_b,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.confirm_call(call_id, access_hash, &g_b).await {
+                        Ok(emojis) => out.send(Ev::CallEmojis(emojis)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::DeriveIncomingCallEmojis { call_id, g_a } => {
+                if let Ok(emojis) = engine.derive_incoming_call_emojis(call_id, &g_a) {
+                    out.send(Ev::CallEmojis(emojis));
+                }
+            }
+            Cmd::DiscardCall {
+                call_id,
+                access_hash,
+                duration,
+                video,
+                busy,
+            } => {
+                let eng = engine.clone();
+                tokio::spawn(async move {
+                    let _ = eng.discard_call(call_id, access_hash, duration, video, busy).await;
+                });
+            }
+            Cmd::CheckUpdates => {
+                let out_u = out.clone();
+                tokio::spawn(async move {
+                    out_u.send(Ev::Status("Проверка обновлений Rustgramm…".to_owned()));
+                    let res = tokio::task::spawn_blocking(|| {
+                        crate::updater::check_latest_release(env!("CARGO_PKG_VERSION"))
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(Some(info))) => out_u.send(Ev::UpdateAvailable(Box::new(info))),
+                        Ok(Ok(None)) => out_u.send(Ev::Status(format!(
+                            "У вас установлена актуальная версия v{}",
+                            env!("CARGO_PKG_VERSION")
+                        ))),
+                        Ok(Err(e)) => out_u.err(e),
+                        Err(_) => out_u.err("Ошибка фоновой проверки обновлений"),
+                    }
+                });
+            }
+            Cmd::ApplyUpdate(info) => {
+                let out_u = out.clone();
+                tokio::spawn(async move {
+                    let o_prog = out_u.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        crate::updater::download_and_apply_update(&info, move |done, total| {
+                            o_prog.send(Ev::UpdateProgress(done, total));
+                        })
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(_path)) => {
+                            out_u.send(Ev::UpdateReady(if cfg!(windows) {
+                                "Обновление скачано — Rustgramm перезапускается…".to_owned()
+                            } else {
+                                "Открыта загрузка нового APK в браузере".to_owned()
+                            }));
+                            if cfg!(windows) {
+                                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                                std::process::exit(0);
+                            }
+                        }
+                        Ok(Err(e)) => out_u.err(format!("Обновление: {e}")),
+                        Err(_) => out_u.err("Ошибка загрузки обновления"),
+                    }
+                });
+            }
             Cmd::Settings(s) => {
                 let s = *s;
                 if s.privacy_shield.ephemeral_local_cache {
@@ -2374,17 +2892,20 @@ async fn enter(
     if !engine.settings().privacy_shield.ephemeral_local_cache {
         save_disk_cache(home, cached_me, dialogs, cached_folders);
     }
-    // Подгружаем обзор аккаунта (заблокированные для `hide_from_blocked`, приватность) и истории в фоне.
+    // Подгружаем обзор аккаунта (заблокированные для `hide_from_blocked`, приватность), истории и секретные чаты в фоне.
     {
         let eng = engine.clone();
         let out_acc = out.clone();
         tokio::spawn(async move {
-            let (acc_res, st_res) = tokio::join!(eng.account_overview(), eng.stories());
+            let (acc_res, st_res, sec_list) = tokio::join!(eng.account_overview(), eng.stories(), eng.secret_chats());
             if let Ok(a) = acc_res {
                 out_acc.send(Ev::Account(Box::new(a)));
             }
             if let Ok(st) = st_res {
                 out_acc.send(Ev::Stories(st));
+            }
+            if !sec_list.is_empty() {
+                out_acc.send(Ev::SecretChats(sec_list));
             }
         });
     }
@@ -2418,12 +2939,54 @@ async fn enter(
                     if let Some(ev) = probe.live(upd) {
                         out.send(Ev::Live(ev));
                     }
+                    if matches!(
+                        upd,
+                        grammers_client::update::Update::Raw(r)
+                            if matches!(
+                                r.raw,
+                                grammers_client::tl::enums::Update::Encryption(_)
+                                    | grammers_client::tl::enums::Update::NewEncryptedMessage(_)
+                            )
+                    ) {
+                        let eng_s = probe.clone();
+                        let out_s = out.clone();
+                        let upd_c = upd.clone();
+                        tokio::spawn(async move {
+                            if let Some(ev) = eng_s.process_secret_update(&upd_c).await {
+                                out_s.send(Ev::Live(ev));
+                            }
+                        });
+                    }
                     ctx.request_repaint();
                 })
                 .await;
         });
     }
     out.send(Ev::Stage(Stage::Ready));
+}
+
+/// Переводит технические ошибки MTProto при входе в понятные русские подсказки.
+fn friendly_login_error(raw: &str) -> String {
+    let up = raw.to_ascii_uppercase();
+    if up.contains("PHONE_NUMBER_INVALID") {
+        "Неверный номер телефона — проверьте выбранную страну и цифры".to_owned()
+    } else if up.contains("PHONE_NUMBER_BANNED") {
+        "Этот номер заблокирован в Telegram".to_owned()
+    } else if up.contains("PHONE_PASSWORD_FLOOD") || up.contains("FLOOD_WAIT") {
+        format!("Слишком много попыток входа — подождите немного ({raw})")
+    } else if up.contains("PHONE_CODE_EXPIRED") {
+        "Срок действия кода истёк — запросите новый код".to_owned()
+    } else if up.contains("PHONE_CODE_INVALID") {
+        "Неверный код подтверждения".to_owned()
+    } else if up.contains("UPDATE_APP_TO_LOGIN") {
+        "Сервер Telegram требует обновить версию клиента".to_owned()
+    } else if up.contains("AUTH_RESTART") {
+        "Telegram попросил перезапустить вход — нажмите «ДАЛЕЕ» ещё раз".to_owned()
+    } else if up.contains("IO") || up.contains("TIMED OUT") || up.contains("CONNECTION") || up.contains("RESET") {
+        format!("Нет связи с серверами Telegram ({raw}). Проверьте VPN или SOCKS5 прокси в «НАСТРОЙКИ»")
+    } else {
+        format!("Ошибка входа: {raw}")
+    }
 }
 
 /// Декодирует фото профиля и обрезает до квадрата `side` × `side`.

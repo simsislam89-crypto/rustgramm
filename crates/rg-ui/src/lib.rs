@@ -1,8 +1,11 @@
 //! Общий интерфейс Rustgramm для ПК и Android в стиле Telegram Desktop (AyuGram v7.2.9),
 //! синий везде заменён на оранжевый. Данные уходят только на серверы Telegram (см. `rg-net`).
 
+mod audio_io;
 mod chat;
+mod countries;
 pub mod emoji;
+mod features_ui;
 mod frame;
 pub mod icons;
 mod kit;
@@ -16,6 +19,7 @@ pub mod stream;
 mod tg_settings;
 pub mod theme;
 mod tray;
+pub mod updater;
 mod win;
 #[cfg(windows)]
 mod video;
@@ -297,6 +301,57 @@ struct App {
     wipe_scope: rg_core::engine::WipeScope,
     /// Подсветка целевого сообщения после перехода к реплаю / поиску / закрепу `(msg_id, started_at)`.
     highlight_msg: Option<(i32, f64)>,
+    /// Улучшенный вход по номеру телефона: выбранная страна, код, локальный номер, поиск страны, статус отправки.
+    login_country_idx: usize,
+    login_dial: String,
+    login_country_open: bool,
+    login_country_query: String,
+    login_busy: bool,
+    login_last_phone: String,
+    login_code_sent_at: Option<std::time::Instant>,
+    /// Состояние автоскролла колёсиком мыши: удержание кнопки и факт перетаскивания.
+    autoscroll_holding: bool,
+    autoscroll_dragged: bool,
+    /// Активная запись голосового сообщения с микрофона.
+    voice_rec: Option<audio_io::VoiceRecorder>,
+    /// Публикация своей истории и загруженные картинки просмотра историй.
+    story_composer_open: bool,
+    story_file_path: String,
+    story_caption: String,
+    story_privacy: rg_core::engine::StoryPrivacy,
+    story_period: i32,
+    story_pinned: bool,
+    story_noforwards: bool,
+    story_textures: HashMap<i32, egui::TextureHandle>,
+    story_media_req: HashSet<i32>,
+    story_reply_text: String,
+    story_opened_at: Option<std::time::Instant>,
+    /// Активный голосовой/видеозвонок и история звонков.
+    active_call: Option<features_ui::ActiveCallUi>,
+    calls_open: bool,
+    call_history: Vec<rg_core::calls::CallLogEntry>,
+    /// Секретные чаты E2E.
+    secret_open: bool,
+    secret_chats: Vec<rg_ayu::store::SecretChatRecord>,
+    secret_selected: Option<i32>,
+    secret_messages: Vec<rg_ayu::store::SecretMessageRecord>,
+    secret_input: String,
+    secret_show_key: bool,
+    /// Администрирование групп и каналов.
+    admin_modal: Option<features_ui::AdminModalState>,
+    admin_log: Vec<rg_core::engine::AdminLogRow>,
+    admin_invites: Vec<rg_core::engine::InviteLinkRow>,
+    /// Плашка автообновления при выходе нового релиза на GitHub.
+    update_available: Option<updater::UpdateInfo>,
+    update_dismissed: bool,
+    update_progress: Option<(u64, u64)>,
+    /// Анимация ожидания ответа callback-кнопки бота `(msg_id, btn_text, clicked_at)`.
+    bot_btn_pending: Option<(i32, String, f64)>,
+    /// Время открытия Mini App (для плавной анимации) и режим разворачивания.
+    #[cfg(windows)]
+    miniapp_opened_at: Option<std::time::Instant>,
+    #[cfg(windows)]
+    miniapp_expanded: bool,
 }
 
 pub(crate) struct ShotModal {
@@ -548,6 +603,47 @@ impl App {
             wipe_confirm_step: false,
             wipe_scope: rg_core::engine::WipeScope::default(),
             highlight_msg: None,
+            login_country_idx: 0,
+            login_dial: "+7".to_owned(),
+            login_country_open: false,
+            login_country_query: String::new(),
+            login_busy: false,
+            login_last_phone: String::new(),
+            login_code_sent_at: None,
+            autoscroll_holding: false,
+            autoscroll_dragged: false,
+            voice_rec: None,
+            story_composer_open: false,
+            story_file_path: String::new(),
+            story_caption: String::new(),
+            story_privacy: rg_core::engine::StoryPrivacy::Everyone,
+            story_period: 86_400,
+            story_pinned: true,
+            story_noforwards: false,
+            story_textures: HashMap::new(),
+            story_media_req: HashSet::new(),
+            story_reply_text: String::new(),
+            story_opened_at: None,
+            active_call: None,
+            calls_open: false,
+            call_history: Vec::new(),
+            secret_open: false,
+            secret_chats: Vec::new(),
+            secret_selected: None,
+            secret_messages: Vec::new(),
+            secret_input: String::new(),
+            secret_show_key: false,
+            admin_modal: None,
+            admin_log: Vec::new(),
+            admin_invites: Vec::new(),
+            update_available: None,
+            update_dismissed: false,
+            update_progress: None,
+            bot_btn_pending: None,
+            #[cfg(windows)]
+            miniapp_opened_at: None,
+            #[cfg(windows)]
+            miniapp_expanded: false,
         }
     }
 
@@ -670,6 +766,136 @@ impl App {
                 }
                 ctx.request_repaint();
             }
+            Live::PhoneCall(ev) => {
+                use rg_core::calls::{CallEvent, CallState};
+                match ev {
+                    CallEvent::Incoming {
+                        call_id,
+                        access_hash,
+                        admin_id,
+                        video,
+                        ..
+                    } => {
+                        let name = self
+                            .dialogs
+                            .iter()
+                            .find(|d| d.id == admin_id)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| format!("Пользователь {admin_id}"));
+                        if self.settings.notify.allow_sound && self.settings.notify.volume > 0 {
+                            audio_io::play_ringtone(self.settings.notify.volume);
+                        }
+                        self.push_notification(
+                            ctx,
+                            &name,
+                            if video { "Входящий видеозвонок" } else { "Входящий голосовой звонок" },
+                        );
+                        self.active_call = Some(features_ui::ActiveCallUi {
+                            call_id,
+                            access_hash,
+                            peer_name: name,
+                            peer_id: admin_id,
+                            video,
+                            outgoing: false,
+                            state: CallState::RingingIn,
+                            connected_at: None,
+                            muted: false,
+                            speaker: false,
+                            camera_on: video,
+                            emojis: None,
+                            relays: 0,
+                        });
+                    }
+                    CallEvent::Waiting { call_id, access_hash, .. } => {
+                        if let Some(c) = self.active_call.as_mut()
+                            && (c.call_id == 0 || c.call_id == call_id)
+                        {
+                            c.call_id = call_id;
+                            c.access_hash = access_hash;
+                        }
+                    }
+                    CallEvent::Accepted { call_id, access_hash, g_b } => {
+                        audio_io::stop_ringtone();
+                        if let Some(c) = self.active_call.as_mut()
+                            && (c.call_id == 0 || c.call_id == call_id)
+                        {
+                            c.call_id = call_id;
+                            c.access_hash = access_hash;
+                            c.state = CallState::Connecting;
+                        }
+                        self.send(Cmd::ConfirmCall { call_id, access_hash, g_b });
+                    }
+                    CallEvent::Active {
+                        call_id,
+                        access_hash,
+                        g_a_or_b,
+                        relays,
+                        ..
+                    } => {
+                        audio_io::stop_ringtone();
+                        let derive_incoming = if let Some(c) = self.active_call.as_mut()
+                            && (c.call_id == 0 || c.call_id == call_id)
+                        {
+                            c.call_id = call_id;
+                            c.access_hash = access_hash;
+                            c.state = CallState::Active;
+                            if c.connected_at.is_none() {
+                                c.connected_at = Some(std::time::Instant::now());
+                            }
+                            c.relays = relays;
+                            !c.outgoing && c.emojis.is_none()
+                        } else {
+                            false
+                        };
+                        if derive_incoming {
+                            self.send(Cmd::DeriveIncomingCallEmojis { call_id, g_a: g_a_or_b });
+                        }
+                    }
+                    CallEvent::Discarded { call_id, reason, duration } => {
+                        audio_io::stop_ringtone();
+                        if let Some(c) = self.active_call.as_mut()
+                            && (c.call_id == 0 || c.call_id == call_id)
+                        {
+                            c.state = CallState::Ended(reason.clone());
+                            self.call_history.insert(
+                                0,
+                                rg_core::calls::CallLogEntry {
+                                    peer_name: c.peer_name.clone(),
+                                    peer_id: c.peer_id,
+                                    video: c.video,
+                                    outgoing: c.outgoing,
+                                    duration: duration.max(0) as u32,
+                                    status: reason,
+                                    timestamp: self.now,
+                                },
+                            );
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Live::SecretChatUpdate(rec) => {
+                if rec.state == "discarded" {
+                    self.secret_chats.retain(|c| c.chat_id != rec.chat_id);
+                    if self.secret_selected == Some(rec.chat_id) {
+                        self.secret_selected = None;
+                        self.secret_messages.clear();
+                    }
+                } else if let Some(ex) = self.secret_chats.iter_mut().find(|c| c.chat_id == rec.chat_id) {
+                    *ex = rec;
+                } else {
+                    self.push_notification(ctx, &rec.peer_name, "Новый секретный чат (E2E)");
+                    self.secret_chats.insert(0, rec);
+                }
+                ctx.request_repaint();
+            }
+            Live::SecretMsg(msg) => {
+                if self.secret_selected == Some(msg.chat_id) {
+                    self.secret_messages.push(msg.clone());
+                }
+                self.push_notification(ctx, "Секретный чат (E2E)", "Новое зашифрованное сообщение");
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -686,7 +912,7 @@ impl App {
             win::flash_taskbar();
         }
         if cfg.allow_sound && cfg.volume > 0 {
-            win::play_notify_sound();
+            win::play_notify_sound(cfg.volume);
         }
         if cfg.use_windows_notifications {
             notify_toast(title, body);
@@ -962,6 +1188,10 @@ impl App {
             }
         }
         if let Some(v) = self.audio_view.as_ref() {
+            if let Some(err) = v.take_error() {
+                self.error = err;
+                self.error_at = self.now;
+            }
             if v.is_playing() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
@@ -1828,13 +2058,19 @@ impl App {
                 }
                 Ev::MiniAppReady { title, url } => {
                     #[cfg(windows)]
-                    if let Some(v) = self.miniapp_view.take() {
-                        v.stop();
+                    {
+                        if let Some(v) = self.miniapp_view.take() {
+                            v.stop();
+                        }
+                        self.miniapp_opened_at = Some(std::time::Instant::now());
+                        self.miniapp_expanded = false;
                     }
                     self.miniapp_modal = Some((title, url));
+                    self.bot_btn_pending = None;
                 }
                 Ev::BotAlert(msg) => {
                     self.bot_alert = Some(msg);
+                    self.bot_btn_pending = None;
                 }
                 Ev::NavigateTo { id, post } => {
                     if let Some(pos) = self.dialogs.iter().position(|d| d.id == id) {
@@ -1994,10 +2230,63 @@ impl App {
                         self.autostart_minimized = false;
                     }
                 }
-                Ev::Status(s) => self.status = s,
+                Ev::LoginBusy(b) => {
+                    self.login_busy = b;
+                    ctx.request_repaint();
+                }
+                Ev::StoryImage(sid, img) => {
+                    let tex = ctx.load_texture(format!("story-{sid}"), *img, egui::TextureOptions::LINEAR);
+                    self.story_textures.insert(sid, tex);
+                }
+                Ev::AdminLog(rows) => self.admin_log = rows,
+                Ev::AdminInvites(rows) => self.admin_invites = rows,
+                Ev::SecretChats(list) => self.secret_chats = list,
+                Ev::SecretMessages(cid, msgs) => {
+                    if self.secret_selected == Some(cid) {
+                        self.secret_messages = msgs;
+                    }
+                }
+                Ev::CallStarted {
+                    call_id,
+                    access_hash,
+                    peer_name,
+                    video,
+                } => {
+                    if let Some(c) = self.active_call.as_mut() {
+                        c.call_id = call_id;
+                        c.access_hash = access_hash;
+                        c.peer_name = peer_name;
+                        c.video = video;
+                    }
+                }
+                Ev::CallEmojis(em) => {
+                    if let Some(c) = self.active_call.as_mut() {
+                        c.emojis = Some(em);
+                        c.state = rg_core::calls::CallState::Active;
+                        if c.connected_at.is_none() {
+                            c.connected_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                Ev::UpdateAvailable(info) => {
+                    self.update_available = Some(*info);
+                    self.update_dismissed = false;
+                }
+                Ev::UpdateProgress(done, total) => {
+                    self.update_progress = Some((done, total));
+                }
+                Ev::UpdateReady(msg) => {
+                    self.update_progress = None;
+                    self.status = msg;
+                }
+                Ev::Status(s) => {
+                    self.status = s;
+                    self.bot_btn_pending = None;
+                }
                 Ev::Error(e) => {
                     self.error = e;
                     self.error_at = self.now;
+                    self.bot_btn_pending = None;
                 }
             }
         }
@@ -2006,30 +2295,45 @@ impl App {
     // ---------- вход ----------
 
     fn login_ui(&mut self, ui: &mut egui::Ui) {
-        // Ссылка «Настройки» в правом верхнем углу, как у Telegram Desktop.
-        let top = ui.max_rect().right_top() + Vec2::new(-24.0, 22.0);
-        let rect = egui::Rect::from_min_size(top - Vec2::new(120.0, 0.0), Vec2::new(120.0, 22.0));
-        let r = ui.interact(rect, ui.make_persistent_id("login-settings"), Sense::click());
-        ui.painter().text(
-            rect.right_center(),
-            egui::Align2::RIGHT_CENTER,
-            "НАСТРОЙКИ",
-            FontId::proportional(14.0),
-            ACCENT,
-        );
-        if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            self.proxy_open = !self.proxy_open;
-        }
+        // Верхняя полоса с кнопкой «НАСТРОЙКИ» (не перекрывает статус-бар Android и не уезжает за край).
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            if self.login_busy {
+                ui.add(egui::Spinner::new().size(15.0).color(ORANGE));
+                ui.label(RichText::new("Связь с Telegram…").size(12.5).color(SUBTEXT));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(16.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("НАСТРОЙКИ").size(13.5).strong().color(ACCENT))
+                            .frame(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.proxy_open = !self.proxy_open;
+                }
+            });
+        });
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.08).max(16.0));
+                ui.add_space((ui.available_height() * 0.05).max(10.0));
                 match self.stage.clone() {
                     Stage::Qr(url) => self.qr_screen(ui, &url),
                     _ => self.form_screen(ui),
                 }
                 if !self.error.is_empty() {
-                    ui.add_space(10.0);
-                    ui.colored_label(DANGER, &self.error);
+                    ui.add_space(12.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(220, 68, 68, 36))
+                        .stroke(egui::Stroke::new(1.0, DANGER.gamma_multiply(0.6)))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.set_max_width(300.0);
+                            ui.label(RichText::new(&self.error).size(12.5).color(Color32::from_rgb(255, 165, 165)));
+                        });
                 }
                 // Если уже есть другой авторизованный аккаунт, можно отменить вход и вернуться обратно.
                 if let Some(prev) = self
@@ -2049,12 +2353,13 @@ impl App {
                         }
                     }
                 }
-                ui.add_space(24.0);
+                ui.add_space(20.0);
                 ui.label(
                     RichText::new(format!("Rustgramm v{}", env!("CARGO_PKG_VERSION")))
                         .color(SUBTEXT)
-                        .size(13.0),
+                        .size(12.5),
                 );
+                ui.add_space(18.0);
             });
         });
         self.proxy_window(ui.ctx());
@@ -2144,59 +2449,227 @@ impl App {
                 }
             }
             Stage::NeedPhone => {
-                ui.label(RichText::new("Ваш номер телефона").size(18.0).color(WHITE));
-                ui.label(RichText::new("Укажите код страны и номер").color(SUBTEXT));
-                ui.add_space(8.0);
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.phone)
-                        .hint_text("+7 …")
-                        .desired_width(280.0)
-                        .margin(Vec2::new(10.0, 9.0)),
+                let country = countries::COUNTRIES
+                    .get(self.login_country_idx)
+                    .copied()
+                    .unwrap_or(countries::COUNTRIES[0]);
+                ui.label(RichText::new("Ваш номер телефона").size(19.0).strong().color(WHITE));
+                ui.label(
+                    RichText::new("Выберите страну и введите номер телефона")
+                        .size(13.0)
+                        .color(SUBTEXT),
                 );
-                ui.add_space(6.0);
-                let go = primary_button(ui, "ДАЛЕЕ").clicked()
-                    || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if go && !self.phone.trim().is_empty() {
-                    self.send(Cmd::RequestCode(self.phone.trim().to_owned()));
+                ui.add_space(12.0);
+                // Кнопка выбора страны (с поиском по названию/коду).
+                let cbtn = egui::Button::new(
+                    RichText::new(format!("{}  {} ({})  ▼", country.iso, country.name, country.dial))
+                        .size(14.0)
+                        .color(WHITE),
+                )
+                .fill(t(SIDEBAR_BG))
+                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(28)))
+                .corner_radius(egui::CornerRadius::same(10));
+                if ui
+                    .add_sized([296.0, 38.0], cbtn)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.login_country_open = !self.login_country_open;
+                    self.login_country_query.clear();
                 }
-                ui.add_space(18.0);
+                if self.login_country_open {
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(t2(WINDOW_BG))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(30)))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(280.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.login_country_query)
+                                    .hint_text("Поиск страны или кода (+7, +1, США)…")
+                                    .desired_width(276.0),
+                            );
+                            ui.add_space(4.0);
+                            let matches = countries::filter_countries(&self.login_country_query);
+                            egui::ScrollArea::vertical()
+                                .max_height(175.0)
+                                .id_salt("country-picker")
+                                .show(ui, |ui| {
+                                    for idx in matches {
+                                        let c = countries::COUNTRIES[idx];
+                                        let sel = idx == self.login_country_idx;
+                                        let lbl = format!("{}  {}  {}", c.iso, c.name, c.dial);
+                                        if ui
+                                            .selectable_label(
+                                                sel,
+                                                RichText::new(lbl)
+                                                    .size(13.0)
+                                                    .color(if sel { ORANGE } else { WHITE }),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.login_country_idx = idx;
+                                            self.login_dial = c.dial.to_owned();
+                                            self.login_country_open = false;
+                                        }
+                                    }
+                                });
+                        });
+                }
+                ui.add_space(8.0);
+                // Два синхронизированных поля: [Код страны] + [Номер телефона].
+                let mut enter_pressed = false;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(296.0, 40.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let dr = ui.add_sized(
+                            [76.0, 38.0],
+                            egui::TextEdit::singleline(&mut self.login_dial)
+                                .hint_text("+7")
+                                .margin(Vec2::new(10.0, 9.0)),
+                        );
+                        if dr.changed() {
+                            if !self.login_dial.starts_with('+') && !self.login_dial.is_empty() {
+                                let d: String = self.login_dial.chars().filter(char::is_ascii_digit).collect();
+                                self.login_dial = format!("+{d}");
+                            }
+                            if let Some(idx) = countries::find_country_by_dial(&self.login_dial) {
+                                self.login_country_idx = idx;
+                            }
+                        }
+                        let pr = ui.add_sized(
+                            [212.0, 38.0],
+                            egui::TextEdit::singleline(&mut self.phone)
+                                .hint_text(country.hint)
+                                .margin(Vec2::new(10.0, 9.0)),
+                        );
+                        if pr.changed()
+                            && let Some((idx, dial, local)) = countries::split_full_phone(&self.phone)
+                        {
+                            self.login_country_idx = idx;
+                            self.login_dial = dial.to_owned();
+                            self.phone = local;
+                        }
+                        if (pr.lost_focus() || dr.lost_focus())
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            enter_pressed = true;
+                        }
+                    },
+                );
+                ui.add_space(12.0);
+                let btn_lbl = if self.login_busy { "ОТПРАВКА КОДА…" } else { "ДАЛЕЕ" };
+                let clicked = ui
+                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(296.0, 42.0)))
+                    .inner
+                    .clicked();
+                if (clicked || enter_pressed) && !self.login_busy {
+                    match countries::normalize_phone(&self.login_dial, &self.phone) {
+                        Ok(full_phone) => {
+                            self.error.clear();
+                            self.login_last_phone = full_phone.clone();
+                            self.login_code_sent_at = Some(std::time::Instant::now());
+                            self.login_busy = true;
+                            self.send(Cmd::RequestCode(full_phone));
+                        }
+                        Err(msg) => {
+                            self.error = msg.to_owned();
+                            self.error_at = self.now;
+                        }
+                    }
+                }
+                ui.add_space(16.0);
                 if link(ui, "Войти по QR-коду").clicked() {
+                    self.error.clear();
                     self.send(Cmd::UseQr);
                 }
             }
             Stage::NeedCode => {
-                ui.label(RichText::new("Введите код").size(18.0).color(WHITE));
-                ui.label(RichText::new("Мы отправили код в приложение Telegram").color(SUBTEXT));
-                ui.add_space(8.0);
+                ui.label(RichText::new("Введите код подтверждения").size(18.0).strong().color(WHITE));
+                if !self.login_last_phone.is_empty() {
+                    ui.label(RichText::new(&self.login_last_phone).size(14.0).color(ORANGE));
+                }
+                ui.label(
+                    RichText::new("Код отправлен в приложение Telegram (или по SMS)")
+                        .size(12.5)
+                        .color(SUBTEXT),
+                );
+                ui.add_space(10.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.code)
-                        .desired_width(280.0)
+                        .hint_text("5 цифр кода")
+                        .desired_width(296.0)
                         .margin(Vec2::new(10.0, 9.0)),
                 );
-                ui.add_space(6.0);
-                let go = primary_button(ui, "ВОЙТИ").clicked()
+                ui.add_space(10.0);
+                let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ВОЙТИ" };
+                let go = ui
+                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(296.0, 42.0)))
+                    .inner
+                    .clicked()
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if go && !self.code.trim().is_empty() {
-                    self.send(Cmd::Code(self.code.trim().to_owned()));
+                if go && !self.code.trim().is_empty() && !self.login_busy {
+                    self.error.clear();
+                    self.login_busy = true;
+                    let clean: String = self.code.chars().filter(char::is_ascii_digit).collect();
+                    self.send(Cmd::Code(if clean.is_empty() { self.code.trim().to_owned() } else { clean }));
                     self.code.clear();
                 }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if link(ui, "← Изменить номер").clicked() {
+                        self.error.clear();
+                        self.code.clear();
+                        self.send(Cmd::BackToPhone);
+                    }
+                    ui.add_space(18.0);
+                    let wait_left = self
+                        .login_code_sent_at
+                        .map_or(0, |t| 30u64.saturating_sub(t.elapsed().as_secs()));
+                    if wait_left > 0 {
+                        ui.label(RichText::new(format!("Повторно через {wait_left}с")).size(12.0).color(SUBTEXT));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                    } else if !self.login_last_phone.is_empty() && link(ui, "Отправить ещё раз").clicked() {
+                        self.error.clear();
+                        self.login_code_sent_at = Some(std::time::Instant::now());
+                        self.login_busy = true;
+                        self.send(Cmd::RequestCode(self.login_last_phone.clone()));
+                    }
+                });
             }
             Stage::NeedPassword(hint) => {
-                ui.label(RichText::new("Облачный пароль").size(18.0).color(WHITE));
+                ui.label(RichText::new("Облачный пароль (2FA)").size(18.0).strong().color(WHITE));
                 ui.label(RichText::new(format!("Подсказка: {hint}")).color(SUBTEXT));
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.password)
                         .password(true)
-                        .desired_width(280.0)
+                        .hint_text("Введите пароль")
+                        .desired_width(296.0)
                         .margin(Vec2::new(10.0, 9.0)),
                 );
-                ui.add_space(6.0);
-                let go = primary_button(ui, "ПРОДОЛЖИТЬ").clicked()
+                ui.add_space(10.0);
+                let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ПРОДОЛЖИТЬ" };
+                let go = ui
+                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(296.0, 42.0)))
+                    .inner
+                    .clicked()
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if go && !self.password.is_empty() {
+                if go && !self.password.is_empty() && !self.login_busy {
+                    self.error.clear();
+                    self.login_busy = true;
                     let pw = std::mem::take(&mut self.password);
                     self.send(Cmd::Password(pw));
+                }
+                ui.add_space(12.0);
+                if link(ui, "← Назад к номеру").clicked() {
+                    self.error.clear();
+                    self.password.clear();
+                    self.send(Cmd::BackToPhone);
                 }
             }
             Stage::Qr(_) | Stage::Ready => {}
@@ -2780,6 +3253,20 @@ impl eframe::App for App {
                 .show(ui, |ui| self.titlebar(ui));
             self.resize_edges(ui);
         }
+        #[cfg(target_os = "android")]
+        {
+            // Безопасный отступ под системный статус-бар Android (часы, Wi-Fi, батарея).
+            egui::Panel::top("android-safe-top")
+                .exact_size(40.0)
+                .frame(egui::Frame::new().fill(tint_title()))
+                .show(ui, |_ui| {});
+        }
+        if self.update_available.is_some() && !self.update_dismissed {
+            egui::Panel::top("update-banner")
+                .exact_size(42.0)
+                .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
+                .show(ui, |ui| self.update_banner_ui(ui));
+        }
         if self.app_locked && !self.settings.security.passcode_hash.is_empty() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(tint_panel()))
@@ -2798,6 +3285,7 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
+            self.render_modals(&ctx, frame);
             return;
         }
         if !narrow {
@@ -2903,32 +3391,42 @@ impl eframe::App for App {
         if narrow {
             self.emoji_window(&ctx);
         }
-        self.chat_windows(&ctx);
-        self.viewer_window(&ctx);
-        self.contacts_window(&ctx);
-        self.drawer(&ctx);
-        self.create_window(&ctx);
-        self.settings_window(&ctx);
-        self.tg_settings_window(&ctx);
-        self.my_profile_window(&ctx);
-        self.proxy_window(&ctx);
-        self.toasts_overlay(&ctx);
-        #[cfg(windows)]
-        {
-            self.inline_gif_overlay(&ctx, frame);
-            self.player_overlay(&ctx, frame);
-            self.audio_overlay(&ctx, frame);
-            self.miniapp_overlay(&ctx, frame);
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = frame;
-            self.miniapp_fallback_window(&ctx);
-        }
+        self.render_modals(&ctx, frame);
     }
 }
 
 impl App {
+    /// Все поверх-оконные шторки, модалки и плееры (работают и в обычном, и в узком Android-режиме).
+    fn render_modals(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        self.chat_windows(ctx);
+        self.viewer_window(ctx);
+        self.contacts_window(ctx);
+        self.drawer(ctx);
+        self.create_window(ctx);
+        self.settings_window(ctx);
+        self.tg_settings_window(ctx);
+        self.my_profile_window(ctx);
+        self.proxy_window(ctx);
+        self.story_composer_window(ctx);
+        self.call_window(ctx);
+        self.calls_history_window(ctx);
+        self.secret_chats_window(ctx);
+        self.admin_window(ctx);
+        self.toasts_overlay(ctx);
+        #[cfg(windows)]
+        {
+            self.inline_gif_overlay(ctx, frame);
+            self.player_overlay(ctx, frame);
+            self.audio_overlay(ctx, frame);
+            self.miniapp_overlay(ctx, frame);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = frame;
+            self.miniapp_fallback_window(ctx);
+        }
+    }
+
     #[cfg(windows)]
     #[allow(deprecated)]
     fn miniapp_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -2940,17 +3438,51 @@ impl App {
         };
         let screen = ctx.content_rect();
         let ppp = ctx.pixels_per_point();
-        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let open_k = self
+            .miniapp_opened_at
+            .map_or(1.0, |t| (t.elapsed().as_secs_f32() / 0.22).clamp(0.0, 1.0));
+        if open_k < 1.0 {
+            ctx.request_repaint();
+        }
+        let ease = ios_spring(open_k);
+        let bridge = self
+            .miniapp_view
+            .as_ref()
+            .map(video::MiniAppView::bridge_snapshot)
+            .unwrap_or_default();
+        if bridge.expanded {
+            self.miniapp_expanded = true;
+        }
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape)) || bridge.wants_close;
         let mut reload = false;
         let mut open_ext = false;
-        let base_w: f32 = if self.settings.ayu.increase_webview_width { 560.0 } else { 420.0 };
-        let base_h: f32 = if self.settings.ayu.increase_webview_height { 720.0 } else { 580.0 };
-        let card_w = base_w.min(screen.width() - 24.0).max(280.0);
-        let card_h = base_h.min(screen.height() - 36.0).max(320.0);
-        let card_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(card_w, card_h));
+        let mut back_pressed = false;
+        let mut main_pressed = false;
+        let base_w: f32 = if self.miniapp_expanded {
+            (screen.width() - 48.0).min(860.0)
+        } else if self.settings.ayu.increase_webview_width {
+            560.0
+        } else {
+            440.0
+        };
+        let base_h: f32 = if self.miniapp_expanded {
+            (screen.height() - 48.0).min(840.0)
+        } else if self.settings.ayu.increase_webview_height {
+            720.0
+        } else {
+            610.0
+        };
+        let card_w = base_w.min(screen.width() - 24.0).max(300.0);
+        let card_h = base_h.min(screen.height() - 36.0).max(340.0);
+        let slide_y = (1.0 - ease) * 24.0;
+        let card_rect = egui::Rect::from_center_size(
+            screen.center() + Vec2::new(0.0, slide_y),
+            Vec2::new(card_w, card_h),
+        );
+        let bottom_bar_h = if bridge.main_btn_visible && !bridge.main_btn_text.is_empty() { 48.0 } else { 2.0 };
         let web_rect = egui::Rect::from_min_max(
-            card_rect.min + Vec2::new(2.0, 42.0),
-            card_rect.max - Vec2::new(2.0, 2.0),
+            card_rect.min + Vec2::new(2.0, 44.0),
+            card_rect.max - Vec2::new(2.0, bottom_bar_h),
         );
         if self.miniapp_view.is_none() {
             let dir = worker::account_home(&worker::home(), self.settings.active_account);
@@ -2977,20 +3509,52 @@ impl App {
                 (web_rect.width() * ppp).round() as u32,
                 (web_rect.height() * ppp).round() as u32,
             ));
+            let (ext_link, tg_link) = v.take_links();
+            if let Some(u) = ext_link {
+                rich::open_url(&u);
+            }
+            if let Some(tgu) = tg_link {
+                if let Some(parsed) = rg_core::engine::parse_tg_link(&tgu) {
+                    self.send(Cmd::OpenTgLink(parsed));
+                    close = true;
+                } else {
+                    rich::open_url(&tgu);
+                }
+            }
         }
         egui::Area::new(egui::Id::new("miniapp-overlay"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                paint_frosted_scrim(ui.painter(), rect, 1.0);
+                paint_frosted_scrim(ui.painter(), rect, ease);
                 ui.painter().rect_filled(card_rect, egui::CornerRadius::same(14), t2(WINDOW_BG));
-                paint_modal_subblur(ui.painter(), card_rect, 14.0, 1.0);
-                let hdr = egui::Rect::from_min_size(card_rect.min, Vec2::new(card_w, 40.0));
-                let hdr_clip = egui::Rect::from_min_max(hdr.min, egui::pos2((hdr.right() - 102.0).max(hdr.left() + 40.0), hdr.bottom()));
-                icons::tg_sized(ui.painter(), "settings/language", egui::pos2(hdr.left() + 24.0, hdr.center().y), Vec2::splat(16.0), ORANGE);
+                paint_modal_subblur(ui.painter(), card_rect, 14.0, ease);
+                let hdr = egui::Rect::from_min_size(card_rect.min, Vec2::new(card_w, 42.0));
+                if let Some((r, g, b)) = bridge.header_color {
+                    ui.painter().rect_filled(
+                        hdr,
+                        egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 },
+                        Color32::from_rgb(r, g, b),
+                    );
+                }
+                let mut left_x = hdr.left() + 14.0;
+                if bridge.back_visible {
+                    let br = egui::Rect::from_center_size(egui::pos2(left_x + 12.0, hdr.center().y), Vec2::splat(28.0));
+                    let bresp = ui.interact(br, ui.make_persistent_id("miniapp-back"), Sense::click());
+                    ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, "←", FontId::proportional(16.0), if bresp.hovered() { ORANGE } else { WHITE });
+                    if bresp.on_hover_text("Назад в Mini App").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        back_pressed = true;
+                    }
+                    left_x += 30.0;
+                }
+                icons::tg_sized(ui.painter(), "settings/language", egui::pos2(left_x + 8.0, hdr.center().y), Vec2::splat(16.0), ORANGE);
+                let hdr_clip = egui::Rect::from_min_max(
+                    egui::pos2(left_x + 22.0, hdr.top()),
+                    egui::pos2((hdr.right() - 134.0).max(left_x + 60.0), hdr.bottom()),
+                );
                 ui.painter().with_clip_rect(hdr_clip).text(
-                    egui::pos2(hdr.left() + 42.0, hdr.center().y),
+                    egui::pos2(left_x + 24.0, hdr.center().y),
                     egui::Align2::LEFT_CENTER,
                     &title,
                     FontId::proportional(14.5),
@@ -3002,22 +3566,54 @@ impl App {
                 if xr.on_hover_text("Закрыть Mini App").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     close = true;
                 }
-                let btn_ext = egui::Rect::from_center_size(egui::pos2(hdr.right() - 54.0, hdr.center().y), Vec2::splat(28.0));
+                let btn_exp = egui::Rect::from_center_size(egui::pos2(hdr.right() - 52.0, hdr.center().y), Vec2::splat(28.0));
+                let expr = ui.interact(btn_exp, ui.make_persistent_id("miniapp-expand"), Sense::click());
+                ui.painter().text(
+                    btn_exp.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if self.miniapp_expanded { "⤡" } else { "⤢" },
+                    FontId::proportional(14.0),
+                    if expr.hovered() { ORANGE } else { SUBTEXT },
+                );
+                if expr.on_hover_text(if self.miniapp_expanded { "Обычный размер" } else { "Развернуть" }).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.miniapp_expanded = !self.miniapp_expanded;
+                }
+                let btn_ext = egui::Rect::from_center_size(egui::pos2(hdr.right() - 82.0, hdr.center().y), Vec2::splat(28.0));
                 let er = ui.interact(btn_ext, ui.make_persistent_id("miniapp-ext"), Sense::click());
                 ui.painter().text(btn_ext.center(), egui::Align2::CENTER_CENTER, "↗", FontId::proportional(14.0), if er.hovered() { ORANGE } else { SUBTEXT });
                 if er.on_hover_text("Открыть в браузере").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     open_ext = true;
                 }
-                let btn_rel = egui::Rect::from_center_size(egui::pos2(hdr.right() - 84.0, hdr.center().y), Vec2::splat(28.0));
+                let btn_rel = egui::Rect::from_center_size(egui::pos2(hdr.right() - 112.0, hdr.center().y), Vec2::splat(28.0));
                 let rr = ui.interact(btn_rel, ui.make_persistent_id("miniapp-reload"), Sense::click());
                 ui.painter().text(btn_rel.center(), egui::Align2::CENTER_CENTER, "↻", FontId::proportional(14.0), if rr.hovered() { WHITE } else { SUBTEXT });
                 if rr.on_hover_text("Обновить").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     reload = true;
                 }
-                if resp.clicked() && ! ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| card_rect.contains(p)) {
+                if bridge.main_btn_visible && !bridge.main_btn_text.is_empty() {
+                    let mb_rect = egui::Rect::from_min_max(
+                        egui::pos2(card_rect.left() + 10.0, card_rect.bottom() - 42.0),
+                        egui::pos2(card_rect.right() - 10.0, card_rect.bottom() - 8.0),
+                    );
+                    let mbr = ui.interact(mb_rect, ui.make_persistent_id("miniapp-mainbtn"), Sense::click());
+                    let base_c = bridge.main_btn_color.map_or(ORANGE, |(r, g, b)| Color32::from_rgb(r, g, b));
+                    let fill_c = if mbr.hovered() { base_c.gamma_multiply(1.12) } else { base_c };
+                    ui.painter().rect_filled(mb_rect, egui::CornerRadius::same(10), fill_c);
+                    ui.painter().text(mb_rect.center(), egui::Align2::CENTER_CENTER, &bridge.main_btn_text, FontId::proportional(14.0), Color32::WHITE);
+                    if mbr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        main_pressed = true;
+                    }
+                }
+                if resp.clicked() && !ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| card_rect.contains(p)) {
                     close = true;
                 }
             });
+        if back_pressed && let Some(v) = self.miniapp_view.as_ref() {
+            v.emit_back_pressed();
+        }
+        if main_pressed && let Some(v) = self.miniapp_view.as_ref() {
+            v.emit_main_button_pressed();
+        }
         if reload && let Some(v) = self.miniapp_view.as_ref() {
             v.reload();
         }

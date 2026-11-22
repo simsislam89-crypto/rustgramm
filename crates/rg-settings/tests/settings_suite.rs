@@ -551,6 +551,7 @@ fn isolated_account_profiles_have_distinct_fingerprints_and_roundtrip() {
             ephemeral_local_cache: true,
             anonymize_filenames: true,
             anti_correlation_accounts: true,
+            check_updates: false,
         },
         ..Settings::default()
     };

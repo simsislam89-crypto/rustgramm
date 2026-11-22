@@ -102,13 +102,31 @@ pub fn decode_waveform(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Расширение файла по MIME-типу, когда у документа нет имени.
+/// Упаковывает массив пиков `0..=31` в битовый поток волны голосового сообщения Telegram (5 бит на столбик).
+pub fn encode_waveform(peaks: &[u8]) -> Vec<u8> {
+    let total_bits = peaks.len() * 5;
+    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    for (i, &val) in peaks.iter().enumerate() {
+        let v = u16::from(val.min(31));
+        let bit = i * 5;
+        let (byte, off) = (bit / 8, bit % 8);
+        out[byte] |= ((v << off) & 0xff) as u8;
+        if off > 3 && byte + 1 < out.len() {
+            out[byte + 1] |= ((v >> (8 - off)) & 0xff) as u8;
+        }
+    }
+    out
+}
+
+/// Расширение файла по MIME-типу, когда у документа нет имени (отбрасывает параметры `; codecs=...`).
 pub fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
+    let base = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
+    match base.as_str() {
         "audio/ogg" | "audio/opus" => "ogg",
-        "audio/mpeg" => "mp3",
-        "audio/mp4" | "audio/m4a" => "m4a",
-        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/m4a" | "audio/aac" => "m4a",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/flac" => "flac",
         "video/mp4" => "mp4",
         "video/webm" => "webm",
         "video/quicktime" => "mov",
@@ -436,7 +454,17 @@ mod tests {
     #[test]
     fn mime_gives_extension() {
         assert_eq!(ext_for_mime("audio/ogg"), "ogg");
+        assert_eq!(ext_for_mime("audio/ogg; codecs=opus"), "ogg");
+        assert_eq!(ext_for_mime("audio/mp4; codecs=mp4a"), "m4a");
         assert_eq!(ext_for_mime("weird/thing"), "bin");
+    }
+
+    #[test]
+    fn waveform_encode_decode_roundtrip() {
+        let peaks: Vec<u8> = (0..63).map(|i| ((i * 7) % 32) as u8).collect();
+        let packed = encode_waveform(&peaks);
+        let decoded = decode_waveform(&packed);
+        assert_eq!(&decoded[..peaks.len()], peaks.as_slice());
     }
 
     #[test]

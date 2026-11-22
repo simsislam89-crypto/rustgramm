@@ -227,6 +227,9 @@ impl App {
                 if a.drawer_calls && item(ui, icons::Ico::Calls, "Звонки") {
                     act = Some("calls");
                 }
+                if item(ui, icons::Ico::Ghost, "Секретные чаты (E2E)") {
+                    act = Some("secret");
+                }
                 if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
                     act = Some("saved");
                 }
@@ -252,18 +255,22 @@ impl App {
                         s.ayu.streamer_mode = st;
                     }
                 }
-                // Аккуратная подпись версии внизу шторки, как в AyuGram Desktop.
+                // Аккуратная подпись версии внизу шторки с проверкой обновлений по клику.
                 let foot = Rect::from_min_max(
                     Pos2::new(rect.left() + 18.0, rect.bottom() - 34.0),
                     Pos2::new(rect.right() - 18.0, rect.bottom() - 10.0),
                 );
+                let fresp = ui.interact(foot, ui.make_persistent_id("drawer-ver-check"), Sense::click());
                 ui.painter().text(
                     foot.left_center(),
                     Align2::LEFT_CENTER,
-                    format!("Rustgramm Desktop  v{}", env!("CARGO_PKG_VERSION")),
+                    format!("Rustgramm  v{} · Обновления", env!("CARGO_PKG_VERSION")),
                     FontId::proportional(12.0),
-                    SUBTEXT,
+                    if fresp.hovered() { ORANGE } else { SUBTEXT },
                 );
+                if fresp.on_hover_text("Проверить новую версию на GitHub").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    act = Some("check_updates");
+                }
             });
         match act {
             Some("prefs") => {
@@ -326,16 +333,22 @@ impl App {
                 self.drawer_open = false;
                 self.send(Cmd::AddAccountAuto);
             }
-            Some(other) => {
+            Some("calls") => {
                 self.drawer_open = false;
-                let name = match other {
-                    "profile" => "Профиль",
-                    "group" => "Создание группы",
-                    "channel" => "Создание канала",
-                    "contacts" => "Контакты",
-                    _ => "Звонки",
-                };
-                self.status = format!("{name}: этот раздел будет в следующем этапе");
+                self.calls_open = true;
+            }
+            Some("secret") => {
+                self.drawer_open = false;
+                self.secret_open = true;
+                self.send(Cmd::LoadSecretChats);
+            }
+            Some("check_updates") => {
+                self.drawer_open = false;
+                self.update_dismissed = false;
+                self.send(Cmd::CheckUpdates);
+            }
+            Some(_) => {
+                self.drawer_open = false;
             }
             None => {}
         }
@@ -850,6 +863,11 @@ fn ayu_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     );
     toggle(
         ui,
+        "Проверять выход обновлений Rustgramm (анонимно)",
+        &mut s.privacy_shield.check_updates,
+    );
+    toggle(
+        ui,
         "Маскировать Mini Apps под Telegram Android",
         &mut s.ayu.spoof_webview_as_android,
     );
@@ -1213,7 +1231,7 @@ fn appearance_page(
     ui.horizontal(|ui| {
         ui.add_space(kit::PAD);
         ui.label(RichText::new("Метка удалённых:").size(13.0).color(SUBTEXT));
-        ui.add(egui::TextEdit::singleline(&mut a.deleted_mark).desired_width(68.0).hint_text("🧹"));
+        ui.add(egui::TextEdit::singleline(&mut a.deleted_mark).desired_width(68.0).hint_text("иконка"));
         ui.add_space(8.0);
         ui.label(RichText::new("Метка правок:").size(13.0).color(SUBTEXT));
         ui.add(egui::TextEdit::singleline(&mut a.edited_mark).desired_width(68.0).hint_text("изм."));

@@ -272,21 +272,28 @@ pub fn orange_button_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, min_s
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     let hover = tween(ui.ctx(), ("obtn", resp.id), f32::from(u8::from(enabled && resp.hovered())), 0.12);
+    let press = tween(ui.ctx(), ("obtn-p", resp.id), f32::from(u8::from(enabled && resp.is_pointer_button_down_on())), 0.08);
+    let draw_r = rect.shrink(press * 1.4);
     let base = if !enabled {
         ORANGE_DISABLED
-    } else if resp.is_pointer_button_down_on() {
-        ORANGE_ACTIVE
+    } else if press > 0.35 {
+        lerp_color(ORANGE_OVER, ORANGE_ACTIVE, press)
     } else {
         lerp_color(ORANGE, ORANGE_OVER, hover)
     };
     let fill = t_btn(base);
     let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(10), fill);
+    p.rect_filled(draw_r, CornerRadius::same(10), fill);
+    if press > 0.05 {
+        let rad = draw_r.width() * 0.55 * press;
+        p.with_clip_rect(draw_r)
+            .circle_filled(draw_r.center(), rad, Color32::from_white_alpha((32.0 * press) as u8));
+    }
     if enabled {
-        paint_glass_rim(p, rect, 10.0);
+        paint_glass_rim(p, draw_r, 10.0);
     }
     let text_c = if enabled { Color32::WHITE } else { Color32::from_white_alpha(150) };
-    p.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.5), text_c);
+    p.text(draw_r.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.5), text_c);
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {

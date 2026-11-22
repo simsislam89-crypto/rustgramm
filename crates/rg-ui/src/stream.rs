@@ -99,6 +99,15 @@ async fn serve_conn(mut sock: tokio::net::TcpStream, st: Arc<StreamState>) -> st
         return Ok(());
     }
     let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or("");
+    let is_head = first_line.starts_with("HEAD ");
+    let is_options = first_line.starts_with("OPTIONS ");
+    if is_options {
+        let cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Range\r\nConnection: close\r\n\r\n";
+        sock.write_all(cors.as_bytes()).await?;
+        let _ = sock.shutdown().await;
+        return Ok(());
+    }
     let mut range_hdr = None;
     for line in req.lines().skip(1) {
         if let Some((k, v)) = line.split_once(':')
@@ -116,16 +125,20 @@ async fn serve_conn(mut sock: tokio::net::TcpStream, st: Arc<StreamState>) -> st
     let len = end - start + 1;
     let headers = if status.starts_with("206") {
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: Content-Range, Accept-Ranges, Content-Length\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
             st.mime
         )
     } else {
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: Content-Range, Accept-Ranges, Content-Length\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
             st.mime
         )
     };
     sock.write_all(headers.as_bytes()).await?;
+    if is_head {
+        let _ = sock.shutdown().await;
+        return Ok(());
+    }
 
     let mut pos = start;
     let mut chunk = vec![0u8; 64 * 1024];

@@ -34,12 +34,13 @@ pub(crate) enum StickerAct {
 }
 
 impl App {
-    /// Горизонтальная полоса историй контактов над вкладками папок (`!disable_stories`).
+    /// Горизонтальная полоса историй контактов + кнопка «+ Моя история» над вкладками папок (`!disable_stories`).
     pub(crate) fn stories_strip(&mut self, ui: &mut egui::Ui) {
-        if self.settings.ayu.disable_stories || self.stories.is_empty() {
+        if self.settings.ayu.disable_stories {
             return;
         }
         let mut clicked: Option<usize> = None;
+        let mut open_composer = false;
         let mut need_avatar = Vec::new();
         egui::ScrollArea::horizontal()
             .id_salt("stories-strip")
@@ -48,6 +49,25 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.x = 10.0;
+                    // Кнопка публикации своей истории («+ Моя история»).
+                    {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 62.0), Sense::click());
+                        let center = Pos2::new(rect.center().x, rect.top() + 23.0);
+                        let hk = tween(ui.ctx(), "story-add-h", f32::from(u8::from(resp.hovered())), 0.12);
+                        ui.painter().circle_stroke(center, 20.5, Stroke::new(2.0, lerp_color(ORANGE.gamma_multiply(0.75), ORANGE, hk)));
+                        ui.painter().circle_filled(center, 18.0, t(WINDOW_OVER));
+                        ui.painter().text(center, Align2::CENTER_CENTER, "+", FontId::proportional(20.0), ORANGE);
+                        ui.painter().text(
+                            Pos2::new(rect.center().x, rect.bottom() - 8.0),
+                            Align2::CENTER_CENTER,
+                            "Моя",
+                            FontId::proportional(11.0),
+                            if resp.hovered() { ORANGE } else { WHITE },
+                        );
+                        if resp.on_hover_text("Опубликовать свою историю").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            open_composer = true;
+                        }
+                    }
                     for (idx, st) in self.stories.iter().enumerate() {
                         if !self.avatars.contains_key(&st.peer_id) && self.avatar_req.insert(st.peer_id) {
                             need_avatar.push((st.peer, st.peer_id));
@@ -83,15 +103,22 @@ impl App {
         for (peer, id) in need_avatar {
             self.send(Cmd::AvatarPeer(peer, id));
         }
+        if open_composer {
+            self.story_composer_open = true;
+        }
         if let Some(idx) = clicked {
             if self.settings.ayu.suggest_ghost_mode_before_viewing_story && self.settings.ghost.send_read_stories {
                 self.story_ghost_ask = Some(idx);
             } else {
                 self.story_open = Some(idx);
+                self.story_opened_at = Some(std::time::Instant::now());
                 if let Some(st) = self.stories.get_mut(idx) {
                     st.unread = false;
                     let (peer, sid) = (st.peer, st.story_id);
                     self.send(Cmd::ReadStory(peer, sid));
+                    if self.story_media_req.insert(sid) {
+                        self.send(Cmd::LoadStoryMedia(peer, sid));
+                    }
                 }
             }
         }

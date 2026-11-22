@@ -1403,6 +1403,11 @@ fn privacy_page(
     );
     toggle(
         ui,
+        "Проверять выход обновлений Rustgramm (анонимно)",
+        &mut s.privacy_shield.check_updates,
+    );
+    toggle(
+        ui,
         "Маскировать Mini Apps под Telegram Android",
         &mut s.ayu.spoof_webview_as_android,
     );

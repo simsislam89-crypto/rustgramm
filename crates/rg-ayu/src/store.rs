@@ -24,6 +24,35 @@ pub struct SavedAudit {
     pub edits: Vec<(String, i64)>,
 }
 
+/// Запись секретного чата E2E в локальной БД слота (ключ хранится только на этом устройстве).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretChatRecord {
+    pub chat_id: i32,
+    pub access_hash: i64,
+    pub peer_user_id: i64,
+    pub peer_name: String,
+    pub auth_key: Vec<u8>,
+    pub key_fingerprint: i64,
+    pub ttl_secs: i32,
+    /// `waiting` | `requested` | `ready` | `discarded`
+    pub state: String,
+    pub created_at: i64,
+    pub is_admin: bool,
+}
+
+/// Расшифрованное сообщение секретного чата с поддержкой таймера самоуничтожения (`expires_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretMessageRecord {
+    pub id: i64,
+    pub chat_id: i32,
+    pub random_id: i64,
+    pub outgoing: bool,
+    pub text: String,
+    pub date: i64,
+    pub ttl_secs: i32,
+    pub expires_at: i64,
+}
+
 /// Граница идентификаторов каналов в формате Bot API (-100…).
 const CHANNEL_BOUND: i64 = -1_000_000_000_000;
 
@@ -54,7 +83,27 @@ impl MessageStore {
              CREATE TABLE IF NOT EXISTS edits(
                  peer INTEGER NOT NULL, msg_id INTEGER NOT NULL,
                  rev INTEGER NOT NULL, old_text TEXT NOT NULL, edited_at INTEGER NOT NULL,
-                 PRIMARY KEY(peer, msg_id, rev));",
+                 PRIMARY KEY(peer, msg_id, rev));
+             CREATE TABLE IF NOT EXISTS secret_chats(
+                 chat_id INTEGER PRIMARY KEY,
+                 access_hash INTEGER NOT NULL,
+                 peer_user_id INTEGER NOT NULL,
+                 peer_name TEXT NOT NULL,
+                 auth_key BLOB NOT NULL,
+                 key_fingerprint INTEGER NOT NULL,
+                 ttl_secs INTEGER NOT NULL DEFAULT 0,
+                 state TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 is_admin INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS secret_messages(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 chat_id INTEGER NOT NULL,
+                 random_id INTEGER NOT NULL,
+                 outgoing INTEGER NOT NULL,
+                 text TEXT NOT NULL,
+                 date INTEGER NOT NULL,
+                 ttl_secs INTEGER NOT NULL DEFAULT 0,
+                 expires_at INTEGER NOT NULL DEFAULT 0);",
         )
         .await?;
         Ok(Self { _db: db, conn })
@@ -303,6 +352,145 @@ impl MessageStore {
         }
         Ok(out)
     }
+
+    /// Сохранить или обновить секретный чат E2E.
+    pub async fn save_secret_chat(&self, c: &SecretChatRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO secret_chats(chat_id,access_hash,peer_user_id,peer_name,auth_key,key_fingerprint,ttl_secs,state,created_at,is_admin)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                   access_hash=excluded.access_hash,
+                   peer_user_id=excluded.peer_user_id,
+                   peer_name=CASE WHEN excluded.peer_name!='' THEN excluded.peer_name ELSE secret_chats.peer_name END,
+                   auth_key=CASE WHEN length(excluded.auth_key)>0 THEN excluded.auth_key ELSE secret_chats.auth_key END,
+                   key_fingerprint=CASE WHEN excluded.key_fingerprint!=0 THEN excluded.key_fingerprint ELSE secret_chats.key_fingerprint END,
+                   ttl_secs=excluded.ttl_secs,
+                   state=excluded.state,
+                   is_admin=excluded.is_admin",
+                params![
+                    i64::from(c.chat_id),
+                    c.access_hash,
+                    c.peer_user_id,
+                    c.peer_name.as_str(),
+                    c.auth_key.clone(),
+                    c.key_fingerprint,
+                    i64::from(c.ttl_secs),
+                    c.state.as_str(),
+                    c.created_at,
+                    i64::from(u8::from(c.is_admin)),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Список всех локальных секретных чатов.
+    pub async fn list_secret_chats(&self) -> Result<Vec<SecretChatRecord>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT chat_id,access_hash,peer_user_id,peer_name,auth_key,key_fingerprint,ttl_secs,state,created_at,is_admin
+                 FROM secret_chats ORDER BY created_at DESC",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(SecretChatRecord {
+                chat_id: i32::try_from(r.get::<i64>(0)?).unwrap_or_default(),
+                access_hash: r.get(1)?,
+                peer_user_id: r.get(2)?,
+                peer_name: r.get(3)?,
+                auth_key: r.get(4)?,
+                key_fingerprint: r.get(5)?,
+                ttl_secs: i32::try_from(r.get::<i64>(6)?).unwrap_or_default(),
+                state: r.get(7)?,
+                created_at: r.get(8)?,
+                is_admin: r.get::<i64>(9)? != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Обновить таймер самоуничтожения секретного чата.
+    pub async fn set_secret_ttl(&self, chat_id: i32, ttl_secs: i32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE secret_chats SET ttl_secs=?1 WHERE chat_id=?2",
+                params![i64::from(ttl_secs), i64::from(chat_id)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Полностью удалить секретный чат и его сообщения с устройства.
+    pub async fn delete_secret_chat(&self, chat_id: i32) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM secret_messages WHERE chat_id=?1", params![i64::from(chat_id)])
+            .await?;
+        self.conn
+            .execute("DELETE FROM secret_chats WHERE chat_id=?1", params![i64::from(chat_id)])
+            .await?;
+        Ok(())
+    }
+
+    /// Сохранить сообщение секретного чата.
+    pub async fn save_secret_message(&self, m: &SecretMessageRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO secret_messages(chat_id,random_id,outgoing,text,date,ttl_secs,expires_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    i64::from(m.chat_id),
+                    m.random_id,
+                    i64::from(u8::from(m.outgoing)),
+                    m.text.as_str(),
+                    m.date,
+                    i64::from(m.ttl_secs),
+                    m.expires_at,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Удалить просроченные самоуничтожающиеся сообщения (`expires_at > 0 && expires_at <= now`).
+    pub async fn purge_expired_secret_messages(&self, now: i64) -> Result<u64> {
+        self.conn
+            .execute(
+                "DELETE FROM secret_messages WHERE expires_at > 0 AND expires_at <= ?1",
+                params![now],
+            )
+            .await
+    }
+
+    /// Загрузить актуальные сообщения секретного чата (с очисткой просроченных).
+    pub async fn secret_messages(&self, chat_id: i32, now: i64) -> Result<Vec<SecretMessageRecord>> {
+        let _ = self.purge_expired_secret_messages(now).await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id,chat_id,random_id,outgoing,text,date,ttl_secs,expires_at
+                 FROM secret_messages WHERE chat_id=?1 ORDER BY date ASC, id ASC",
+                params![i64::from(chat_id)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(SecretMessageRecord {
+                id: r.get(0)?,
+                chat_id: i32::try_from(r.get::<i64>(1)?).unwrap_or_default(),
+                random_id: r.get(2)?,
+                outgoing: r.get::<i64>(3)? != 0,
+                text: r.get(4)?,
+                date: r.get(5)?,
+                ttl_secs: i32::try_from(r.get::<i64>(6)?).unwrap_or_default(),
+                expires_at: r.get(7)?,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn row(r: &Row) -> Result<Saved> {
@@ -418,5 +606,60 @@ mod tests {
         assert_eq!(s.purge_all_deleted(10).await.unwrap(), 1);
         assert!(s.deleted(10).await.unwrap().is_empty());
         assert!(s.get(10, 1).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn secret_chat_storage_and_ttl_purge_work() {
+        let s = MessageStore::in_memory().await.unwrap();
+        let rec = SecretChatRecord {
+            chat_id: 777,
+            access_hash: 123456789,
+            peer_user_id: 42,
+            peer_name: "Алиса".to_owned(),
+            auth_key: vec![0xAB; 256],
+            key_fingerprint: 987654321,
+            ttl_secs: 15,
+            state: "ready".to_owned(),
+            created_at: 1000,
+            is_admin: true,
+        };
+        s.save_secret_chat(&rec).await.unwrap();
+        let chats = s.list_secret_chats().await.unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].peer_name, "Алиса");
+        assert_eq!(chats[0].auth_key.len(), 256);
+
+        s.save_secret_message(&SecretMessageRecord {
+            id: 0,
+            chat_id: 777,
+            random_id: 1,
+            outgoing: true,
+            text: "самоуничтожится".to_owned(),
+            date: 1000,
+            ttl_secs: 15,
+            expires_at: 1015,
+        })
+        .await
+        .unwrap();
+        s.save_secret_message(&SecretMessageRecord {
+            id: 0,
+            chat_id: 777,
+            random_id: 2,
+            outgoing: false,
+            text: "вечное".to_owned(),
+            date: 1001,
+            ttl_secs: 0,
+            expires_at: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.secret_messages(777, 1010).await.unwrap().len(), 2);
+        let after = s.secret_messages(777, 1020).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "вечное");
+
+        s.delete_secret_chat(777).await.unwrap();
+        assert!(s.list_secret_chats().await.unwrap().is_empty());
+        assert!(s.secret_messages(777, 1020).await.unwrap().is_empty());
     }
 }

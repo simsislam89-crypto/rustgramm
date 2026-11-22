@@ -225,7 +225,6 @@ mod imp {
     unsafe extern "system" {
         fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
         fn FlashWindowEx(pfwi: *const FlashWInfo) -> i32;
-        fn MessageBeep(utype: u32) -> i32;
         fn SetWindowDisplayAffinity(hwnd: *mut c_void, dw_affinity: u32) -> i32;
         fn ShowWindow(hwnd: *mut c_void, cmd_show: i32) -> i32;
         fn IsWindowVisible(hwnd: *mut c_void) -> i32;
@@ -610,10 +609,9 @@ mod imp {
         let _ = unsafe { FlashWindowEx(&raw const info) };
     }
 
-    /// Проигрывает короткий системный звук уведомления Windows.
-    pub fn play_notify_sound() {
-        // SAFETY: системный вызов не принимает указателей.
-        let _ = unsafe { MessageBeep(0x0000_0040) };
+    /// Проигрывает чистый двухтоновый WAV-звук уведомления через WinMM (работает даже при отключённых системных звуках Windows).
+    pub fn play_notify_sound(volume: u8) {
+        crate::audio_io::play_notify_chime(volume);
     }
 }
 
@@ -657,7 +655,7 @@ pub fn register_tg_url_scheme() -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn flash_taskbar() {}
 #[cfg(not(windows))]
-pub fn play_notify_sound() {}
+pub fn play_notify_sound(_volume: u8) {}
 
 #[cfg(test)]
 mod tests {
