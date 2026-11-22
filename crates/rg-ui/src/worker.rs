@@ -46,6 +46,24 @@ pub enum Cmd {
     Open(usize),
     /// Текст и, при ответе, идентификатор исходного сообщения.
     Send(String, Option<i32>),
+    /// Отправить сообщение с пользовательскими Premium-эмодзи `(char_start, char_len, doc_id)`.
+    SendRich(String, Vec<(usize, usize, i64)>, Option<i32>),
+    /// Загрузить текстуры пользовательских Premium-эмодзи по `document_id`.
+    CustomEmojiDocs(Vec<i64>),
+    /// Создать канал/супергруппу (название, описание, broadcast, @username, участники).
+    CreateChannelFull(String, String, bool, Option<String>, Vec<grammers_session::types::PeerRef>),
+    /// Пригласить людей в существующий чат/канал с индексом.
+    InviteMembers(usize, Vec<grammers_session::types::PeerRef>),
+    /// Список участников группы/канала.
+    Participants(usize),
+    /// Получить ссылку-приглашение группы/канала.
+    ExportInvite(usize),
+    /// Заблокировать или разблокировать собеседника.
+    BlockPeer(usize, bool),
+    /// Проголосовать в опросе.
+    VotePoll(i32, Vec<u8>),
+    /// Поиск любых пользователей Telegram для добавления в канал или группу.
+    MemberSearch(String),
     Edit(i32, String),
     /// Отправить файл с подписью (и ответом на сообщение).
     SendFile(PathBuf, String, Option<i32>),
@@ -168,6 +186,12 @@ pub enum Ev {
     GlobalFound(Vec<ContactRow>),
     /// Переведённый текст сообщения (идентификатор сообщения, перевод).
     Translated(i32, String),
+    /// Участники группы/канала (идентификатор чата, список).
+    Participants(i64, Vec<ContactRow>),
+    /// Ссылка-приглашение группы/канала.
+    InviteLink(i64, String),
+    /// Найденные пользователи для добавления в канал/группу.
+    MemberSearch(Vec<ContactRow>),
     /// Ход загрузки вложения: сообщение, скачано, всего (байт).
     Progress(i32, u64, u64),
     /// Загрузка вложения закончилась (успешно, отменена или с ошибкой).
@@ -667,6 +691,115 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     continue;
                 }
                 reload(&engine, &out, d.peer, i).await;
+            }
+            Cmd::SendRich(text, custom, reply_to) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                if let Err(e) = engine.send_rich(d.peer, &text, &custom, reply_to).await {
+                    out.err(format!("Не отправлено: {e}"));
+                    continue;
+                }
+                reload(&engine, &out, d.peer, i).await;
+            }
+            Cmd::CustomEmojiDocs(ids) => {
+                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                tokio::spawn(async move {
+                    if let Ok(rows) = eng.custom_emoji_docs(&ids).await {
+                        for row in rows {
+                            let (e2, o2, lim) = (eng.clone(), out.clone(), limit.clone());
+                            tokio::spawn(async move {
+                                let Ok(_permit) = lim.acquire().await else { return };
+                                if let Ok(Some(path)) = e2.sticker_file(&row).await
+                                    && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 72)).await
+                                {
+                                    o2.send(Ev::StickerImg(row.id, Box::new(img)));
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+            Cmd::CreateChannelFull(title, about, broadcast, username, members) => {
+                match engine
+                    .create_channel_full(&title, &about, broadcast, username.as_deref(), &members)
+                    .await
+                {
+                    Ok(()) => {
+                        out.send(Ev::Status(format!("Создано: «{title}»")));
+                        refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                    }
+                    Err(e) => out.err(format!("Не создано: {e}")),
+                }
+            }
+            Cmd::InviteMembers(i, members) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng.invite_members(peer, &members).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Участники приглашены".into()));
+                            if let Ok(p) = eng.channel_participants(peer, 80).await {
+                                out.send(Ev::Participants(id, p));
+                            }
+                            if let Ok(info) = eng.peer_info(peer).await {
+                                out.send(Ev::PeerInfo(id, info));
+                            }
+                        }
+                        Err(e) => out.err(format!("Приглашение: {e}")),
+                    }
+                });
+            }
+            Cmd::Participants(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok(list) = eng.channel_participants(peer, 80).await {
+                        out.send(Ev::Participants(id, list));
+                    }
+                });
+            }
+            Cmd::ExportInvite(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng.export_invite_link(peer).await {
+                        Ok(link) if !link.is_empty() => out.send(Ev::InviteLink(id, link)),
+                        Ok(_) => out.err("Ссылка-приглашение недоступна"),
+                        Err(e) => out.err(format!("Ссылка: {e}")),
+                    }
+                });
+            }
+            Cmd::BlockPeer(i, block) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng.set_blocked(peer, block).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if block { "Пользователь заблокирован".into() } else { "Пользователь разблокирован".into() }));
+                            if let Ok(info) = eng.peer_info(peer).await {
+                                out.send(Ev::PeerInfo(id, info));
+                            }
+                        }
+                        Err(e) => out.err(format!("Блокировка: {e}")),
+                    }
+                });
+            }
+            Cmd::VotePoll(msg_id, option) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                match engine.vote_poll(d.peer, msg_id, option).await {
+                    Ok(()) => reload(&engine, &out, d.peer, i).await,
+                    Err(e) => out.err(format!("Голосование: {e}")),
+                }
+            }
+            Cmd::MemberSearch(q) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    let list = eng.global_search(&q, 15).await.unwrap_or_default();
+                    // Оставляем только пользователей (id > 0), которых можно пригласить в канал/группу.
+                    let users: Vec<ContactRow> = list.into_iter().filter(|c| c.id > 0).collect();
+                    out.send(Ev::MemberSearch(users));
+                });
             }
             Cmd::SendFile(path, caption, reply_to) => {
                 let Some(i) = current else { continue };

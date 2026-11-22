@@ -173,6 +173,18 @@ impl App {
                         s.ayu.streamer_mode = st;
                     }
                 }
+                // Аккуратная подпись версии внизу шторки, как в AyuGram Desktop.
+                let foot = Rect::from_min_max(
+                    Pos2::new(rect.left() + 18.0, rect.bottom() - 34.0),
+                    Pos2::new(rect.right() - 18.0, rect.bottom() - 10.0),
+                );
+                ui.painter().text(
+                    foot.left_center(),
+                    Align2::LEFT_CENTER,
+                    format!("Rustgramm Desktop  v{}", env!("CARGO_PKG_VERSION")),
+                    FontId::proportional(12.0),
+                    SUBTEXT,
+                );
             });
         match act {
             Some("prefs") => {
@@ -211,7 +223,13 @@ impl App {
                 self.drawer_open = false;
                 self.create_kind = 1;
                 self.create_title.clear();
+                self.create_about.clear();
+                self.create_username.clear();
+                self.create_public = false;
                 self.create_members.clear();
+                self.create_member_query.clear();
+                self.create_member_results.clear();
+                self.create_member_map.clear();
                 self.send(Cmd::Contacts);
             }
             Some("channel") => {
@@ -219,6 +237,13 @@ impl App {
                 self.create_kind = 2;
                 self.create_title.clear();
                 self.create_about.clear();
+                self.create_username.clear();
+                self.create_public = false;
+                self.create_members.clear();
+                self.create_member_query.clear();
+                self.create_member_results.clear();
+                self.create_member_map.clear();
+                self.send(Cmd::Contacts);
             }
             Some(other) => {
                 self.drawer_open = false;
@@ -910,71 +935,188 @@ fn register_url_scheme(ctx: &egui::Context) {
 }
 
 impl App {
-    /// Окно «Новая группа» (название и участники из контактов) и «Новый канал» (название и описание).
+    /// Окно создания группы (`1`), канала (`2`) и добавления участников в открытый чат (`3`).
+    /// Позволяет находить и добавлять ЛЮБЫХ пользователей (из контактов или по `@username`/имени).
     #[allow(deprecated)]
     pub(crate) fn create_window(&mut self, ctx: &egui::Context) {
         if self.create_kind == 0 {
             return;
         }
-        let group = self.create_kind == 1;
+        let kind = self.create_kind;
+        let group = kind == 1;
+        let channel = kind == 2;
+        let invite_only = kind == 3;
+        let screen = ctx.content_rect();
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let mut create = false;
-        egui::Area::new(egui::Id::new("create-chat"))
+
+        // Живой поиск любых пользователей Telegram при вводе >= 3 символов.
+        let mq = self.create_member_query.trim().to_lowercase();
+        if mq.chars().count() >= 3 {
+            if mq != self.create_member_last_q {
+                self.create_member_last_q.clone_from(&mq);
+                self.create_member_at = Some(std::time::Instant::now());
+            }
+            if let Some(at) = self.create_member_at {
+                if at.elapsed().as_millis() >= 320 {
+                    self.create_member_at = None;
+                    self.send(Cmd::MemberSearch(mq.clone()));
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        } else if !self.create_member_last_q.is_empty() {
+            self.create_member_last_q.clear();
+            self.create_member_results.clear();
+            self.create_member_at = None;
+        }
+
+        // Запоминаем peer всех контактов и найденных людей, чтобы можно было пригласить любого.
+        for c in self.contacts.iter().chain(self.create_member_results.iter()) {
+            self.create_member_map.entry(c.id).or_insert_with(|| c.clone());
+        }
+
+        egui::Area::new(egui::Id::new("create-dim"))
             .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                paint_frosted_scrim(ui.painter(), rect, 1.0);
+                if resp.clicked() {
+                    close = true;
+                }
+            });
+
+        egui::Area::new(egui::Id::new("create-chat"))
+            .order(egui::Order::Tooltip)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::Frame::new()
+                let card = egui::Frame::new()
                     .fill(t2(WINDOW_BG))
-                    .corner_radius(CornerRadius::same(10))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
+                    .corner_radius(CornerRadius::same(14))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha((26.0 * opacity_f32()) as u8)))
                     .inner_margin(egui::Margin::same(16))
                     .show(ui, |ui| {
-                        ui.set_width(340.0);
-                        ui.label(RichText::new(if group { "Новая группа" } else { "Новый канал" }).size(17.0).color(WHITE));
-                        ui.add_space(10.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.create_title)
-                                .hint_text(if group { "Название группы" } else { "Название канала" })
-                                .desired_width(f32::INFINITY),
-                        );
-                        if group {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("Участники").size(12.5).color(SUBTEXT));
-                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                                if self.contacts.is_empty() {
-                                    ui.label(RichText::new("Загрузка контактов…").color(SUBTEXT));
-                                }
-                                for c in &self.contacts {
-                                    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(r, CornerRadius::same(6), t2(WINDOW_OVER));
-                                    }
-                                    let on = self.create_members.contains(&c.id);
-                                    let box_r = Rect::from_center_size(Pos2::new(r.left() + 14.0, r.center().y), Vec2::splat(16.0));
-                                    ui.painter().rect_stroke(box_r, CornerRadius::same(4), egui::Stroke::new(1.5, if on { WHITE } else { SUBTEXT }), egui::StrokeKind::Middle);
-                                    if on {
-                                        icons::tg(ui.painter(), "info/info_close", box_r.center(), WHITE);
-                                    }
-                                    ui.painter().text(Pos2::new(r.left() + 36.0, r.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(14.0), WHITE);
-                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !self.create_members.remove(&c.id) {
-                                        self.create_members.insert(c.id);
-                                    }
-                                }
-                            });
+                        ui.set_width(380.0_f32.min(screen.width() - 24.0));
+                        let heading = if invite_only {
+                            "Добавить участников"
+                        } else if group {
+                            "Новая группа"
                         } else {
-                            ui.add_space(8.0);
+                            "Новый канал"
+                        };
+                        ui.label(RichText::new(heading).size(17.0).strong().color(WHITE));
+                        ui.add_space(10.0);
+                        if !invite_only {
                             ui.add(
-                                egui::TextEdit::multiline(&mut self.create_about)
-                                    .hint_text("Описание (необязательно)")
-                                    .desired_rows(3)
-                                    .desired_width(f32::INFINITY),
+                                egui::TextEdit::singleline(&mut self.create_title)
+                                    .hint_text(if group { "Название группы" } else { "Название канала" })
+                                    .desired_width(f32::INFINITY)
+                                    .margin(Vec2::new(8.0, 6.0)),
                             );
+                            if channel {
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.create_about)
+                                        .hint_text("Описание канала (необязательно)")
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY)
+                                        .margin(Vec2::new(8.0, 6.0)),
+                                );
+                                ui.add_space(6.0);
+                                ui.checkbox(&mut self.create_public, "Публичный канал (постоянная @ссылка)");
+                                if self.create_public {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.create_username)
+                                            .hint_text("@имя_канала (латиница и цифры)")
+                                            .desired_width(f32::INFINITY)
+                                            .margin(Vec2::new(8.0, 6.0)),
+                                    );
+                                }
+                            }
+                            ui.add_space(8.0);
                         }
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Участники (выбрано: {})",
+                                    self.create_members.len()
+                                ))
+                                .size(12.5)
+                                .color(ORANGE),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.create_member_query)
+                                .hint_text("Поиск среди контактов или любой @username…")
+                                .desired_width(f32::INFINITY)
+                                .margin(Vec2::new(8.0, 6.0)),
+                        );
+                        ui.add_space(6.0);
+                        // Собираем объединённый список кандидатов: контакты по фильтру + найденные в Telegram.
+                        let mut pool: Vec<rg_core::engine::ContactRow> = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for c in &self.contacts {
+                            if (mq.is_empty()
+                                || c.name.to_lowercase().contains(&mq)
+                                || c.status.to_lowercase().contains(&mq))
+                                && seen.insert(c.id)
+                            {
+                                pool.push(c.clone());
+                            }
+                        }
+                        for c in &self.create_member_results {
+                            if seen.insert(c.id) {
+                                pool.push(c.clone());
+                            }
+                        }
+                        egui::ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+                            if pool.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    RichText::new(if self.contacts.is_empty() && mq.is_empty() {
+                                        "Загрузка контактов… Можно сразу ввести @username выше"
+                                    } else {
+                                        "Никого не найдено — введите @username целиком"
+                                    })
+                                    .size(13.0)
+                                    .color(SUBTEXT),
+                                );
+                            }
+                            for c in &pool {
+                                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(r, CornerRadius::same(6), t(WINDOW_OVER));
+                                }
+                                let on = self.create_members.contains(&c.id);
+                                let box_r = Rect::from_center_size(Pos2::new(r.left() + 16.0, r.center().y), Vec2::splat(16.0));
+                                if on {
+                                    ui.painter().rect_filled(box_r, CornerRadius::same(4), t_btn(ORANGE));
+                                    ui.painter().text(box_r.center(), Align2::CENTER_CENTER, "✓", FontId::proportional(11.0), Color32::WHITE);
+                                } else {
+                                    ui.painter().rect_stroke(box_r, CornerRadius::same(4), egui::Stroke::new(1.5, SUBTEXT), egui::StrokeKind::Middle);
+                                }
+                                ui.painter().text(Pos2::new(r.left() + 36.0, r.center().y - 6.0), Align2::LEFT_CENTER, &c.name, FontId::proportional(13.5), WHITE);
+                                if !c.status.is_empty() {
+                                    ui.painter().text(Pos2::new(r.left() + 36.0, r.center().y + 9.0), Align2::LEFT_CENTER, &c.status, FontId::proportional(11.5), SUBTEXT);
+                                }
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !self.create_members.remove(&c.id) {
+                                    self.create_members.insert(c.id);
+                                }
+                            }
+                        });
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            let ok = !self.create_title.trim().is_empty() && (!group || !self.create_members.is_empty());
-                            if orange_button_enabled(ui, ok, "Создать", Vec2::new(110.0, 32.0)).clicked() {
+                            let ok = if invite_only {
+                                !self.create_members.is_empty()
+                            } else {
+                                !self.create_title.trim().is_empty() && (!group || !self.create_members.is_empty())
+                            };
+                            let action_label = if invite_only { "Пригласить" } else { "Создать" };
+                            if orange_button_enabled(ui, ok, action_label, Vec2::new(124.0, 34.0)).clicked() {
                                 create = true;
                             }
                             if ui.button("Отмена").clicked() {
@@ -982,14 +1124,35 @@ impl App {
                             }
                         });
                     });
+                paint_glass_rim(ui.painter(), card.response.rect, 14.0);
             });
         if create {
-            let title = self.create_title.trim().to_owned();
-            if group {
-                let members: Vec<_> = self.contacts.iter().filter(|c| self.create_members.contains(&c.id)).map(|c| c.peer).collect();
-                self.send(Cmd::CreateGroup(title, members));
+            let members: Vec<_> = self
+                .create_members
+                .iter()
+                .filter_map(|id| self.create_member_map.get(id).map(|c| c.peer))
+                .collect();
+            if invite_only {
+                if let Some(i) = self.selected {
+                    self.send(Cmd::InviteMembers(i, members));
+                }
             } else {
-                self.send(Cmd::CreateChannel(title, self.create_about.trim().to_owned(), true));
+                let title = self.create_title.trim().to_owned();
+                if group {
+                    self.send(Cmd::CreateGroup(title, members));
+                } else {
+                    let username = self
+                        .create_public
+                        .then(|| self.create_username.trim().trim_start_matches('@').to_owned())
+                        .filter(|s| !s.is_empty());
+                    self.send(Cmd::CreateChannelFull(
+                        title,
+                        self.create_about.trim().to_owned(),
+                        true,
+                        username,
+                        members,
+                    ));
+                }
             }
             close = true;
         }

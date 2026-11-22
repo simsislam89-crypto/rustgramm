@@ -145,15 +145,29 @@ struct App {
     /// Сохранённые GIF и окно создания группы/канала.
     gif_list: Vec<StickerRow>,
     gifs_requested: bool,
-    /// Создание: 0 — нет, 1 — группа, 2 — канал.
+    /// Создание: 0 — нет, 1 — группа, 2 — канал, 3 — пригласить в открытый чат.
     create_kind: u8,
     create_title: String,
     create_about: String,
+    create_username: String,
+    create_public: bool,
     create_members: HashSet<i64>,
+    create_member_query: String,
+    create_member_results: Vec<ContactRow>,
+    create_member_map: HashMap<i64, ContactRow>,
+    create_member_last_q: String,
+    create_member_at: Option<std::time::Instant>,
     /// Правая панель сведений о чате.
     info_open: bool,
+    info_tab: usize,
     peer_infos: HashMap<i64, rg_core::engine::PeerInfo>,
     info_req: HashSet<i64>,
+    participants: HashMap<i64, Vec<ContactRow>>,
+    participants_req: HashSet<i64>,
+    /// Пользовательские Premium-эмодзи в поле ввода `(char_start, char_len, doc_id)` и запрошенные текстуры.
+    input_custom_emojis: Vec<(usize, usize, i64)>,
+    custom_emoji_req: HashSet<i64>,
+    last_toast: Option<std::time::Instant>,
     #[cfg(windows)]
     player: Option<video::VideoView>,
     refresh_at: Option<std::time::Instant>,
@@ -297,10 +311,23 @@ impl App {
             create_kind: 0,
             create_title: String::new(),
             create_about: String::new(),
+            create_username: String::new(),
+            create_public: false,
             create_members: HashSet::new(),
+            create_member_query: String::new(),
+            create_member_results: Vec::new(),
+            create_member_map: HashMap::new(),
+            create_member_last_q: String::new(),
+            create_member_at: None,
             info_open: false,
+            info_tab: 0,
             peer_infos: HashMap::new(),
             info_req: HashSet::new(),
+            participants: HashMap::new(),
+            participants_req: HashSet::new(),
+            input_custom_emojis: Vec::new(),
+            custom_emoji_req: HashSet::new(),
+            last_toast: None,
             #[cfg(windows)]
             player: None,
             refresh_at: None,
@@ -391,6 +418,24 @@ impl App {
                 // нужен, только если чат должен подняться вверх или его нет в списке.
                 if self.apply_live_to_list(key, &row_snapshot, open_id == Some(key)) {
                     self.refresh_at.get_or_insert(std::time::Instant::now());
+                }
+                // Системное уведомление Windows, когда пришло входящее, чат не заглушён и окно не в фокусе.
+                if !row_snapshot.1 && !ctx.input(|i| i.focused) {
+                    let dialog = self.dialogs.iter().find(|d| d.id == key);
+                    let muted = dialog.is_some_and(|d| d.muted);
+                    let cooldown_ok = self.last_toast.is_none_or(|t| t.elapsed().as_secs() >= 3);
+                    if !muted && cooldown_ok {
+                        self.last_toast = Some(std::time::Instant::now());
+                        let title = dialog.map_or("Rustgramm", |d| d.name.as_str());
+                        let body = if self.settings.ayu.streamer_mode {
+                            "Новое сообщение"
+                        } else if row_snapshot.2.is_empty() {
+                            "Вложение"
+                        } else {
+                            row_snapshot.2.as_str()
+                        };
+                        notify_toast(title, body);
+                    }
                 }
             }
             Live::Deleted(ch, ids) => {
@@ -630,20 +675,41 @@ impl App {
                 }
             }
         }
+        // Загружаем текстуры всех пользовательских Premium-эмодзи из сообщений.
+        let mut custom_ids: Vec<i64> = Vec::new();
+        for r in rows {
+            for e in &r.entities {
+                if let rg_core::engine::EntityKind::CustomEmoji(doc_id) = e.kind
+                    && !self.sticker_tex.contains_key(&doc_id)
+                    && self.custom_emoji_req.insert(doc_id)
+                {
+                    custom_ids.push(doc_id);
+                }
+            }
+        }
+        if !custom_ids.is_empty() {
+            let _ = self.cmd.send(Cmd::CustomEmojiDocs(custom_ids));
+        }
     }
 
     /// Открыть чат из списка (мгновенно из кэша в памяти, если уже открывался).
     fn open_dialog(&mut self, i: usize) {
         self.reset_chat_state();
         self.selected = Some(i);
-        if let Some(id) = self.dialogs.get(i).map(|d| d.id)
-            && let Some(cached) = self.history_cache.get(&id).cloned()
-            && !cached.is_empty()
-        {
-            self.known.extend(cached.iter().map(|r| r.id));
-            self.request_previews(i, &cached);
-            self.messages = cached;
-            self.history_loading = false;
+        if let Some(id) = self.dialogs.get(i).map(|d| d.id) {
+            if self.info_req.insert(id) {
+                self.send(Cmd::PeerInfo(i));
+            }
+            if let Some(cached) = self.history_cache.get(&id).cloned()
+                && !cached.is_empty()
+            {
+                self.known.extend(cached.iter().map(|r| r.id));
+                self.request_previews(i, &cached);
+                self.messages = cached;
+                self.history_loading = false;
+            } else {
+                self.history_loading = true;
+            }
         } else {
             self.history_loading = true;
         }
@@ -739,6 +805,19 @@ impl App {
                 Ev::Translated(id, tr) => {
                     self.translated.insert(id, tr);
                     self.status.clear();
+                }
+                Ev::Participants(id, list) => {
+                    self.participants.insert(id, list);
+                }
+                Ev::InviteLink(id, link) => {
+                    ctx.copy_text(link.clone());
+                    if let Some(info) = self.peer_infos.get_mut(&id) {
+                        info.invite_link = link.clone();
+                    }
+                    self.status = format!("Ссылка скопирована: {link}");
+                }
+                Ev::MemberSearch(list) => {
+                    self.create_member_results = list;
                 }
                 Ev::Progress(id, done, total) => {
                     self.fetching.insert(id, (done, total));
@@ -1065,7 +1144,10 @@ impl App {
             let (srect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
             ui.painter()
                 .rect_filled(srect, egui::CornerRadius::same(18), t(FILTER_INPUT));
-            let inner = srect.shrink2(Vec2::new(18.0, 4.0));
+            let inner = egui::Rect::from_min_max(
+                srect.min + Vec2::new(14.0, 4.0),
+                srect.max - Vec2::new(if self.search.is_empty() { 14.0 } else { 32.0 }, 4.0),
+            );
             ui.put(
                 inner,
                 egui::TextEdit::singleline(&mut self.search)
@@ -1073,6 +1155,15 @@ impl App {
                     .frame(egui::Frame::NONE)
                     .desired_width(inner.width()),
             );
+            if !self.search.is_empty() {
+                let xr = egui::Rect::from_center_size(egui::pos2(srect.right() - 16.0, srect.center().y), Vec2::splat(24.0));
+                let xresp = ui.interact(xr, ui.make_persistent_id("dlg-search-clear"), Sense::click());
+                icons::tg(ui.painter(), "info/info_close", xr.center(), if xresp.hovered() { WHITE } else { SUBTEXT });
+                if xresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.search.clear();
+                    self.global_results.clear();
+                }
+            }
         });
         ui.add_space(4.0);
         let needle = self.search.trim().to_lowercase();
@@ -1137,10 +1228,15 @@ impl App {
                         let g_idx = row_pos - filtered.len();
                         if g_idx == 0 {
                             let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT), Sense::hover());
+                            let y_line = r.bottom() - 28.0;
+                            ui.painter().line_segment(
+                                [egui::pos2(r.left() + 14.0, y_line), egui::pos2(r.right() - 14.0, y_line)],
+                                egui::Stroke::new(1.0, Color32::from_white_alpha((18.0 * opacity_f32()) as u8)),
+                            );
                             ui.painter().text(
-                                egui::pos2(r.left() + 16.0, r.center().y),
+                                egui::pos2(r.left() + 16.0, r.bottom() - 14.0),
                                 egui::Align2::LEFT_CENTER,
-                                "ГЛОБАЛЬНЫЙ ПОИСК",
+                                format!("ГЛОБАЛЬНЫЙ ПОИСК · {}", self.global_results.len()),
                                 display(12.0),
                                 ORANGE,
                             );
@@ -1346,6 +1442,38 @@ impl App {
             self.open_dialog(i);
         }
     }
+}
+
+/// Неблокирующее системное уведомление Windows (без консольного окна).
+fn notify_toast(title: &str, body: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let esc = |s: &str| {
+            s.chars()
+                .take(120)
+                .map(|c| match c {
+                    '\'' | '"' | '<' | '>' | '&' | '\r' | '\n' => ' ',
+                    other => other,
+                })
+                .collect::<String>()
+        };
+        let t = esc(title);
+        let b = esc(body);
+        let script = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+            $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+            $nodes = $xml.GetElementsByTagName('text'); $nodes[0].InnerText = '{t}'; $nodes[1].InnerText = '{b}'; \
+            $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Rustgramm').Show($toast)"
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = (title, body);
 }
 
 /// Действие из контекстного меню строки списка чатов.

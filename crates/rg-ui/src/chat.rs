@@ -43,6 +43,8 @@ pub(crate) enum Act {
     Translate(i32, String),
     /// Сохранить карточку-снимок сообщения (Message Shot, функция AyuGram).
     Shot(i32),
+    /// Проголосовать в опросе (идентификатор сообщения, байты варианта).
+    VotePoll(i32, Vec<u8>),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -68,6 +70,8 @@ struct Env<'a> {
     gif_paths: &'a HashMap<i32, std::path::PathBuf>,
     /// Переведённые тексты сообщений.
     translated: &'a HashMap<i32, String>,
+    /// Текстуры пользовательских Premium-эмодзи (`document_id` -> текстура).
+    custom_tex: &'a HashMap<i64, egui::TextureHandle>,
     /// Видимая область ленты (для аккуратного размещения встроенного GIF).
     clip_rect: Rect,
 }
@@ -93,22 +97,64 @@ impl App {
                 }
             }
             if let Some(d) = self.selected.and_then(|i| self.dialogs.get(i)) {
-                avatar(ui, &d.name, d.id, 42.0, self.avatars.get(&d.id), self.settings.ayu.avatar_corners);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(&d.name).strong().size(16.0).color(WHITE));
-                    match self.settings.ayu.show_peer_id {
-                        rg_settings::PeerIdDisplay::Hidden => {}
-                        rg_settings::PeerIdDisplay::BotApi => {
-                            ui.label(RichText::new(format!("ID {}", d.id)).size(12.0).color(SUBTEXT));
+                let info = self.peer_infos.get(&d.id);
+                let sub = if d.saved {
+                    "Сохраняйте важные сообщения".to_owned()
+                } else if let Some(inf) = info {
+                    if inf.members > 0 {
+                        if inf.broadcast {
+                            format!("{} подписчиков", inf.members)
+                        } else {
+                            format!("{} участников", inf.members)
                         }
-                        rg_settings::PeerIdDisplay::Telegram => {
-                            let raw = d.id.unsigned_abs() % 1_000_000_000_000;
-                            ui.label(RichText::new(format!("ID {raw}")).size(12.0).color(SUBTEXT));
-                        }
+                    } else if !inf.status.is_empty() {
+                        inf.status.clone()
+                    } else {
+                        String::new()
                     }
-                });
+                } else {
+                    match d.kind {
+                        rg_core::engine::DialogKind::Bot => "бот".to_owned(),
+                        rg_core::engine::DialogKind::Channel => "канал".to_owned(),
+                        rg_core::engine::DialogKind::Group => "группа".to_owned(),
+                        rg_core::engine::DialogKind::User => String::new(),
+                    }
+                };
+                let id_note = match self.settings.ayu.show_peer_id {
+                    rg_settings::PeerIdDisplay::Hidden => String::new(),
+                    rg_settings::PeerIdDisplay::BotApi => format!("ID {}", d.id),
+                    rg_settings::PeerIdDisplay::Telegram => {
+                        let raw = d.id.unsigned_abs() % 1_000_000_000_000;
+                        format!("ID {raw}")
+                    }
+                };
+                let subtitle = match (sub.is_empty(), id_note.is_empty()) {
+                    (false, false) => format!("{sub} · {id_note}"),
+                    (false, true) => sub,
+                    (true, false) => id_note,
+                    (true, true) => String::new(),
+                };
+                let online = subtitle.starts_with("в сети");
+                let hresp = ui
+                    .horizontal(|ui| {
+                        avatar(ui, &d.name, d.id, 40.0, self.avatars.get(&d.id), self.settings.ayu.avatar_corners);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add_space(if subtitle.is_empty() { 11.0 } else { 5.0 });
+                            ui.label(RichText::new(if d.saved { "Избранное" } else { &d.name }).strong().size(15.5).color(WHITE));
+                            if !subtitle.is_empty() {
+                                ui.label(RichText::new(subtitle).size(12.5).color(if online { GREEN } else { SUBTEXT }));
+                            }
+                        });
+                    })
+                    .response;
+                if ui
+                    .interact(hresp.rect, ui.make_persistent_id("hdr-profile"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.info_open = !self.info_open;
+                }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -188,20 +234,30 @@ impl App {
         });
     }
 
-    /// Правая панель: аватар, имя, статус и сведения о собеседнике, группе или канале.
+    /// Правая панель профиля (как в AyuGram Desktop): шапка, быстрые действия, сведения,
+    /// общие медиа/файлы/ссылки и список участников с добавлением новых людей.
     pub(crate) fn info_ui(&mut self, ui: &mut egui::Ui) {
         let Some((i, d)) = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.clone()))) else { return };
         if self.info_req.insert(d.id) {
             self.send(Cmd::PeerInfo(i));
         }
+        let is_group = d.id < 0;
+        if is_group && self.participants_req.insert(d.id) {
+            self.send(Cmd::Participants(i));
+        }
         let info = self.peer_infos.get(&d.id).cloned();
+        let members_list = self.participants.get(&d.id).cloned().unwrap_or_default();
         let w = ui.available_width();
         ui.set_clip_rect(ui.max_rect());
         let (head, _) = ui.allocate_exact_size(Vec2::new(w, 54.0), Sense::hover());
         ui.painter().text(
             head.left_center() + Vec2::new(18.0, 0.0),
             egui::Align2::LEFT_CENTER,
-            if d.id < 0 { "Информация" } else { "Профиль" },
+            if is_group {
+                if info.as_ref().is_some_and(|x| x.broadcast) { "Канал" } else { "Группа" }
+            } else {
+                "Профиль"
+            },
             FontId::proportional(16.0),
             WHITE,
         );
@@ -211,86 +267,320 @@ impl App {
         if xr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             self.info_open = false;
         }
+        let mut open_contact: Option<(grammers_session::types::PeerRef, i64, String)> = None;
+        let mut open_viewer: Option<i32> = None;
+        let mut open_save: Option<i32> = None;
+        let mut open_url: Option<String> = None;
+        let mut cmd_after: Option<Cmd> = None;
+        let mut start_invite = false;
+        let mut start_search = false;
+        let mut info_tab = self.info_tab;
+
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            let (top, _) = ui.allocate_exact_size(Vec2::new(w, 168.0), Sense::hover());
-            let c = Pos2::new(top.center().x, top.top() + 52.0);
-            let r = Rect::from_center_size(c, Vec2::splat(88.0));
+            let (top, _) = ui.allocate_exact_size(Vec2::new(w, 160.0), Sense::hover());
+            let c = Pos2::new(top.center().x, top.top() + 50.0);
+            let r = Rect::from_center_size(c, Vec2::splat(84.0));
             match self.avatars.get(&d.id) {
                 Some(t) => {
-                    egui::Image::new(t).fit_to_exact_size(r.size()).corner_radius(44.0).paint_at(ui, r);
+                    egui::Image::new(t).fit_to_exact_size(r.size()).corner_radius(42.0).paint_at(ui, r);
                 }
                 None => {
-                    ui.painter().circle_filled(c, 44.0, avatar_color(d.id));
+                    ui.painter().circle_filled(c, 42.0, avatar_color(d.id));
                     ui.painter().text(
                         c,
                         egui::Align2::CENTER_CENTER,
                         d.name.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_default(),
-                        FontId::proportional(36.0),
+                        FontId::proportional(34.0),
                         Color32::WHITE,
                     );
                 }
             }
             ui.painter().text(
-                Pos2::new(top.center().x, top.top() + 120.0),
+                Pos2::new(top.center().x, top.top() + 114.0),
                 egui::Align2::CENTER_CENTER,
-                &d.name,
-                FontId::proportional(18.0),
+                if d.saved { "Избранное" } else { &d.name },
+                FontId::proportional(17.5),
                 WHITE,
             );
             let sub = info
                 .as_ref()
                 .map(|x| {
                     if x.members > 0 {
-                        format!("{} участников", x.members)
+                        if x.broadcast { format!("{} подписчиков", x.members) } else { format!("{} участников", x.members) }
                     } else {
                         x.status.clone()
                     }
                 })
                 .unwrap_or_default();
-            ui.painter().text(Pos2::new(top.center().x, top.top() + 144.0), egui::Align2::CENTER_CENTER, sub, FontId::proportional(13.0), SUBTEXT);
+            let sub_c = if sub == "в сети" { GREEN } else { SUBTEXT };
+            ui.painter().text(Pos2::new(top.center().x, top.top() + 138.0), egui::Align2::CENTER_CENTER, sub, FontId::proportional(13.0), sub_c);
+
+            // Полоса быстрых действий профиля (как в AyuGram/iOS Telegram).
+            let blocked = info.as_ref().is_some_and(|x| x.blocked);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let actions: Vec<(&str, &str, u8)> = if is_group {
+                    vec![
+                        (if d.muted { "menu/unmute" } else { "menu/mute" }, if d.muted { "Звук" } else { "Тихо" }, 1),
+                        ("menu/search", "Поиск", 2),
+                        ("menu/add", "Люди", 3),
+                        ("menu/link", "Ссылка", 4),
+                    ]
+                } else {
+                    vec![
+                        (if d.muted { "menu/unmute" } else { "menu/mute" }, if d.muted { "Звук" } else { "Тихо" }, 1),
+                        ("menu/search", "Поиск", 2),
+                        ("menu/block", if blocked { "Разблок" } else { "Блок" }, 5),
+                    ]
+                };
+                let bw = ((w - 24.0 - (actions.len() as f32 - 1.0) * 6.0) / actions.len() as f32).max(56.0);
+                for (k, (ico, lbl, code)) in actions.iter().enumerate() {
+                    if k > 0 {
+                        ui.add_space(6.0);
+                    }
+                    let (br, bresp) = ui.allocate_exact_size(Vec2::new(bw, 52.0), Sense::click());
+                    let h = tween(ui.ctx(), ("pqa", d.id, *code), f32::from(u8::from(bresp.hovered())), 0.12);
+                    let fill = lerp_color(t(WINDOW_OVER), t_btn(ORANGE), h * 0.45);
+                    ui.painter().rect_filled(br, egui::CornerRadius::same(10), fill);
+                    let col = if *code == 5 && blocked { DANGER } else if h > 0.4 { Color32::WHITE } else { ORANGE };
+                    icons::tg(ui.painter(), ico, Pos2::new(br.center().x, br.top() + 18.0), col);
+                    ui.painter().text(
+                        Pos2::new(br.center().x, br.bottom() - 12.0),
+                        egui::Align2::CENTER_CENTER,
+                        *lbl,
+                        FontId::proportional(11.5),
+                        WHITE,
+                    );
+                    if bresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        match code {
+                            1 => cmd_after = Some(Cmd::MuteDialog(i, !d.muted)),
+                            2 => start_search = true,
+                            3 => start_invite = true,
+                            4 => cmd_after = Some(Cmd::ExportInvite(i)),
+                            5 => cmd_after = Some(Cmd::BlockPeer(i, !blocked)),
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            ui.add_space(10.0);
             kit::divider(ui);
-            let Some(info) = info else {
-                ui.add_space(30.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new("Загрузка…").color(SUBTEXT)));
-                return;
+
+            if let Some(info) = &info {
+                let row = |ui: &mut egui::Ui, icon: &str, value: &str, label: &str, copy: bool| {
+                    if value.is_empty() {
+                        return;
+                    }
+                    let galley = ui.painter().layout(value.to_owned(), FontId::proportional(14.0), WHITE, (w - 80.0).max(80.0));
+                    let h = (galley.size().y + 34.0).max(52.0);
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
+                    }
+                    icons::tg(ui.painter(), icon, Pos2::new(r.left() + 28.0, r.top() + 24.0), DIALOG_DATE);
+                    ui.painter().galley(Pos2::new(r.left() + 58.0, r.top() + 10.0), galley.clone(), WHITE);
+                    ui.painter().text(
+                        Pos2::new(r.left() + 58.0, r.top() + 12.0 + galley.size().y + 8.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        FontId::proportional(12.0),
+                        SUBTEXT,
+                    );
+                    if copy && resp.on_hover_text("Нажмите, чтобы скопировать").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        ui.ctx().copy_text(value.to_owned());
+                    }
+                };
+                let streamer = self.settings.ayu.streamer_mode;
+                row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { mask_streamer(&format!("+{}", info.phone), streamer) }, "Телефон", !streamer);
+                row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { mask_streamer(&format!("@{}", info.username), streamer) }, "Имя пользователя", !streamer);
+                row(ui, "menu/info", &info.about, if is_group { "Описание" } else { "О себе" }, true);
+                if !info.invite_link.is_empty() {
+                    row(ui, "menu/link", &info.invite_link, "Ссылка-приглашение", true);
+                }
+                row(ui, "menu/profile", &mask_streamer(&format!("{}", d.id), streamer), "ID", !streamer);
+            } else {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Загрузка сведений…").color(SUBTEXT)));
+            }
+
+            kit::divider(ui);
+            // Вкладки общих материалов и участников (Медиа / Файлы / Ссылки / Участники).
+            let tabs: &[(&str, usize)] = if is_group {
+                &[("Медиа", 0), ("Файлы", 1), ("Ссылки", 2), ("Люди", 3)]
+            } else {
+                &[("Медиа", 0), ("Файлы", 1), ("Ссылки", 2)]
             };
-            let row = |ui: &mut egui::Ui, icon: &str, value: &str, label: &str, copy: bool| {
-                if value.is_empty() {
-                    return;
+            if info_tab >= tabs.len() {
+                info_tab = 0;
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let tw = w / tabs.len() as f32;
+                for (name, tid) in tabs {
+                    let (tr, tresp) = ui.allocate_exact_size(Vec2::new(tw, 36.0), Sense::click());
+                    let k = tween(ui.ctx(), ("inftab", *tid), f32::from(u8::from(info_tab == *tid)), 0.14);
+                    ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(13.0), lerp_color(SUBTEXT, WHITE, k));
+                    ui.painter().rect_filled(
+                        Rect::from_center_size(Pos2::new(tr.center().x, tr.bottom() - 1.5), Vec2::new((tw - 14.0) * k, 2.5)),
+                        egui::CornerRadius::same(1),
+                        t_btn(ORANGE),
+                    );
+                    if tresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        info_tab = *tid;
+                    }
                 }
-                let galley = ui.painter().layout(value.to_owned(), FontId::proportional(14.0), WHITE, w - 80.0);
-                let h = (galley.size().y + 38.0).max(56.0);
-                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
-                if resp.hovered() {
-                    ui.painter().rect_filled(r, 0.0, t2(WINDOW_OVER));
+            });
+            ui.add_space(6.0);
+
+            match info_tab {
+                0 => {
+                    // Сетка 3xN миниатюр фото и видео из чата.
+                    let media_ids: Vec<i32> = self
+                        .messages
+                        .iter()
+                        .rev()
+                        .filter(|m| {
+                            m.media.as_ref().is_some_and(|x| {
+                                matches!(x.kind, rg_core::media::MediaKind::Photo | rg_core::media::MediaKind::Video | rg_core::media::MediaKind::Gif)
+                            })
+                        })
+                        .map(|m| m.id)
+                        .collect();
+                    if media_ids.is_empty() {
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| ui.label(RichText::new("Нет медиа в загруженной истории").size(12.5).color(SUBTEXT)));
+                    } else {
+                        let cols = 3usize;
+                        let cell = (w - 16.0) / cols as f32;
+                        for row_ids in media_ids.chunks(cols) {
+                            let (rr, _) = ui.allocate_exact_size(Vec2::new(w, cell), Sense::hover());
+                            for (k, &mid) in row_ids.iter().enumerate() {
+                                let cell_r = Rect::from_min_size(Pos2::new(rr.left() + 8.0 + k as f32 * cell, rr.top()), Vec2::splat(cell)).shrink(2.0);
+                                let resp = ui.interact(cell_r, ui.make_persistent_id(("im", mid)), Sense::click());
+                                match self.textures.get(&mid) {
+                                    Some(t) => {
+                                        egui::Image::new(t).fit_to_exact_size(cell_r.size()).corner_radius(6.0).paint_at(ui, cell_r);
+                                    }
+                                    None => {
+                                        ui.painter().rect_filled(cell_r, egui::CornerRadius::same(6), t(WINDOW_OVER));
+                                    }
+                                }
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    open_viewer = Some(mid);
+                                }
+                            }
+                        }
+                    }
                 }
-                icons::tg(ui.painter(), icon, Pos2::new(r.left() + 30.0, r.top() + 24.0), DIALOG_DATE);
-                ui.painter().galley(Pos2::new(r.left() + 64.0, r.top() + 12.0), galley.clone(), WHITE);
-                ui.painter().text(
-                    Pos2::new(r.left() + 64.0, r.top() + 14.0 + galley.size().y + 8.0),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    FontId::proportional(12.0),
-                    SUBTEXT,
-                );
-                if copy && resp.on_hover_text("Нажмите, чтобы скопировать").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    ui.ctx().copy_text(value.to_owned());
+                1 => {
+                    let files: Vec<(i32, String, u64)> = self
+                        .messages
+                        .iter()
+                        .rev()
+                        .filter_map(|m| {
+                            let inf = m.media.as_ref()?;
+                            matches!(inf.kind, rg_core::media::MediaKind::File | rg_core::media::MediaKind::Audio)
+                                .then(|| (m.id, inf.name.clone(), inf.size))
+                        })
+                        .collect();
+                    if files.is_empty() {
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| ui.label(RichText::new("Нет файлов в загруженной истории").size(12.5).color(SUBTEXT)));
+                    } else {
+                        for (mid, name, sz) in files {
+                            if kit::nav_row(ui, "menu/download", &short(&name, 26), &rg_core::media::human_size(sz)) {
+                                open_save = Some(mid);
+                            }
+                        }
+                    }
                 }
-            };
-            let streamer = self.settings.ayu.streamer_mode;
-            row(ui, "menu/phone", &if info.phone.is_empty() { String::new() } else { mask_streamer(&format!("+{}", info.phone), streamer) }, "Телефон", !streamer);
-            row(ui, "settings/mention", &if info.username.is_empty() { String::new() } else { mask_streamer(&format!("@{}", info.username), streamer) }, "Имя пользователя", !streamer);
-            row(ui, "menu/info", &info.about, if d.id < 0 { "Описание" } else { "О себе" }, true);
-            row(ui, "menu/profile", &mask_streamer(&format!("{}", d.id), streamer), "ID", !streamer);
+                2 => {
+                    let mut links: Vec<String> = Vec::new();
+                    for m in self.messages.iter().rev() {
+                        if let Some(rg_core::media::MediaInfo { kind: rg_core::media::MediaKind::WebPage { url, .. }, .. }) = &m.media
+                            && !url.is_empty()
+                        {
+                            links.push(url.clone());
+                        }
+                        for e in &m.entities {
+                            if e.kind == rg_core::engine::EntityKind::Link {
+                                let u = e.url.clone().unwrap_or_else(|| m.text.chars().skip(e.start).take(e.end.saturating_sub(e.start)).collect());
+                                if !u.is_empty() {
+                                    links.push(u);
+                                }
+                            }
+                        }
+                    }
+                    if links.is_empty() {
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| ui.label(RichText::new("Нет ссылок в загруженной истории").size(12.5).color(SUBTEXT)));
+                    } else {
+                        for u in links.into_iter().take(40) {
+                            if kit::nav_row(ui, "menu/link", &short(&u, 32), "") {
+                                open_url = Some(u);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if members_list.is_empty() {
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| ui.label(RichText::new("Список участников недоступен или пуст").size(12.5).color(SUBTEXT)));
+                    } else {
+                        for c in &members_list {
+                            let (mr, mresp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
+                            if mresp.hovered() {
+                                ui.painter().rect_filled(mr, 0.0, t(WINDOW_OVER));
+                            }
+                            draw_avatar(ui, mr.left_center() + Vec2::new(30.0, 0.0), &c.name, c.id, 34.0, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
+                            ui.painter().text(mr.left_top() + Vec2::new(56.0, 9.0), egui::Align2::LEFT_TOP, &c.name, FontId::proportional(13.5), WHITE);
+                            ui.painter().text(mr.left_top() + Vec2::new(56.0, 27.0), egui::Align2::LEFT_TOP, &c.status, FontId::proportional(11.5), SUBTEXT);
+                            if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                open_contact = Some((c.peer, c.id, c.name.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            ui.add_space(16.0);
         });
+
+        self.info_tab = info_tab;
+        if let Some(cmd) = cmd_after {
+            self.send(cmd);
+        }
+        if start_search {
+            self.search_open = true;
+        }
+        if start_invite {
+            self.create_kind = 3;
+            self.create_members.clear();
+            self.create_member_query.clear();
+            self.create_member_results.clear();
+            self.create_member_map.clear();
+            self.send(Cmd::Contacts);
+        }
+        if let Some((peer, id, name)) = open_contact {
+            self.send(Cmd::OpenContact(peer, id, name));
+        }
+        if let Some(mid) = open_viewer {
+            self.viewer = Some(mid);
+            self.viewer_zoom = 1.0;
+        }
+        if let Some(mid) = open_save {
+            self.send(Cmd::Download(mid));
+        }
+        if let Some(u) = open_url {
+            self.apply(ui.ctx(), Act::OpenUrl(u));
+        }
     }
 
-    /// Строка поиска по чату под шапкой.
+    /// Строка поиска по чату под шапкой (без пустых зазоров в строке).
     pub(crate) fn search_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            ui.add_space(12.0);
-            let w = (ui.available_width() - 120.0).max(80.0);
+            ui.add_space(10.0);
+            let w = (ui.available_width() - 168.0).max(120.0);
             let r = ui.add_sized(
                 [w, 30.0],
                 egui::TextEdit::singleline(&mut self.chat_search)
@@ -303,7 +593,7 @@ impl App {
             if go {
                 self.send(Cmd::Search(self.chat_search.clone()));
             }
-            if ui.button("Закрыть").clicked() {
+            if ui.add_sized([74.0, 30.0], egui::Button::new("Закрыть")).clicked() {
                 self.search_open = false;
                 self.chat_search.clear();
                 self.found = None;
@@ -352,14 +642,16 @@ impl App {
         let mut attach = false;
         ui.horizontal(|ui| {
             ui.set_min_height(46.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
             #[cfg(not(target_os = "android"))]
             if s.field_attach_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(46.0, 46.0), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 44.0), Sense::click());
                 icons::attach(ui.painter(), rect.center(), if resp.hovered() { WHITE } else { DIALOG_DATE });
                 attach = resp.on_hover_text("Отправить файл").clicked();
             }
-            let reserve = 100.0 + if s.field_emoji_button { 46.0 } else { 0.0 };
-            let width = (ui.available_width() - reserve).max(80.0);
+            // Точный расчёт правой части (без лишнего пустого зазора в строке ввода).
+            let right_w = 44.0 + if s.field_emoji_button { 46.0 } else { 0.0 };
+            let width = (ui.available_width() - right_w).max(80.0);
             let id = ui.make_persistent_id("composer-input");
             let focused = ui.memory(|m| m.has_focus(id));
             // Enter отправляет, Shift+Enter — новая строка.
@@ -375,8 +667,11 @@ impl App {
                     .frame(egui::Frame::NONE)
                     .margin(Vec2::new(4.0, 8.0)),
             );
+            if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
+                self.input_custom_emojis.clear();
+            }
             if s.field_emoji_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(46.0, 46.0), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 44.0), Sense::click());
                 self.emoji_btn = rect;
                 let k = tween(ui.ctx(), "emoji-btn", f32::from(u8::from(resp.hovered() || self.emoji_open)), 0.12);
                 let color = lerp_color(DIALOG_DATE, WHITE, k);
@@ -409,13 +704,26 @@ impl App {
             icons::send(ui.painter(), srect.center(), arrow_c);
             let sresp = if active { sresp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { sresp };
             if (sresp.clicked() || enter) && active && self.selected.is_some() {
+                let lead = self.input.chars().take_while(|c| c.is_whitespace()).count();
                 let text = self.input.trim().to_owned();
+                let char_total = text.chars().count();
+                let custom: Vec<(usize, usize, i64)> = std::mem::take(&mut self.input_custom_emojis)
+                    .into_iter()
+                    .filter_map(|(st, ln, id)| {
+                        let ns = st.checked_sub(lead)?;
+                        (ns + ln <= char_total).then_some((ns, ln, id))
+                    })
+                    .collect();
                 self.input.clear();
                 if let Some(id) = self.editing.take() {
                     self.send(Cmd::Edit(id, text));
                 } else {
                     let reply = self.reply.take().map(|(id, _)| id);
-                    self.send(Cmd::Send(text, reply));
+                    if custom.is_empty() {
+                        self.send(Cmd::Send(text, reply));
+                    } else {
+                        self.send(Cmd::SendRich(text, custom, reply));
+                    }
                 }
                 r.request_focus();
             }
@@ -480,7 +788,10 @@ impl App {
                 let sw = (ui.available_width() - 12.0).max(80.0);
                 let (srect, _) = ui.allocate_exact_size(Vec2::new(sw, 30.0), Sense::hover());
                 ui.painter().rect_filled(srect, egui::CornerRadius::same(15), t(FILTER_INPUT));
-                let inner = srect.shrink2(Vec2::new(12.0, 3.0));
+                let inner = Rect::from_min_max(
+                    srect.min + Vec2::new(12.0, 3.0),
+                    srect.max - Vec2::new(if self.emoji_search.is_empty() { 12.0 } else { 28.0 }, 3.0),
+                );
                 ui.put(
                     inner,
                     egui::TextEdit::singleline(&mut self.emoji_search)
@@ -488,6 +799,14 @@ impl App {
                         .frame(egui::Frame::NONE)
                         .desired_width(inner.width()),
                 );
+                if !self.emoji_search.is_empty() {
+                    let xr = Rect::from_center_size(Pos2::new(srect.right() - 15.0, srect.center().y), Vec2::splat(22.0));
+                    let xresp = ui.interact(xr, ui.make_persistent_id("em-search-clear"), Sense::click());
+                    icons::tg(ui.painter(), "info/info_close", xr.center(), if xresp.hovered() { WHITE } else { SUBTEXT });
+                    if xresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.emoji_search.clear();
+                    }
+                }
             });
             ui.add_space(4.0);
             let h = (ui.available_height() - 42.0).max(60.0);
@@ -578,8 +897,13 @@ impl App {
                         self.send(Cmd::LoadSetRow(set));
                     }
                 }
-                A::Insert(text) => {
+                A::InsertCustom(text, doc_id) => {
+                    let start = self.input.chars().count();
+                    let len = text.chars().count();
                     self.input.push_str(&text);
+                    if len > 0 {
+                        self.input_custom_emojis.push((start, len, doc_id));
+                    }
                 }
             }
         }
@@ -682,6 +1006,7 @@ impl App {
                 cached: &self.cached_media,
                 gif_paths: &self.gif_paths,
                 translated: &self.translated,
+                custom_tex: &self.sticker_tex,
                 clip_rect,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
@@ -831,6 +1156,9 @@ impl App {
                         None => self.error = "Не удалось сохранить снимок".to_owned(),
                     }
                 }
+            }
+            Act::VotePoll(id, option) => {
+                self.send(Cmd::VotePoll(id, option));
             }
         }
     }
@@ -1148,7 +1476,12 @@ fn bubble(
             meta = format!("{mark} {meta}");
         }
         let tick_w = if m.outgoing { 22.0 } else { 0.0 };
-        let meta_w = meta.chars().count() as f32 * 6.4 + tick_w + 4.0;
+        let meta_text_w = ui
+            .painter()
+            .layout_no_wrap(meta.clone(), FontId::proportional(12.0), date_c)
+            .size()
+            .x;
+        let meta_w = meta_text_w + tick_w + 6.0;
         let mut w = galley.size().x.max(meta_w + 8.0);
         if m.deleted {
             w = w.max(90.0);
@@ -1240,10 +1573,11 @@ fn bubble(
                         hot.extend(super::rich::render(
                             ui,
                             env.emoji,
+                            env.custom_tex,
                             &runs,
                             15.0,
                             text_c,
-                            WHITE,
+                            ORANGE,
                             m.id,
                             env.spoilers,
                         ));

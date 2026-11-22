@@ -356,17 +356,31 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, save: &mut bool, streamer: bo
     for (label, text) in [("Имя", &mut st.first), ("Фамилия", &mut st.last)] {
         ui.horizontal(|ui| {
             ui.add_space(kit::PAD);
-            ui.add_sized([70.0, 32.0], egui::Label::new(RichText::new(label).color(SUBTEXT).size(13.0)));
-            ui.add_sized([ui.available_width() - kit::PAD, 30.0], egui::TextEdit::singleline(text).margin(Vec2::new(6.0, 6.0)));
+            ui.allocate_ui_with_layout(
+                Vec2::new(84.0, 30.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(RichText::new(label).color(SUBTEXT).size(13.0));
+                },
+            );
+            let fw = (ui.available_width() - kit::PAD).max(120.0);
+            ui.add_sized([fw, 30.0], egui::TextEdit::singleline(text).margin(Vec2::new(8.0, 6.0)));
         });
         ui.add_space(4.0);
     }
     ui.horizontal(|ui| {
         ui.add_space(kit::PAD);
-        ui.add_sized([70.0, 32.0], egui::Label::new(RichText::new("О себе").color(SUBTEXT).size(13.0)));
+        ui.allocate_ui_with_layout(
+            Vec2::new(84.0, 30.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(RichText::new("О себе").color(SUBTEXT).size(13.0));
+            },
+        );
+        let fw = (ui.available_width() - kit::PAD).max(120.0);
         ui.add_sized(
-            [ui.available_width() - kit::PAD, 60.0],
-            egui::TextEdit::multiline(&mut st.about).margin(Vec2::new(6.0, 6.0)).desired_rows(3),
+            [fw, 60.0],
+            egui::TextEdit::multiline(&mut st.about).margin(Vec2::new(8.0, 6.0)).desired_rows(3),
         );
     });
     ui.add_space(8.0);

@@ -27,8 +27,8 @@ pub(crate) enum StickerAct {
     SetIcon(usize),
     /// Загрузить содержимое набора эмодзи с номером.
     LoadPack(usize),
-    /// Вставить в поле ввода (обычный эмодзи для набора Premium).
-    Insert(String),
+    /// Вставить пользовательский Premium-эмодзи (запасной символ, `document_id`).
+    InsertCustom(String, i64),
     /// Загрузить сохранённые GIF.
     Gifs,
 }
@@ -326,8 +326,9 @@ impl App {
                         } else if st.has_preview() && ui.is_rect_visible(r) {
                             acts.push(StickerAct::Thumb(st.id));
                         }
-                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !st.emoji.is_empty() {
-                            acts.push(StickerAct::Insert(st.emoji.clone()));
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            let fallback = if st.emoji.is_empty() { "✨".to_owned() } else { st.emoji.clone() };
+                            acts.push(StickerAct::InsertCustom(fallback, st.id));
                         }
                     }
                 }

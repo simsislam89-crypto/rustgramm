@@ -297,7 +297,7 @@ pub fn card(
                 cards.push((rect, Act::OpenUrl(url.clone())));
             }
         }
-        MediaKind::Poll { question, options, total, closed, quiz } => {
+        MediaKind::Poll { question, options, option_bytes, total, closed, quiz } => {
             let kind_label = match (*quiz, *closed) {
                 (true, true) => "Викторина · завершена",
                 (true, false) => "Викторина",
@@ -307,7 +307,7 @@ pub fn card(
             ui.label(RichText::new(kind_label).size(11.5).color(ORANGE));
             ui.label(RichText::new(question).strong().size(14.5).color(text_c));
             ui.add_space(4.0);
-            for (opt, pct, chosen) in options {
+            for (idx, (opt, pct, chosen)) in options.iter().enumerate() {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
                 let p = ui.painter();
                 p.rect_filled(
@@ -337,6 +337,9 @@ pub fn card(
                     FontId::proportional(12.0),
                     text_c,
                 );
+                if !*closed && let Some(bytes) = option_bytes.get(idx) {
+                    cards.push((r, Act::VotePoll(m.id, bytes.clone())));
+                }
                 ui.add_space(2.0);
             }
             ui.label(RichText::new(format!("Голосов: {total}")).size(12.0).color(date_c));

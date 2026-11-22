@@ -1,9 +1,9 @@
 //! Форматированный текст сообщений: жирный, курсив, подчёркнутый, зачёркнутый, код, спойлер,
 //! ссылки и упоминания. Текст режется на куски по границам сущностей Telegram.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use eframe::egui::{self, Color32, FontFamily, FontId, RichText};
+use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Vec2};
 use rg_core::engine::{Entity, EntityKind};
 
 use super::emoji::{Emoji, Seg};
@@ -22,6 +22,8 @@ pub struct Run {
     pub spoiler: bool,
     /// Куда ведёт ссылка (только http/https).
     pub url: Option<String>,
+    /// Пользовательский Premium-эмодзи (идентификатор документа Telegram).
+    pub custom_emoji: Option<i64>,
 }
 
 /// Разрешён ли адрес для открытия в браузере: только http и https.
@@ -82,6 +84,7 @@ pub fn build_runs(text: &str, ents: &[Entity]) -> Vec<Run> {
                     }
                 }
                 EntityKind::Hashtag | EntityKind::Command => {}
+                EntityKind::CustomEmoji(id) => r.custom_emoji = Some(id),
             }
         }
         runs.push(r);
@@ -101,6 +104,7 @@ pub enum Hit {
 pub fn render(
     ui: &mut egui::Ui,
     emoji: Option<&Emoji>,
+    custom_tex: &HashMap<i64, egui::TextureHandle>,
     runs: &[Run],
     size: f32,
     color: Color32,
@@ -113,6 +117,16 @@ pub fn render(
         ui.spacing_mut().item_spacing.x = 0.0;
         for (idx, run) in runs.iter().enumerate() {
             let shown = !run.spoiler || open.contains(&(msg_id, idx));
+            if shown
+                && let Some(doc_id) = run.custom_emoji
+                && let Some(tex) = custom_tex.get(&doc_id)
+            {
+                let img = egui::Image::new(tex)
+                    .fit_to_exact_size(Vec2::splat(size * 1.35))
+                    .corner_radius(3);
+                ui.add(img);
+                continue;
+            }
             let segs = match emoji {
                 Some(e) if shown => e.segments(&run.text),
                 _ => vec![Seg::Text(run.text.clone())],
@@ -232,5 +246,14 @@ mod tests {
     fn mention_links_to_telegram() {
         let r = build_runs("@durov", &[ent(EntityKind::Mention, 0, 6)]);
         assert_eq!(r[0].url.as_deref(), Some("https://t.me/durov"));
+    }
+
+    #[test]
+    fn custom_emoji_sets_doc_id_on_run() {
+        let r = build_runs("hi 🔥!", &[ent(EntityKind::CustomEmoji(42), 3, 4)]);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].custom_emoji, None);
+        assert_eq!(r[1].custom_emoji, Some(42));
+        assert_eq!(r[2].custom_emoji, None);
     }
 }

@@ -28,10 +28,11 @@ pub enum MediaKind {
         title: String,
         desc: String,
     },
-    /// Опрос или викторина (вопрос, варианты `(текст, процент, выбран)`, всего голосов, закрыт, викторина).
+    /// Опрос или викторина (вопрос, варианты `(текст, процент, выбран)`, байты вариантов для голосования).
     Poll {
         question: String,
         options: Vec<(String, u8, bool)>,
+        option_bytes: Vec<Vec<u8>>,
         total: i32,
         closed: bool,
         quiz: bool,
@@ -207,6 +208,7 @@ pub fn describe(media: &Media) -> MediaInfo {
             let total = p.raw_results.total_voters.unwrap_or(0).max(0);
             let voters = p.raw_results.results.as_deref().unwrap_or(&[]);
             let mut options = Vec::with_capacity(p.raw.answers.len());
+            let mut option_bytes = Vec::with_capacity(p.raw.answers.len());
             for ans in &p.raw.answers {
                 let tl::enums::PollAnswer::Answer(a) = ans else { continue };
                 let tl::enums::TextWithEntities::Entities(t) = &a.text;
@@ -223,11 +225,13 @@ pub fn describe(media: &Media) -> MediaInfo {
                     0
                 };
                 options.push((t.text.clone(), pct, chosen));
+                option_bytes.push(a.option.clone());
             }
             MediaInfo::basic(
                 MediaKind::Poll {
                     question: q.text.clone(),
                     options,
+                    option_bytes,
                     total,
                     closed: p.raw.closed,
                     quiz: p.raw.quiz,
@@ -459,6 +463,7 @@ mod tests {
             MediaKind::Poll {
                 question: "Rust?".into(),
                 options: vec![("Да".into(), 100, true)],
+                option_bytes: vec![b"0".to_vec()],
                 total: 1,
                 closed: false,
                 quiz: false,
