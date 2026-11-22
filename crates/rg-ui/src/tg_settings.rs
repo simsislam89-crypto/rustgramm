@@ -59,6 +59,9 @@ pub(crate) struct State {
     /// Размеры кэша и загрузок (байт), считаются при открытии страницы «Данные и память».
     pub cache_bytes: u64,
     pub downloads_bytes: u64,
+    /// Редактор папки (None — список папок, Some — создание/правка).
+    pub edit_folder: Option<rg_core::engine::FolderRow>,
+    pub edit_folder_is_new: bool,
 }
 
 /// Размер каталога со всем содержимым (байт).
@@ -122,14 +125,14 @@ impl App {
         if raw < 0.005 && !self.tgs.open {
             return;
         }
-        let appear = spring(raw);
+        let appear = ios_spring(raw);
         let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("tgs-dim"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::ZERO)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * raw) as u8));
+                paint_frosted_scrim(ui.painter(), rect, raw);
                 if resp.clicked() {
                     self.tgs.open = false;
                 }
@@ -139,6 +142,8 @@ impl App {
         let mut close = false;
         let mut advanced = false;
         let mut save_profile = false;
+        let mut save_folder: Option<rg_core::engine::FolderRow> = None;
+        let mut delete_folder: Option<i32> = None;
         let mut clear = false;
         let mut open_downloads = false;
         let max_h = (screen.height() - 40.0).clamp(280.0, 720.0);
@@ -152,10 +157,14 @@ impl App {
         let dialogs = &self.dialogs;
         egui::Area::new(egui::Id::new("tgs-box"))
             .order(egui::Order::Tooltip)
-            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 18.0))
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - appear) * 20.0))
             .show(ctx, |ui| {
-                ui.set_opacity(raw.min(1.0).powf(0.6));
-                egui::Frame::new().fill(t2(WINDOW_BG)).corner_radius(CornerRadius::same(10)).show(ui, |ui| {
+                ui.set_opacity(raw.min(1.0).powf(0.55));
+                let card = egui::Frame::new()
+                    .fill(t2(WINDOW_BG))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha((26.0 * opacity_f32()) as u8)))
+                    .corner_radius(CornerRadius::same(14))
+                    .show(ui, |ui| {
                     let width = BOX_W.min(screen.width() - 16.0);
                     ui.set_width(width);
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -166,7 +175,11 @@ impl App {
                         let r = ui.interact(back, ui.make_persistent_id("tgs-back"), Sense::click());
                         icons::back(ui.painter(), back.center(), if r.hovered() { WHITE } else { SUBTEXT });
                         if r.clicked() {
-                            page = pg::MAIN;
+                            if page == pg::FOLDERS && st.edit_folder.is_some() {
+                                st.edit_folder = None;
+                            } else {
+                                page = pg::MAIN;
+                            }
                         }
                     }
                     ui.painter().text(
@@ -193,7 +206,7 @@ impl App {
                                 pg::NOTIFY => notify_page(ui, &st),
                                 pg::PRIVACY => privacy_page(ui, &st),
                                 pg::DATA => data_page(ui, &st, &mut clear, &mut open_downloads),
-                                pg::FOLDERS => folders_page(ui, folders, dialogs),
+                                pg::FOLDERS => folders_page(ui, &mut st, folders, dialogs, &mut save_folder, &mut delete_folder),
                                 pg::APPEARANCE => appearance_page(ui, &mut s),
                                 pg::LANGUAGE => language_page(ui),
                                 pg::DEVICES => devices_page(ui, &st, self.now),
@@ -207,6 +220,7 @@ impl App {
                             }
                         });
                 });
+                paint_glass_rim(ui.painter(), card.response.rect, 14.0);
             });
         // При входе на страницу «Данные и память» и «Rustgramm» считаем размер кэша.
         if (page == pg::DATA || page == pg::RUSTGRAMM) && st.page != page {
@@ -228,6 +242,14 @@ impl App {
         if save_profile {
             self.send(Cmd::UpdateProfile(st.first.trim().to_owned(), st.last.trim().to_owned(), st.about.trim().to_owned()));
             st.filled = false;
+        }
+        if let Some(f) = save_folder {
+            self.send(Cmd::SaveFolder(f));
+            st.edit_folder = None;
+        }
+        if let Some(id) = delete_folder {
+            self.send(Cmd::DeleteFolder(id));
+            st.edit_folder = None;
         }
         self.tgs = st;
         self.tgs.open = was_open && !(close || ctx.input(|i| i.key_pressed(egui::Key::Escape)));
@@ -349,7 +371,7 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, save: &mut bool) {
     };
     ui.horizontal(|ui| {
         ui.add_space(kit::PAD);
-        if ui.add_enabled(changed && !st.first.trim().is_empty(), egui::Button::new("Сохранить")).clicked() {
+        if orange_button_enabled(ui, changed && !st.first.trim().is_empty(), "Сохранить", Vec2::new(140.0, 34.0)).clicked() {
             *save = true;
         }
     });
@@ -411,19 +433,115 @@ fn data_page(ui: &mut egui::Ui, st: &State, clear: &mut bool, open_dl: &mut bool
     }
 }
 
-fn folders_page(ui: &mut egui::Ui, folders: &[rg_core::engine::FolderRow], dialogs: &[rg_core::engine::DialogRow]) {
+fn folders_page(
+    ui: &mut egui::Ui,
+    st: &mut State,
+    folders: &[rg_core::engine::FolderRow],
+    dialogs: &[rg_core::engine::DialogRow],
+    save_folder: &mut Option<rg_core::engine::FolderRow>,
+    delete_folder: &mut Option<i32>,
+) {
+    if let Some(f) = st.edit_folder.as_mut() {
+        section(ui, if st.edit_folder_is_new { "Новая папка" } else { "Изменить папку" });
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            ui.add_sized(
+                [ui.available_width() - kit::PAD, 32.0],
+                egui::TextEdit::singleline(&mut f.title)
+                    .hint_text("Название папки (до 12 символов)")
+                    .margin(Vec2::new(8.0, 6.0)),
+            );
+        });
+        ui.add_space(8.0);
+        divider(ui);
+        section(ui, "Включить типы чатов");
+        toggle(ui, "Контакты", &mut f.contacts);
+        toggle(ui, "Не контакты", &mut f.non_contacts);
+        toggle(ui, "Группы", &mut f.groups);
+        toggle(ui, "Каналы", &mut f.broadcasts);
+        toggle(ui, "Боты", &mut f.bots);
+        divider(ui);
+        section(ui, "Исключить");
+        toggle(ui, "Без звука", &mut f.exclude_muted);
+        toggle(ui, "Прочитанные", &mut f.exclude_read);
+        toggle(ui, "Архивированные", &mut f.exclude_archived);
+        ui.add_space(10.0);
+        let has_any = f.contacts || f.non_contacts || f.groups || f.broadcasts || f.bots || !f.include.is_empty();
+        let valid = !f.title.trim().is_empty() && has_any;
+        let is_new = st.edit_folder_is_new;
+        let id = f.id;
+        let cloned = f.clone();
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            if orange_button_enabled(ui, valid, "Сохранить", Vec2::new(130.0, 34.0)).clicked() {
+                let mut clean = cloned;
+                clean.title = clean.title.trim().chars().take(12).collect();
+                *save_folder = Some(clean);
+            }
+            ui.add_space(8.0);
+            if !is_new && ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
+                *delete_folder = Some(id);
+            }
+        });
+        ui.add_space(10.0);
+        return;
+    }
     section(ui, "Мои папки");
     if folders.is_empty() {
         info_row(ui, "Папок пока нет", "");
     }
     for f in folders {
         let n = dialogs.iter().filter(|d| rg_core::engine::folder_matches(f, d)).count();
-        two_lines(ui, &f.title, &format!("чатов: {n}"));
+        if nav_row(ui, "settings/folders", &f.title, &format!("{n}")) {
+            st.edit_folder = Some(f.clone());
+            st.edit_folder_is_new = false;
+        }
     }
-    desc(ui, "Список папок берётся из Telegram. Создание и правка папок появятся позже — пока их можно менять в официальном клиенте.");
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        if orange_button(ui, "Создать папку", Vec2::new(160.0, 34.0)).clicked() {
+            let next_id = (2..=255).find(|id| !folders.iter().any(|f| f.id == *id)).unwrap_or(2);
+            st.edit_folder = Some(rg_core::engine::FolderRow {
+                id: next_id,
+                title: String::new(),
+                contacts: true,
+                non_contacts: false,
+                groups: false,
+                broadcasts: false,
+                bots: false,
+                exclude_muted: false,
+                exclude_read: false,
+                exclude_archived: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            });
+            st.edit_folder_is_new = true;
+        }
+    });
+    ui.add_space(10.0);
+    desc(ui, "Папки синхронизируются с серверами Telegram. Нажмите на папку, чтобы изменить её правила или удалить.");
 }
 
 fn appearance_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
+    section(ui, "Прозрачность и стекло");
+    let mut o = i32::from(s.window_opacity);
+    let shown = format!("{o}%");
+    if slider(ui, "Прозрачность окна и кнопок", &mut o, (15, 100), shown) {
+        s.window_opacity = o.clamp(15, 100) as u8;
+    }
+    toggle(ui, "Размытие стекла (блюр)", &mut s.blur_enabled);
+    desc(ui, "На старте окно непрозрачное (100%). Снизьте прозрачность — фон окна и кнопок станет стеклянным с размытием как на iPhone.");
+    divider(ui);
+    section(ui, "Фон чата");
+    let styles = [(0u8, "Сплошной тёмный"), (1, "Мягкий градиент"), (2, "Узор Telegram")];
+    for (id, label) in styles {
+        let mark = if s.chat_bg_style == id { "✓" } else { "" };
+        if nav_row(ui, "settings/palette", label, mark) {
+            s.chat_bg_style = id;
+        }
+    }
+    divider(ui);
     section(ui, "Масштаб интерфейса");
     let mut v = i32::from(s.ui_scale);
     let shown = format!("{v}%");
@@ -431,10 +549,6 @@ fn appearance_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
         s.ui_scale = v.clamp(80, 150) as u8;
     }
     desc(ui, "Применяется сразу. По умолчанию 100%.");
-    divider(ui);
-    section(ui, "Тема");
-    info_row(ui, "Оформление", "Чёрно-белое");
-    desc(ui, "Прозрачность окна и скорость анимаций — в разделе «Rustgramm».");
 }
 
 fn language_page(ui: &mut egui::Ui) {
@@ -477,13 +591,15 @@ fn power_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
 }
 
 fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, clear: &mut bool, atlas: bool) {
-    section(ui, "Окно");
+    section(ui, "Окно и стекло");
     let mut o = i32::from(s.window_opacity);
     let shown = format!("{o}%");
-    if slider(ui, "Прозрачность окна", &mut o, (15, 100), shown) {
+    if slider(ui, "Прозрачность окна и кнопок", &mut o, (15, 100), shown) {
         s.window_opacity = o.clamp(15, 100) as u8;
     }
-    desc(ui, "Меняется на лету. По умолчанию 86%.");
+    toggle(ui, "Размытие стекла (блюр)", &mut s.blur_enabled);
+    toggle(ui, "Автозапуск GIF в ленте", &mut s.auto_play_gifs);
+    desc(ui, "По умолчанию окно непрозрачное (100%). При снижении процента фон окна и кнопок плавно становится прозрачнее с размытием.");
     let mut a = i32::from(s.anim_speed);
     let shown = if a == 0 { "выкл.".to_owned() } else { format!("{a}%") };
     if slider(ui, "Скорость анимаций", &mut a, (0, 200), shown) {
@@ -503,7 +619,7 @@ fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, clear: &mut 
     desc(ui, "Не отправляет «прочитано», «в сети» и прогресс загрузки. Подробные параметры — в «Расширенных настройках».");
     divider(ui);
     section(ui, "Оформление и данные");
-    info_row(ui, "Тема", "Чёрно-белая");
+    info_row(ui, "Тема", "Тёмная · оранжевые кнопки");
     let atlas_path = worker::home().join("emoji-apple.png");
     info_row(ui, "Эмодзи", if atlas && atlas_path.exists() { "Apple (локально)" } else { "Twemoji" });
     desc(ui, &format!("Атлас Apple-эмодзи берётся из файла {} (в программу не вшит: права на эти картинки не наши).", atlas_path.display()));

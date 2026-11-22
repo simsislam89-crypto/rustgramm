@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "rg-click"
+version = "0.1.0"
+edition = "2024"
+description = "Локальная утилита Win32 для автотестов интерфейса (клики, ввод, фокус, снимки окон)"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]

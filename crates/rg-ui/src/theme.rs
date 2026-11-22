@@ -1,12 +1,13 @@
-//! Оформление Rustgramm: чёрно-белое, в духе LLM Launcher — одна «бумага», один «шрифт» чернил
-//! и ступени прозрачности. Цвета лишь по делу: красный для ошибок и удаления.
-//! Крупные фоны проходят через `t()` и учитывают прозрачность окна (86% по умолчанию).
+//! Оформление Rustgramm: чёрно-белая «бумага» с оранжевыми основными кнопками и ступенями
+//! прозрачности. На старте окно непрозрачное (100%); ползунок в настройках меняет прозрачность
+//! и фонов, и кнопок на лету, а при прозрачности < 100% включает размытие стекла (блюр).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Sense, Stroke, Vec2,
+    self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
+    Sense, Stroke, Vec2,
 };
 
 /// Серый тон из палитры Telegram `0xRRGGBB`: тот же свет, но без цвета (для шкал в `kit`).
@@ -54,6 +55,11 @@ pub const SERVICE_BG: Color32 = Color32::from_rgb(34, 34, 38);
 pub const COMPOSE_BG: Color32 = Color32::from_rgb(14, 14, 16);
 pub const DANGER: Color32 = Color32::from_rgb(242, 108, 108);
 pub const GREEN: Color32 = Color32::from_rgb(104, 224, 146);
+/// Основные кнопки и главный акцент (оранжевый).
+pub const ORANGE: Color32 = Color32::from_rgb(245, 130, 32);
+pub const ORANGE_OVER: Color32 = Color32::from_rgb(255, 148, 54);
+pub const ORANGE_ACTIVE: Color32 = Color32::from_rgb(218, 110, 20);
+pub const ORANGE_DISABLED: Color32 = Color32::from_rgb(122, 68, 24);
 pub const ACCENT_TEXT: Color32 = Color32::WHITE;
 /// Тонкая линия-разделитель стекла.
 pub const LINE: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
@@ -72,9 +78,13 @@ pub const COLUMN_LEFT_NORMAL: f32 = 380.0;
 /// Уже этого окно показывает одну колонку (телефон): список чатов или чат.
 pub const NARROW_WIDTH: f32 = 720.0;
 
-// ---- прозрачность окна
-/// Непрозрачность фонов, 0..=255 (86% ≈ 219).
-static ALPHA: AtomicU8 = AtomicU8::new(219);
+// ---- прозрачность окна и блюр
+/// Непрозрачность фонов и кнопок, 0..=255 (100% = 255, непрозрачное на старте).
+static ALPHA: AtomicU8 = AtomicU8::new(255);
+/// Последняя альфа, применённая к глобальному стилю egui (кнопки, окна, поля).
+static VISUAL_ALPHA: AtomicU8 = AtomicU8::new(0);
+/// Включён ли блюр-эффект в стиле iOS.
+static BLUR: AtomicBool = AtomicBool::new(true);
 /// Скорость анимаций, проценты (0 — мгновенно).
 static ANIM: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(100);
 
@@ -82,13 +92,25 @@ static ANIM: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(10
 pub fn set_anim_speed(pct: u8) {
     ANIM.store(u16::from(pct.min(200)), Ordering::Relaxed);
 }
-/// Процент непрозрачности по умолчанию.
-pub const DEFAULT_OPACITY_PCT: u8 = 86;
+/// Включить или выключить размытие стекла.
+pub fn set_blur(on: bool) {
+    BLUR.store(on, Ordering::Relaxed);
+}
+pub fn blur_on() -> bool {
+    BLUR.load(Ordering::Relaxed)
+}
+/// Процент непрозрачности по умолчанию (100% — непрозрачное на старте).
+pub const DEFAULT_OPACITY_PCT: u8 = 100;
 
-/// Задать непрозрачность фонов в процентах (15..=100).
+/// Задать непрозрачность фонов и кнопок в процентах (15..=100).
 pub fn set_opacity(pct: u8) {
     let pct = pct.clamp(15, 100);
     ALPHA.store((u16::from(pct) * 255 / 100) as u8, Ordering::Relaxed);
+}
+
+/// Текущая непрозрачность окна (0.15..=1.0).
+pub fn opacity_f32() -> f32 {
+    f32::from(ALPHA.load(Ordering::Relaxed)) / 255.0
 }
 
 /// Единая подложка окна: рисуется один раз под всеми панелями, чтобы на стыках не было швов.
@@ -96,17 +118,17 @@ pub const BACKDROP: Color32 = Color32::from_rgb(10, 10, 12);
 
 /// Лёгкий светлый налёт поверх подложки: панели списка, шапки, поле ввода.
 pub fn tint_panel() -> Color32 {
-    Color32::from_white_alpha(7)
+    Color32::from_white_alpha((7.0 * opacity_f32()).round() as u8)
 }
 
 /// Тёмный налёт ленты сообщений.
 pub fn tint_chat() -> Color32 {
-    Color32::from_black_alpha(70)
+    Color32::from_black_alpha((70.0 * opacity_f32()).round() as u8)
 }
 
 /// Налёт заголовка окна.
 pub fn tint_title() -> Color32 {
-    Color32::from_white_alpha(11)
+    Color32::from_white_alpha((11.0 * opacity_f32()).round() as u8)
 }
 
 /// Фон с учётом прозрачности окна.
@@ -114,13 +136,165 @@ pub fn t(c: Color32) -> Color32 {
     with_alpha(c, ALPHA.load(Ordering::Relaxed))
 }
 
-/// Фон окон и меню: чуть плотнее основного, чтобы текст читался при любой прозрачности.
+/// Фон кнопки с учётом прозрачности окна: альфа кнопки масштабируется вместе с окном.
+pub fn t_btn(c: Color32) -> Color32 {
+    let a = ALPHA.load(Ordering::Relaxed);
+    let out = ((u16::from(c.a()) * u16::from(a)) / 255) as u8;
+    with_alpha(c, out)
+}
+
+/// Фон окон и меню: чуть плотнее основного, но тоже становится прозрачнее с ползунком.
 pub fn t2(c: Color32) -> Color32 {
-    with_alpha(c, ALPHA.load(Ordering::Relaxed).max(236))
+    let a = ALPHA.load(Ordering::Relaxed);
+    let out = if a >= 245 {
+        a
+    } else {
+        ((u16::from(a) * 108) / 100).clamp(44, 255) as u8
+    };
+    with_alpha(c, out)
 }
 
 fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// Плавная кривая iOS (быстрый старт, шёлковая остановка без перелёта).
+pub fn ios_spring(k: f32) -> f32 {
+    let k = k.clamp(0.0, 1.0);
+    1.0 - (1.0 - k).powi(4)
+}
+
+/// Полупрозрачная вуаль под модальными окнами с мягким «блюр-дымом» в стиле iOS.
+pub fn paint_frosted_scrim(p: &egui::Painter, rect: Rect, raw: f32) {
+    let raw = raw.clamp(0.0, 1.0);
+    let k = ios_spring(raw);
+    let op = opacity_f32();
+    let dark_a = (150.0 * k * (0.45 + 0.55 * op)) as u8;
+    p.rect_filled(rect, 0.0, Color32::from_black_alpha(dark_a));
+    if blur_on() {
+        // Лёгкий молочно-стеклянный слой поверх затемнения (эффект матового стекла iOS).
+        let frost_a = (16.0 * k * (0.5 + 0.5 * op)) as u8;
+        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(210, 218, 232, frost_a));
+    }
+}
+
+/// Рисует тонкий верхний стеклянный блик на карточке или модальном окне.
+pub fn paint_glass_rim(p: &egui::Painter, rect: Rect, radius: f32) {
+    let a = (38.0 * opacity_f32()) as u8;
+    p.line_segment(
+        [
+            Pos2::new(rect.left() + radius, rect.top() + 0.5),
+            Pos2::new(rect.right() - radius, rect.top() + 0.5),
+        ],
+        Stroke::new(1.0, Color32::from_white_alpha(a)),
+    );
+}
+
+/// Фон области чата: 0 — тёмный, 1 — мягкий градиент, 2 — тонкий узор Telegram.
+pub fn paint_chat_backdrop(p: &egui::Painter, rect: Rect, style: u8) {
+    p.rect_filled(rect, 0.0, tint_chat());
+    let op = opacity_f32();
+    match style {
+        1 => {
+            // Мягкий вертикальный градиент (тёплый тёмно-угольный сверху к глубокому чёрному снизу).
+            let bands = 12;
+            let bh = rect.height() / bands as f32;
+            for i in 0..bands {
+                let f = 1.0 - i as f32 / bands as f32;
+                let a = (24.0 * f * f * op) as u8;
+                let r = Rect::from_min_size(
+                    Pos2::new(rect.left(), rect.top() + i as f32 * bh),
+                    Vec2::new(rect.width(), bh + 1.0),
+                );
+                p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(245, 140, 56, a));
+            }
+        }
+        2 => {
+            // Тонкая геометрическая сетка-ромбы в духе обоев Telegram.
+            let step = 44.0;
+            let c = Color32::from_white_alpha((12.0 * op) as u8);
+            let mut y = rect.top() + step * 0.5;
+            let mut row = 0usize;
+            while y < rect.bottom() {
+                let mut x = rect.left() + if row.is_multiple_of(2) { step * 0.5 } else { step };
+                while x < rect.right() {
+                    let pt = Pos2::new(x, y);
+                    p.circle_stroke(pt, 4.5, Stroke::new(1.0, c));
+                    p.circle_filled(pt + Vec2::new(step * 0.5, 0.0), 1.4, c);
+                    x += step;
+                }
+                y += step * 0.85;
+                row += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Основная оранжевая кнопка: фон прозрачнеет вместе с процентом прозрачности окна.
+pub fn orange_button(ui: &mut egui::Ui, text: &str, min_size: Vec2) -> egui::Response {
+    orange_button_enabled(ui, true, text, min_size)
+}
+
+/// Основная оранжевая кнопка с состоянием активности `enabled`.
+pub fn orange_button_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, min_size: Vec2) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), FontId::proportional(14.5), Color32::WHITE);
+    let size = Vec2::new(
+        (galley.size().x + 28.0).max(min_size.x),
+        (galley.size().y + 14.0).max(min_size.y),
+    );
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let hover = tween(ui.ctx(), ("obtn", resp.id), f32::from(u8::from(enabled && resp.hovered())), 0.12);
+    let base = if !enabled {
+        ORANGE_DISABLED
+    } else if resp.is_pointer_button_down_on() {
+        ORANGE_ACTIVE
+    } else {
+        lerp_color(ORANGE, ORANGE_OVER, hover)
+    };
+    let fill = t_btn(base);
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(10), fill);
+    if enabled {
+        paint_glass_rim(p, rect, 10.0);
+    }
+    let text_c = if enabled { Color32::WHITE } else { Color32::from_white_alpha(150) };
+    p.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.5), text_c);
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Обновляет глобальный стиль кнопок и окон egui при изменении прозрачности окна.
+pub fn sync_visuals(ctx: &egui::Context) {
+    let a = ALPHA.load(Ordering::Relaxed);
+    if VISUAL_ALPHA.swap(a, Ordering::Relaxed) == a {
+        return;
+    }
+    let op = f32::from(a) / 255.0;
+    ctx.global_style_mut(|s| {
+        let v = &mut s.visuals;
+        v.window_fill = t2(WINDOW_BG);
+        v.extreme_bg_color = Color32::from_rgba_unmultiplied(0, 0, 0, (90.0 * op) as u8);
+        v.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, (10.0 * op) as u8);
+        let fill = Color32::from_rgba_unmultiplied(255, 255, 255, (18.0 * op) as u8);
+        let hover = Color32::from_rgba_unmultiplied(255, 255, 255, (30.0 * op) as u8);
+        let line = Color32::from_rgba_unmultiplied(255, 255, 255, (28.0 * op).max(10.0) as u8);
+        v.widgets.inactive.bg_fill = fill;
+        v.widgets.inactive.weak_bg_fill = fill;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, line);
+        v.widgets.hovered.bg_fill = hover;
+        v.widgets.hovered.weak_bg_fill = hover;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, (44.0 * op).max(14.0) as u8));
+        v.widgets.active.bg_fill = hover;
+        v.widgets.active.weak_bg_fill = hover;
+        v.widgets.open = v.widgets.active;
+    });
 }
 
 /// Плавный переход к `target` за `dur` секунд (мгновенно при «уменьшении движения»).
@@ -408,21 +582,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn palette_is_monochrome() {
+    fn palette_and_orange_buttons() {
         for c in [ACCENT, BUTTON, UNREAD, DIALOG_ACTIVE, MSG_OUT_BG, OUT_TICK, WINDOW_BG, CHAT_BG] {
             assert!(c.r().abs_diff(c.b()) <= 8 && c.g().abs_diff(c.b()) <= 8, "{c:?}");
         }
+        assert!(ORANGE.r() > ORANGE.g() && ORANGE.g() > ORANGE.b());
         let g = navy(0x5288c1);
         assert!(g.r() == g.g() && g.g() == g.b());
     }
 
     #[test]
-    fn opacity_scales_backgrounds() {
-        set_opacity(86);
-        assert_eq!(t(WINDOW_BG).a(), 219);
-        set_opacity(30);
-        assert_eq!(t(WINDOW_BG).a(), 76);
-        assert!(t2(WINDOW_BG).a() >= 236);
+    fn opacity_scales_backgrounds_and_buttons() {
+        set_opacity(100);
+        assert_eq!(t(WINDOW_BG).a(), 255);
+        assert_eq!(t_btn(ORANGE).a(), 255);
+        set_opacity(50);
+        assert_eq!(t(WINDOW_BG).a(), 127);
+        assert_eq!(t_btn(ORANGE).a(), 127);
+        assert!(t2(WINDOW_BG).a() < 200);
         set_opacity(200);
         assert_eq!(t(WINDOW_BG).a(), 255);
         set_opacity(DEFAULT_OPACITY_PCT);

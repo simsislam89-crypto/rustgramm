@@ -85,7 +85,7 @@ impl App {
                         p.rect_filled(
                             Rect::from_center_size(Pos2::new(rect.center().x, rect.bottom() - 1.5), Vec2::new(w, 2.5)),
                             CornerRadius::same(1),
-                            WHITE,
+                            t_btn(ORANGE),
                         );
                         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             chosen = Some(*id);
@@ -108,14 +108,14 @@ impl App {
         if raw < 0.005 && !self.contacts_open {
             return;
         }
-        let appear = spring(raw);
+        let appear = ios_spring(raw);
         let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("contacts-dim"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::ZERO)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * raw) as u8));
+                paint_frosted_scrim(ui.painter(), rect, raw);
                 if resp.clicked() {
                     self.contacts_open = false;
                 }
@@ -427,8 +427,8 @@ impl App {
                     if set.installed {
                         p.text(btn.center(), Align2::CENTER_CENTER, "Добавлено", FontId::proportional(12.5), SUBTEXT);
                     } else {
-                        p.rect_stroke(btn, CornerRadius::same(14), Stroke::new(1.0, lerp_color(SUBTEXT, WHITE, k)), egui::StrokeKind::Inside);
-                        p.text(btn.center(), Align2::CENTER_CENTER, "Добавить", FontId::proportional(12.5), lerp_color(DIALOG_TEXT, WHITE, k));
+                        p.rect_filled(btn, CornerRadius::same(14), t_btn(lerp_color(ORANGE, ORANGE_OVER, k)));
+                        p.text(btn.center(), Align2::CENTER_CENTER, "Добавить", FontId::proportional(12.5), Color32::WHITE);
                         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             acts.push(StickerAct::Install(i));
                         }

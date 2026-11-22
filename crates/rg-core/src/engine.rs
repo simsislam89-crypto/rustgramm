@@ -901,6 +901,21 @@ impl Engine {
         cancel: &std::sync::atomic::AtomicBool,
         progress: impl Fn(u64, u64),
     ) -> Result<Fetched, BoxErr> {
+        self.fetch_media_stream(peer, msg_id, to_downloads, cancel, progress, |_, _, _, _| {})
+            .await
+    }
+
+    /// То же, что `fetch_media`, но вызывает `on_stream(part, dest, total, ext)` сразу после
+    /// создания `.part` и первых чанков (для потокового воспроизведения до окончания загрузки).
+    pub async fn fetch_media_stream(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        to_downloads: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: impl Fn(u64, u64),
+        mut on_stream: impl FnMut(&Path, &Path, u64, &str),
+    ) -> Result<Fetched, BoxErr> {
         use std::io::Write;
         use std::sync::atomic::Ordering;
         if !to_downloads && let Some(p) = self.cached_media(peer, msg_id) {
@@ -929,6 +944,8 @@ impl Engine {
         let total = info.size.max(1);
         let mut file = std::fs::File::create(&part)?;
         let mut done = 0u64;
+        let mut streamed = false;
+        let stream_at = (384 * 1024u64).min(total);
         let mut it = self.client.iter_download(&media);
         progress(0, total);
         loop {
@@ -940,8 +957,13 @@ impl Engine {
             match it.next().await {
                 Ok(Some(chunk)) => {
                     file.write_all(&chunk)?;
+                    file.flush()?;
                     done += chunk.len() as u64;
                     progress(done.min(total), total);
+                    if !to_downloads && !streamed && done >= stream_at && done < total {
+                        streamed = true;
+                        on_stream(&part, &dest, total, ext);
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -1306,6 +1328,144 @@ impl Engine {
                     include,
                     exclude: ids(&x.exclude_peers),
                 });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Создать или обновить папку чатов (`messages.updateDialogFilter`).
+    pub async fn save_folder(&self, f: &FolderRow) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let filter = tl::enums::DialogFilter::Filter(tl::types::DialogFilter {
+            contacts: f.contacts,
+            non_contacts: f.non_contacts,
+            groups: f.groups,
+            broadcasts: f.broadcasts,
+            bots: f.bots,
+            exclude_muted: f.exclude_muted,
+            exclude_read: f.exclude_read,
+            exclude_archived: f.exclude_archived,
+            title_noanimate: false,
+            id: f.id,
+            title: tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                text: f.title.clone(),
+                entities: Vec::new(),
+            }),
+            emoticon: None,
+            color: None,
+            pinned_peers: Vec::new(),
+            include_peers: Vec::new(),
+            exclude_peers: Vec::new(),
+        });
+        self.client
+            .invoke(&tl::functions::messages::UpdateDialogFilter {
+                id: f.id,
+                filter: Some(filter),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Удалить папку чатов по идентификатору (`messages.updateDialogFilter` с пустым фильтром).
+    pub async fn delete_folder(&self, id: i32) -> Result<(), grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::messages::UpdateDialogFilter { id, filter: None })
+            .await?;
+        Ok(())
+    }
+
+    /// Ключевые слова для поиска эмодзи из Telegram (`messages.getEmojiKeywords`).
+    pub async fn emoji_keywords(&self, lang: &str) -> Result<Vec<(String, Vec<String>)>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let tl::enums::EmojiKeywordsDifference::Difference(diff) = self
+            .client
+            .invoke(&tl::functions::messages::GetEmojiKeywords {
+                lang_code: lang.to_owned(),
+            })
+            .await?;
+        let mut out = Vec::with_capacity(diff.keywords.len());
+        for kw in diff.keywords {
+            if let tl::enums::EmojiKeyword::Keyword(k) = kw {
+                out.push((k.keyword.to_lowercase(), k.emoticons));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Глобальный поиск пользователей, групп и каналов в Telegram (`contacts.search`).
+    pub async fn global_search(&self, query: &str, limit: i32) -> Result<Vec<ContactRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let q = query.trim();
+        if q.len() < 3 {
+            return Ok(Vec::new());
+        }
+        let tl::enums::contacts::Found::Found(found) = self
+            .client
+            .invoke(&tl::functions::contacts::Search {
+                broadcasts: true,
+                bots: true,
+                q: q.to_owned(),
+                limit: limit.clamp(1, 30),
+            })
+            .await?;
+        let mut out = Vec::new();
+        for u in &found.users {
+            if let tl::enums::User::User(y) = u
+                && !y.deleted
+            {
+                let name = format!(
+                    "{} {}",
+                    y.first_name.clone().unwrap_or_default(),
+                    y.last_name.clone().unwrap_or_default()
+                )
+                .trim()
+                .to_owned();
+                let sub = y
+                    .username
+                    .as_ref()
+                    .map(|un| format!("@{un}"))
+                    .unwrap_or_else(|| y.status.as_ref().map(status_text).unwrap_or_default());
+                out.push(ContactRow {
+                    peer: PeerRef::from(u),
+                    id: y.id,
+                    name: if name.is_empty() { "Без имени".to_owned() } else { name },
+                    status: sub,
+                });
+            }
+        }
+        for c in &found.chats {
+            match c {
+                tl::enums::Chat::Channel(ch) => {
+                    let peer = PeerRef::from(c);
+                    let sub = ch
+                        .username
+                        .as_ref()
+                        .map(|un| format!("@{un}"))
+                        .unwrap_or_else(|| {
+                            if ch.broadcast {
+                                "Канал".to_owned()
+                            } else {
+                                "Группа".to_owned()
+                            }
+                        });
+                    out.push(ContactRow {
+                        peer,
+                        id: peer_key(&peer),
+                        name: ch.title.clone(),
+                        status: sub,
+                    });
+                }
+                tl::enums::Chat::Chat(ch) => {
+                    let peer = PeerRef::from(c);
+                    out.push(ContactRow {
+                        peer,
+                        id: peer_key(&peer),
+                        name: ch.title.clone(),
+                        status: format!("{} участников", ch.participants_count),
+                    });
+                }
+                _ => {}
             }
         }
         Ok(out)

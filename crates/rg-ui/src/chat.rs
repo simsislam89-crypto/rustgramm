@@ -50,17 +50,20 @@ struct Env<'a> {
     scroll_to: Option<i32>,
     group: bool,
     arrived: &'a HashMap<i32, f64>,
+    img_arrived: &'a HashMap<i32, f64>,
     time: f64,
     emoji: Option<&'a super::emoji::Emoji>,
     spoilers: &'a std::collections::HashSet<(i32, usize)>,
     read_out: i32,
     avatars: &'a HashMap<i64, egui::TextureHandle>,
-    /// Сообщения, у которых слева рисуется аватарка отправителя (последнее в серии).
-    avatar_msgs: &'a std::collections::HashSet<i32>,
     /// Идущие загрузки вложений: сообщение → (скачано, всего).
     fetching: &'a HashMap<i32, (u64, u64)>,
     /// Вложения, уже лежащие в кэше.
     cached: &'a std::collections::HashSet<i32>,
+    /// Скачанные GIF (путь на диске) для автозапуска в ленте.
+    gif_paths: &'a HashMap<i32, std::path::PathBuf>,
+    /// Видимая область ленты (для аккуратного размещения встроенного GIF).
+    clip_rect: Rect,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -288,7 +291,7 @@ impl App {
                     .margin(Vec2::new(8.0, 6.0)),
             );
             r.request_focus();
-            let go = ui.button("Найти").clicked()
+            let go = orange_button(ui, "Найти", Vec2::new(72.0, 30.0)).clicked()
                 || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
                 self.send(Cmd::Search(self.chat_search.clone()));
@@ -382,7 +385,22 @@ impl App {
             }
             let (srect, sresp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
             let active = !self.input.trim().is_empty();
-            icons::send(ui.painter(), srect.center(), if active { ACCENT } else { DIALOG_DATE });
+            let send_k = tween(ui.ctx(), "send-active", f32::from(u8::from(active)), 0.14);
+            let send_h = tween(ui.ctx(), "send-hover", f32::from(u8::from(active && sresp.hovered())), 0.12);
+            if send_k > 0.02 {
+                let r_btn = 16.5 + 1.2 * send_h;
+                let base = lerp_color(ORANGE, ORANGE_OVER, send_h);
+                let fill = Color32::from_rgba_unmultiplied(
+                    base.r(),
+                    base.g(),
+                    base.b(),
+                    (f32::from(t_btn(base).a()) * send_k) as u8,
+                );
+                ui.painter().circle_filled(srect.center(), r_btn, fill);
+            }
+            let arrow_c = if active { Color32::WHITE } else { DIALOG_DATE };
+            icons::send(ui.painter(), srect.center(), arrow_c);
+            let sresp = if active { sresp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { sresp };
             if (sresp.clicked() || enter) && active && self.selected.is_some() {
                 let text = self.input.trim().to_owned();
                 self.input.clear();
@@ -414,10 +432,11 @@ impl App {
         let mut jump = self.emoji_jump.take();
         let mut tab = self.emoji_tab;
         let mut sacts: Vec<super::panels::StickerAct> = Vec::new();
-        // Вкладки как в AyuGram: на всю ширину, подчёркивание у выбранной.
+        // Вкладки как в AyuGram: на всю ширину, оранжевое подчёркивание у выбранной + кнопка закрепления.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let w = ui.available_width() / 3.0;
+            let pin_w = 34.0;
+            let w = ((ui.available_width() - pin_w) / 3.0).max(50.0);
             for (n, name) in ["Эмодзи", "Стикеры", "GIF"].iter().enumerate() {
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
                 let k = tween(ui.ctx(), ("emtab", n), f32::from(u8::from(tab == n)), 0.16);
@@ -425,22 +444,54 @@ impl App {
                 ui.painter().rect_filled(
                     Rect::from_center_size(egui::pos2(r.center().x, r.bottom() - 1.0), Vec2::new(44.0 * k, 2.5)),
                     egui::CornerRadius::same(1),
-                    WHITE,
+                    t_btn(ORANGE),
                 );
-                if resp.clicked() {
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     tab = n;
                 }
             }
+            let (pr, presp) = ui.allocate_exact_size(Vec2::new(pin_w, 34.0), Sense::click());
+            let pin_c = if self.emoji_pinned { ORANGE } else if presp.hovered() { WHITE } else { SUBTEXT };
+            icons::tg(ui.painter(), "dialogs/dialogs_pinned", pr.center(), pin_c);
+            if presp
+                .on_hover_text(if self.emoji_pinned { "Открепить панель" } else { "Закрепить панель" })
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                self.emoji_pinned = !self.emoji_pinned;
+            }
         });
         if tab == 0 {
+            if !self.emoji_kw_requested {
+                self.emoji_kw_requested = true;
+                self.send(Cmd::EmojiKeywords);
+            }
+            // Поле поиска эмодзи сверху, как в AyuGram.
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                let sw = (ui.available_width() - 12.0).max(80.0);
+                let (srect, _) = ui.allocate_exact_size(Vec2::new(sw, 30.0), Sense::hover());
+                ui.painter().rect_filled(srect, egui::CornerRadius::same(15), t(FILTER_INPUT));
+                let inner = srect.shrink2(Vec2::new(12.0, 3.0));
+                ui.put(
+                    inner,
+                    egui::TextEdit::singleline(&mut self.emoji_search)
+                        .hint_text("Поиск эмодзи")
+                        .frame(egui::Frame::NONE)
+                        .desired_width(inner.width()),
+                );
+            });
+            ui.add_space(4.0);
             let h = (ui.available_height() - 42.0).max(60.0);
+            let query = self.emoji_search.clone();
             ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| {
                 if self.emoji_add_open {
                     self.featured_view(ui, &mut sacts);
                 } else if let Some(i) = self.emoji_pack {
                     self.pack_view(ui, i, &mut sacts);
                 } else if let Some(emoji) = self.emoji.as_ref() {
-                    picked = emoji.picker(ui, &self.settings.recent_emoji, &mut jump);
+                    picked = emoji.picker(ui, &self.settings.recent_emoji, &query, &mut jump);
                 }
             });
             self.emoji_bar(ui, &mut jump, &mut sacts);
@@ -591,39 +642,39 @@ impl App {
             });
             return;
         }
-        let fade = (self.chat_opened.elapsed().as_secs_f32() / 0.2).clamp(0.0, 1.0);
+        let fade = (self.chat_opened.elapsed().as_secs_f32() / 0.22).clamp(0.0, 1.0);
         if fade < 1.0 {
             ui.ctx().request_repaint();
         }
-        ui.set_opacity(ease_out(fade));
+        ui.set_opacity(ios_spring(fade));
         let now = self.now;
         // Имя отправителя показываем только в группах и каналах (их идентификаторы отрицательные).
         let group = self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id < 0);
         let shift = ui.input(|i| i.modifiers.shift);
         let viewport_h = ui.available_height();
+        let clip_rect = ui.clip_rect();
         let scroll_to = self.scroll_to.take();
         let mut acts: Vec<Act> = Vec::new();
         let mut want_older = false;
         let searching = self.found.is_some();
+        let loading = self.history_loading && !searching && self.messages.is_empty();
+        self.inline_gif_rect = None;
+        let mut gif_candidate: Option<(i32, Rect)> = None;
+        if loading {
+            paint_message_skeleton(ui, ui.available_width());
+            return;
+        }
         let pad = (viewport_h - self.msgs_h).max(0.0);
         let out = {
             let list: &[MessageRow] = self.found.as_deref().unwrap_or(&self.messages);
             let read_out = self.selected.and_then(|i| self.dialogs.get(i)).map_or(0, |d| d.read_out);
-            let mut avatar_msgs = std::collections::HashSet::new();
-            if group {
-                for (k, m) in list.iter().enumerate() {
-                    let next = list.get(k + 1);
-                    if !m.outgoing && next.is_none_or(|n| n.outgoing || n.sender_id != m.sender_id) {
-                        avatar_msgs.insert(m.id);
-                    }
-                }
-            }
             let env = Env {
                 read_out,
                 avatars: &self.avatars,
-                avatar_msgs: &avatar_msgs,
                 fetching: &self.fetching,
                 cached: &self.cached_media,
+                gif_paths: &self.gif_paths,
+                clip_rect,
                 avail: ui.available_width(),
                 s: &self.settings.ayu,
                 tex: &self.textures,
@@ -631,6 +682,7 @@ impl App {
                 scroll_to,
                 group,
                 arrived: &self.arrived,
+                img_arrived: &self.img_arrived,
                 time: ui.input(|i| i.time),
                 emoji: self.emoji.as_ref(),
                 spoilers: &self.spoilers,
@@ -658,15 +710,18 @@ impl App {
                             }
                         }
                         let album = &visible[i..j];
+                        let show_avatar = group
+                            && !m.outgoing
+                            && visible.get(j).is_none_or(|n| n.outgoing || n.sender_id != m.sender_id);
                         if prev_date.is_none_or(|p| !same_day(p, m.date)) {
                             day_pill(ui, env.avail, day_label(m.date, now));
                         }
                         prev_date = Some(m.date);
                         if album.len() > 1 {
                             let caption = album.iter().find(|x| !x.text.is_empty()).copied().unwrap_or(album[album.len() - 1]);
-                            bubble(ui, caption, album, &env, &mut acts);
+                            bubble(ui, caption, album, show_avatar, &env, &mut acts, &mut gif_candidate);
                         } else {
-                            bubble(ui, m, &[], &env, &mut acts);
+                            bubble(ui, m, &[], show_avatar, &env, &mut acts, &mut gif_candidate);
                         }
                         ui.add_space(4.0);
                         i = j;
@@ -674,6 +729,7 @@ impl App {
                     ui.add_space(8.0);
                 })
         };
+        self.inline_gif_rect = gif_candidate;
         self.msgs_h = (out.content_size.y - pad).max(0.0);
         // Достигли верха — просим более старую историю.
         if !searching && out.state.clamped_offset().y <= 4.0 && out.content_size.y > out.inner_rect.height() {
@@ -804,7 +860,7 @@ impl App {
                     ui.label("Ссылка откроется в браузере по умолчанию:");
                     ui.label(RichText::new(&url).color(WHITE).strong());
                     ui.horizontal(|ui| {
-                        if ui.button("Открыть").clicked() {
+                        if orange_button(ui, "Открыть", Vec2::new(96.0, 32.0)).clicked() {
                             super::rich::open_url(&url);
                             close = true;
                         }
@@ -913,7 +969,7 @@ impl App {
             .fixed_pos(egui::Pos2::ZERO)
             .show(ctx, |ui| {
                 let (rect, bg) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(225));
+                paint_frosted_scrim(ui.painter(), rect, 1.0);
                 if let Some(tex) = &tex {
                     let size = tex.size_vec2();
                     let fit = (screen.width() * 0.9 / size.x).min(screen.height() * 0.82 / size.y).min(3.0);
@@ -926,16 +982,16 @@ impl App {
                     close = true;
                 }
                 let bar = Rect::from_center_size(
-                    egui::pos2(rect.center().x, rect.bottom() - 34.0),
-                    Vec2::new(330.0, 36.0),
+                    egui::pos2(rect.center().x, rect.bottom() - 36.0),
+                    Vec2::new(360.0, 38.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
                     ui.horizontal(|ui| {
+                        if orange_button(ui, "Сохранить", Vec2::new(105.0, 32.0)).clicked() {
+                            acts.push(Act::Save(id));
+                        }
                         if ui.button("Открыть оригинал").clicked() {
                             acts.push(Act::Open(id));
-                        }
-                        if ui.button("Сохранить").clicked() {
-                            acts.push(Act::Save(id));
                         }
                         if ui.button("Закрыть").clicked() {
                             close = true;
@@ -964,8 +1020,55 @@ fn day_pill(ui: &mut egui::Ui, avail: f32, label: String) {
         .galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
 }
 
-/// Один пузырь сообщения с контекстным меню.
-fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, acts: &mut Vec<Act>) {
+/// Плавные переливающиеся скелетон-пузыри в стиле iOS, пока грузится история нового чата.
+fn paint_message_skeleton(ui: &mut egui::Ui, avail: f32) {
+    let time = ui.input(|i| i.time) as f32;
+    ui.ctx().request_repaint();
+    let op = opacity_f32();
+    let items = [
+        (false, 220.0_f32, 46.0_f32),
+        (false, 160.0, 38.0),
+        (true, 240.0, 52.0),
+        (false, 280.0, 62.0),
+        (true, 180.0, 40.0),
+        (true, 210.0, 48.0),
+    ];
+    let total_h: f32 = items.iter().map(|(_, _, h)| h + 10.0).sum();
+    let pad = (ui.available_height() - total_h - 16.0).max(16.0);
+    ui.add_space(pad);
+    for (idx, (out, w, h)) in items.iter().enumerate() {
+        let phase = ((time * 1.4 - idx as f32 * 0.14).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+        let (row, _) = ui.allocate_exact_size(Vec2::new(avail, h + 8.0), Sense::hover());
+        let bw = w.min(avail * 0.72);
+        let x = if *out { row.right() - bw - 14.0 } else { row.left() + 14.0 };
+        let r = Rect::from_min_size(Pos2::new(x, row.top() + 4.0), Vec2::new(bw, *h));
+        let base = if *out { MSG_OUT_BG } else { MSG_IN_BG };
+        let a = ((110.0 + 65.0 * phase) * op) as u8;
+        let fill = Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a);
+        ui.painter().rect_filled(r, egui::CornerRadius::same(15), fill);
+        // Мягкий бегущий блик.
+        let shine_x = r.left() + (r.width() + 80.0) * ((time * 0.75 + idx as f32 * 0.11).fract()) - 40.0;
+        let shine = Rect::from_min_size(Pos2::new(shine_x, r.top()), Vec2::new(48.0, *h)).intersect(r);
+        if shine.width() > 1.0 {
+            ui.painter().rect_filled(
+                shine,
+                egui::CornerRadius::same(12),
+                Color32::from_white_alpha((18.0 * op) as u8),
+            );
+        }
+    }
+}
+
+/// Один пузырь сообщения с контекстным меню и плавным iOS-выходом из блюра.
+fn bubble(
+    ui: &mut egui::Ui,
+    m: &MessageRow,
+    album: &[&MessageRow],
+    show_avatar: bool,
+    env: &Env,
+    acts: &mut Vec<Act>,
+    gif_candidate: &mut Option<(i32, Rect)>,
+) {
     let s = env.s;
     let layout = if m.outgoing {
         Layout::right_to_left(Align::TOP)
@@ -974,18 +1077,27 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
     };
     let mut k_in = 1.0_f32;
     if let Some(t0) = env.arrived.get(&m.id) {
-        k_in = ((env.time - t0) / 0.15).clamp(0.0, 1.0) as f32;
-        if k_in < 1.0 {
+        let dt = env.time - t0;
+        if dt < 0.0 {
+            k_in = 0.0;
             ui.ctx().request_repaint();
-            // Новое сообщение чуть поднимается снизу за 150 мс, как в Telegram Desktop.
-            ui.add_space(((1.0 - spring(k_in)) * 14.0).max(0.0));
+        } else {
+            k_in = (dt / 0.24).clamp(0.0, 1.0) as f32;
+            if k_in < 1.0 {
+                ui.ctx().request_repaint();
+            }
+        }
+        if k_in < 1.0 {
+            // Плавный выезд снизу по кривой iOS (без перелёта).
+            ui.add_space(((1.0 - ios_spring(k_in)) * 16.0).max(0.0));
         }
     }
+    let ease_in = ios_spring(k_in);
     ui.with_layout(layout, |ui| {
-        ui.set_opacity(ease_out((k_in * 2.5).min(1.0)));
+        ui.set_opacity(ease_in.powf(0.75).clamp(0.0, 1.0));
         ui.add_space(6.0);
         if env.group && !m.outgoing {
-            if env.avatar_msgs.contains(&m.id) {
+            if show_avatar {
                 avatar(ui, &m.sender, m.sender_id, 34.0, env.avatars.get(&m.sender_id), s.avatar_corners);
             } else {
                 ui.add_space(34.0);
@@ -1073,7 +1185,30 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                             None if env.cached.contains(&m.id) => super::media_ui::Load::Cached,
                             None => super::media_ui::Load::Remote,
                         };
+                        let before = cards.len();
                         super::media_ui::card(ui, m, info, w, env.tex.get(&m.id), text_c, date_c, &mut cards, load);
+                        if let Some((card_rect, _)) = cards.get(before) {
+                            // Плавное проявление свежезагруженной картинки (эффект выхода из размытия).
+                            if let Some(t0) = env.img_arrived.get(&m.id) {
+                                let ik = ((env.time - t0) / 0.22).clamp(0.0, 1.0) as f32;
+                                if ik < 1.0 {
+                                    ui.ctx().request_repaint();
+                                    let mist = (1.0 - ios_spring(ik)).powi(2);
+                                    ui.painter().rect_filled(
+                                        *card_rect,
+                                        egui::CornerRadius::same(10),
+                                        Color32::from_rgba_unmultiplied(30, 32, 38, (150.0 * mist) as u8),
+                                    );
+                                }
+                            }
+                            // Кэшированный GIF, целиком видимый в окне ленты — кандидат для автозапуска.
+                            if info.kind == rg_core::media::MediaKind::Gif
+                                && env.gif_paths.contains_key(&m.id)
+                                && env.clip_rect.contains_rect(*card_rect)
+                            {
+                                *gif_candidate = Some((m.id, *card_rect));
+                            }
+                        }
                     }
                     if !m.text.is_empty() && !m.entities.is_empty() {
                         let runs = super::rich::build_runs(&m.text, &m.entities);
@@ -1140,6 +1275,15 @@ fn bubble(ui: &mut egui::Ui, m: &MessageRow, album: &[&MessageRow], env: &Env, a
                 });
             });
         let rect = inner.response.rect;
+        // Мягкая дымка фокусировки (iOS blur-dissolve), тающая по мере появления сообщения.
+        if k_in < 0.99 && blur_on() {
+            let mist = (1.0 - ease_in).powi(2);
+            ui.painter().rect_filled(
+                rect,
+                radius,
+                Color32::from_rgba_unmultiplied(210, 218, 232, (36.0 * mist * opacity_f32()) as u8),
+            );
+        }
         // Один отклик на весь пузырь: правый клик — меню, левый — по области ссылки, спойлера или карточки.
         let resp = ui.interact(rect, bid, Sense::click());
         let pointer = ui.ctx().input(|i| i.pointer.hover_pos());

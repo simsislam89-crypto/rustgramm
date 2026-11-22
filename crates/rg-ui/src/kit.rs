@@ -39,7 +39,7 @@ pub fn desc(ui: &mut egui::Ui, text: &str) {
         w - 2.0 * PAD,
     );
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, galley.size().y + 20.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, DESC_BG);
+    ui.painter().rect_filled(rect, 0.0, t(DESC_BG));
     ui.painter()
         .galley(Pos2::new(rect.left() + PAD, rect.top() + 10.0), galley, SUBTEXT);
 }
@@ -56,11 +56,11 @@ fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
     // Ручка и цвет дорожки плавно переезжают при смене значения.
     let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.15);
     // Ручка едет с замедлением к краю, цвет — линейно (переключатель Telegram, 150 мс).
-    let k = if on { spring(lin) } else { 1.0 - spring(1.0 - lin) };
-    let fill = lerp_color(TRACK_OFF, ACCENT, lin);
+    let k = if on { ios_spring(lin) } else { 1.0 - ios_spring(1.0 - lin) };
+    let fill = lerp_color(t_btn(TRACK_OFF), t_btn(ORANGE), lin);
     ui.painter().rect_filled(track, CornerRadius::same(7), fill);
     let knob = Pos2::new(track.left() + 7.0 + k * (track.width() - 14.0), center.y);
-    ui.painter().circle_filled(knob, 6.0, INK_DARK);
+    ui.painter().circle_filled(knob, 6.0, Color32::WHITE);
 }
 
 /// Строка с переключателем; возвращает `true`, если значение изменилось.
@@ -225,19 +225,19 @@ pub fn slider(ui: &mut egui::Ui, label: &str, value: &mut i32, range: (i32, i32)
     let t = (*value - range.0) as f32 / (range.1 - range.0).max(1) as f32;
     let knob_x = track.left() + t * track.width();
     let p = ui.painter();
-    p.rect_filled(track, CornerRadius::same(2), TRACK_OFF);
+    p.rect_filled(track, CornerRadius::same(2), t_btn(TRACK_OFF));
     p.rect_filled(
         Rect::from_min_max(track.min, Pos2::new(knob_x, track.max.y)),
         CornerRadius::same(2),
-        ACCENT,
+        t_btn(ORANGE),
     );
-    p.circle_filled(Pos2::new(knob_x, track.center().y), 7.0, ACCENT);
+    p.circle_filled(Pos2::new(knob_x, track.center().y), 7.0, t_btn(ORANGE));
     p.text(
         Pos2::new(rect.right() - PAD, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         shown,
         FontId::proportional(13.0),
-        ACCENT,
+        ORANGE,
     );
     changed
 }

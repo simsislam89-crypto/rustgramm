@@ -9,3 +9,5 @@
 api.keys
 *.jks
 keystore.pass
+.agents/
+vendor/rg-click/target/

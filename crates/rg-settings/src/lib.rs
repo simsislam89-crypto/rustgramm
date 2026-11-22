@@ -121,8 +121,14 @@ pub struct Settings {
     pub extera: ExteraSettings,
     /// Фильтры сообщений.
     pub filters: Vec<Filter>,
-    /// Непрозрачность окна, проценты (15..=100); по умолчанию 86.
+    /// Непрозрачность окна, проценты (15..=100); по умолчанию 100 (непрозрачное на старте).
     pub window_opacity: u8,
+    /// Размытие стекла (Windows 11 Acrylic при прозрачности < 100% и блюр-анимации в стиле iOS).
+    pub blur_enabled: bool,
+    /// Стиль фона чата: 0 — тёмный, 1 — мягкий градиент, 2 — тонкий узор.
+    pub chat_bg_style: u8,
+    /// Автоматическая подгрузка и воспроизведение GIF в ленте без звука.
+    pub auto_play_gifs: bool,
     /// Недавно выбранные эмодзи (строка символов, новые впереди).
     pub recent_emoji: String,
     /// Скорость анимаций, проценты (0 — без анимаций, 100 — как в Telegram, до 200).
@@ -140,7 +146,10 @@ impl Default for Settings {
             ayu: AyuSettings::default(),
             extera: ExteraSettings::default(),
             filters: Vec::new(),
-            window_opacity: 86,
+            window_opacity: 100,
+            blur_enabled: true,
+            chat_bg_style: 0,
+            auto_play_gifs: true,
             recent_emoji: String::new(),
             anim_speed: 100,
             ui_scale: 100,
@@ -237,9 +246,15 @@ mod tests {
     }
 
     #[test]
-    fn opacity_defaults_to_86_and_survives_old_files() {
-        assert_eq!(Settings::default().window_opacity, 86);
-        assert_eq!(Settings::from_json("{}").unwrap().window_opacity, 86);
+    fn opacity_defaults_to_100_and_survives_old_files() {
+        let def = Settings::default();
+        assert_eq!(def.window_opacity, 100);
+        assert!(def.blur_enabled);
+        assert!(def.auto_play_gifs);
+        assert_eq!(def.chat_bg_style, 0);
+        let from_empty = Settings::from_json("{}").unwrap();
+        assert_eq!(from_empty.window_opacity, 100);
+        assert!(from_empty.blur_enabled);
         assert_eq!(Settings::from_json(r#"{"window_opacity":40}"#).unwrap().window_opacity, 40);
     }
 

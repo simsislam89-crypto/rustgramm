@@ -65,14 +65,13 @@ impl App {
         }
         let screen = ctx.content_rect();
         let w = 275.0_f32.min(screen.width());
-        // Затемнение: клик вне панели закрывает её.
+        // Затемнение с iOS-блюром: клик вне панели закрывает её.
         egui::Area::new(egui::Id::new("drawer-dim"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::ZERO)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_black_alpha((110.0 * open) as u8));
+                paint_frosted_scrim(ui.painter(), rect, open);
                 if resp.clicked() {
                     self.drawer_open = false;
                 }
@@ -245,7 +244,7 @@ impl App {
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         self.logout_window(ctx);
         let raw = tween(ctx, "prefs", f32::from(u8::from(self.settings_open)), 0.2);
-        let appear = spring(raw);
+        let appear = ios_spring(raw);
         if raw < 0.005 && !self.settings_open {
             return;
         }
@@ -255,8 +254,7 @@ impl App {
             .fixed_pos(Pos2::ZERO)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_black_alpha((140.0 * raw) as u8));
+                paint_frosted_scrim(ui.painter(), rect, raw);
                 if resp.clicked() {
                     self.settings_open = false;
                 }
@@ -976,7 +974,7 @@ impl App {
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             let ok = !self.create_title.trim().is_empty() && (!group || !self.create_members.is_empty());
-                            if ui.add_enabled(ok, egui::Button::new("Создать")).clicked() {
+                            if orange_button_enabled(ui, ok, "Создать", Vec2::new(110.0, 32.0)).clicked() {
                                 create = true;
                             }
                             if ui.button("Отмена").clicked() {

@@ -102,15 +102,16 @@ impl App {
         let resp = ui.interact(rect, id, Sense::click());
         let hover = tween(ui.ctx(), ("wb", g as u8), f32::from(u8::from(resp.hovered())), 0.12);
         if hover > 0.01 {
+            let op = opacity_f32();
             let fill = if g == Glyph::Close {
-                Color32::from_rgba_unmultiplied(255, 255, 255, (238.0 * hover) as u8)
+                Color32::from_rgba_unmultiplied(242, 108, 108, (220.0 * hover * op) as u8)
             } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, (22.0 * hover) as u8)
+                Color32::from_rgba_unmultiplied(255, 255, 255, (28.0 * hover * op) as u8)
             };
             ui.painter().rect_filled(rect.shrink(4.0), CornerRadius::same(7), fill);
         }
         let color = if g == Glyph::Close && hover > 0.5 {
-            INK_DARK
+            Color32::WHITE
         } else {
             lerp_color(DIALOG_DATE, WHITE, hover)
         };

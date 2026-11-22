@@ -10,6 +10,7 @@ mod media_ui;
 mod panels;
 mod rich;
 mod settings_ui;
+mod stream;
 mod tg_settings;
 pub mod theme;
 mod win;
@@ -48,6 +49,8 @@ struct App {
     emoji_pinned: bool,
     emoji_jump: Option<usize>,
     emoji_btn: egui::Rect,
+    emoji_search: String,
+    emoji_kw_requested: bool,
     emoji: Option<emoji::Emoji>,
     emoji_tried: bool,
     settings: Settings,
@@ -113,14 +116,30 @@ struct App {
     stickers_requested: bool,
     /// Установленные и рекомендуемые наборы эмодзи, выбранный набор, окно «Добавить».
     emoji_sets: Vec<StickerSetRow>,
-    /// Открытый ролик: путь и окно плеера (создаётся при первом показе).
+    /// Открытый ролик: путь или потоковый локальный адрес (url, название).
     player_path: Option<std::path::PathBuf>,
+    player_stream: Option<(String, String)>,
     /// Идущие загрузки вложений: сообщение → (скачано, всего).
     fetching: HashMap<i32, (u64, u64)>,
     /// Окно «Настройки» Telegram.
     tgs: tg_settings::State,
     /// Сообщения, вложения которых уже в кэше (открываются мгновенно).
     cached_media: HashSet<i32>,
+    /// Скачанные GIF для автозапуска в ленте и отслеживание видимой карточки.
+    gif_paths: HashMap<i32, std::path::PathBuf>,
+    gif_auto_req: HashSet<i32>,
+    inline_gif_rect: Option<(i32, egui::Rect)>,
+    #[cfg(windows)]
+    inline_gif: Option<video::InlineGifView>,
+    /// Кэш истории уже открытых чатов (мгновенное переключение за 0 мс).
+    history_cache: HashMap<i64, Vec<MessageRow>>,
+    history_loading: bool,
+    /// Время загрузки миниатюр (для плавного проявления).
+    img_arrived: HashMap<i32, f64>,
+    /// Глобальный поиск пользователей и каналов в левой колонке.
+    global_results: Vec<ContactRow>,
+    global_last_q: String,
+    global_query_at: Option<std::time::Instant>,
     /// Сохранённые GIF и окно создания группы/канала.
     gif_list: Vec<StickerRow>,
     gifs_requested: bool,
@@ -173,11 +192,7 @@ fn qr_image(url: &str) -> Option<QrImage> {
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
-            .fill(BUTTON)
-            .min_size(Vec2::new(280.0, 40.0)),
-    )
+    orange_button(ui, text, Vec2::new(280.0, 40.0))
 }
 
 fn link(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -204,6 +219,8 @@ impl App {
             emoji_pinned: false,
             emoji_jump: None,
             emoji_btn: egui::Rect::NOTHING,
+            emoji_search: String::new(),
+            emoji_kw_requested: false,
             emoji: None,
             emoji_tried: false,
             settings: Settings::default(),
@@ -256,9 +273,21 @@ impl App {
             stickers_requested: false,
             emoji_sets: Vec::new(),
             player_path: None,
+            player_stream: None,
             fetching: HashMap::new(),
             tgs: tg_settings::State::default(),
             cached_media: HashSet::new(),
+            gif_paths: HashMap::new(),
+            gif_auto_req: HashSet::new(),
+            inline_gif_rect: None,
+            #[cfg(windows)]
+            inline_gif: None,
+            history_cache: HashMap::new(),
+            history_loading: false,
+            img_arrived: HashMap::new(),
+            global_results: Vec::new(),
+            global_last_q: String::new(),
+            global_query_at: None,
             gif_list: Vec::new(),
             gifs_requested: false,
             create_kind: 0,
@@ -382,11 +411,19 @@ impl App {
         }
     }
 
-    /// Просмотрщик ролика: тёмная подложка, окно плеера по центру, закрытие по Esc, крестику и клику вне видео.
+    /// Просмотрщик ролика: локальный файл или потоковый адрес `127.0.0.1`, закрытие по Esc/крестику/клику.
     #[cfg(windows)]
     #[allow(deprecated)]
     fn player_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let Some(path) = self.player_path.clone() else {
+        let source = if let Some(path) = self.player_path.clone() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            Some((Some(path), None, name))
+        } else if let Some((url, name)) = self.player_stream.clone() {
+            Some((None, Some(url), name))
+        } else {
+            None
+        };
+        let Some((path_opt, url_opt, name)) = source else {
             if let Some(p) = self.player.take() {
                 p.stop();
             }
@@ -409,13 +446,21 @@ impl App {
         };
         if self.player.is_none() {
             let dir = worker::home().join("player");
-            match video::VideoView::new(frame, &path, &dir, false) {
+            let built = match (&path_opt, &url_opt) {
+                (Some(p), _) => video::VideoView::new(frame, p, &dir, false),
+                (None, Some(u)) => video::VideoView::new_url(frame, u, &dir, false),
+                _ => Err("Источник видео не задан".to_owned()),
+            };
+            match built {
                 Ok(v) => self.player = Some(v),
                 Err(e) => {
                     self.error = e;
                     self.error_at = self.now;
-                    rg_core::media::open_downloaded(&path);
+                    if let Some(p) = path_opt {
+                        rg_core::media::open_downloaded(&p);
+                    }
                     self.player_path = None;
+                    self.player_stream = None;
                     return;
                 }
             }
@@ -428,13 +473,12 @@ impl App {
                 (vr.height() * ppp).round() as u32,
             ));
         }
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         egui::Area::new(egui::Id::new("player-overlay"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(225));
+                paint_frosted_scrim(ui.painter(), rect, 1.0);
                 ui.painter().text(
                     rect.left_top() + Vec2::new(24.0, 32.0),
                     egui::Align2::LEFT_CENTER,
@@ -458,6 +502,62 @@ impl App {
                 p.stop();
             }
             self.player_path = None;
+            self.player_stream = None;
+        }
+    }
+
+    /// Автозапуск видимого кэшированного GIF без звука прямо в ленте (только когда поверх нет окон).
+    #[cfg(windows)]
+    fn inline_gif_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let blocked = !self.settings.auto_play_gifs
+            || self.player_path.is_some()
+            || self.player_stream.is_some()
+            || self.viewer.is_some()
+            || self.drawer_open
+            || self.settings_open
+            || self.tgs.open
+            || self.contacts_open
+            || self.create_kind != 0
+            || self.forward.is_some()
+            || self.confirm_delete.is_some()
+            || self.details.is_some()
+            || self.link_confirm.is_some()
+            || self.logout_confirm
+            || ctx.any_popup_open();
+        let target = if blocked { None } else { self.inline_gif_rect };
+        let Some((msg_id, rect)) = target else {
+            if let Some(g) = self.inline_gif.take() {
+                g.stop();
+            }
+            return;
+        };
+        let Some(path) = self.gif_paths.get(&msg_id).cloned() else {
+            if let Some(g) = self.inline_gif.take() {
+                g.stop();
+            }
+            return;
+        };
+        let need_new = self.inline_gif.as_ref().is_none_or(|g| g.msg_id != msg_id);
+        if need_new {
+            if let Some(old) = self.inline_gif.take() {
+                old.stop();
+            }
+            let dir = worker::home().join("inline_gif");
+            if let Ok(v) = video::InlineGifView::new(frame, msg_id, &path, &dir) {
+                self.inline_gif = Some(v);
+            }
+        }
+        let ppp = ctx.pixels_per_point();
+        if let Some(v) = self.inline_gif.as_mut() {
+            v.place((
+                (rect.min.x * ppp).round() as i32,
+                (rect.min.y * ppp).round() as i32,
+                (rect.width() * ppp).round() as u32,
+                (rect.height() * ppp).round() as u32,
+            ));
+            if v.take_clicked() {
+                self.player_path = Some(path);
+            }
         }
     }
 
@@ -507,12 +607,42 @@ impl App {
         if !videos.is_empty() {
             let _ = self.cmd.send(Cmd::CachedMedia(videos));
         }
+        // Короткие GIF до 4 МБ подгружаются в фоне для мгновенного автозапуска в ленте.
+        if self.settings.auto_play_gifs {
+            let gifs: Vec<i32> = rows
+                .iter()
+                .rev()
+                .filter(|r| {
+                    r.media.as_ref().is_some_and(|x| {
+                        x.kind == rg_core::media::MediaKind::Gif && x.size > 0 && x.size <= 4 * 1024 * 1024
+                    })
+                })
+                .take(4)
+                .map(|r| r.id)
+                .collect();
+            for id in gifs {
+                if !self.gif_paths.contains_key(&id) && self.gif_auto_req.insert(id) {
+                    let _ = self.cmd.send(Cmd::AutoFetchGif(id));
+                }
+            }
+        }
     }
 
-    /// Открыть чат из списка.
+    /// Открыть чат из списка (мгновенно из кэша в памяти, если уже открывался).
     fn open_dialog(&mut self, i: usize) {
         self.reset_chat_state();
         self.selected = Some(i);
+        if let Some(id) = self.dialogs.get(i).map(|d| d.id)
+            && let Some(cached) = self.history_cache.get(&id).cloned()
+            && !cached.is_empty()
+        {
+            self.known.extend(cached.iter().map(|r| r.id));
+            self.request_previews(i, &cached);
+            self.messages = cached;
+            self.history_loading = false;
+        } else {
+            self.history_loading = true;
+        }
         self.send(Cmd::Open(i));
     }
 
@@ -524,8 +654,17 @@ impl App {
 
     fn reset_chat_state(&mut self) {
         self.cached_media.clear();
+        self.gif_paths.clear();
+        self.gif_auto_req.clear();
+        self.inline_gif_rect = None;
+        #[cfg(windows)]
+        if let Some(g) = self.inline_gif.take() {
+            g.stop();
+        }
         self.known.clear();
         self.arrived.clear();
+        self.img_arrived.clear();
+        self.history_loading = false;
         self.chat_opened = std::time::Instant::now();
         self.messages.clear();
         self.textures.clear();
@@ -575,7 +714,23 @@ impl App {
                     self.sticker_cur = 0;
                 }
                 Ev::Live(l) => self.on_live(ctx, l),
-                Ev::PlayVideo(p) => self.player_path = Some(p),
+                Ev::PlayVideo(p) => {
+                    self.player_stream = None;
+                    self.player_path = Some(p);
+                }
+                Ev::StreamVideo(url, name) => {
+                    self.player_path = None;
+                    self.player_stream = Some((url, name));
+                }
+                Ev::GifReady(id, p) => {
+                    self.gif_paths.insert(id, p);
+                }
+                Ev::EmojiKeywords(pairs) => {
+                    if let Some(em) = self.emoji.as_mut() {
+                        em.merge_keywords(pairs);
+                    }
+                }
+                Ev::GlobalFound(list) => self.global_results = list,
                 Ev::Progress(id, done, total) => {
                     self.fetching.insert(id, (done, total));
                 }
@@ -606,9 +761,14 @@ impl App {
                     self.sticker_tex.insert(id, tex);
                 }
                 Ev::History(idx, m) if self.selected == Some(idx) => {
-                    // Новые сообщения после первой загрузки появляются плавно.
+                    // Плавная каскадная загрузка сообщений как на iPhone.
                     let now_t = ctx.input(|i| i.time);
-                    if !self.known.is_empty() {
+                    if self.known.is_empty() {
+                        let tail = m.len().saturating_sub(12);
+                        for (k, r) in m[tail..].iter().enumerate() {
+                            self.arrived.insert(r.id, now_t + k as f64 * 0.016);
+                        }
+                    } else {
                         for r in &m {
                             if !self.known.contains(&r.id) {
                                 self.arrived.insert(r.id, now_t);
@@ -617,7 +777,11 @@ impl App {
                     }
                     self.known.extend(m.iter().map(|r| r.id));
                     self.request_previews(idx, &m);
+                    if let Some(id) = self.dialogs.get(idx).map(|d| d.id) {
+                        self.history_cache.insert(id, m.clone());
+                    }
                     self.messages = m;
+                    self.history_loading = false;
                     self.older_pending = false;
                 }
                 Ev::Older(idx, rows) if self.selected == Some(idx) => {
@@ -625,11 +789,15 @@ impl App {
                     if rows.is_empty() {
                         self.history_end = true;
                     } else {
+                        let now_t = ctx.input(|i| i.time);
                         self.scroll_to = self.messages.first().map(|m| m.id);
                         self.request_previews(idx, &rows);
                         let known: HashSet<i32> = self.messages.iter().map(|m| m.id).collect();
                         let mut all: Vec<MessageRow> =
                             rows.into_iter().filter(|r| !known.contains(&r.id)).collect();
+                        for r in &all {
+                            self.arrived.insert(r.id, now_t);
+                        }
                         all.append(&mut self.messages);
                         self.messages = all;
                     }
@@ -645,6 +813,7 @@ impl App {
                 Ev::Image(idx, id, img) if self.selected == Some(idx) => {
                     let tex = ctx.load_texture(format!("m{id}"), *img, egui::TextureOptions::LINEAR);
                     self.textures.insert(id, tex);
+                    self.img_arrived.insert(id, ctx.input(|i| i.time));
                 }
                 Ev::Image(..) => {}
                 Ev::Avatar(id, img) => {
@@ -861,7 +1030,7 @@ impl App {
                         .desired_width(300.0),
                 );
                 ui.weak("Без прокси соединение идёт напрямую с серверами Telegram.");
-                if ui.button("Сохранить").clicked() {
+                if orange_button(ui, "Сохранить", Vec2::new(110.0, 32.0)).clicked() {
                     self.send(Cmd::Proxy(self.proxy.trim().to_owned()));
                     self.status = "Прокси сохранён: перезапустите приложение".to_owned();
                 }
@@ -897,208 +1066,264 @@ impl App {
             );
         });
         ui.add_space(4.0);
-        let needle = self.search.to_lowercase();
+        let needle = self.search.trim().to_lowercase();
+        // Дебаунс глобального поиска в Telegram, когда введено >= 3 символов.
+        if needle.chars().count() >= 3 {
+            if needle != self.global_last_q {
+                self.global_last_q.clone_from(&needle);
+                self.global_query_at = Some(std::time::Instant::now());
+            }
+            if let Some(at) = self.global_query_at {
+                if at.elapsed().as_millis() >= 350 {
+                    self.global_query_at = None;
+                    self.send(Cmd::GlobalSearch(needle.clone()));
+                } else {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+                }
+            }
+        } else if !self.global_last_q.is_empty() || !self.global_results.is_empty() {
+            self.global_last_q.clear();
+            self.global_results.clear();
+            self.global_query_at = None;
+        }
         let now = self.now;
         self.folder_tabs(ui);
         let mut open = None;
+        let mut open_global: Option<(grammers_session::types::PeerRef, i64, String)> = None;
         let mut dact: Option<(usize, DialogAct)> = None;
         let mut toggle_archive = false;
         let archived_total = self.dialogs.iter().filter(|d| d.archived).count();
         let in_archive = self.in_archive;
         let active_folder = self.folders.iter().find(|f| Some(f.id) == self.folder).cloned();
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            if in_archive {
-                if archive_header(ui) {
-                    toggle_archive = true;
-                }
-            } else if archived_total > 0 && needle.is_empty() && active_folder.is_none() && archive_row(ui, &self.dialogs) {
+        // Быстрая фильтрация индексов для виртуализации списка (`show_rows`: рисуем только видимые ~14 строк).
+        let filtered: Vec<usize> = self
+            .dialogs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                let in_scope = match &active_folder {
+                    Some(f) if !in_archive => folder_matches(f, d),
+                    _ => d.archived == in_archive,
+                };
+                in_scope && (needle.is_empty() || d.name.to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if in_archive {
+            if archive_header(ui) {
                 toggle_archive = true;
             }
-            for (i, d) in self.dialogs.iter().enumerate() {
-                match &active_folder {
-                    Some(f) if !in_archive => {
-                        if !folder_matches(f, d) {
-                            continue;
+        } else if archived_total > 0 && needle.is_empty() && active_folder.is_none() && archive_row(ui, &self.dialogs) {
+            toggle_archive = true;
+        }
+        let show_global = !needle.is_empty() && !self.global_results.is_empty();
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
+            ui,
+            DIALOG_ROW_HEIGHT,
+            filtered.len() + if show_global { self.global_results.len() + 1 } else { 0 },
+            |ui, row_range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for row_pos in row_range {
+                    if row_pos >= filtered.len() {
+                        let g_idx = row_pos - filtered.len();
+                        if g_idx == 0 {
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT), Sense::hover());
+                            ui.painter().text(
+                                egui::pos2(r.left() + 16.0, r.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                "ГЛОБАЛЬНЫЙ ПОИСК",
+                                display(12.0),
+                                ORANGE,
+                            );
+                        } else if let Some(c) = self.global_results.get(g_idx - 1) {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT), Sense::click());
+                            let hover = theme::tween(ui.ctx(), ("glbl", c.id), f32::from(u8::from(resp.hovered())), 0.12);
+                            ui.painter().rect_filled(rect, 0.0, theme::lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover));
+                            draw_avatar(ui, rect.left_center() + Vec2::new(32.0, 0.0), &c.name, c.id, DIALOG_PHOTO, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
+                            ui.painter().text(rect.left_top() + Vec2::new(68.0, 12.0), egui::Align2::LEFT_TOP, &c.name, FontId::proportional(15.0), WHITE);
+                            ui.painter().text(rect.left_top() + Vec2::new(68.0, 35.0), egui::Align2::LEFT_TOP, &c.status, FontId::proportional(13.5), DIALOG_TEXT);
+                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                open_global = Some((c.peer, c.id, c.name.clone()));
+                            }
                         }
+                        continue;
                     }
-                    _ => {
-                        if d.archived != in_archive {
-                            continue;
-                        }
+                    let i = filtered[row_pos];
+                    let d = &self.dialogs[i];
+                    let (rect, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT),
+                        Sense::click(),
+                    );
+                    let selected = self.selected == Some(i);
+                    let hover = theme::tween(ui.ctx(), ("dlg", i), f32::from(u8::from(resp.hovered())), 0.12);
+                    let fill = if selected {
+                        t(DIALOG_ACTIVE)
+                    } else {
+                        theme::lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover)
+                    };
+                    let p = ui.painter();
+                    p.rect_filled(rect, 0.0, fill);
+                    if self.avatar_req.insert(d.id) {
+                        let _ = self.cmd.send(Cmd::Avatar(i));
                     }
-                }
-                if !needle.is_empty() && !d.name.to_lowercase().contains(&needle) {
-                    continue;
-                }
-                let (rect, resp) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT),
-                    Sense::click(),
-                );
-                let selected = self.selected == Some(i);
-                let hover = theme::tween(ui.ctx(), ("dlg", i), f32::from(u8::from(resp.hovered())), 0.12);
-                let fill = if selected {
-                    t(DIALOG_ACTIVE)
-                } else {
-                    theme::lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover)
-                };
-                let p = ui.painter();
-                p.rect_filled(rect, 0.0, fill);
-                if ui.is_rect_visible(rect) && self.avatar_req.insert(d.id) {
-                    let _ = self.cmd.send(Cmd::Avatar(i));
-                }
-                draw_avatar(
-                    ui,
-                    rect.left_center() + Vec2::new(32.0, 0.0),
-                    if d.saved { "И" } else { &d.name },
-                    d.id,
-                    DIALOG_PHOTO,
-                    self.avatars.get(&d.id),
-                    self.settings.ayu.avatar_corners,
-                );
-                let (name_c, text_c, date_c) = if selected {
-                    (Color32::WHITE, Color32::WHITE, Color32::WHITE)
-                } else {
-                    (WHITE, DIALOG_TEXT, DIALOG_DATE)
-                };
-                // Бейдж непрочитанных справа внизу, время справа вверху.
-                let mut right = rect.right() - 12.0;
-                if d.unread > 0 {
-                    let label = if d.unread > 999 {
-                        "999+".to_owned()
-                    } else {
-                        d.unread.to_string()
-                    };
-                    let w = (label.chars().count() as f32 * 7.5 + 12.0).max(19.0);
-                    let b = egui::Rect::from_min_size(
-                        egui::pos2(right - w, rect.bottom() - 14.0 - 19.0),
-                        Vec2::new(w, 19.0),
+                    draw_avatar(
+                        ui,
+                        rect.left_center() + Vec2::new(32.0, 0.0),
+                        if d.saved { "И" } else { &d.name },
+                        d.id,
+                        DIALOG_PHOTO,
+                        self.avatars.get(&d.id),
+                        self.settings.ayu.avatar_corners,
                     );
-                    let bg = if selected {
-                        Color32::WHITE
-                    } else if d.muted {
-                        t(UNREAD_MUTED)
+                    let (name_c, text_c, date_c) = if selected {
+                        (Color32::WHITE, Color32::WHITE, Color32::WHITE)
                     } else {
-                        UNREAD
+                        (WHITE, DIALOG_TEXT, DIALOG_DATE)
                     };
-                    p.rect_filled(b, egui::CornerRadius::same(10), bg);
-                    p.text(
-                        b.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        FontId::proportional(12.0),
-                        if selected { t(DIALOG_ACTIVE) } else { INK_DARK },
-                    );
-                    right = b.left() - 6.0;
-                } else if d.pinned {
-                    // Закреплённый чат без непрочитанных: значок кнопки вместо бейджа.
-                    let c = egui::pos2(rect.right() - 22.0, rect.bottom() - 24.0);
-                    icons::tg(p, "dialogs/dialogs_pinned", c, date_c);
-                    right = c.x - 12.0;
-                }
-                let date = if d.date > 0 {
-                    dialog_date(d.date, now)
-                } else {
-                    String::new()
-                };
-                let date_w = p
-                    .layout_no_wrap(date.clone(), FontId::proportional(13.0), date_c)
-                    .size()
-                    .x;
-                p.text(
-                    egui::pos2(rect.right() - 12.0, rect.top() + 12.0),
-                    egui::Align2::RIGHT_TOP,
-                    &date,
-                    FontId::proportional(13.0),
-                    date_c,
-                );
-                let clip_right = (rect.right() - 12.0 - date_w - 8.0).max(rect.left() + 70.0);
-                let name_clip = egui::Rect::from_min_max(rect.min, egui::pos2(clip_right, rect.max.y));
-                let text_clip = egui::Rect::from_min_max(
-                    rect.min,
-                    egui::pos2(right.max(rect.left() + 70.0), rect.max.y),
-                );
-                p.with_clip_rect(name_clip).text(
-                    rect.left_top() + Vec2::new(68.0, 12.0),
-                    egui::Align2::LEFT_TOP,
-                    if d.saved { "Избранное" } else { &d.name },
-                    FontId::proportional(15.0),
-                    name_c,
-                );
-                if d.muted {
-                    // Перечёркнутый динамик после имени, если звук отключён.
-                    let w = p
-                        .layout_no_wrap(
-                            (if d.saved { "Избранное" } else { d.name.as_str() }).to_owned(),
-                            FontId::proportional(15.0),
-                            name_c,
-                        )
+                    // Бейдж непрочитанных справа внизу, время справа вверху.
+                    let mut right = rect.right() - 12.0;
+                    if d.unread > 0 {
+                        let label = if d.unread > 999 {
+                            "999+".to_owned()
+                        } else {
+                            d.unread.to_string()
+                        };
+                        let w = (label.chars().count() as f32 * 7.5 + 12.0).max(19.0);
+                        let b = egui::Rect::from_min_size(
+                            egui::pos2(right - w, rect.bottom() - 14.0 - 19.0),
+                            Vec2::new(w, 19.0),
+                        );
+                        let bg = if selected {
+                            Color32::WHITE
+                        } else if d.muted {
+                            t(UNREAD_MUTED)
+                        } else {
+                            t_btn(ORANGE)
+                        };
+                        p.rect_filled(b, egui::CornerRadius::same(10), bg);
+                        p.text(
+                            b.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            FontId::proportional(12.0),
+                            if selected { t(DIALOG_ACTIVE) } else { Color32::WHITE },
+                        );
+                        right = b.left() - 6.0;
+                    } else if d.pinned {
+                        // Закреплённый чат без непрочитанных: значок кнопки вместо бейджа.
+                        let c = egui::pos2(rect.right() - 22.0, rect.bottom() - 24.0);
+                        icons::tg(p, "dialogs/dialogs_pinned", c, date_c);
+                        right = c.x - 12.0;
+                    }
+                    let date = if d.date > 0 {
+                        dialog_date(d.date, now)
+                    } else {
+                        String::new()
+                    };
+                    let date_w = p
+                        .layout_no_wrap(date.clone(), FontId::proportional(13.0), date_c)
                         .size()
                         .x;
-                    let x = rect.left() + 68.0 + w + 14.0;
-                    if x < clip_right - 8.0 {
-                        icons::tg(p, "dialogs/dialogs_mute", egui::pos2(x - 4.0, rect.top() + 21.0), date_c);
-                    }
-                }
-                match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
-                    Some(e) => e.paint_line(
-                        ui,
-                        text_clip,
-                        rect.left_top() + Vec2::new(68.0, 35.0),
-                        &d.last,
-                        14.0,
-                        text_c,
-                    ),
-                    None => {
-                        p.with_clip_rect(text_clip).text(
-                            rect.left_top() + Vec2::new(68.0, 35.0),
-                            egui::Align2::LEFT_TOP,
-                            &d.last,
-                            FontId::proportional(14.0),
-                            text_c,
-                        );
-                    }
-                }
-                if resp.clicked() {
-                    open = Some(i);
-                }
-                egui::Popup::context_menu(&resp).show(|ui| {
-                    ui.set_min_width(210.0);
-                    ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, a: DialogAct| {
-                        if kit::menu_item(ui, icon, label, false) {
-                            dact = Some((i, a));
-                            ui.close();
+                    p.text(
+                        egui::pos2(rect.right() - 12.0, rect.top() + 12.0),
+                        egui::Align2::RIGHT_TOP,
+                        &date,
+                        FontId::proportional(13.0),
+                        date_c,
+                    );
+                    let clip_right = (rect.right() - 12.0 - date_w - 8.0).max(rect.left() + 70.0);
+                    let name_clip = egui::Rect::from_min_max(rect.min, egui::pos2(clip_right, rect.max.y));
+                    let text_clip = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(right.max(rect.left() + 70.0), rect.max.y),
+                    );
+                    p.with_clip_rect(name_clip).text(
+                        rect.left_top() + Vec2::new(68.0, 12.0),
+                        egui::Align2::LEFT_TOP,
+                        if d.saved { "Избранное" } else { &d.name },
+                        FontId::proportional(15.0),
+                        name_c,
+                    );
+                    if d.muted {
+                        // Перечёркнутый динамик после имени, если звук отключён.
+                        let w = p
+                            .layout_no_wrap(
+                                (if d.saved { "Избранное" } else { d.name.as_str() }).to_owned(),
+                                FontId::proportional(15.0),
+                                name_c,
+                            )
+                            .size()
+                            .x;
+                        let x = rect.left() + 68.0 + w + 14.0;
+                        if x < clip_right - 8.0 {
+                            icons::tg(p, "dialogs/dialogs_mute", egui::pos2(x - 4.0, rect.top() + 21.0), date_c);
                         }
-                    };
-                    if !d.saved {
+                    }
+                    match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
+                        Some(e) => e.paint_line(
+                            ui,
+                            text_clip,
+                            rect.left_top() + Vec2::new(68.0, 35.0),
+                            &d.last,
+                            14.0,
+                            text_c,
+                        ),
+                        None => {
+                            p.with_clip_rect(text_clip).text(
+                                rect.left_top() + Vec2::new(68.0, 35.0),
+                                egui::Align2::LEFT_TOP,
+                                &d.last,
+                                FontId::proportional(14.0),
+                                text_c,
+                            );
+                        }
+                    }
+                    if resp.clicked() {
+                        open = Some(i);
+                    }
+                    egui::Popup::context_menu(&resp).show(|ui| {
+                        ui.set_min_width(210.0);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, a: DialogAct| {
+                            if kit::menu_item(ui, icon, label, false) {
+                                dact = Some((i, a));
+                                ui.close();
+                            }
+                        };
+                        if !d.saved {
+                            item(
+                                ui,
+                                if d.archived { "menu/unarchive" } else { "menu/archive" },
+                                if d.archived { "Вернуть из архива" } else { "В архив" },
+                                DialogAct::Archive(!d.archived),
+                            );
+                        }
                         item(
                             ui,
-                            if d.archived { "menu/unarchive" } else { "menu/archive" },
-                            if d.archived { "Вернуть из архива" } else { "В архив" },
-                            DialogAct::Archive(!d.archived),
+                            if d.pinned { "menu/unpin" } else { "menu/pin" },
+                            if d.pinned { "Открепить" } else { "Закрепить" },
+                            DialogAct::Pin(!d.pinned),
                         );
-                    }
-                    item(
-                        ui,
-                        if d.pinned { "menu/unpin" } else { "menu/pin" },
-                        if d.pinned { "Открепить" } else { "Закрепить" },
-                        DialogAct::Pin(!d.pinned),
-                    );
-                    item(
-                        ui,
-                        if d.muted { "menu/unmute" } else { "menu/mute" },
-                        if d.muted { "Включить звук" } else { "Отключить звук" },
-                        DialogAct::Mute(!d.muted),
-                    );
-                    if d.unread > 0 {
-                        item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
-                    }
-                });
-            }
-        });
+                        item(
+                            ui,
+                            if d.muted { "menu/unmute" } else { "menu/mute" },
+                            if d.muted { "Включить звук" } else { "Отключить звук" },
+                            DialogAct::Mute(!d.muted),
+                        );
+                        if d.unread > 0 {
+                            item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
+                        }
+                    });
+                }
+            },
+        );
         if toggle_archive {
             self.in_archive = !self.in_archive;
+        }
+        if let Some((peer, id, name)) = open_global {
+            self.search.clear();
+            self.global_results.clear();
+            self.send(Cmd::OpenContact(peer, id, name));
         }
         if let Some((i, a)) = dact {
             match a {
@@ -1202,6 +1427,9 @@ impl eframe::App for App {
         self.flush_refresh(ui.ctx());
         let ctx = ui.ctx().clone();
         theme::set_opacity(self.settings.window_opacity);
+        theme::set_blur(self.settings.blur_enabled);
+        theme::sync_visuals(&ctx);
+        win::set_window_blur(self.settings.blur_enabled && self.settings.window_opacity < 100);
         theme::set_anim_speed(self.settings.anim_speed);
         let zoom = f32::from(self.settings.ui_scale.clamp(80, 150)) / 100.0;
         if (ctx.zoom_factor() - zoom).abs() > 0.001 {
@@ -1263,9 +1491,8 @@ impl eframe::App for App {
                     ui.set_min_width(300.0);
                     self.emoji_panel_body(ui);
                 });
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.emoji_pinned {
                 self.emoji_open = false;
-                self.emoji_pinned = false;
             }
         }
         let info_k = theme::tween(&ctx, "info-panel", f32::from(u8::from(self.info_open && !self.emoji_open && self.selected.is_some() && !narrow)), 0.2);
@@ -1309,16 +1536,17 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| self.composer_ui(ui));
         }
-        // Лента мягко подъезжает при открытии чата (150 мс, без перелёта).
-        let push = (self.chat_opened.elapsed().as_secs_f32() / 0.15).clamp(0.0, 1.0);
+        // Лента мягко подъезжает при открытии чата (200 мс, кривая iOS без перелёта).
+        let push = (self.chat_opened.elapsed().as_secs_f32() / 0.2).clamp(0.0, 1.0);
         if push < 1.0 && self.selected.is_some() {
             ctx.request_repaint();
         }
-        let slide = if self.selected.is_some() { (1.0 - spring(push)) * 12.0 } else { 0.0 };
+        let slide = if self.selected.is_some() { (1.0 - ios_spring(push)) * 14.0 } else { 0.0 };
+        let bg_style = self.settings.chat_bg_style;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(tint_chat())
+                    .fill(Color32::TRANSPARENT)
                     .inner_margin(egui::Margin {
                         left: (8.0 + slide.max(0.0)) as i8,
                         right: 8,
@@ -1326,7 +1554,10 @@ impl eframe::App for App {
                         bottom: 0,
                     }),
             )
-            .show(ui, |ui| self.messages_ui(ui));
+            .show(ui, |ui| {
+                paint_chat_backdrop(ui.painter(), ui.max_rect(), bg_style);
+                self.messages_ui(ui);
+            });
         if narrow {
             self.emoji_window(&ctx);
         }
@@ -1338,7 +1569,10 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.tg_settings_window(&ctx);
         #[cfg(windows)]
-        self.player_overlay(&ctx, frame);
+        {
+            self.inline_gif_overlay(&ctx, frame);
+            self.player_overlay(&ctx, frame);
+        }
         #[cfg(not(windows))]
         let _ = frame;
     }

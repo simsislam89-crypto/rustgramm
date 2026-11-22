@@ -59,11 +59,16 @@ fn page(src: &str, loop_it: bool) -> String {
 }
 
 impl VideoView {
-    /// Создаёт плеер для `video`; страница записывается в `dir`, данные WebView2 — в `dir/webview`.
+    /// Создаёт плеер для локального файла `video`.
     pub fn new(window: &impl HasWindowHandle, video: &Path, dir: &Path, loop_it: bool) -> Result<VideoView, String> {
+        Self::new_url(window, &file_url(video), dir, loop_it)
+    }
+
+    /// Создаёт плеер для произвольного локального адреса (`file:///` или loopback-потока).
+    pub fn new_url(window: &impl HasWindowHandle, src: &str, dir: &Path, loop_it: bool) -> Result<VideoView, String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let html_path: PathBuf = dir.join("player.html");
-        std::fs::write(&html_path, page(&file_url(video), loop_it)).map_err(|e| e.to_string())?;
+        std::fs::write(&html_path, page(src, loop_it)).map_err(|e| e.to_string())?;
         let icons = dir.join("i");
         std::fs::create_dir_all(&icons).map_err(|e| e.to_string())?;
         for (file, name) in PLAYER_ICONS {
@@ -138,6 +143,71 @@ impl VideoView {
     }
 
     /// Останавливает воспроизведение и возвращает фокус главному окну.
+    pub fn stop(&self) {
+        let _ = self.webview.evaluate_script("document.getElementById('v').pause()");
+        let _ = self.webview.focus_parent();
+    }
+}
+
+/// Встроенный в ленту мини-плеер для автозапуска GIF и коротких роликов без звука.
+pub struct InlineGifView {
+    webview: WebView,
+    pub msg_id: i32,
+    bounds: (i32, i32, u32, u32),
+    clicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InlineGifView {
+    pub fn new(window: &impl HasWindowHandle, msg_id: i32, video: &Path, dir: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let html_path = dir.join("inline.html");
+        let src = file_url(video);
+        let html = format!(
+            "<!doctype html><html><head><meta charset=utf-8><style>\
+            html,body{{margin:0;height:100%;background:#141418;overflow:hidden;cursor:pointer}}\
+            video{{width:100%;height:100%;object-fit:cover;display:block}}\
+            </style></head><body><video id=v src=\"{src}\" autoplay loop muted playsinline></video>\
+            <script>var n=0;document.onclick=function(){{document.title='rg'+(++n)+'|open'}}</script>\
+            </body></html>"
+        );
+        std::fs::write(&html_path, html).map_err(|e| e.to_string())?;
+        let clicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = clicked.clone();
+        let mut context = wry::WebContext::new(Some(dir.join("webview")));
+        let webview = WebViewBuilder::new_with_web_context(&mut context)
+            .with_url(file_url(&html_path))
+            .with_autoplay(true)
+            .with_background_color((20, 20, 24, 255))
+            .with_devtools(false)
+            .with_bounds(Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(16u32, 16u32).into(),
+            })
+            .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+            .with_document_title_changed_handler(move |title| {
+                if title.ends_with("|open") {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .build_as_child(window)
+            .map_err(|e| e.to_string())?;
+        Ok(Self { webview, msg_id, bounds: (0, 0, 16, 16), clicked })
+    }
+
+    pub fn place(&mut self, bounds: (i32, i32, u32, u32)) {
+        if bounds != self.bounds {
+            self.bounds = bounds;
+            let _ = self.webview.set_bounds(Rect {
+                position: PhysicalPosition::new(bounds.0, bounds.1).into(),
+                size: PhysicalSize::new(bounds.2.max(1), bounds.3.max(1)).into(),
+            });
+        }
+    }
+
+    pub fn take_clicked(&self) -> bool {
+        self.clicked.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn stop(&self) {
         let _ = self.webview.evaluate_script("document.getElementById('v').pause()");
         let _ = self.webview.focus_parent();
