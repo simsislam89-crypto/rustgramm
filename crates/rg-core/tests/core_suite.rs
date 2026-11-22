@@ -36,6 +36,7 @@ fn dummy_dialog(
         unread,
         pinned: false,
         muted,
+        notify_explicit: None,
         saved: false,
         archived,
         kind,

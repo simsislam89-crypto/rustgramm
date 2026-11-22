@@ -972,3 +972,22 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --target aarch64-linux-android` (`--features plugins` и `--no-default-features`, NDK 27) — **OK**.
 - `cargo test --workspace` — **2134 теста пройдено, 0 провалено, 0 пропущено** (включая `no_foreign_hosts`, `diag`, `rich_msg`, `opacity_v19_migrated`, `default_opacity_is_70_and_spring_curves_behave`, `ui_suite`).
 - `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` собран (**14 106 624 байта**), smoke-запуск `RG_DEMO=1` и `RG_DEMO=qr` — **OK** (`smoke_main=True smoke_qr=True`).
+
+## Этап 31 (2026-11-22, v0.19.1)
+
+Срочный патч по скринам пользователя после теста `dist/Rustgramm.exe` v0.19.0.
+
+### Причины и решения
+
+1. **Пустая левая панель, «Поиск» посередине экрана**: `ui.horizontal_centered` внутри вертикальной `Panel::left("dialogs")` занимал всю высоту панели и выталкивал истории, папки, архив и чаты за экран. Решение: `allocate_ui_with_layout(…, 40 px, left_to_right(Center))` в `dialogs_ui`; то же в `composer_ui` (высота 44..120 px по числу строк). Добавлен регресс-тест `dialogs_sidebar_renders_search_at_top_and_all_chats_visible`.
+2. **Двойные кнопки `— □ ×` справа сверху**: Windows 11 DWM рисовал системные кнопки (`WS_SYSMENU`) под Acrylic. Решение: `win.rs::strip_native_caption_buttons` снимает `WS_SYSMENU` на UI-потоке уже после показа окна (`set_window_blur`/`apply_blur`), `dress_window` ждёт `IsWindowVisible`, чтобы не было гонки с `ShowWindow`. Проверено: `WS_SYSMENU=0`, `WS_VISIBLE` сохранён.
+3. **Уведомления из заглушенных чатов**: неизвестные/архивные чаты считались незаглушенными, `silent: true` и глобальные категории Telegram (`NotifyScope`) игнорировались. Решение: `DialogRow.notify_explicit`, `MessageRow.silent`, `parse_notify_settings`, `is_dialog_muted_for_notify` (неизвестный, архив, Избранное, mute, явная настройка, категория), немедленное локальное применение mute (`toggle_mute_dialog`).
+4. **Спам >3 сообщений/сек**: `NotifyGate` (глобально и по чату) гасит звук/тост/мигание на 6 с, 350-мс буфер перед уведомлением, 0% CPU в простое.
+5. **Назойливый звук**: `generate_chime_wav` — мягкая «капля» C5→F5, 145 мс, плавная атака/затухание, квадратичная громкость (пик < 14 000).
+
+### Проверки (v0.19.1)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и Lite — **0 предупреждений**.
+- `cargo check -p rg-android --target aarch64-linux-android` (Full и Lite, NDK 27) — **OK**.
+- `cargo test --workspace` — **2137 пройдено, 0 провалено** (включая `no_foreign_hosts`, `notify_gate`, `notify_mute`, регресс-тест левой панели).
+- `dist/Rustgramm.exe` — **14 114 304 байта**, smoke `RG_DEMO=1` и `RG_DEMO=qr` — **OK**.

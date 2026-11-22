@@ -716,6 +716,8 @@ struct CachedDialog {
     unread: i32,
     pinned: bool,
     muted: bool,
+    #[serde(default)]
+    notify_explicit: Option<bool>,
     saved: bool,
     archived: bool,
     kind: u8,
@@ -776,6 +778,7 @@ fn save_disk_cache(home: &std::path::Path, me: &str, dialogs: &[DialogRow], fold
                 unread: d.unread,
                 pinned: d.pinned,
                 muted: d.muted,
+                notify_explicit: d.notify_explicit,
                 saved: d.saved,
                 archived: d.archived,
                 kind: kind_to_u8(d.kind),
@@ -835,6 +838,7 @@ fn load_disk_cache(home: &std::path::Path) -> Option<(String, Vec<DialogRow>, Ve
             unread: d.unread,
             pinned: d.pinned,
             muted: d.muted,
+            notify_explicit: d.notify_explicit,
             saved: d.saved,
             archived: d.archived,
             kind: u8_to_kind(d.kind),
@@ -1674,9 +1678,15 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 }
             }
             Cmd::MuteDialog(i, on) => {
-                let Some(d) = dialogs.get(i) else { continue };
-                match engine.set_muted(d.peer, on).await {
-                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
+                let Some(peer) = dialogs.get(i).map(|d| d.peer) else { continue };
+                match engine.set_muted(peer, on).await {
+                    Ok(()) => {
+                        if let Some(d) = dialogs.get_mut(i) {
+                            d.muted = on;
+                            d.notify_explicit = Some(on);
+                        }
+                        refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                    }
                     Err(e) => out.err(format!("Звук: {e}")),
                 }
             }
@@ -1712,6 +1722,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             unread: 0,
                             pinned: false,
                             muted: false,
+                            notify_explicit: None,
                             saved: false,
                             archived: false,
                             kind: DialogKind::User,
@@ -2633,6 +2644,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                             unread: 0,
                                             pinned: false,
                                             muted: false,
+                                            notify_explicit: None,
                                             saved: false,
                                             archived: false,
                                             kind: if id < -1_000_000_000_000 {
@@ -2676,6 +2688,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                             unread: 0,
                                             pinned: false,
                                             muted: false,
+                                            notify_explicit: None,
                                             saved: false,
                                             archived: false,
                                             kind: if id < -1_000_000_000_000 {
@@ -4014,6 +4027,7 @@ mod tests {
                 unread: (i % 5) as i32,
                 pinned: i < 3,
                 muted: i % 7 == 0,
+                notify_explicit: (i % 7 == 0).then_some(true),
                 saved: i == 0,
                 archived: i > 250,
                 kind: DialogKind::User,

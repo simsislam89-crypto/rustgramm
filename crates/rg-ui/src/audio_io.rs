@@ -39,23 +39,42 @@ pub fn pcm16_to_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     out
 }
 
-/// Генерирует мягкий двухтоновый звук уведомления (44.1 кГц WAV) с масштабированием громкости `0.0..=1.0`.
+/// Генерирует мягкий короткий звук уведомления в стиле официального Telegram Desktop
+/// (гладкая тёплая капля/маримба 523→698 Гц, 145 мс, 44.1 кГц WAV) с масштабированием громкости `0.0..=1.0`.
 pub fn generate_chime_wav(volume: f32) -> Vec<u8> {
     let sr = 44_100u32;
     let vol = volume.clamp(0.0, 1.0);
-    let dur_ms = 260usize;
+    let dur_ms = 145usize;
     let total = (sr as usize * dur_ms) / 1000;
     let mut samples = Vec::with_capacity(total);
     let two_pi = std::f32::consts::TAU;
+    let mut phase = 0.0_f32;
+    // Квадратичная кривая громкости — на средних и высоких значениях звук остаётся деликатным.
+    let gain = vol * vol * 11_500.0;
+    let sr_f = sr as f32;
+    let fade_start = (dur_ms as f32 - 15.0) / 1000.0;
     for i in 0..total {
-        let t = i as f32 / sr as f32;
-        // Две чистые ноты (C6 -> G6) с мягкой огибающей без щелчков.
-        let (freq, local_t) = if t < 0.105 { (1046.5_f32, t) } else { (1567.98_f32, t - 0.105) };
-        let attack = (local_t / 0.008).min(1.0);
-        let decay = (-local_t * 16.0).exp();
-        let env = attack * decay;
-        let wave = (two_pi * freq * t).sin() * 0.72 + (two_pi * freq * 2.0 * t).sin() * 0.18;
-        let v = (wave * env * vol * 22_000.0).clamp(-32_767.0, 32_767.0) as i16;
+        let t = i as f32 / sr_f;
+        // Плавный скользящий подъём C5 -> F5 в первые 40 мс без скачка фазы.
+        let glide = (t / 0.040).min(1.0);
+        let smooth_glide = glide * glide * (3.0 - 2.0 * glide);
+        let freq = 523.25 + (698.46 - 523.25) * smooth_glide;
+        phase = (phase + two_pi * freq / sr_f) % two_pi;
+        let attack = if t < 0.006 {
+            0.5 - 0.5 * (std::f32::consts::PI * (t / 0.006)).cos()
+        } else {
+            1.0
+        };
+        let tail = if t > fade_start {
+            let p = ((t - fade_start) / 0.015).clamp(0.0, 1.0);
+            0.5 + 0.5 * (std::f32::consts::PI * p).cos()
+        } else {
+            1.0
+        };
+        let decay = (-t * 25.0).exp();
+        let env = attack * decay * tail;
+        let wave = phase.sin() * 0.90 + (phase * 2.0).sin() * (0.08 * (-t * 50.0).exp());
+        let v = (wave * env * gain).clamp(-32_767.0, 32_767.0) as i16;
         samples.push(v);
     }
     pcm16_to_wav(&samples, sr)
@@ -743,6 +762,24 @@ mod tests {
 
         let silent = generate_chime_wav(0.0);
         assert!(silent[44..].iter().all(|&b| b == 0));
+
+        // Пиковая амплитуда мягкого звука не должна быть резкой/писклявой, а хвост затухает в 0.
+        let peak = chime[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1_000 && peak < 14_000, "unexpected peak={peak}");
+        let tail_peak = chime[chime.len() - 20..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(tail_peak < 50, "tail did not decay cleanly: {tail_peak}");
 
         let ring = generate_ringtone_wav(0.7);
         assert_eq!(&ring[0..4], b"RIFF");

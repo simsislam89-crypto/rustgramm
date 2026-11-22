@@ -190,6 +190,7 @@ mod imp {
     static HWND_VAL: AtomicIsize = AtomicIsize::new(0);
     static WANT_BLUR: AtomicBool = AtomicBool::new(false);
     static APPLIED_BLUR: AtomicBool = AtomicBool::new(false);
+    static STYLE_STRIPPED: AtomicBool = AtomicBool::new(false);
     static WANT_CAPTURE_EXCLUDED: AtomicBool = AtomicBool::new(false);
     static APPLIED_CAPTURE_EXCLUDED: AtomicBool = AtomicBool::new(false);
     type IconCacheEntry = (usize, i32, bool, bool, isize);
@@ -232,6 +233,8 @@ mod imp {
         fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
         fn BringWindowToTop(hwnd: *mut c_void) -> i32;
         fn SendMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn GetWindowLongW(hwnd: *mut c_void, index: i32) -> i32;
+        fn SetWindowLongW(hwnd: *mut c_void, index: i32, new_long: i32) -> i32;
         fn SetWindowPos(
             hwnd: *mut c_void,
             insert_after: *mut c_void,
@@ -311,6 +314,8 @@ mod imp {
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_FRAMECHANGED: u32 = 0x0020;
+    const GWL_STYLE: i32 = -16;
+    const WS_SYSMENU: i32 = 0x0008_0000;
     const WM_SETICON: u32 = 0x0080;
     const ICON_SMALL: usize = 0;
     const ICON_BIG: usize = 1;
@@ -366,10 +371,25 @@ mod imp {
         }
     }
 
+    /// Снимает `WS_SYSMENU` на главном UI-потоке после показа окна, чтобы Windows 11 DWM не рисовал
+    /// призрачные кнопки `— □ ×` под Acrylic-стеклом и не возникала гонка `SetWindowLongW` с `ShowWindow`.
+    fn strip_native_caption_buttons(hwnd: *mut c_void) {
+        if hwnd.is_null() || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return;
+        }
+        // SAFETY: валидный видимый HWND главного окна на UI-потоке.
+        let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
+        if style != 0 && (style & WS_SYSMENU) != 0 {
+            let _ = unsafe { SetWindowLongW(hwnd, GWL_STYLE, style & !WS_SYSMENU) };
+        }
+        STYLE_STRIPPED.store(true, Ordering::Relaxed);
+    }
+
     fn apply_blur(hwnd: *mut c_void, blur: bool) {
         if hwnd.is_null() {
             return;
         }
+        strip_native_caption_buttons(hwnd);
         let m = if blur {
             Margins { left: -1, right: -1, top: -1, bottom: -1 }
         } else {
@@ -414,11 +434,14 @@ mod imp {
         let wtitle = wide(title);
         let mut hwnd = std::ptr::null_mut();
         for _ in 0..120 {
+            // Ждём пока winit создаст И покажет окно (`IsWindowVisible != 0`), чтобы не перехватить
+            // стиль до вызова `ShowWindow`.
             // SAFETY: строка заканчивается нулём и живёт до конца вызова.
             hwnd = unsafe { FindWindowW(std::ptr::null(), wtitle.as_ptr()) };
-            if !hwnd.is_null() {
+            if !hwnd.is_null() && unsafe { IsWindowVisible(hwnd) } != 0 {
                 break;
             }
+            hwnd = std::ptr::null_mut();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if hwnd.is_null() {
@@ -431,17 +454,29 @@ mod imp {
         };
         set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
         set(DWMWA_WINDOW_CORNER_PREFERENCE, 2); // скруглённые углы Windows 11
-        apply_blur(hwnd, WANT_BLUR.load(Ordering::Relaxed));
         if WANT_CAPTURE_EXCLUDED.load(Ordering::Relaxed) {
             apply_capture_excluded(hwnd, true);
         }
     }
 
-    /// Переключает системное размытие Acrylic за прозрачным окном на лету.
+    /// Переключает системное размытие Acrylic за прозрачным окном на лету (вызывается на UI-потоке).
     pub fn set_window_blur(enabled: bool) {
         WANT_BLUR.store(enabled, Ordering::Relaxed);
-        let raw = HWND_VAL.load(Ordering::Acquire);
-        if raw != 0 && APPLIED_BLUR.load(Ordering::Relaxed) != enabled {
+        let mut raw = HWND_VAL.load(Ordering::Acquire);
+        if raw == 0 {
+            let wtitle = wide("Rustgramm");
+            // SAFETY: нуль-терминированная строка на стеке.
+            let hwnd = unsafe { FindWindowW(std::ptr::null(), wtitle.as_ptr()) };
+            if !hwnd.is_null() && unsafe { IsWindowVisible(hwnd) } != 0 {
+                HWND_VAL.store(hwnd as isize, Ordering::Release);
+                let dark = 1i32;
+                let corner = 2i32;
+                let _ = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const dark).cast(), 4) };
+                let _ = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, (&raw const corner).cast(), 4) };
+                raw = hwnd as isize;
+            }
+        }
+        if raw != 0 && (!STYLE_STRIPPED.load(Ordering::Relaxed) || APPLIED_BLUR.load(Ordering::Relaxed) != enabled) {
             apply_blur(raw as *mut c_void, enabled);
         }
     }

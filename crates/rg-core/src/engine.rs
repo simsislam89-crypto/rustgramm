@@ -36,6 +36,8 @@ pub struct DialogRow {
     pub unread: i32,
     pub pinned: bool,
     pub muted: bool,
+    /// Явная настройка уведомлений чата: `Some(true)` — заглушен, `Some(false)` — явно включён, `None` — наследует глобальную категорию Telegram.
+    pub notify_explicit: Option<bool>,
     /// Чат с самим собой (Избранное).
     pub saved: bool,
     /// Лежит в архиве.
@@ -755,6 +757,9 @@ pub struct MessageRow {
     /// Интерактивный чеклист (`MessageMedia::ToDo`).
     #[serde(default)]
     pub todo: Option<TodoListInfo>,
+    /// Беззвучное сообщение Telegram (`Message.silent == true`) — не издаёт звук и не шлёт уведомление.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 impl MessageRow {
@@ -784,6 +789,7 @@ impl MessageRow {
             rich_blocks: Vec::new(),
             effect: None,
             todo: None,
+            silent: false,
         }
     }
 }
@@ -1234,11 +1240,7 @@ impl Engine {
             if date > 0 {
                 last_off = (date as i32, msg_id_raw, tl::enums::InputPeer::from(peer));
             }
-            let muted = matches!(
-                &d.notify_settings,
-                tl::enums::PeerNotifySettings::Settings(s)
-                    if s.mute_until.is_some_and(|t| i64::from(t) > now)
-            );
+            let (muted, notify_explicit) = parse_notify_settings(&d.notify_settings, now);
             let is_archived = archived_flag || d.folder_id == Some(1);
             out.push(DialogRow {
                 peer,
@@ -1255,6 +1257,7 @@ impl Engine {
                 unread: d.unread_count.max(i32::from(d.unread_mark)),
                 pinned: d.pinned,
                 muted,
+                notify_explicit,
                 saved: is_self,
                 archived: is_archived,
                 kind,
@@ -1755,7 +1758,7 @@ impl Engine {
                 .or(h.post_author)
                 .unwrap_or_else(|| "скрытый отправитель".to_owned())
         });
-        let (inline_buttons, reply_keyboard, paid_reactions, service_text, rich_blocks, rich_summary, rich_media, effect, todo) = match &m.raw {
+        let (inline_buttons, reply_keyboard, paid_reactions, service_text, rich_blocks, rich_summary, rich_media, effect, todo, silent) = match &m.raw {
             grammers_client::tl::enums::Message::Message(x) => {
                 let (ib, rk) = extract_reply_markup(x.reply_markup.as_ref());
                 let (rblocks, rsum) = x
@@ -1775,6 +1778,7 @@ impl Engine {
                     rmedia,
                     x.effect,
                     todo,
+                    x.silent,
                 )
             }
             grammers_client::tl::enums::Message::Service(s) => (
@@ -1787,6 +1791,7 @@ impl Engine {
                 None,
                 None,
                 None,
+                s.silent,
             ),
             _ => (
                 Vec::new(),
@@ -1798,6 +1803,7 @@ impl Engine {
                 None,
                 None,
                 None,
+                false,
             ),
         };
         let text = if !m.text().is_empty() {
@@ -1841,6 +1847,7 @@ impl Engine {
             rich_blocks,
             effect,
             todo,
+            silent,
         }
     }
 
@@ -4171,12 +4178,15 @@ impl Engine {
                 self.client.invoke(&r_b),
             );
             let mut list = Vec::with_capacity(3);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
             for (scope, res) in [(NotifyScope::Users, u), (NotifyScope::Chats, c), (NotifyScope::Broadcasts, b)] {
                 if let Ok(tl::enums::PeerNotifySettings::Settings(s)) = res {
                     list.push(NotifyRow {
                         scope,
                         title: scope.title(),
-                        enabled: s.mute_until.unwrap_or(0) == 0 && !s.silent.unwrap_or(false),
+                        enabled: !s.silent.unwrap_or(false) && !s.mute_until.is_some_and(|t| i64::from(t) > now),
                         preview: s.show_previews.unwrap_or(true),
                     });
                 }
@@ -5023,6 +5033,7 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
                 pinned: x.pinned,
                 inline_buttons,
                 reply_keyboard,
+                silent: x.silent,
                 ..MessageRow::plain(x.id, x.message.clone(), x.out, i64::from(x.date))
             })
         })
@@ -5172,23 +5183,38 @@ fn extract_todo_media(media: Option<&grammers_client::tl::enums::MessageMedia>) 
     })
 }
 
+fn parse_notify_settings(
+    ns: &grammers_client::tl::enums::PeerNotifySettings,
+    now: i64,
+) -> (bool, Option<bool>) {
+    match ns {
+        grammers_client::tl::enums::PeerNotifySettings::Settings(s) => {
+            let explicit_muted = s.silent == Some(true) || s.mute_until.is_some_and(|t| i64::from(t) > now);
+            let explicit_unmuted = !explicit_muted && (s.mute_until == Some(0) || s.silent == Some(false));
+            let explicit = if explicit_muted {
+                Some(true)
+            } else if explicit_unmuted {
+                Some(false)
+            } else {
+                None
+            };
+            (explicit_muted, explicit)
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
     let archived = matches!(
         &d.raw,
         grammers_client::tl::enums::Dialog::Dialog(x) if x.folder_id == Some(1)
     );
-    let (unread, pinned, muted) = match &d.raw {
-        grammers_client::tl::enums::Dialog::Dialog(x) => (
-            x.unread_count.max(i32::from(x.unread_mark)),
-            x.pinned,
-            matches!(
-                &x.notify_settings,
-                grammers_client::tl::enums::PeerNotifySettings::Settings(s)
-                    if s.mute_until.is_some_and(|t| i64::from(t) > now)
-            ),
-        ),
-        _ => (0, false, false),
+    let (unread, pinned, muted, notify_explicit) = match &d.raw {
+        grammers_client::tl::enums::Dialog::Dialog(x) => {
+            let (m, exp) = parse_notify_settings(&x.notify_settings, now);
+            (x.unread_count.max(i32::from(x.unread_mark)), x.pinned, m, exp)
+        }
+        _ => (0, false, false, None),
     };
     let (emoji_status, verified, premium) = match d.peer() {
         grammers_client::peer::Peer::User(u) => match &u.raw {
@@ -5219,6 +5245,7 @@ fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
         unread,
         pinned,
         muted,
+        notify_explicit,
         saved: matches!(d.peer(), grammers_client::peer::Peer::User(u) if u.is_self()),
         archived,
         kind: match d.peer() {
@@ -5363,6 +5390,7 @@ mod tests {
             unread: 0,
             pinned: false,
             muted: false,
+            notify_explicit: None,
             saved: false,
             archived: false,
             kind,

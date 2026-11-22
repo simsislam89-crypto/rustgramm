@@ -371,7 +371,11 @@ impl App {
                     {
                         d.unread = 0;
                     }
-                    self.send(cmd);
+                    if let Cmd::MuteDialog(i, on) = cmd {
+                        self.toggle_mute_dialog(i, on);
+                    } else {
+                        self.send(cmd);
+                    }
                 }
                 // Переключатель правой панели со сведениями о чате (пружинная микроанимация).
                 let (prect, ptog) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
@@ -907,7 +911,11 @@ impl App {
             self.toggle_audio_playback();
         }
         if let Some(cmd) = cmd_after {
-            self.send(cmd);
+            if let Cmd::MuteDialog(i, on) = cmd {
+                self.toggle_mute_dialog(i, on);
+            } else {
+                self.send(cmd);
+            }
         }
         if start_search {
             self.search_open = true;
@@ -1424,8 +1432,12 @@ impl App {
         let has_send_as = cur_dlg_info
             .and_then(|(_, cid, _)| self.send_as_map.get(&cid))
             .is_some_and(|v| v.len() > 1);
-        ui.horizontal_centered(|ui| {
-            ui.set_min_height(44.0);
+        let line_cnt = self.input.lines().count().clamp(1, 5);
+        let row_h = (44.0 + (line_cnt - 1) as f32 * 18.0).min(120.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), row_h),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             // Все иконки поля ввода стоят на одной линии (высота слота 40 px, визуальный размер 19×19 px!).
             if s.field_attach_button {
@@ -1585,7 +1597,7 @@ impl App {
                 && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
                 && ui.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Enter));
             let text_out = ui
-                .allocate_ui(Vec2::new(width, 36.0), |ui| {
+                .allocate_ui(Vec2::new(width, (row_h - 8.0).max(36.0)), |ui| {
                     egui::TextEdit::multiline(&mut self.input)
                         .id(id)
                         .desired_width(width)
@@ -2813,7 +2825,7 @@ impl App {
             } else {
                 let lbl = if muted { "Включить звук" } else { "Выключить звук" };
                 if orange_button(ui, lbl, Vec2::new(w, 34.0)).clicked() {
-                    self.send(Cmd::MuteDialog(idx, !muted));
+                    self.toggle_mute_dialog(idx, !muted);
                 }
             }
         });

@@ -28,7 +28,7 @@ mod win;
 mod video;
 pub mod worker;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui::{self, Color32, FontId, RichText, Sense, Vec2};
@@ -186,6 +186,8 @@ struct App {
     input_custom_emojis: Vec<(usize, usize, i64)>,
     custom_emoji_req: HashSet<i64>,
     last_toast: Option<std::time::Instant>,
+    /// Антиспам-фильтр уведомлений (>3 сообщений в секунду) и 350-мс буфер перед звуком.
+    notify_gate: NotifyGate,
     /// Встроенные карточки уведомлений Rustgramm (когда выключены системные уведомления Windows).
     toasts: Vec<InAppToast>,
     /// Локальная блокировка по код-паролю.
@@ -483,6 +485,127 @@ struct InAppToast {
     at: std::time::Instant,
 }
 
+/// Защита уведомлений от спам-флуда (> 3 сообщений/сек) и проверка глобальной/локальной тишины.
+#[derive(Default)]
+struct NotifyGate {
+    global_hits: VecDeque<std::time::Instant>,
+    peer_hits: HashMap<i64, VecDeque<std::time::Instant>>,
+    spam_muted_until: Option<std::time::Instant>,
+    pending: Option<(std::time::Instant, String, String)>,
+}
+
+impl NotifyGate {
+    /// Фиксирует входящее сообщение и возвращает `true`, если включён антиспам (>3 сообщений/сек).
+    fn record_incoming(&mut self, now: std::time::Instant, peer_id: i64) -> bool {
+        let win = std::time::Duration::from_secs(1);
+        while self
+            .global_hits
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= win)
+        {
+            self.global_hits.pop_front();
+        }
+        self.global_hits.push_back(now);
+
+        let peer_q = self.peer_hits.entry(peer_id).or_default();
+        while peer_q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= win)
+        {
+            peer_q.pop_front();
+        }
+        peer_q.push_back(now);
+        let peer_len = peer_q.len();
+
+        if self.peer_hits.len() > 64 {
+            self.peer_hits.retain(|k, q| {
+                *k == peer_id
+                    || q.back()
+                        .is_some_and(|t| now.saturating_duration_since(*t) < win)
+            });
+        }
+
+        if self.global_hits.len() > 3 || peer_len > 3 {
+            self.spam_muted_until = Some(now + std::time::Duration::from_secs(6));
+            self.pending = None;
+            return true;
+        }
+        if self.is_spam_muted(now) {
+            self.pending = None;
+            return true;
+        }
+        false
+    }
+
+    fn is_spam_muted(&self, now: std::time::Instant) -> bool {
+        self.spam_muted_until.is_some_and(|until| now < until)
+    }
+
+    fn enqueue(&mut self, now: std::time::Instant, title: String, body: String) {
+        if !self.is_spam_muted(now) {
+            self.pending = Some((now, title, body));
+        }
+    }
+
+    fn take_ready(&mut self, now: std::time::Instant) -> Option<(String, String)> {
+        if self.is_spam_muted(now) {
+            self.pending = None;
+            return None;
+        }
+        let ready = self
+            .pending
+            .as_ref()
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) >= std::time::Duration::from_millis(350));
+        if ready {
+            self.pending.take().map(|(_, title, body)| (title, body))
+        } else {
+            None
+        }
+    }
+
+    fn next_wakeup_ms(&self, now: std::time::Instant) -> Option<u64> {
+        if self.is_spam_muted(now) {
+            return None;
+        }
+        self.pending.as_ref().map(|(at, _, _)| {
+            350u64
+                .saturating_sub(now.saturating_duration_since(*at).as_millis() as u64)
+                .max(20)
+        })
+    }
+}
+
+/// Возвращает `true`, если для этого чата звук/уведомления отключены (чат в муте, архиве,
+/// не загружен или отключена вся его категория в глобальных настройках Telegram).
+fn is_dialog_muted_for_notify(
+    dialog: Option<&DialogRow>,
+    account: Option<&rg_core::engine::AccountOverview>,
+) -> bool {
+    let Some(d) = dialog else {
+        return true;
+    };
+    if d.archived || d.saved || d.muted || d.notify_explicit == Some(true) {
+        return true;
+    }
+    if d.notify_explicit == Some(false) {
+        return false;
+    }
+    let Some(acc) = account else {
+        return true;
+    };
+    let scope = match d.kind {
+        rg_core::engine::DialogKind::User | rg_core::engine::DialogKind::Bot => {
+            rg_core::engine::NotifyScope::Users
+        }
+        rg_core::engine::DialogKind::Group => rg_core::engine::NotifyScope::Chats,
+        rg_core::engine::DialogKind::Channel => rg_core::engine::NotifyScope::Broadcasts,
+    };
+    acc.notify
+        .iter()
+        .find(|n| n.scope == scope)
+        .is_none_or(|n| !n.enabled)
+}
+
 fn link(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(egui::Label::new(RichText::new(text).color(ACCENT)).sense(Sense::click()))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -599,6 +722,7 @@ impl App {
             input_custom_emojis: Vec::new(),
             custom_emoji_req: HashSet::new(),
             last_toast: None,
+            notify_gate: NotifyGate::default(),
             toasts: Vec::new(),
             app_locked: false,
             lock_input: String::new(),
@@ -815,8 +939,34 @@ impl App {
         }
     }
 
-    fn send(&self, c: Cmd) {
+    pub(crate) fn send(&self, c: Cmd) {
         let _ = self.cmd.send(c);
+    }
+
+    pub(crate) fn toggle_mute_dialog(&mut self, idx: usize, muted: bool) {
+        if let Some(d) = self.dialogs.get_mut(idx) {
+            d.muted = muted;
+            d.notify_explicit = Some(muted);
+            self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+        }
+        self.send(Cmd::MuteDialog(idx, muted));
+    }
+
+    fn flush_pending_notification(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        if ctx.input(|i| i.focused) {
+            self.notify_gate.pending = None;
+            return;
+        }
+        if let Some((title, body)) = self.notify_gate.take_ready(now) {
+            let cooldown_ok = self.last_toast.is_none_or(|t| t.elapsed().as_secs() >= 2);
+            if cooldown_ok {
+                self.last_toast = Some(now);
+                self.push_notification(ctx, &title, &body);
+            }
+        } else if let Some(ms) = self.notify_gate.next_wakeup_ms(now) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        }
     }
 
     /// Предпросмотры только для свежих вложений и по одному разу.
@@ -874,6 +1024,7 @@ impl App {
                 if cfg!(feature = "plugins") && self.settings.plugins_enabled && !row.outgoing {
                     row.text = self.plugins.apply_incoming(&row.text);
                 }
+                let row_silent = row.silent;
                 let row_snapshot = (row.date, row.outgoing, row.text.chars().take(80).collect::<String>());
                 if open_id == Some(key) {
                     let idx = self.selected.unwrap_or(0);
@@ -905,20 +1056,22 @@ impl App {
                 if self.apply_live_to_list(key, &row_snapshot, open_id == Some(key)) {
                     self.refresh_at.get_or_insert(std::time::Instant::now());
                 }
-                // Уведомление по настройкам (Windows Toast или встроенные карточки + мигание + звук).
-                if !row_snapshot.1 && !ctx.input(|i| i.focused) {
-                    let dialog = self.dialogs.iter().find(|d| d.id == key);
-                    let muted = dialog.is_some_and(|d| d.muted);
-                    let cooldown_ok = self.last_toast.is_none_or(|t| t.elapsed().as_secs() >= 2);
-                    if !muted && cooldown_ok {
-                        self.last_toast = Some(std::time::Instant::now());
-                        let title = dialog.map_or("Rustgramm".to_owned(), |d| d.name.clone());
-                        let body = if row_snapshot.2.is_empty() {
-                            "Вложение".to_owned()
-                        } else {
-                            row_snapshot.2.clone()
-                        };
-                        self.push_notification(ctx, &title, &body);
+                // Уведомление по настройкам с учётом мута (чат, архив, категория Telegram), `silent` и антиспама >3/сек.
+                if !row_snapshot.1 {
+                    let now = std::time::Instant::now();
+                    let is_spam = self.notify_gate.record_incoming(now, key);
+                    if !row_silent && !is_spam && !ctx.input(|i| i.focused) {
+                        let dialog = self.dialogs.iter().find(|d| d.id == key);
+                        if !is_dialog_muted_for_notify(dialog, self.tgs.account.as_ref()) {
+                            let title = dialog.map_or_else(|| "Rustgramm".to_owned(), |d| d.name.clone());
+                            let body = if row_snapshot.2.is_empty() {
+                                "Вложение".to_owned()
+                            } else {
+                                row_snapshot.2.clone()
+                            };
+                            self.notify_gate.enqueue(now, title, body);
+                            ctx.request_repaint_after(std::time::Duration::from_millis(360));
+                        }
                     }
                 }
             }
@@ -1087,7 +1240,15 @@ impl App {
                 if self.secret_selected == Some(msg.chat_id) {
                     self.secret_messages.push(msg.clone());
                 }
-                self.push_notification(ctx, "Секретный чат (E2E)", "Новое зашифрованное сообщение");
+                let now = std::time::Instant::now();
+                if !self.notify_gate.record_incoming(now, i64::from(msg.chat_id)) && !ctx.input(|i| i.focused) {
+                    self.notify_gate.enqueue(
+                        now,
+                        "Секретный чат (E2E)".to_owned(),
+                        "Новое зашифрованное сообщение".to_owned(),
+                    );
+                    ctx.request_repaint_after(std::time::Duration::from_millis(360));
+                }
                 ctx.request_repaint();
             }
         }
@@ -3236,9 +3397,13 @@ impl App {
     // ---------- главное окно ----------
 
     fn dialogs_ui(&mut self, ui: &mut egui::Ui) {
-        // Верхняя строка: меню и поле поиска — идеальное выравнивание по центру (Y).
+        // Верхняя строка: меню и поле поиска — фиксированная высота 40 px, иначе horizontal_centered
+        // внутри вертикальной панели растягивает её на всю высоту окна!
         ui.add_space(6.0);
-        ui.horizontal_centered(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 40.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(38.0, 36.0), Sense::click());
             let m_hov = theme::tween(ui.ctx(), "burger-h", f32::from(u8::from(resp.hovered())), 0.12);
             if m_hov > 0.01 {
@@ -3607,7 +3772,7 @@ impl App {
         if let Some((i, a)) = dact {
             match a {
                 DialogAct::Pin(on) => self.send(Cmd::PinDialog(i, on)),
-                DialogAct::Mute(on) => self.send(Cmd::MuteDialog(i, on)),
+                DialogAct::Mute(on) => self.toggle_mute_dialog(i, on),
                 DialogAct::Read => {
                     if let Some(d) = self.dialogs.get_mut(i) {
                         d.unread = 0;
@@ -3800,6 +3965,7 @@ impl eframe::App for App {
             self.emoji = emoji::Emoji::load(&ctx);
         }
         self.drain_events(&ctx);
+        self.flush_pending_notification(&ctx);
         self.tick_tgs(&ctx);
         self.handle_shortcuts(&ctx);
         self.now = std::time::SystemTime::now()
@@ -4407,6 +4573,7 @@ fn demo_app(mode: &str) -> App {
             unread: *unread,
             pinned: i == 0,
             muted: *muted,
+            notify_explicit: (*muted).then_some(true),
             saved: false,
             archived: false,
             kind: rg_core::engine::DialogKind::User,
@@ -4431,6 +4598,7 @@ fn demo_app(mode: &str) -> App {
             unread: 4,
             pinned: false,
             muted: false,
+            notify_explicit: None,
             saved: false,
             archived: true,
             kind: rg_core::engine::DialogKind::User,
@@ -4514,7 +4682,7 @@ pub fn run_demo(mode: &str) -> eframe::Result {
     eframe::run_native(
         "Rustgramm (демо)",
         {
-            std::thread::spawn(|| win::dress_window("Rustgramm (демо)"));
+            std::thread::spawn(|| win::dress_window("Rustgramm"));
             native_options()
         },
         Box::new(move |cc| {
@@ -4522,4 +4690,174 @@ pub fn run_demo(mode: &str) -> eframe::Result {
             Ok(Box::new(demo_app(&mode)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+    use rg_core::engine::{AccountOverview, DialogKind, NotifyRow, NotifyScope};
+    use std::time::{Duration, Instant};
+
+    fn test_dialog(kind: DialogKind, muted: bool, archived: bool, saved: bool, notify_explicit: Option<bool>) -> DialogRow {
+        DialogRow {
+            peer: PeerRef {
+                id: PeerId::user_unchecked(42),
+                auth: PeerAuth::default(),
+            },
+            id: 42,
+            name: "Тест".to_owned(),
+            last: String::new(),
+            date: 0,
+            unread: 1,
+            pinned: false,
+            muted,
+            notify_explicit,
+            saved,
+            archived,
+            kind,
+            contact: true,
+            read_out: 0,
+            emoji_status: None,
+            verified: false,
+            premium: false,
+        }
+    }
+
+    fn test_account(users: bool, chats: bool, broadcasts: bool) -> AccountOverview {
+        AccountOverview {
+            notify: vec![
+                NotifyRow { scope: NotifyScope::Users, title: "Личные чаты", enabled: users, preview: true },
+                NotifyRow { scope: NotifyScope::Chats, title: "Группы", enabled: chats, preview: true },
+                NotifyRow { scope: NotifyScope::Broadcasts, title: "Каналы", enabled: broadcasts, preview: true },
+            ],
+            ..AccountOverview::default()
+        }
+    }
+
+    #[test]
+    fn notify_mute_respects_unknown_archived_saved_explicit_and_global_scopes() {
+        let acc_all_muted = test_account(false, false, false);
+        let acc_users_only = test_account(true, false, false);
+
+        assert!(is_dialog_muted_for_notify(None, Some(&acc_users_only)));
+        assert!(is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::User, false, true, false, Some(false))),
+            Some(&acc_users_only),
+        ));
+        assert!(is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::User, false, false, true, Some(false))),
+            Some(&acc_users_only),
+        ));
+        assert!(is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::User, true, false, false, Some(true))),
+            Some(&acc_users_only),
+        ));
+        assert!(is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::User, false, false, false, None)),
+            None,
+        ));
+        assert!(is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::Channel, false, false, false, None)),
+            Some(&acc_users_only),
+        ));
+        assert!(!is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::Channel, false, false, false, Some(false))),
+            Some(&acc_all_muted),
+        ));
+        assert!(!is_dialog_muted_for_notify(
+            Some(&test_dialog(DialogKind::User, false, false, false, None)),
+            Some(&acc_users_only),
+        ));
+    }
+
+    #[test]
+    fn notify_gate_suppresses_spam_bursts_above_three_per_second() {
+        let mut gate = NotifyGate::default();
+        let t0 = Instant::now();
+
+        // 3 сообщения за секунду не считаются спамом и отдаются через 350 мс.
+        for i in 0..3 {
+            let t = t0 + Duration::from_millis(i * 100);
+            assert!(!gate.record_incoming(t, 100));
+            gate.enqueue(t, "Иван".to_owned(), format!("msg {i}"));
+        }
+        // Четвёртое сообщение за ту же секунду гасит весь всплеск ещё до срабатывания таймера 350 мс.
+        let t3 = t0 + Duration::from_millis(280);
+        assert!(gate.record_incoming(t3, 100));
+        assert!(gate.take_ready(t0 + Duration::from_millis(700)).is_none());
+
+        // Во время 6-секундного антиспама новые единичные сообщения тоже игнорируются.
+        let t_during = t3 + Duration::from_secs(2);
+        assert!(gate.record_incoming(t_during, 200));
+        gate.enqueue(t_during, "Анна".to_owned(), "привет".to_owned());
+        assert!(gate.take_ready(t_during + Duration::from_millis(500)).is_none());
+
+        // После окончания паузы тишины (>6 сек) одиночные сообщения снова уведомляют.
+        let t_after = t3 + Duration::from_secs(7);
+        assert!(!gate.record_incoming(t_after, 200));
+        gate.enqueue(t_after, "Анна".to_owned(), "на связи".to_owned());
+        assert!(gate.take_ready(t_after + Duration::from_millis(200)).is_none());
+        let delivered = gate.take_ready(t_after + Duration::from_millis(360));
+        assert_eq!(delivered, Some(("Анна".to_owned(), "на связи".to_owned())));
+    }
+
+    #[test]
+    fn dialogs_sidebar_renders_search_at_top_and_all_chats_visible() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1100.0, 720.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::Panel::top("titlebar")
+                .exact_size(34.0)
+                .show(ui, |ui| app.titlebar(ui));
+            egui::Panel::left("dialogs")
+                .default_size(COLUMN_LEFT_NORMAL)
+                .show(ui, |ui| app.dialogs_ui(ui));
+            egui::CentralPanel::default().show(ui, |_ui| {});
+        });
+        out.textures_delta.clear();
+
+        let mut search_y: Option<f32> = None;
+        let mut chat_ys: Vec<(String, f32)> = Vec::new();
+        let mut visit = |shapes: &[egui::epaint::ClippedShape]| {
+            fn walk(shape: &egui::Shape, search_y: &mut Option<f32>, chat_ys: &mut Vec<(String, f32)>) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        let txt = t.galley.text();
+                        if txt.contains("Поиск") && search_y.is_none() {
+                            *search_y = Some(t.pos.y);
+                        }
+                        if txt.contains("Анна") || txt.contains("Команда") || txt.contains("Мама") {
+                            chat_ys.push((txt.to_owned(), t.pos.y));
+                        }
+                    }
+                    egui::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, search_y, chat_ys);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for cs in shapes {
+                walk(&cs.shape, &mut search_y, &mut chat_ys);
+            }
+        };
+        visit(&out.shapes);
+
+        let sy = search_y.expect("search bar text must render");
+        assert!(sy < 90.0, "search bar pushed down to y={sy}");
+        assert!(
+            chat_ys.len() >= 3,
+            "expected demo chats rendered above fold, got {chat_ys:?}"
+        );
+        for (name, y) in &chat_ys {
+            assert!(*y > 100.0 && *y < 700.0, "chat '{name}' offscreen at y={y}");
+        }
+    }
 }
