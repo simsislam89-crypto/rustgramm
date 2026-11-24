@@ -2042,4 +2042,126 @@ impl App {
             self.palette_open = false;
         }
     }
+
+    /// Модальное окно выбора эмодзи-статуса аккаунта и таймера действия (`account.updateEmojiStatus`).
+    pub(crate) fn emoji_status_window(&mut self, ctx: &egui::Context) {
+        if !self.emoji_status_open {
+            return;
+        }
+        if !self.default_emoji_statuses_req {
+            self.default_emoji_statuses_req = true;
+            self.send(Cmd::LoadDefaultEmojiStatuses);
+        }
+        if self.emoji_sets.is_empty() && !self.emoji_sets_requested {
+            self.emoji_sets_requested = true;
+            self.send(Cmd::EmojiSets);
+        }
+        let mut candidates: Vec<i64> = self.default_emoji_statuses.clone();
+        for set in self.emoji_sets.iter().take(6) {
+            if let Some(list) = self.sticker_lists.get(&set.id) {
+                for row in list.iter().take(24) {
+                    if !candidates.contains(&row.id) {
+                        candidates.push(row.id);
+                    }
+                }
+            }
+        }
+        let missing: Vec<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !self.sticker_tex.contains_key(id) && self.custom_emoji_req.insert(*id))
+            .take(48)
+            .collect();
+        if !missing.is_empty() {
+            self.send(Cmd::CustomEmojiDocs(missing));
+        }
+
+        let mut open = self.emoji_status_open;
+        let mut pick: Option<Option<i64>> = None;
+        egui::Window::new("Эмодзи-статус профиля")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(370.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Срок действия:").size(12.5).color(SUBTEXT));
+                ui.horizontal_wrapped(|ui| {
+                    for (lbl, secs) in [
+                        ("Навсегда", 0),
+                        ("1 час", 3600),
+                        ("2 часа", 7200),
+                        ("8 часов", 28800),
+                        ("1 день", 86400),
+                        ("7 дней", 604800),
+                    ] {
+                        let sel = self.emoji_status_ttl == secs;
+                        if ui.selectable_label(sel, lbl).clicked() {
+                            self.emoji_status_ttl = secs;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                if ui.button("Сбросить эмодзи-статус").clicked() {
+                    pick = Some(None);
+                }
+                ui.separator();
+                if candidates.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(16.0);
+                        ui.add(egui::Spinner::new().size(20.0).color(c_orange()));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Загрузка статусов…").color(SUBTEXT));
+                        ui.add_space(12.0);
+                    });
+                } else {
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::splat(6.0);
+                            for doc_id in &candidates {
+                                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(rect, CornerRadius::same(8), t(WINDOW_OVER));
+                                }
+                                if let Some(tex) = self.sticker_tex.get(doc_id) {
+                                    egui::Image::new(tex)
+                                        .fit_to_exact_size(Vec2::splat(26.0))
+                                        .paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(26.0)));
+                                } else {
+                                    ui.painter().text(
+                                        rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "✨",
+                                        FontId::proportional(18.0),
+                                        WHITE,
+                                    );
+                                }
+                                if resp
+                                    .on_hover_text(format!("ID {doc_id}"))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    pick = Some(Some(*doc_id));
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+        self.emoji_status_open = open;
+        if let Some(choice) = pick {
+            let until = match (choice, self.emoji_status_ttl) {
+                (Some(_), secs) if secs > 0 => Some((self.now + i64::from(secs)) as i32),
+                _ => None,
+            };
+            self.send(Cmd::SetEmojiStatus {
+                document_id: choice,
+                until,
+            });
+            self.emoji_status_open = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.emoji_status_open = false;
+        }
+    }
 }

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rg-net", "crates/rg-settings", "crates/rg-core", "crates/rg-ayu", "crates/rg-ui", "crates/rg-desktop", "crates/rg-android"]
 
 [workspace.package]
-version = "0.19.1"
+version = "0.20.0"
 edition = "2024"
 license = "GPL-3.0-only"
 publish = false
@@ -20,4 +20,4 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-opt-level = "s"
+opt-level = 3

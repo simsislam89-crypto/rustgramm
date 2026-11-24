@@ -135,6 +135,8 @@ static LIVE_PALETTE: std::sync::RwLock<LivePalette> = std::sync::RwLock::new(Liv
 
 static PALETTE_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static VISUAL_PALETTE_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PALETTE_CUSTOMIZED: AtomicBool = AtomicBool::new(false);
+static LOCAL_TZ: std::sync::OnceLock<jiff::tz::TimeZone> = std::sync::OnceLock::new();
 
 pub fn sync_custom_theme(s: &rg_settings::CustomThemeSettings) {
     let parse_or = |hex: &str, def: Color32| -> (Color32, bool) {
@@ -156,6 +158,7 @@ pub fn sync_custom_theme(s: &rg_settings::CustomThemeSettings) {
     let (text_secondary, c8) = parse_or(&s.text_secondary_hex, SUBTEXT);
     let (button_bg, c9) = parse_or(&s.button_bg_hex, BUTTON);
     let customized = c1 || c2 || c3 || c4 || c5 || c6 || c7 || c8 || c9;
+    PALETTE_CUSTOMIZED.store(customized, Ordering::Relaxed);
     if let Ok(mut g) = LIVE_PALETTE.write() {
         let next = LivePalette {
             accent,
@@ -187,6 +190,9 @@ pub fn sync_custom_theme(s: &rg_settings::CustomThemeSettings) {
 }
 
 fn resolve_theme_color(c: Color32) -> Color32 {
+    if !PALETTE_CUSTOMIZED.load(Ordering::Relaxed) {
+        return c;
+    }
     let p = palette();
     if !p.customized {
         return c;
@@ -215,6 +221,9 @@ fn resolve_theme_color(c: Color32) -> Color32 {
 }
 
 pub fn palette() -> LivePalette {
+    if !PALETTE_CUSTOMIZED.load(Ordering::Relaxed) {
+        return LivePalette::default();
+    }
     LIVE_PALETTE.read().map(|g| *g).unwrap_or_default()
 }
 
@@ -260,10 +269,18 @@ pub fn blur_on() -> bool {
 /// Процент непрозрачности по умолчанию (70% — мягкое матовое стекло на старте).
 pub const DEFAULT_OPACITY_PCT: u8 = 70;
 
-/// Задать непрозрачность фонов и кнопок в процентах (15..=100).
+/// Задать непрозрачность фонов и кнопок в процентах (15..=100). На Android всегда 100% без альфа-блендинга.
 pub fn set_opacity(pct: u8) {
-    let pct = pct.clamp(15, 100);
-    ALPHA.store((u16::from(pct) * 255 / 100) as u8, Ordering::Relaxed);
+    #[cfg(target_os = "android")]
+    {
+        let _ = pct;
+        ALPHA.store(255, Ordering::Relaxed);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let pct = pct.clamp(15, 100);
+        ALPHA.store((u16::from(pct) * 255 / 100) as u8, Ordering::Relaxed);
+    }
 }
 
 /// Текущая непрозрачность окна (0.15..=1.0).
@@ -393,52 +410,95 @@ pub fn paint_frosted_glass_panel(p: &egui::Painter, rect: Rect, radius: f32, raw
     paint_modal_subblur(p, rect, radius, raw);
 }
 
-/// Стильный QR-код в фирменном стиле Rustgramm (матовая стеклянная подложка, жидкие скруглённые
-/// модули, мягкие рамки поисковых узоров, градиентный акцент и эмблема в центре).
-pub fn draw_styled_qr(ui: &mut egui::Ui, url: &str, size: f32, accent: Color32, pop_k: f32) -> bool {
-    let Ok(code) = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M) else {
-        return false;
-    };
+/// Стильный QR-код в стиле Telegram: высокий уровень коррекции ошибок `EcLevel::H` (30%),
+/// чисто-белая тихая зона >= 4 модулей, высококонтрастные чёрные поисковые глаза и модули
+/// (100% сканирование камерой любого телефона), кэш растра `ColorImage`/`TextureHandle` для 0 лагов.
+pub fn render_qr_image(url: &str, badge_accent: Color32) -> Option<egui::ColorImage> {
+    let code = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::H).ok()?;
     let n = code.width();
     if n == 0 {
-        return false;
+        return None;
     }
-    let scale = 0.92 + 0.08 * ios_spring_bounce(pop_k);
-    let (outer, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let card = Rect::from_center_size(outer.center(), Vec2::splat(size * scale));
-    let p = ui.painter();
+    const IMG_SIDE: usize = 512;
+    let quiet_mods = 4usize;
+    let total_mods = n + quiet_mods * 2;
+    let mut pixels = vec![Color32::WHITE; IMG_SIDE * IMG_SIDE];
 
-    // Матовое мягкое свечение вокруг карточки QR.
-    p.rect_filled(
-        card.expand(5.0),
-        CornerRadius::same(26),
-        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (24.0 * pop_k) as u8),
-    );
-    // Контрастная светло-жемчужная стеклянная подложка — сканируется камерой с 0.1 секунды.
-    p.rect_filled(
-        card,
-        CornerRadius::same(22),
-        Color32::from_rgba_unmultiplied(248, 249, 252, (248.0 * pop_k.clamp(0.2, 1.0)) as u8),
-    );
-    p.rect_stroke(
-        card,
-        CornerRadius::same(22),
-        Stroke::new(1.5, Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 120)),
-        egui::StrokeKind::Inside,
-    );
-
-    let quiet = 16.0 * scale;
-    let inner = card.shrink(quiet);
-    let cell = inner.width() / n as f32;
-    let center_clear_r = (n as f32 * 0.145).max(3.2);
+    let cell = IMG_SIDE as f32 / total_mods as f32;
+    let origin = quiet_mods as f32 * cell;
     let mid = (n as f32 - 1.0) * 0.5;
+    let center_clear_r = (n as f32 * 0.145).max(3.2);
+    let badge_px_r = (center_clear_r * cell * 0.90).clamp(24.0, 44.0);
+    let center_px = IMG_SIDE as f32 * 0.5;
 
     let is_finder = |x: usize, y: usize| -> bool {
         (x < 7 && y < 7) || (x + 7 >= n && y < 7) || (x < 7 && y + 7 >= n)
     };
 
-    // Жидкие точки данных с лёгким градиентом к акцентному цвету по диагонали.
-    let dark_base = Color32::from_rgb(18, 20, 26);
+    let dark = Color32::from_rgb(10, 12, 16);
+    let pure_black = Color32::BLACK;
+
+    let fill_disk = |pixels: &mut [Color32], cx: f32, cy: f32, r: f32, col: Color32| {
+        let x0 = ((cx - r - 1.0).floor() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let x1 = ((cx + r + 1.0).ceil() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let y0 = ((cy - r - 1.0).floor() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let y1 = ((cy + r + 1.0).ceil() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let r2 = r * r;
+        for py in y0..=y1 {
+            let dy = py as f32 + 0.5 - cy;
+            for px in x0..=x1 {
+                let dx = px as f32 + 0.5 - cx;
+                if dx * dx + dy * dy <= r2 {
+                    pixels[py * IMG_SIDE + px] = col;
+                }
+            }
+        }
+    };
+
+    let fill_round_rect = |pixels: &mut [Color32], rx0: f32, ry0: f32, rx1: f32, ry1: f32, rad: f32, col: Color32| {
+        let x0 = (rx0.floor() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let x1 = (rx1.ceil() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let y0 = (ry0.floor() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let y1 = (ry1.ceil() as isize).clamp(0, IMG_SIDE as isize - 1) as usize;
+        let r = rad.max(0.0);
+        let r2 = r * r;
+        let ix0 = rx0 + r;
+        let ix1 = rx1 - r;
+        let iy0 = ry0 + r;
+        let iy1 = ry1 - r;
+        for py in y0..=y1 {
+            let fy = py as f32 + 0.5;
+            if fy < ry0 || fy > ry1 {
+                continue;
+            }
+            for px in x0..=x1 {
+                let fx = px as f32 + 0.5;
+                if fx < rx0 || fx > rx1 {
+                    continue;
+                }
+                let dx = if fx < ix0 {
+                    ix0 - fx
+                } else if fx > ix1 {
+                    fx - ix1
+                } else {
+                    0.0
+                };
+                let dy = if fy < iy0 {
+                    iy0 - fy
+                } else if fy > iy1 {
+                    fy - iy1
+                } else {
+                    0.0
+                };
+                if dx * dx + dy * dy <= r2 {
+                    pixels[py * IMG_SIDE + px] = col;
+                }
+            }
+        }
+    };
+
+    // Модули данных: контрастные тёмные округлые точки с перемычками (легко читаются любыми камерами).
+    let mod_r = (cell * 0.45).max(1.4);
     for y in 0..n {
         for x in 0..n {
             if is_finder(x, y) || code[(x, y)] != qrcode::Color::Dark {
@@ -449,65 +509,140 @@ pub fn draw_styled_qr(ui: &mut egui::Ui, url: &str, size: f32, accent: Color32, 
             if (dx * dx + dy * dy).sqrt() < center_clear_r {
                 continue;
             }
-            let diag = ((x + y) as f32 / (2.0 * n as f32)).clamp(0.0, 1.0);
-            let dot_col = lerp_color(dark_base, lerp_color(dark_base, accent, 0.28), diag);
-            let cx = inner.left() + (x as f32 + 0.5) * cell;
-            let cy = inner.top() + (y as f32 + 0.5) * cell;
-            let r = (cell * 0.44).max(1.2);
-            p.circle_filled(Pos2::new(cx, cy), r, dot_col);
-            // Мягкое слияние соседних тёмных точек для «жидкого» силуэта.
+            let cx = origin + (x as f32 + 0.5) * cell;
+            let cy = origin + (y as f32 + 0.5) * cell;
+            fill_disk(&mut pixels, cx, cy, mod_r, dark);
             if x + 1 < n && !is_finder(x + 1, y) && code[(x + 1, y)] == qrcode::Color::Dark {
                 let dx2 = (x + 1) as f32 - mid;
                 if (dx2 * dx2 + dy * dy).sqrt() >= center_clear_r {
-                    let bridge = Rect::from_center_size(
-                        Pos2::new(cx + cell * 0.5, cy),
-                        Vec2::new(cell * 0.6, r * 1.45),
+                    fill_round_rect(
+                        &mut pixels,
+                        cx,
+                        cy - mod_r * 0.84,
+                        cx + cell,
+                        cy + mod_r * 0.84,
+                        1.0,
+                        dark,
                     );
-                    p.rect_filled(bridge, CornerRadius::same(1), dot_col);
                 }
             }
             if y + 1 < n && !is_finder(x, y + 1) && code[(x, y + 1)] == qrcode::Color::Dark {
                 let dy2 = (y + 1) as f32 - mid;
                 if (dx * dx + dy2 * dy2).sqrt() >= center_clear_r {
-                    let bridge = Rect::from_center_size(
-                        Pos2::new(cx, cy + cell * 0.5),
-                        Vec2::new(r * 1.45, cell * 0.6),
+                    fill_round_rect(
+                        &mut pixels,
+                        cx - mod_r * 0.84,
+                        cy,
+                        cx + mod_r * 0.84,
+                        cy + cell,
+                        1.0,
+                        dark,
                     );
-                    p.rect_filled(bridge, CornerRadius::same(1), dot_col);
                 }
             }
         }
     }
 
-    // 3 скруглённых поисковых узора (finder eyes) с акцентным центром.
+    // 3 поисковых глаза (strict 7x7 / 5x5 white / 3x3 black — максимальная надёжность сканирования).
     for (fx, fy) in [(0usize, 0usize), (n - 7, 0), (0, n - 7)] {
-        let fr = Rect::from_min_size(
-            Pos2::new(inner.left() + fx as f32 * cell, inner.top() + fy as f32 * cell),
-            Vec2::splat(7.0 * cell),
+        let x0 = origin + fx as f32 * cell;
+        let y0 = origin + fy as f32 * cell;
+        fill_round_rect(&mut pixels, x0, y0, x0 + 7.0 * cell, y0 + 7.0 * cell, cell * 1.4, pure_black);
+        fill_round_rect(
+            &mut pixels,
+            x0 + cell,
+            y0 + cell,
+            x0 + 6.0 * cell,
+            y0 + 6.0 * cell,
+            cell * 0.9,
+            Color32::WHITE,
         );
-        let outer_cr = CornerRadius::same((cell * 2.1).clamp(4.0, 18.0) as u8);
-        let inner_cr = CornerRadius::same((cell * 1.2).clamp(2.0, 12.0) as u8);
-        p.rect_stroke(
-            fr.shrink(cell * 0.5),
-            outer_cr,
-            Stroke::new(cell * 1.02, dark_base),
-            egui::StrokeKind::Middle,
+        fill_round_rect(
+            &mut pixels,
+            x0 + 2.0 * cell,
+            y0 + 2.0 * cell,
+            x0 + 5.0 * cell,
+            y0 + 5.0 * cell,
+            cell * 0.65,
+            pure_black,
         );
-        p.rect_filled(fr.shrink(cell * 2.0), inner_cr, accent);
     }
 
-    // Центральный значок-медальон (бумажный самолётик Rustgramm).
-    let badge_r = (center_clear_r * cell * 0.92).clamp(16.0, 26.0);
-    p.circle_filled(inner.center(), badge_r + 2.5, Color32::from_rgb(248, 249, 252));
-    p.circle_filled(inner.center(), badge_r, accent);
+    // Белый ободок и центральный синий/акцентный кружок медальона.
+    fill_disk(&mut pixels, center_px, center_px, badge_px_r + 5.0, Color32::WHITE);
+    fill_disk(&mut pixels, center_px, center_px, badge_px_r, badge_accent);
+
+    Some(egui::ColorImage {
+        size: [IMG_SIDE, IMG_SIDE],
+        source_size: Vec2::new(IMG_SIDE as f32, IMG_SIDE as f32),
+        pixels,
+    })
+}
+
+/// Рисует стильный QR-код с кэшированием GPU-текстуры (1 текстура в кадр, без лагов и CPU-пересчёта).
+#[allow(deprecated)]
+pub fn draw_styled_qr(ui: &mut egui::Ui, url: &str, size: f32, accent: Color32, pop_k: f32) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    let cache_id = egui::Id::new("rg-qr-tex-cache-v2");
+    let badge_col = Color32::from_rgb(42, 171, 238);
+    let tex: Option<egui::TextureHandle> = ui.ctx().data(|d| {
+        d.get_temp::<(String, Color32, egui::TextureHandle)>(cache_id)
+            .filter(|(u, c, _)| u == url && *c == badge_col)
+            .map(|(_, _, t)| t)
+    });
+    let tex = match tex {
+        Some(t) => t,
+        None => {
+            let Some(img) = render_qr_image(url, badge_col) else {
+                return false;
+            };
+            let handle = ui.ctx().load_texture("rg-qr-code", img, egui::TextureOptions::LINEAR);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(cache_id, (url.to_owned(), badge_col, handle.clone())));
+            handle
+        }
+    };
+
+    let scale = 0.92 + 0.08 * ios_spring_bounce(pop_k);
+    let (outer, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let card = Rect::from_center_size(outer.center(), Vec2::splat(size * scale));
+    let p = ui.painter();
+
+    p.rect_filled(
+        card.expand(4.0),
+        CornerRadius::same(24),
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (26.0 * pop_k) as u8),
+    );
+    p.rect_filled(
+        card,
+        CornerRadius::same(20),
+        Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * pop_k.clamp(0.25, 1.0)) as u8),
+    );
+    let inner = card.shrink(6.0 * scale);
+    p.image(
+        tex.id(),
+        inner,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::from_white_alpha((255.0 * pop_k.clamp(0.25, 1.0)) as u8),
+    );
+    p.rect_stroke(
+        card,
+        CornerRadius::same(20),
+        Stroke::new(1.2, Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 110)),
+        egui::StrokeKind::Inside,
+    );
+
+    // Чёткий векторный бумажный самолётик поверх центрального медальона QR.
     let c = inner.center();
-    let s = badge_r * 0.52;
+    let s = (inner.width() * 0.044).clamp(7.0, 14.0);
     p.add(egui::Shape::convex_polygon(
         vec![
-            c + Vec2::new(-s * 1.05, 0.0),
-            c + Vec2::new(s * 0.95, -s * 0.78),
-            c + Vec2::new(s * 0.45, s * 0.9),
-            c + Vec2::new(-s * 0.12, s * 0.22),
+            c + Vec2::new(-s * 1.10, 0.1 * s),
+            c + Vec2::new(s * 0.96, -s * 0.80),
+            c + Vec2::new(s * 0.44, s * 0.92),
+            c + Vec2::new(-s * 0.14, s * 0.24),
         ],
         Color32::WHITE,
         Stroke::NONE,
@@ -571,6 +706,7 @@ pub fn paint_chat_backdrop(p: &egui::Painter, rect: Rect, style: u8) {
 }
 
 /// Расширенная отрисовка фона чата с поддержкой кастомной картинки обоев из `.tdesktop-theme` / `.attheme`.
+#[allow(deprecated)]
 pub fn paint_chat_backdrop_ex(
     p: &egui::Painter,
     rect: Rect,
@@ -614,22 +750,42 @@ pub fn paint_chat_backdrop_ex(
             }
         }
         2 => {
-            // Тонкая геометрическая сетка-ромбы в духе обоев Telegram.
-            let step = 44.0;
-            let c = Color32::from_white_alpha((12.0 * op) as u8);
-            let mut y = rect.top() + step * 0.5;
-            let mut row = 0usize;
-            while y < rect.bottom() {
-                let mut x = rect.left() + if row.is_multiple_of(2) { step * 0.5 } else { step };
-                while x < rect.right() {
-                    let pt = Pos2::new(x, y);
-                    p.circle_stroke(pt, 4.5, Stroke::new(1.0, c));
-                    p.circle_filled(pt + Vec2::new(step * 0.5, 0.0), 1.4, c);
-                    x += step;
+            // Оптимизированный геометрический узор в духе Telegram: одна повторяемая тайл-текстура вместо 1,600 фигур/кадр.
+            let tile_id = egui::Id::new("rg-bg-pattern-tile");
+            let tex: egui::TextureHandle = match p.ctx().data(|d| d.get_temp(tile_id)) {
+                Some(t) => t,
+                None => {
+                    const S: usize = 64;
+                    let mut px = vec![Color32::TRANSPARENT; S * S];
+                    let c = Color32::from_white_alpha(18);
+                    let ring = |px: &mut [Color32], cx: f32, cy: f32, r: f32| {
+                        for y in 0..S {
+                            for x in 0..S {
+                                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                                if (d - r).abs() <= 0.85 {
+                                    px[y * S + x] = c;
+                                }
+                            }
+                        }
+                    };
+                    ring(&mut px, 16.0, 16.0, 4.5);
+                    ring(&mut px, 48.0, 48.0, 4.5);
+                    px[16 * S + 48] = c;
+                    px[48 * S + 16] = c;
+                    let ci = egui::ColorImage { size: [S, S], source_size: Vec2::new(S as f32, S as f32), pixels: px };
+                    let t = p.ctx().load_texture("rg-bg-tile", ci, egui::TextureOptions::LINEAR_REPEAT);
+                    p.ctx().data_mut(|d| d.insert_temp(tile_id, t.clone()));
+                    t
                 }
-                y += step * 0.85;
-                row += 1;
-            }
+            };
+            let u = rect.width() / 64.0;
+            let v = rect.height() / 64.0;
+            p.image(
+                tex.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(u, v)),
+                Color32::from_white_alpha((255.0 * op) as u8),
+            );
         }
         _ => {}
     }
@@ -879,14 +1035,24 @@ fn install_fonts(ctx: &egui::Context) {
             .or_default()
             .push("segoe".into());
     }
-    // Фоллбэки Unicode/символов/эмодзи во ВСЕ три семейства — гарантирует отсутствие квадратов `[]`.
+    if cfg!(target_os = "android")
+        && let Ok(bytes) = std::fs::read("/system/fonts/Roboto-Regular.ttf")
+    {
+        fonts
+            .font_data
+            .insert("android-roboto".to_owned(), Arc::new(FontData::from_owned(bytes)));
+        for family in [
+            FontFamily::Proportional,
+            FontFamily::Name(FAM_DISPLAY.into()),
+        ] {
+            fonts.families.entry(family).or_default().insert(0, "android-roboto".to_owned());
+        }
+    }
+    // Фоллбэки Unicode/символов во ВСЕ три семейства — без 10-МБ NotoColorEmoji (эмодзи рисует атлас).
     let fallback_paths = [
         ("segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
-        ("segoe-emoji", "C:\\Windows\\Fonts\\seguiemj.ttf"),
-        ("arial-uni", "C:\\Windows\\Fonts\\arial.ttf"),
         ("noto-symbols2", "/system/fonts/NotoSansSymbols2-Regular.ttf"),
         ("noto-symbols", "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf"),
-        ("noto-emoji", "/system/fonts/NotoColorEmoji.ttf"),
         ("dejavu-sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     ];
     for (name, path) in fallback_paths {
@@ -967,9 +1133,8 @@ const MONTHS: [&str; 12] = [
 const WEEKDAYS: [&str; 7] = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
 
 fn zoned(ts: i64) -> Option<jiff::Zoned> {
-    jiff::Timestamp::from_second(ts)
-        .ok()
-        .map(|t| t.to_zoned(jiff::tz::TimeZone::system()))
+    let tz = LOCAL_TZ.get_or_init(jiff::tz::TimeZone::system).clone();
+    jiff::Timestamp::from_second(ts).ok().map(|t| t.to_zoned(tz))
 }
 
 /// «ЧЧ:ММ» по местному времени.
@@ -1124,5 +1289,16 @@ mod tests {
         assert!(ios_spring_bounce(0.5) > 0.9);
         assert!(spring_scale(1.0, 0.0) > 1.05);
         assert!(spring_scale(0.0, 1.0) < 1.0);
+    }
+
+    #[test]
+    fn render_qr_image_produces_crisp_512_code_with_white_quiet_zone() {
+        let img = render_qr_image("tg://login?token=test123", Color32::from_rgb(42, 171, 238))
+            .expect("qr image must render");
+        assert_eq!(img.size, [512, 512]);
+        assert_eq!(img.pixels[0], Color32::WHITE);
+        assert_eq!(img.pixels[512 * 511 + 511], Color32::WHITE);
+        let center_px = img.pixels[256 * 512 + 256];
+        assert_eq!(center_px, Color32::from_rgb(42, 171, 238));
     }
 }

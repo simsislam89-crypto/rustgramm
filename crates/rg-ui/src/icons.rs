@@ -14,18 +14,31 @@ const ATLAS_IDX: &str = include_str!("../assets/icons.idx");
 /// Стиль/пак иконок AyuGram: стандартный, жирный, минималистичный или пользовательский из папки.
 static ACTIVE_PACK: RwLock<Option<String>> = RwLock::new(None);
 static CUSTOM_PACK_DIR: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
+/// Быстрый атомарный индекс пака (`0 = default`, `1 = ayu_bold`, `2 = ayu_minimal`, `3 = custom`) — 0 локов в кадре.
+static PACK_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Устанавливает активный пак иконок (`default`, `ayu_bold`, `ayu_minimal`, или имя папки в `<RG_HOME>/icon_packs/`).
 pub fn set_icon_pack(pack: &str, packs_root: Option<&std::path::Path>) {
     let clean = pack.trim().to_owned();
+    let custom_dir = packs_root.and_then(|root| {
+        let p = root.join(&clean);
+        p.is_dir().then_some(p)
+    });
+    let kind = if custom_dir.is_some() {
+        3
+    } else {
+        match clean.as_str() {
+            "ayu_bold" => 1,
+            "ayu_minimal" => 2,
+            _ => 0,
+        }
+    };
+    PACK_KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut g) = ACTIVE_PACK.write() {
         *g = (!clean.is_empty() && clean != "default").then(|| clean.clone());
     }
     if let Ok(mut d) = CUSTOM_PACK_DIR.write() {
-        *d = packs_root.and_then(|root| {
-            let p = root.join(&clean);
-            p.is_dir().then_some(p)
-        });
+        *d = custom_dir;
     }
 }
 
@@ -102,10 +115,12 @@ pub fn tg(p: &Painter, name: &str, c: Pos2, color: Color32) {
 
 /// То же, но с заданным размером (масштаб картинки + поддержка паков иконок AyuGram).
 pub fn tg_sized(p: &Painter, name: &str, c: Pos2, size: Vec2, color: Color32) {
-    let pack = active_icon_pack();
-    if let Ok(guard) = CUSTOM_PACK_DIR.read()
+    let pack_kind = PACK_KIND.load(std::sync::atomic::Ordering::Relaxed);
+    if pack_kind == 3
+        && let Ok(guard) = CUSTOM_PACK_DIR.read()
         && let Some(dir) = guard.as_ref()
     {
+        let pack = active_icon_pack();
         let key = format!("rg-custom-ico:{pack}:{name}");
         #[allow(deprecated)]
         let icon_id = egui::Id::new(&key);
@@ -145,9 +160,9 @@ pub fn tg_sized(p: &Painter, name: &str, c: Pos2, size: Vec2, color: Color32) {
     let (Some(r), Some(a)) = (index().get(name), atlas(p.ctx())) else {
         return;
     };
-    let size = match pack.as_str() {
-        "ayu_bold" => size * 1.08,
-        "ayu_minimal" => size * 0.90,
+    let size = match pack_kind {
+        1 => size * 1.08,
+        2 => size * 0.90,
         _ => size,
     };
     let ppp = p.ctx().pixels_per_point();
@@ -158,7 +173,7 @@ pub fn tg_sized(p: &Painter, name: &str, c: Pos2, size: Vec2, color: Color32) {
         Pos2::new((r[0] + r[2]) / a.size[0], (r[1] + r[3]) / a.size[1]),
     );
     p.image(a.tex.id(), Rect::from_min_size(min, size), uv, color);
-    if pack == "ayu_bold" {
+    if pack_kind == 1 {
         p.image(a.tex.id(), Rect::from_min_size(min + Vec2::new(0.45, 0.0), size), uv, color.gamma_multiply(0.45));
     }
 }

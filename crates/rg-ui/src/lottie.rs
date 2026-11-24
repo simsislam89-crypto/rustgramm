@@ -818,15 +818,27 @@ fn stroke_contours(
     let sb = rgb[2] * alpha;
     let inv_a = 1.0 - alpha;
 
-    for y in y0..=y1 {
-        let py = y as f32 + 0.5;
-        for x in x0..=x1 {
-            let px = x as f32 + 0.5;
-            let mut hit = false;
-            for &(a, b) in &segs {
-                let vx = b[0] - a[0];
-                let vy = b[1] - a[1];
-                let len2 = vx * vx + vy * vy;
+    // Отмечаем только пиксели внутри bbox каждого сегмента (O(segs * seg_area) вместо O(W * H * segs)).
+    let box_w = x1 - x0 + 1;
+    let box_h = y1 - y0 + 1;
+    let mut mask = vec![0u8; box_w * box_h];
+    let pad_f = half_r + 1.0;
+    for &(a, b) in &segs {
+        let sx0 = ((a[0].min(b[0]) - pad_f).floor() as isize).clamp(x0 as isize, x1 as isize) as usize;
+        let sx1 = ((a[0].max(b[0]) + pad_f).ceil() as isize).clamp(x0 as isize, x1 as isize) as usize;
+        let sy0 = ((a[1].min(b[1]) - pad_f).floor() as isize).clamp(y0 as isize, y1 as isize) as usize;
+        let sy1 = ((a[1].max(b[1]) + pad_f).ceil() as isize).clamp(y0 as isize, y1 as isize) as usize;
+        let vx = b[0] - a[0];
+        let vy = b[1] - a[1];
+        let len2 = vx * vx + vy * vy;
+        for y in sy0..=sy1 {
+            let py = y as f32 + 0.5;
+            let row = (y - y0) * box_w;
+            for x in sx0..=sx1 {
+                if mask[row + (x - x0)] != 0 {
+                    continue;
+                }
+                let px = x as f32 + 0.5;
                 let t = if len2 < 1e-6 {
                     0.0
                 } else {
@@ -835,12 +847,17 @@ fn stroke_contours(
                 let dx = px - (a[0] + vx * t);
                 let dy = py - (a[1] + vy * t);
                 if dx * dx + dy * dy <= r2 {
-                    hit = true;
-                    break;
+                    mask[row + (x - x0)] = 1;
                 }
             }
-            if hit {
-                let off = (y * ss + x) * 4;
+        }
+    }
+    for dy_i in 0..box_h {
+        let y = y0 + dy_i;
+        let mrow = dy_i * box_w;
+        for dx_i in 0..box_w {
+            if mask[mrow + dx_i] != 0 {
+                let off = (y * ss + (x0 + dx_i)) * 4;
                 fb[off] = sr + fb[off] * inv_a;
                 fb[off + 1] = sg + fb[off + 1] * inv_a;
                 fb[off + 2] = sb + fb[off + 2] * inv_a;
@@ -1295,5 +1312,19 @@ mod tests {
         let anim = TgsAnim::from_bytes(json.as_bytes()).unwrap();
         let img = anim.render_frame(10.0, 32);
         assert!(img.pixels.iter().any(|p| p.a() > 100));
+    }
+
+    #[test]
+    fn stroke_contours_fast_bbox_renders_accurate_pixels() {
+        let mut rgba = vec![0.0_f32; 64 * 64 * 4];
+        let poly = vec![[8.0, 8.0], [56.0, 8.0], [56.0, 56.0], [8.0, 56.0]];
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            stroke_contours(&mut rgba, 64, &[(poly.clone(), true)], [1.0, 0.5, 0.1], 1.0, 3.0);
+        }
+        let elapsed = t0.elapsed();
+        let lit = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 0.5).count();
+        assert!(lit > 300 && lit < 1800, "unexpected stroke pixel count: {lit}");
+        assert!(elapsed.as_millis() < 250, "stroke_contours too slow: {elapsed:?}");
     }
 }

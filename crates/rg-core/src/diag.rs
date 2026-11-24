@@ -16,6 +16,9 @@ const RING_CAP: usize = 200;
 struct LoggerState {
     path: PathBuf,
     ring: VecDeque<String>,
+    writer: Option<std::io::BufWriter<fs::File>>,
+    bytes_written: u64,
+    pending_flush: u8,
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -42,14 +45,27 @@ pub fn init(home_dir: &Path) {
         let _ = fs::remove_file(&backup);
         let _ = fs::rename(&path, &backup);
     }
+    let init_bytes = fs::metadata(&path).map_or(0, |m| m.len());
+    let writer = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
+        .map(std::io::BufWriter::new);
     let state = STATE.get_or_init(|| {
         Mutex::new(LoggerState {
             path: path.clone(),
             ring: VecDeque::with_capacity(RING_CAP),
+            writer: None,
+            bytes_written: 0,
+            pending_flush: 0,
         })
     });
     if let Ok(mut g) = state.lock() {
         g.path = path;
+        g.writer = writer;
+        g.bytes_written = init_bytes;
+        g.pending_flush = 0;
     }
     info(
         "BOOT",
@@ -82,7 +98,16 @@ pub fn clear() {
         && let Ok(mut g) = st.lock()
     {
         g.ring.clear();
+        g.writer = None;
         let _ = fs::write(&g.path, b"");
+        g.bytes_written = 0;
+        g.pending_flush = 0;
+        g.writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&g.path)
+            .ok()
+            .map(std::io::BufWriter::new);
     }
 }
 
@@ -145,15 +170,37 @@ fn write_entry(level: &str, scope: &str, msg: &str) {
         g.ring.pop_front();
     }
     g.ring.push_back(line.clone());
-    if let Ok(meta) = fs::metadata(&g.path)
-        && meta.len() > MAX_LOG_BYTES
-    {
+    if g.bytes_written > MAX_LOG_BYTES {
+        g.writer = None;
         let backup = g.path.with_extension("log.1");
         let _ = fs::remove_file(&backup);
         let _ = fs::rename(&g.path, &backup);
+        g.bytes_written = 0;
     }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&g.path) {
-        let _ = writeln!(f, "{line}");
+    if g.writer.is_none() {
+        g.writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&g.path)
+            .ok()
+            .map(std::io::BufWriter::new);
+    }
+    let urgent = level != "INFO";
+    let should_flush = if let Some(w) = g.writer.as_mut() {
+        let _ = writeln!(w, "{line}");
+        true
+    } else {
+        false
+    };
+    if should_flush {
+        g.bytes_written += line.len() as u64 + 1;
+        g.pending_flush = g.pending_flush.saturating_add(1);
+        if (urgent || g.pending_flush >= 8)
+            && let Some(w) = g.writer.as_mut()
+        {
+            let _ = w.flush();
+            g.pending_flush = 0;
+        }
     }
 }
 

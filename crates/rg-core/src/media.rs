@@ -60,6 +60,9 @@ pub struct MediaInfo {
     /// Таймер самоуничтожения медиа, секунды (`Some(N)` — исчезающее медиа).
     #[serde(default)]
     pub ttl_seconds: Option<i32>,
+    /// Номер дата-центра Telegram, хранящего этот медиафайл (`DC1..DC5`).
+    #[serde(default)]
+    pub dc_id: Option<i32>,
 }
 
 impl MediaInfo {
@@ -75,6 +78,17 @@ impl MediaInfo {
             mime: String::new(),
             spoiler: false,
             ttl_seconds: None,
+            dc_id: None,
+        }
+    }
+
+    /// Человекопонятное расположение дата-центра Telegram по его идентификатору.
+    pub fn dc_location(dc_id: i32) -> &'static str {
+        match dc_id {
+            1 | 3 => "Miami",
+            2 | 4 => "Amsterdam",
+            5 => "Singapore",
+            _ => "Telegram DC",
         }
     }
 
@@ -147,6 +161,10 @@ pub fn ext_for_mime(mime: &str) -> &'static str {
     }
 }
 
+pub fn dc_location(dc_id: i32) -> &'static str {
+    MediaInfo::dc_location(dc_id)
+}
+
 pub fn describe(media: &Media) -> MediaInfo {
     use grammers_client::tl;
     match media {
@@ -154,6 +172,9 @@ pub fn describe(media: &Media) -> MediaInfo {
             let mut info = MediaInfo::basic(MediaKind::Photo, "Фото", p.size().map_or(0, |s| s as u64));
             info.spoiler = p.raw.spoiler;
             info.ttl_seconds = p.raw.ttl_seconds;
+            if let Some(tl::enums::Photo::Photo(ph)) = &p.raw.photo {
+                info.dc_id = Some(ph.dc_id);
+            }
             info
         }
         Media::Sticker(s) => {
@@ -167,13 +188,17 @@ pub fn describe(media: &Media) -> MediaInfo {
             );
             info.has_thumb = !s.document.thumbs().is_empty();
             info.mime = mime;
+            if let Some(tl::enums::Document::Document(doc)) = &s.document.raw.document {
+                info.dc_id = Some(doc.dc_id);
+            }
             info
         }
         Media::Document(d) => {
             let mime = d.mime_type().unwrap_or_default().to_owned();
             let (mut video, mut round, mut animated, mut audio, mut voice) = (false, false, false, false, false);
-            let (mut duration, mut dims, mut waveform) = (0u32, (0, 0), Vec::new());
+            let (mut duration, mut dims, mut waveform, mut doc_dc) = (0u32, (0, 0), Vec::new(), None);
             if let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
+                doc_dc = Some(doc.dc_id);
                 for a in &doc.attributes {
                     match a {
                         tl::enums::DocumentAttribute::Video(v) => {
@@ -230,6 +255,7 @@ pub fn describe(media: &Media) -> MediaInfo {
             info.mime = mime;
             info.spoiler = d.raw.spoiler;
             info.ttl_seconds = d.raw.ttl_seconds;
+            info.dc_id = doc_dc;
             info
         }
         Media::Contact(c) => other(&format!(
@@ -515,5 +541,15 @@ mod tests {
             0,
         );
         assert!(!poll.is_downloadable());
+    }
+
+    #[test]
+    fn dc_location_maps_known_dcs() {
+        assert_eq!(dc_location(1), "Miami");
+        assert_eq!(dc_location(2), "Amsterdam");
+        assert_eq!(dc_location(3), "Miami");
+        assert_eq!(dc_location(4), "Amsterdam");
+        assert_eq!(dc_location(5), "Singapore");
+        assert_eq!(dc_location(99), "Telegram DC");
     }
 }

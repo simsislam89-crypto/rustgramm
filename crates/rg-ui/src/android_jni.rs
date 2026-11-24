@@ -427,6 +427,68 @@ mod imp {
         })
     }
 
+    pub fn show_soft_input() {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let _ = env.call_static_method(
+                cls,
+                "showSoftInput",
+                "(Landroid/app/Activity;)V",
+                &[JValue::Object(act)],
+            );
+            Some(())
+        });
+    }
+
+    pub fn prompt_text_input(tag: &str, title: &str, hint: &str, initial: &str, kind: i32) {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let jtag = env.new_string(tag).ok()?;
+            let jtitle = env.new_string(title).ok()?;
+            let jhint = env.new_string(hint).ok()?;
+            let jinit = env.new_string(initial).ok()?;
+            let _ = env.call_static_method(
+                cls,
+                "promptTextInput",
+                "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",
+                &[
+                    JValue::Object(act),
+                    JValue::Object(&jtag),
+                    JValue::Object(&jtitle),
+                    JValue::Object(&jhint),
+                    JValue::Object(&jinit),
+                    JValue::Int(kind),
+                ],
+            );
+            Some(())
+        });
+    }
+
+    pub fn poll_text_input() -> Option<(String, String)> {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let tag_obj = env
+                .call_static_method(&cls, "pollInputTag", "()Ljava/lang/String;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            if tag_obj.is_null() {
+                return None;
+            }
+            let tag: String = env.get_string(&JString::from(tag_obj)).ok()?.into();
+            let val_obj = env
+                .call_static_method(&cls, "pollInputResult", "()Ljava/lang/String;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            if tag.is_empty() || val_obj.is_null() {
+                return Some((String::new(), String::new()));
+            }
+            let val: String = env.get_string(&JString::from(val_obj)).ok()?.into();
+            Some((tag, val))
+        })
+    }
+
     pub fn shutdown_all() {
         stop_audio();
         close_webview();
@@ -634,6 +696,11 @@ mod imp {
     pub fn open_webview(_url: &str, _title: &str, _spoof_android: bool) {}
     pub fn close_webview() {}
     pub fn poll_pending_link() -> Option<String> {
+        None
+    }
+    pub fn show_soft_input() {}
+    pub fn prompt_text_input(_tag: &str, _title: &str, _hint: &str, _initial: &str, _kind: i32) {}
+    pub fn poll_text_input() -> Option<(String, String)> {
         None
     }
     pub fn shutdown_all() {}

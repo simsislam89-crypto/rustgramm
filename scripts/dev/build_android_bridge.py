@@ -16,24 +16,36 @@ OUT_DEX = ROOT / "crates" / "rg-ui" / "assets" / "rg_bridge.dex"
 JAVA_SRC = r"""package app.rustgramm;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.Fragment;
 import android.app.FragmentManager;
+import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
+import android.text.InputType;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.File;
@@ -44,8 +56,147 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class RgBridge {
     public static final AtomicReference<String> PICKED_PATH = new AtomicReference<>(null);
     public static final AtomicReference<String> PENDING_LINK = new AtomicReference<>(null);
+    public static final AtomicReference<String> INPUT_TAG = new AtomicReference<>(null);
+    public static final AtomicReference<String> INPUT_RESULT = new AtomicReference<>(null);
     private static volatile Dialog activeWebDialog = null;
+    private static volatile AlertDialog activeInputDialog = null;
     private static volatile String pendingDestDir = null;
+
+    public static void showSoftInput(final Activity act) {
+        if (act == null) return;
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    View decor = act.getWindow() != null ? act.getWindow().getDecorView() : null;
+                    if (decor == null) return;
+                    decor.requestFocus();
+                    if (Build.VERSION.SDK_INT >= 30 && decor.getWindowInsetsController() != null) {
+                        decor.getWindowInsetsController().show(WindowInsets.Type.ime());
+                    }
+                    InputMethodManager imm = (InputMethodManager) act.getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.showSoftInput(decor, InputMethodManager.SHOW_FORCED);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    public static void promptTextInput(
+        final Activity act,
+        final String tag,
+        final String title,
+        final String hint,
+        final String initial,
+        final int inputTypeKind
+    ) {
+        if (act == null) return;
+        INPUT_TAG.set(null);
+        INPUT_RESULT.set(null);
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (activeInputDialog != null && activeInputDialog.isShowing()) {
+                        activeInputDialog.dismiss();
+                    }
+                    final EditText et = new EditText(act);
+                    et.setHint(hint != null ? hint : "");
+                    et.setText(initial != null ? initial : "");
+                    et.setTextColor(Color.WHITE);
+                    et.setHintTextColor(Color.parseColor("#8E8E98"));
+                    et.setBackgroundColor(Color.parseColor("#22232A"));
+                    et.setPadding(28, 24, 28, 24);
+                    et.setSingleLine(true);
+                    int itype = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+                    if (inputTypeKind == 1) {
+                        itype = InputType.TYPE_CLASS_PHONE;
+                    } else if (inputTypeKind == 2) {
+                        itype = InputType.TYPE_CLASS_NUMBER;
+                    } else if (inputTypeKind == 3) {
+                        itype = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD;
+                    }
+                    et.setInputType(itype);
+                    if (et.getText() != null) {
+                        et.setSelection(et.getText().length());
+                    }
+                    et.setImeOptions(EditorInfo.IME_ACTION_DONE);
+
+                    LinearLayout box = new LinearLayout(act);
+                    box.setOrientation(LinearLayout.VERTICAL);
+                    box.setPadding(40, 20, 40, 8);
+                    box.setBackgroundColor(Color.parseColor("#18191E"));
+                    box.addView(et, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                    final AlertDialog dlg = new AlertDialog.Builder(act, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle(title != null ? title : "")
+                        .setView(box)
+                        .setPositiveButton("Готово", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface d, int which) {
+                                INPUT_TAG.set(tag != null ? tag : "");
+                                INPUT_RESULT.set(et.getText() != null ? et.getText().toString() : "");
+                            }
+                        })
+                        .setNegativeButton("Отмена", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface d, int which) {
+                                INPUT_TAG.set("");
+                                INPUT_RESULT.set(null);
+                            }
+                        })
+                        .setOnCancelListener(new DialogInterface.OnCancelListener() {
+                            @Override
+                            public void onCancel(DialogInterface d) {
+                                INPUT_TAG.set("");
+                                INPUT_RESULT.set(null);
+                            }
+                        })
+                        .create();
+
+                    et.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+                        @Override
+                        public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                            if (actionId == EditorInfo.IME_ACTION_DONE || actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_SEND) {
+                                INPUT_TAG.set(tag != null ? tag : "");
+                                INPUT_RESULT.set(et.getText() != null ? et.getText().toString() : "");
+                                dlg.dismiss();
+                                return true;
+                            }
+                            return false;
+                        }
+                    });
+                    Window w = dlg.getWindow();
+                    if (w != null) {
+                        w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+                    }
+                    activeInputDialog = dlg;
+                    dlg.show();
+                    et.requestFocus();
+                    et.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                InputMethodManager imm = (InputMethodManager) act.getSystemService(Context.INPUT_METHOD_SERVICE);
+                                if (imm != null) {
+                                    imm.showSoftInput(et, InputMethodManager.SHOW_IMPLICIT);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }, 80);
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    public static String pollInputTag() {
+        return INPUT_TAG.getAndSet(null);
+    }
+
+    public static String pollInputResult() {
+        return INPUT_RESULT.getAndSet(null);
+    }
 
     public static void pickFile(final Activity act, final String mime, final String destDir) {
         if (act == null) return;

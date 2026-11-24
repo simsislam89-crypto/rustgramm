@@ -263,7 +263,7 @@ impl Default for PrivacyShieldSettings {
     fn default() -> Self {
         Self {
             block_activity_telemetry: true,
-            traffic_jitter_ms: 85,
+            traffic_jitter_ms: 0,
             ephemeral_local_cache: false,
             anonymize_filenames: true,
             anti_correlation_accounts: true,

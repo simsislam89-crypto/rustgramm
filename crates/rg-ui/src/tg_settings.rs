@@ -187,6 +187,8 @@ struct Actions {
     update_color: Option<(bool, Option<i32>)>,
     open_logs_dir: bool,
     copy_logs: bool,
+    set_default_reaction: Option<String>,
+    request_available_reactions: bool,
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -402,6 +404,7 @@ impl App {
         let has_emoji = self.emoji.is_some();
         let now = self.now;
         let mut plugins_reg = self.plugins.clone();
+        let avail_reacts = self.available_reactions.clone();
 
         // Боковые кнопки мыши (Назад Extra1 / Вперёд Extra2) внутри окна настроек.
         let mouse_back = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
@@ -545,7 +548,7 @@ impl App {
                                     pg::POWER => power_page(ui, &mut s),
                                     pg::RUSTGRAMM => rustgramm_page(ui, &mut s, &mut act, has_emoji),
                                     pg::PLUGINS => plugins_page(ui, &mut st, &mut s, &mut plugins_reg),
-                                    pg::EXTERA => extera_page(ui, &mut s),
+                                    pg::EXTERA => extera_page(ui, &mut s, &avail_reacts, &mut act),
                                     _ => {
                                         if let Some(p) = main_page(ui, &mut st, &mut s, &me_name, me_tex, corners, streamer, &mut act) {
                                             st.page_back.push(page);
@@ -692,6 +695,13 @@ impl App {
                 self.replies_accent_color = col_id;
             }
             self.send(Cmd::UpdateProfileColor(for_prof, col_id));
+        }
+        if let Some(emoji) = act.set_default_reaction {
+            self.send(Cmd::SetDefaultReaction(emoji));
+        }
+        if act.request_available_reactions && !self.available_reactions_req {
+            self.available_reactions_req = true;
+            self.send(Cmd::LoadAvailableReactions);
         }
         if act.open_logs_dir {
             let dir = worker::home().join("logs");
@@ -2200,7 +2210,28 @@ fn plugins_page(
     toggle(ui, "Архив по свайпу вниз", &mut s.extera.archive_on_pull);
 }
 
-fn extera_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
+fn double_tap_label(v: i32, def_react: &str) -> String {
+    match v {
+        1 => format!("Реакция {def_react}"),
+        2 => "Ответить".to_owned(),
+        3 => "Копировать".to_owned(),
+        4 => "Переслать".to_owned(),
+        5 => "Изменить".to_owned(),
+        6 => "Сохранить".to_owned(),
+        7 => "Перевести".to_owned(),
+        _ => "Выкл.".to_owned(),
+    }
+}
+
+fn extera_page(
+    ui: &mut egui::Ui,
+    s: &mut rg_settings::Settings,
+    avail_reacts: &[rg_core::engine::AvailableReactionRow],
+    act: &mut Actions,
+) {
+    if avail_reacts.is_empty() {
+        act.request_available_reactions = true;
+    }
     let e = &mut s.extera;
     section(ui, "Внешний вид exteraGram");
     toggle(ui, "Центрировать заголовок в шапке чата", &mut e.center_title);
@@ -2211,17 +2242,39 @@ fn extera_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {
     toggle(ui, "Размытие панелей (Force Blur)", &mut e.force_blur);
     divider(ui);
     section(ui, "Чаты и жесты");
-    let dbl_lbl = match e.double_tap_action {
-        1 => "Реакция 👍",
-        2 => "Ответить",
-        3 => "Копировать",
-        4 => "Переслать",
-        5 => "Изменить",
-        _ => "Выкл.",
-    };
-    if value_row(ui, "Двойной клик по сообщению", dbl_lbl, false) {
-        e.double_tap_action = (e.double_tap_action + 1) % 6;
+    let def_r = if e.default_reaction.is_empty() { "👍" } else { e.default_reaction.as_str() }.to_owned();
+    if value_row(ui, "Двойной клик (входящие)", &double_tap_label(e.double_tap_action, &def_r), false) {
+        e.double_tap_action = (e.double_tap_action + 1) % 8;
     }
+    if value_row(ui, "Двойной клик (свои)", &double_tap_label(e.double_tap_action_out_owner, &def_r), false) {
+        e.double_tap_action_out_owner = (e.double_tap_action_out_owner + 1) % 8;
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Быстрая реакция по умолчанию:").size(13.0).color(SUBTEXT));
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(6.0);
+        let mut choices: Vec<String> = vec!["👍", "❤", "🔥", "🎉", "🤩", "😢", "🙏", "🤯"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for r in avail_reacts.iter().filter(|x| !x.premium).take(24) {
+            if !choices.iter().any(|c| c == &r.emoji) {
+                choices.push(r.emoji.clone());
+            }
+        }
+        for em in choices {
+            let sel = e.default_reaction == em;
+            let btn = egui::Button::new(RichText::new(&em).size(15.0).color(if sel { Color32::WHITE } else { WHITE }))
+                .fill(if sel { t_btn(ORANGE) } else { t(BUTTON) })
+                .corner_radius(CornerRadius::same(8));
+            if ui.add(btn).clicked() {
+                e.default_reaction = em.clone();
+                act.set_default_reaction = Some(em);
+            }
+        }
+    });
+    ui.add_space(6.0);
     toggle(ui, "Скрывать всплывающие панели при прокрутке", &mut e.hide_keyboard_on_scroll);
     toggle(ui, "Скрывать кнопку пересылки справа от постов", &mut e.hide_share_button);
     toggle(ui, "Пауза при сворачивании", &mut e.pause_on_minimize);
@@ -2284,6 +2337,7 @@ impl App {
         let mut show_qr = false;
         let mut open_stars = false;
         let mut open_biz = false;
+        let mut open_emoji_status = false;
         let mut play_track: Option<rg_core::engine::AudioTrack> = None;
         let mut toggle_audio = false;
 
@@ -2439,7 +2493,27 @@ impl App {
                             field_row(ui, &me_info.birthday, "День рождения", WHITE, false);
                         }
                         if me_info.id != 0 {
-                            field_row(ui, &mask_streamer(&me_info.id.to_string(), streamer), "DC · ID аккаунта", ORANGE, false);
+                            let id_dc = match me_info.dc_id {
+                                Some(dc) => format!("{} · DC{} ({})", me_info.id, dc, rg_core::media::dc_location(dc)),
+                                None => me_info.id.to_string(),
+                            };
+                            field_row(ui, &mask_streamer(&id_dc, streamer), "DC · ID аккаунта", ORANGE, false);
+                        }
+                        if self.settings.extera.change_status {
+                            let (es_r, es_resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
+                            if es_resp.hovered() {
+                                ui.painter().rect_filled(es_r, 0.0, t(WINDOW_OVER));
+                            }
+                            ui.painter().text(
+                                Pos2::new(es_r.left() + 18.0, es_r.center().y),
+                                Align2::LEFT_CENTER,
+                                "✨ Выбрать эмодзи-статус",
+                                FontId::proportional(13.5),
+                                ORANGE,
+                            );
+                            if es_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                open_emoji_status = true;
+                            }
                         }
 
                         divider(ui);
@@ -2472,7 +2546,10 @@ impl App {
         if toggle_audio {
             self.toggle_audio_playback();
         }
-        if open_stars {
+        if open_emoji_status {
+            self.tgs.profile_open = false;
+            self.emoji_status_open = true;
+        } else if open_stars {
             self.tgs.profile_open = false;
             self.stars_modal_open = true;
             self.send(Cmd::LoadStarsStatus);

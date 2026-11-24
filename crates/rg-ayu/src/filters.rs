@@ -4,10 +4,10 @@
 use regex::{Regex, RegexBuilder};
 pub use rg_settings::Filter;
 
-/// Список правил в виде, готовом для проверки (регулярные выражения собраны один раз).
+/// Список правил в виде, готовом для проверки (регулярные выражения и нижний регистр собраны один раз).
 #[derive(Debug, Default)]
 pub struct FilterSet {
-    rules: Vec<(Filter, Option<Regex>)>,
+    rules: Vec<(Filter, Option<Regex>, String)>,
 }
 
 impl FilterSet {
@@ -22,11 +22,12 @@ impl FilterSet {
                     .size_limit(1 << 20)
                     .build()
                 {
-                    Ok(r) => rules.push((f.clone(), Some(r))),
+                    Ok(r) => rules.push((f.clone(), Some(r), String::new())),
                     Err(e) => bad.push(format!("{}: {e}", f.text)),
                 }
             } else {
-                rules.push((f.clone(), None));
+                let lower = if f.case_sensitive { String::new() } else { f.text.to_lowercase() };
+                rules.push((f.clone(), None, lower));
             }
         }
         (Self { rules }, bad)
@@ -38,7 +39,8 @@ impl FilterSet {
 
     /// Нужно ли скрыть сообщение с таким текстом в этом чате.
     pub fn hides(&self, chat: i64, text: &str) -> bool {
-        self.rules.iter().any(|(f, re)| {
+        let mut text_lower: Option<String> = None;
+        self.rules.iter().any(|(f, re, lower)| {
             if let Some(target_dialog) = f.dialog_id
                 && target_dialog != chat
             {
@@ -50,7 +52,10 @@ impl FilterSet {
             match re {
                 Some(r) => r.is_match(text),
                 None if f.case_sensitive => text.contains(&f.text),
-                None => text.to_lowercase().contains(&f.text.to_lowercase()),
+                None => {
+                    let hay = text_lower.get_or_insert_with(|| text.to_lowercase());
+                    hay.contains(lower.as_str())
+                }
             }
         })
     }
@@ -212,5 +217,37 @@ mod tests {
         assert_eq!(parsed[0].dialog_id, Some(5));
         assert_eq!(parsed[0].excluded_chats, vec![9]);
         assert!(import_filters_json("not-json").is_err());
+    }
+
+    #[test]
+    fn filterset_hides_10k_messages_fast_and_equivalent() {
+        let mut r1 = f("КАЗИНО", false);
+        r1.case_sensitive = false;
+        let mut r2 = f(r"\bpromo\d+\b", true);
+        r2.excluded_chats = vec![42];
+        let (set, bad) = FilterSet::build(&[r1, r2]);
+        assert!(bad.is_empty());
+
+        let t0 = std::time::Instant::now();
+        let mut hidden = 0usize;
+        for i in 0..10_000 {
+            let chat = if i % 17 == 0 { 42 } else { 7 };
+            let txt = match i % 5 {
+                0 => "Обычное сообщение в чате без запрещённых слов",
+                1 => "Скидка КАЗИНО только сегодня",
+                2 => "Используй promo123 прямо сейчас",
+                3 => "Просто текст для замера скорости фильтра",
+                _ => "Техническая заметка по проекту Rust",
+            };
+            if set.hides(chat, txt) {
+                hidden += 1;
+            }
+        }
+        let elapsed = t0.elapsed();
+        assert!(hidden > 3_000 && hidden < 4_200, "hidden={hidden}");
+        assert!(
+            elapsed.as_millis() < 150,
+            "FilterSet 10k scan took too long: {elapsed:?}"
+        );
     }
 }

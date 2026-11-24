@@ -991,3 +991,37 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --target aarch64-linux-android` (Full и Lite, NDK 27) — **OK**.
 - `cargo test --workspace` — **2137 пройдено, 0 провалено** (включая `no_foreign_hosts`, `notify_gate`, `notify_mute`, регресс-тест левой панели).
 - `dist/Rustgramm.exe` — **14 114 304 байта**, smoke `RG_DEMO=1` и `RG_DEMO=qr` — **OK**.
+
+## Этап 32 (2026-11-24, v0.20.0)
+
+### Вход с телефона/Android, экран входа 1-в-1 Telegram, crisp QR, ускорение (`fast-anything`) и 5 новых функций Telegram
+
+1. **Авторизация по номеру телефона и нативный ввод на Android (`crates/rg-core/src/auth.rs`, `qr.rs`, `worker.rs`, `android_jni.rs`, `scripts/dev/build_android_bridge.py`, `rg_bridge.dex`)**:
+   - Прямой вызов `tl::functions::auth::SendCode` (`invoke_send_code_with_migrate`) с переключением DC на 303 `PHONE_MIGRATE`/`USER_MIGRATE`, повтором при `AUTH_RESTART`, корректной обработкой `SentCode::PaymentRequired` (вместо `unimplemented!()` в `grammers-client 0.12`) и подсказками канала доставки кода (`Ev::CodeDeliveryHint`).
+   - Исправлены циклы подключения и QR-опроса в `worker.rs`: 14с таймаут `connect_with_updates`, очистка флага занятости и сохранение `pending_auth_cmd` (запрос кода / QR не теряется на переподключении), 10с таймаут + backoff на `qr::poll`, быстрый старт Android при `main.session <= 2048` байт, обработка `AUTH_TOKEN_EXPIRED` и очистка сессии при снятой галочке «Оставаться в системе».
+   - Решена корневая проблема отсутствия ввода текста на `NativeActivity` (`winit`/`android-activity` без `InputConnection`): в `RgBridge` (`rg_bridge.dex`, 15 960 байт) добавлен `promptTextInput` (системный `AlertDialog` + `EditText` для телефона/кода/пароля/чата) и убран холостой ежекадровый опрос JNI.
+
+2. **Экран входа в стиле Telegram и быстрый читаемый QR-код (`theme.rs`, `countries.rs`, `lib.rs`)**:
+   - Переработан экран входа под эталонный скриншот Telegram: круглый логотип Telegram с многогранным бумажным самолётиком и анимацией входа/ожидания (`paint_telegram_login_logo`), поля с плавающим заголовком «Страна» (выпадающий список и автоопределение по коду) и «Номер телефона» (`+7`) с активной фиолетовой рамкой `#8774E1`, чекбокс «Оставаться в системе», полноширинная кнопка и «ВХОД ПО QR-КОДУ»; добавлен режим `RG_DEMO=login`.
+   - Crisp QR-код 512×512 (`render_qr_image`, коррекция `EcLevel::H`, белая тихая зона >= 4 модулей, чёткие чёрные eyes и центральный медальон `#2AABEE`) с кэшированием GPU-текстуры (`rg-qr-tex-cache-v2`) без покадрового пересчёта на CPU.
+
+3. **Ускорение проекта по методологии `fast-anything` (профилирование горячих путей → оптимизация → проверка эквивалентности и скорости)**:
+   - Примечание: внешний CLI `fast-anything` в системе не установлен и предназначен для портирования горячих функций Python/JS/Java на Rust; к кодовой базе Rustgramm напрямую применена его методология по всем 7 крейтам.
+   - Сборка и настройки: `opt-level = 3` в `Cargo.toml`, `PrivacyShieldSettings::traffic_jitter_ms = 0` по умолчанию в `rg-settings`.
+   - `rg-ayu`: прекомпиляция подстрок в `FilterSet::build` (одноразовый `to_lowercase()` в `hides()` вместо пересоздания на каждый фильтр), SQLite-прагмы (`synchronous=NORMAL`, `busy_timeout=5000`, `temp_store=MEMORY`, `cache_size=-8000`), 4 индекса для `messages` и `secret_messages`, пакетные транзакции `mark_deleted` и устранение N+1 в `audit_peer`.
+   - `rg-core` и `worker.rs`: буферизованные `BufWriter` для логов (`diag.rs`) и медиапотока (64 КБ), троттлинг `prune_cache` раз в 40 записей на `spawn_blocking`, пакетный `cached_media_batch`, вынос команд (`EmojiSets`, `FeaturedEmoji`, `InstallSet`, `Send*`, `Edit`, `Delete`, `Pin`, `React`, запись настроек) в `tokio::spawn`/`spawn_blocking`, троттлинг `Ev::Progress` до 80 мс, кэш `home()` в `OnceLock`.
+   - `rg-ui`: кэш `LOCAL_TZ` (`OnceLock`), `AtomicU8 PACK_KIND`, 64×64 repeat-тайл узора вместо 1 600 кругов/кадр, убраны отсутствующие системные шрифты, bbox-маска в `lottie::stroke_contours`, непрозрачный `clear_color` на Android, бюджет 6 GPU-текстур и 2 TGS-растеризаций/кадр только для видимых стикеров, одинарный `Galley` layout в `dialogs_ui` и `bubble`, кэши вкладок/архива/трея, `ScrollArea::show_rows` виртуализация и `ui.add_space` для скрытых пузырей.
+
+4. **5 новых функций Telegram / exteraGram без чужих серверов (`rg-core`, `rg-settings`, `rg-ui`)**:
+   - **Перевод черновика перед отправкой** (`translateBeforeSend` через `messages.translateText`): кнопка языка у поля ввода с выбором `target_language` и действиями «Перевести в поле» / «Перевести и отправить».
+   - **Инлайн-боты (`@bot запрос`)**: `parse_inline_bot_input` с 320-мс дебаунсом, кэш `contacts.resolveUsername` (`inline_bots_cache`), `messages.getInlineBotResults` + пагинация «Ещё» + `messages.sendInlineBotResult` + `SwitchInline`.
+   - **Раздельный двойной клик (входящие / свои, 8 действий) + быстрая реакция по умолчанию**: `ExteraSettings::default_reaction` (`👍`), раздельные селекторы в Настройках → exteraGram и чипы доступных реакций (`messages.getAvailableReactions` + `messages.setDefaultReaction`).
+   - **Выбор эмодзи-статуса аккаунта и таймера**: модальное окно (`emoji_status_window`) из левого меню и «Мой профиль», загрузка стандартных и пользовательских эмодзи-статусов (`account.getDefaultEmojiStatuses`), установка на срок (`account.updateEmojiStatus`).
+   - **Полные сведения о сообщении (3 вкладки + DC) и копирование фото в буфер**: кликабельные метаданные и `DC` (`dc_location`) для медиа и профиля, списки «Прочитали» (`messages.getMessageReadParticipants`) и «Реакции» (`messages.getMessageReactionsList`), `Act::CopyPhoto` через `arboard` в контекстном меню и просмотрщике (с корректным статусом на Android).
+
+### Проверки (v0.20.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и Lite — **0 ошибок, 0 предупреждений**.
+- `cargo check -p rg-android --target aarch64-linux-android` (`--features plugins` и `--no-default-features`, NDK 27) — **0 ошибок**.
+- `cargo test --workspace` — **2 149 тестов пройдено, 0 провалено** (`rg-ayu`: 27+370+320, `rg-core`: 45+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 66+631; включая рендер-тесты нового экрана входа на 1200×760 и 380×780 и QR, бенчмарк `FilterSet` на 10k сообщений, `sqlite_indexes_present`, `stroke_contours` и `dc_location`).
+- `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.20.0`) собран (**19 885 056 байт**, release 4m 34s); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` — **OK** (`ALIVE_OK`).

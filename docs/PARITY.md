@@ -90,6 +90,18 @@
 | Музыка в профиле (`saved_music` / `users.getSavedMusic`) и встроенный аудиоплеер (M4A/MP3/OGG/Opus/FLAC) с потоковым стартом после первых 128 КБ и фоновой предзагрузкой | ✅ этап 23 / 24 (`download_track_streaming`, `StreamAudio`, `AudioView::new_url`) |
 | Создание каналов и групп с добавлением любых людей (`@username` / контакты) и публичной ссылкой, полноценные профили (действия, музыка, медиа, файлы, ссылки, участники) | ✅ этап 21 / 23 |
 
+## Новые функции этапа 32 (v0.20.0)
+
+| Функция | Статус | Где |
+|---|---|---|
+| Вход по номеру телефона и Android-клавиатура + редизайн экрана входа и crisp QR 512 px | ✅ прямая обработка `auth.sendCode` (303 migrate, `AUTH_RESTART`, `SentCode::PaymentRequired`), таймауты сети, нативный Android `promptTextInput` в `rg_bridge.dex`, экран входа с анимацией логотипа и SVG-самолётиком, `render_qr_image` (`EcLevel::H`) с GPU-кэшем, `RG_DEMO=login` | `auth.rs`, `qr.rs`, `android_jni.rs`, `countries.rs`, `theme.rs`, `lib.rs`, `worker.rs`, `build_android_bridge.py` |
+| Ускорение рендера, БД, сети и CPU/RAM (методология профилирования горячих путей) | ✅ `opt-level = 3`, `traffic_jitter_ms = 0`, 4 индекса SQLite + `synchronous=NORMAL` + O(1) `audit_peer`, прекомпилированный `FilterSet`, `BufWriter` логов/медиа, bbox-маска `lottie::stroke_contours`, бюджет 6 GPU-текстур и 2 TGS/кадр, одинарный `Galley` layout, `show_rows` виртуализация | `Cargo.toml`, `rg-settings`, `rg-ayu`, `rg-core`, `rg-ui` |
+| Перевод черновика перед отправкой (`translateBeforeSend`) | ✅ кнопка языка в поле ввода, выбор языка (`target_language`), перевод в поле или сразу с отправкой через `messages.translateText` | `chat.rs`, `worker.rs`, `lib.rs` |
+| Инлайн-боты (`@bot запрос`) | ✅ `parse_inline_bot_input` с 320мс дебаунсом, кэш `ResolveUsername`, `messages.getInlineBotResults` + пагинация «Ещё», `messages.sendInlineBotResult`, `SwitchInline` | `engine_ext.rs`, `worker.rs`, `chat.rs` |
+| Раздельный двойной тап (входящие / свои, 8 действий) + быстрая реакция по умолчанию | ✅ `double_tap_action` и `double_tap_action_out_owner`, настраиваемый чип реакции (`messages.getAvailableReactions` + `messages.setDefaultReaction`) | `extera.rs`, `engine_ext.rs`, `chat.rs`, `tg_settings.rs` |
+| Эмодзи-статус аккаунта и таймер | ✅ модальное окно из меню и «Мой профиль», загрузка стандартных/пользовательских эмодзи-статусов (`account.getDefaultEmojiStatuses`), установка с таймером (`account.updateEmojiStatus`) | `engine_ext.rs`, `worker.rs`, `features_ui.rs`, `settings_ui.rs`, `tg_settings.rs` |
+| Полные сведения о сообщении (3 вкладки + DC) и копирование фото в буфер | ✅ кликабельные метаданные + `DC` (`dc_location`), списки «Прочитали» (`messages.getMessageReadParticipants`) и «Реакции» (`messages.getMessageReactionsList`), ID·DC в профиле, `Act::CopyPhoto` (`arboard`) на ПК | `media.rs`, `engine.rs`, `engine_ext.rs`, `worker.rs`, `chat.rs` |
+
 ## Порядок дальнейших этапов
 1. **Этап 9 — лента как у Telegram:** форматирование текста и ссылки, GIF/видео/голосовые, анимированные стикеры, альбомы.
 2. **Этап 10 — навигация:** папки, архив, контакты, избранное, профили, глобальный поиск.

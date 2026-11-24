@@ -13,6 +13,10 @@ fn one() -> i32 {
     1
 }
 
+fn default_quick_reaction() -> String {
+    "👍".to_owned()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExteraSettings {
@@ -96,6 +100,9 @@ pub struct ExteraSettings {
     pub disable_playback: bool,
     /// Язык перевода (код).
     pub target_language: String,
+    /// Быстрая реакция по умолчанию для двойного нажатия.
+    #[serde(default = "default_quick_reaction")]
+    pub default_reaction: String,
 }
 
 impl Default for ExteraSettings {
@@ -174,6 +181,7 @@ impl Default for ExteraSettings {
             pause_on_minimize: yes(),
             disable_playback: yes(),
             target_language: "en".to_owned(),
+            default_reaction: default_quick_reaction(),
         }
     }
 }

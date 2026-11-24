@@ -8,11 +8,13 @@ use grammers_session::Session;
 /// Результат одного опроса.
 pub enum QrStep {
     /// Показать QR с этой ссылкой.
-    Token { url: String },
+    Token { url: String, expires: i32 },
     /// Вход выполнен.
     Done,
     /// Включена двухэтапная защита: нужен облачный пароль.
     NeedPassword(PasswordToken),
+    /// Токен истёк до подтверждения — запросить новый без ошибки в UI.
+    Expired,
 }
 
 /// Base64url без заполнения (формат токена в ссылке `tg://login`).
@@ -67,11 +69,15 @@ pub async fn poll<S: Session>(
     let token = match res {
         Ok(t) => t,
         Err(e) if needs_password(&e) => return password_step(client).await,
+        Err(InvocationError::Rpc(ref r)) if r.name == "AUTH_TOKEN_EXPIRED" => {
+            return Ok(QrStep::Expired);
+        }
         Err(e) => return Err(e),
     };
     match token {
         T::Token(t) => Ok(QrStep::Token {
             url: login_url(&t.token),
+            expires: t.expires,
         }),
         T::Success(_) => Ok(QrStep::Done),
         T::MigrateTo(m) => {
@@ -90,6 +96,9 @@ pub async fn poll<S: Session>(
                 Err(e) if needs_password(&e) => {
                     let _ = session.set_home_dc_id(m.dc_id).await;
                     password_step(client).await
+                }
+                Err(InvocationError::Rpc(ref r)) if r.name == "AUTH_TOKEN_EXPIRED" => {
+                    Ok(QrStep::Expired)
                 }
                 Err(e) => Err(e),
             }
@@ -114,5 +123,18 @@ mod tests {
     #[test]
     fn login_url_has_scheme_and_token() {
         assert_eq!(login_url(b"foo"), "tg://login?token=Zm9v");
+    }
+
+    #[test]
+    fn qr_step_variants_carry_url_and_expiry() {
+        let step = QrStep::Token {
+            url: login_url(b"abc"),
+            expires: 1_800_000_000,
+        };
+        assert!(matches!(
+            step,
+            QrStep::Token { ref url, expires: 1_800_000_000 } if url == "tg://login?token=YWJj"
+        ));
+        assert!(matches!(QrStep::Expired, QrStep::Expired));
     }
 }

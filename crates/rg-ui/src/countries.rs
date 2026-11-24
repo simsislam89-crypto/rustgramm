@@ -81,6 +81,7 @@ pub const COUNTRIES: &[Country] = &[
 
 /// Подбирает индекс страны по введённому коду (`+7`, `380`, `+1` и т.д.).
 /// Ищет самое длинное совпадение префикса (например `+380` раньше `+3`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn find_country_by_dial(raw_code: &str) -> Option<usize> {
     let digits: String = raw_code.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() {
@@ -105,6 +106,7 @@ pub fn find_country_by_dial(raw_code: &str) -> Option<usize> {
 
 /// Если пользователь вставил полный номер (`+19702876230` или `+380501234567`) в поле номера,
 /// автоматически разделяет его на `(индекс_страны, код, локальный_номер)`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn split_full_phone(raw: &str) -> Option<(usize, &'static str, String)> {
     let trimmed = raw.trim();
     if !trimmed.starts_with('+') {
@@ -141,6 +143,67 @@ pub fn normalize_phone(dial_code: &str, local_number: &str) -> Result<String, &'
         return Err("Номер слишком длинный (максимум 15 цифр по стандарту E.164)");
     }
     Ok(format!("+{digits}"))
+}
+
+/// Подбирает индекс страны по введённому полному номеру (или началу номера `+7`, `+380`, `+1`).
+pub fn detect_country_from_full(raw: &str) -> Option<usize> {
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let prefixed = format!("+{digits}");
+    COUNTRIES
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| prefixed == c.dial)
+        .map(|(i, _)| i)
+        .next()
+        .or_else(|| {
+            COUNTRIES
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| prefixed.starts_with(c.dial))
+                .max_by(|(i1, c1), (i2, c2)| c1.dial.len().cmp(&c2.dial.len()).then_with(|| i2.cmp(i1)))
+                .map(|(i, _)| i)
+        })
+}
+
+/// Мягкое форматирование поля единого ввода номера (`+7 999 123 45 67` / `+7`), сохраняя удобное стирание.
+pub fn format_phone_input(raw: &str) -> String {
+    let digits: String = raw.chars().filter(char::is_ascii_digit).take(15).collect();
+    if digits.is_empty() {
+        return if raw.contains('+') { "+".to_owned() } else { String::new() };
+    }
+    let prefixed = format!("+{digits}");
+    let dial_len = COUNTRIES
+        .iter()
+        .filter(|c| prefixed.starts_with(c.dial))
+        .map(|c| c.dial.len())
+        .max()
+        .unwrap_or(2.min(prefixed.len()));
+    let dial = &prefixed[..dial_len.min(prefixed.len())];
+    let rest = &prefixed[dial.len()..];
+    if rest.is_empty() {
+        if raw.ends_with(' ') {
+            format!("{dial} ")
+        } else {
+            dial.to_owned()
+        }
+    } else {
+        format!("{dial} {rest}")
+    }
+}
+
+/// Заменяет префикс кода страны в строке полного номера при выборе страны из выпадающего списка.
+pub fn replace_dial_in_phone(current: &str, old_dial: &str, new_dial: &str) -> String {
+    let cur_digits: String = current.chars().filter(char::is_ascii_digit).collect();
+    let old_digits: String = old_dial.chars().filter(char::is_ascii_digit).collect();
+    let local = cur_digits.strip_prefix(&old_digits).unwrap_or(&cur_digits);
+    if local.is_empty() {
+        format!("{new_dial} ")
+    } else {
+        format!("{new_dial} {local}")
+    }
 }
 
 /// Фильтрация стран по поиску (название, ISO-код или телефонный код).
@@ -188,5 +251,14 @@ mod tests {
         assert_eq!(normalize_phone("+7", "+19702876230").unwrap(), "+19702876230");
         assert!(normalize_phone("+7", "123").is_err());
         assert!(normalize_phone("+7", "12345678901234567").is_err());
+    }
+
+    #[test]
+    fn detect_country_and_format_full_phone_work() {
+        assert_eq!(COUNTRIES[detect_country_from_full("+7 999 111").unwrap()].iso, "RU");
+        assert_eq!(COUNTRIES[detect_country_from_full("+380501234567").unwrap()].iso, "UA");
+        assert_eq!(format_phone_input("+7"), "+7");
+        assert_eq!(format_phone_input("+79991234567"), "+7 9991234567");
+        assert_eq!(replace_dial_in_phone("+7 999123", "+7", "+1"), "+1 999123");
     }
 }

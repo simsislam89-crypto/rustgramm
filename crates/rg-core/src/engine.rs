@@ -144,6 +144,8 @@ pub struct PeerInfo {
     pub slowmode_next_send_date: i32,
     /// Есть ли приветственные сообщения для новых участников канала/группы.
     pub has_welcome_messages: bool,
+    /// Номер дата-центра Telegram, в котором хранится фото/профиль чата.
+    pub dc_id: Option<i32>,
 }
 
 /// Действие кнопки бота (инлайн под сообщением или реплай-клавиатуры под полем ввода).
@@ -795,6 +797,7 @@ impl MessageRow {
 }
 
 type PendingDhMap = Arc<std::sync::Mutex<HashMap<i64, (Vec<u8>, Vec<u8>, Vec<u8>)>>>;
+type InlineBotCacheMap = Arc<std::sync::Mutex<HashMap<String, grammers_client::tl::enums::InputUser>>>;
 
 #[derive(Clone)]
 pub struct Engine {
@@ -804,6 +807,12 @@ pub struct Engine {
     dirs: Arc<Dirs>,
     /// Незавершённые обмены DH для секретных чатов и звонков: `id -> (our_exp, our_pub, dh_p)`.
     pending_dh: PendingDhMap,
+    /// Прекомпилированный набор фильтров сообщений (пересобирается только при смене настроек).
+    compiled_filters: Arc<RwLock<Arc<FilterSet>>>,
+    /// Счётчик записей превью для редкого вызова `prune_cache`.
+    preview_writes: Arc<std::sync::atomic::AtomicU32>,
+    /// Кэш разрешённых `@bot` в `InputUser` для мгновенных инлайн-запросов.
+    pub(crate) inline_bots_cache: InlineBotCacheMap,
 }
 
 /// Каталоги кэша предпросмотров и загрузок.
@@ -943,12 +952,16 @@ impl Default for SendMediaOptions {
 
 impl Engine {
     pub fn new(client: Client, settings: Settings, store: MessageStore) -> Self {
+        let (fset, _) = FilterSet::build(&settings.filters);
         Self {
             client,
             settings: Arc::new(RwLock::new(settings)),
             store: Arc::new(store),
             dirs: Arc::new(Dirs::default()),
             pending_dh: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            compiled_filters: Arc::new(RwLock::new(Arc::new(fset))),
+            preview_writes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            inline_bots_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -973,6 +986,10 @@ impl Engine {
     pub fn update_settings(&self, f: impl FnOnce(&mut Settings)) {
         if let Ok(mut s) = self.settings.write() {
             f(&mut s);
+            let (fset, _) = FilterSet::build(&s.filters);
+            if let Ok(mut cf) = self.compiled_filters.write() {
+                *cf = Arc::new(fset);
+            }
         }
     }
 
@@ -1466,7 +1483,7 @@ impl Engine {
             off_peer = np;
             exclude_pinned = true;
             // Бережная пауза между фоновыми страницами защищает от 500 RPC_MCGET_FAIL и FLOOD_WAIT.
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(35)).await;
         }
         let _ = tx.send((Vec::new(), true)).await;
         Ok(())
@@ -1558,6 +1575,10 @@ impl Engine {
                     info.emoji_status = emoji_status_id(x.emoji_status.as_ref());
                     info.verified = x.verified;
                     info.premium = x.premium;
+                    info.dc_id = match x.photo.as_ref() {
+                        Some(tl::enums::UserProfilePhoto::Photo(p)) => Some(p.dc_id),
+                        _ => None,
+                    };
                     if let Some(s) = &x.status {
                         info.status = status_text(s);
                     }
@@ -1594,6 +1615,10 @@ impl Engine {
                     info.forum = y.forum;
                     info.emoji_status = emoji_status_id(y.emoji_status.as_ref());
                     info.verified = y.verified;
+                    info.dc_id = match &y.photo {
+                        tl::enums::ChatPhoto::Photo(p) => Some(p.dc_id),
+                        tl::enums::ChatPhoto::Empty => None,
+                    };
                 }
             }
             tl::enums::InputPeer::Chat(c) => {
@@ -1611,6 +1636,10 @@ impl Engine {
                 }
                 if let Some(tl::enums::Chat::Chat(y)) = f.chats.iter().find(|x| matches!(x, tl::enums::Chat::Chat(y) if y.id == c.chat_id)) {
                     info.name = y.title.clone();
+                    info.dc_id = match &y.photo {
+                        tl::enums::ChatPhoto::Photo(p) => Some(p.dc_id),
+                        tl::enums::ChatPhoto::Empty => None,
+                    };
                 }
             }
             _ => {}
@@ -1722,11 +1751,11 @@ impl Engine {
     /// Фильтры и «зальго» из настроек; подписи ответов по сообщениям выборки.
     fn finish(&self, key: i64, mut rows: Vec<MessageRow>) -> Vec<MessageRow> {
         let cfg = self.settings();
-        if cfg.ayu.filters_enabled {
-            let (set, _) = FilterSet::build(&cfg.filters);
-            if !set.is_empty() {
-                rows.retain(|r| !set.hides(key, &r.text));
-            }
+        if cfg.ayu.filters_enabled
+            && let Ok(cf) = self.compiled_filters.read()
+            && !cf.is_empty()
+        {
+            rows.retain(|r| !cf.hides(key, &r.text));
         }
         if !cfg.ayu.shadow_ban_ids.is_empty() {
             rows.retain(|r| !cfg.ayu.shadow_ban_ids.contains(&r.sender_id));
@@ -2203,7 +2232,7 @@ impl Engine {
                     self.client.download_media(&media, &file).await?;
                 }
             }
-            media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
+            self.maybe_prune_preview_cache();
             return Ok(Some(file));
         }
         // Layer 233 RichMessage: встроенные фото/GIF/видео-превью ботов (например eroot).
@@ -2212,11 +2241,19 @@ impl Engine {
             if let Some(bytes) = self.download_rich_preview_bytes(rm).await? {
                 let _ = std::fs::create_dir_all(&self.dirs.cache);
                 std::fs::write(&file, bytes)?;
-                media::prune_cache(&self.dirs.cache, CACHE_LIMIT);
+                self.maybe_prune_preview_cache();
                 return Ok(Some(file));
             }
         }
         Ok(None)
+    }
+
+    fn maybe_prune_preview_cache(&self) {
+        let n = self.preview_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n.is_multiple_of(40) {
+            let dir = self.dirs.cache.clone();
+            tokio::task::spawn_blocking(move || media::prune_cache(&dir, CACHE_LIMIT));
+        }
     }
 
     /// Скачивает превью (фото или обложку GIF/видео) первого встроенного медиа из `RichMessage`.
@@ -2333,6 +2370,34 @@ impl Engine {
             })
     }
 
+    /// Пакетная проверка кэша медиа одним обходом `cache/media/` (`O(files)` вместо `O(ids * files)`).
+    pub fn cached_media_batch(&self, peer: PeerRef, msg_ids: &[i32]) -> Vec<i32> {
+        if msg_ids.is_empty() {
+            return Vec::new();
+        }
+        let wanted: std::collections::HashSet<i32> = msg_ids.iter().copied().collect();
+        let peer_prefix = format!("{}_", peer_key(&peer));
+        let Ok(entries) = std::fs::read_dir(self.dirs.cache.join("media")) else {
+            return Vec::new();
+        };
+        let mut hit = Vec::new();
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let Some(name) = fname.to_str() else { continue };
+            if name.ends_with(".part") {
+                continue;
+            }
+            let Some(rest) = name.strip_prefix(&peer_prefix) else { continue };
+            let Some((id_str, _)) = rest.split_once('.') else { continue };
+            if let Ok(mid) = id_str.parse::<i32>()
+                && wanted.contains(&mid)
+            {
+                hit.push(mid);
+            }
+        }
+        hit
+    }
+
     /// Скачивает вложение по кускам с отчётом о ходе загрузки `progress(скачано, всего)`.
     /// Кэшированный файл возвращается сразу. Загрузка пишется в `.part` и переименовывается
     /// по завершении; флаг `cancel` прерывает её и удаляет недокачанное.
@@ -2386,7 +2451,8 @@ impl Engine {
         };
         let part = dest.with_extension(format!("{ext}.part"));
         let total = info.size.max(1);
-        let mut file = std::fs::File::create(&part)?;
+        let file = std::fs::File::create(&part)?;
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
         let mut done = 0u64;
         let mut streamed = false;
         let stream_at = (384 * 1024u64).min(total);
@@ -2394,31 +2460,31 @@ impl Engine {
         progress(0, total);
         loop {
             if cancel.load(Ordering::Relaxed) {
-                drop(file);
+                drop(writer);
                 let _ = std::fs::remove_file(&part);
                 return Ok(Fetched::Cancelled);
             }
             match it.next().await {
                 Ok(Some(chunk)) => {
-                    file.write_all(&chunk)?;
-                    file.flush()?;
+                    writer.write_all(&chunk)?;
                     done += chunk.len() as u64;
                     progress(done.min(total), total);
                     if !to_downloads && !streamed && done >= stream_at && done < total {
+                        writer.flush()?;
                         streamed = true;
                         on_stream(&part, &dest, total, ext);
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    drop(file);
+                    drop(writer);
                     let _ = std::fs::remove_file(&part);
                     return Err(Box::new(e));
                 }
             }
         }
-        file.flush()?;
-        drop(file);
+        writer.flush()?;
+        drop(writer);
         std::fs::rename(&part, &dest)?;
         Ok(Fetched::Ready(dest))
     }

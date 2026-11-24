@@ -224,6 +224,9 @@ impl App {
                 if a.drawer_my_profile && item(ui, icons::Ico::Profile, "Мой профиль") {
                     act = Some("profile");
                 }
+                if s.extera.change_status && item(ui, icons::Ico::Sticker, "Эмодзи-статус") {
+                    act = Some("emoji_status");
+                }
                 kit::divider(ui);
                 if a.drawer_new_group && item(ui, icons::Ico::Group, "Новая группа") {
                     act = Some("group");
@@ -315,6 +318,10 @@ impl App {
             Some("profile") => {
                 self.drawer_open = false;
                 self.open_my_profile();
+            }
+            Some("emoji_status") => {
+                self.drawer_open = false;
+                self.emoji_status_open = true;
             }
             Some("group") => {
                 self.drawer_open = false;

@@ -48,7 +48,7 @@ fn fetch_overlay(ui: &egui::Ui, c: Pos2, r: f32, load: Load) -> Option<String> {
     p.circle_filled(c, r, Color32::from_black_alpha(190));
     progress_ring(p, c, r - 2.0, load_frac(done, total).max(0.04), Color32::WHITE);
     icons::tg(p, "history_file_cancel", c, Color32::WHITE);
-    ui.ctx().request_repaint();
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
     Some(format!("{} / {}", human_size(done), human_size(total)))
 }
 
@@ -154,7 +154,7 @@ pub fn card(
                     progress_ring(p, c, 24.0, load_frac(done, total).max(0.04), Color32::WHITE);
                     icons::tg(p, "history_file_cancel", c, Color32::WHITE);
                     chip_text = format!("{} / {}", human_size(done), human_size(total));
-                    ui.ctx().request_repaint();
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Load::Remote => {
                     icons::tg(p, "history_file_download", c, Color32::WHITE);

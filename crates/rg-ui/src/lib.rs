@@ -56,7 +56,6 @@ struct App {
     ev: Receiver<Ev>,
     stage: Stage,
     me: String,
-    phone: String,
     code: String,
     password: String,
     dialogs: Vec<DialogRow>,
@@ -316,11 +315,19 @@ struct App {
     /// Улучшенный вход по номеру телефона: выбранная страна, код, локальный номер, поиск страны, статус отправки.
     login_country_idx: usize,
     login_dial: String,
+    login_phone_full: String,
+    login_keep_signed_in: bool,
+    login_code_hint: String,
     login_country_open: bool,
     login_country_query: String,
     login_busy: bool,
     login_last_phone: String,
     login_code_sent_at: Option<std::time::Instant>,
+    /// Активные ожидания нативных диалогов Android (чтобы не дёргать JNI каждый кадр впустую).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    android_webview_open: bool,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    android_input_pending: bool,
     /// Состояние автоскролла колёсиком мыши: удержание кнопки и факт перетаскивания.
     autoscroll_holding: bool,
     autoscroll_dragged: bool,
@@ -369,6 +376,16 @@ struct App {
     filtered_cache_key: (u64, String, bool, Option<i32>),
     filtered_cache: Vec<usize>,
     archived_total_cache: usize,
+    folder_tabs_cache_key: (u64, usize, bool, bool, bool),
+    folder_tabs_cache: Vec<(Option<i32>, String, i32)>,
+    archive_summary_cache_key: (u64, bool),
+    archive_summary_cache: (String, i32),
+    tray_unread_cache: ((u64, bool, bool), i32, bool),
+    last_win_icon: Option<(usize, i32, bool, bool)>,
+    last_capture_excluded: Option<bool>,
+    wallpaper_failed_path: String,
+    visible_tgs_msgs: HashSet<i32>,
+    pending_tex_uploads: VecDeque<Ev>,
     /// Общее число участников в супергруппах/каналах (для догрузки по страницам).
     participants_total: HashMap<i64, i32>,
     /// Встроенный редактор фото/видео перед отправкой.
@@ -467,6 +484,26 @@ struct App {
     palette_open: bool,
     palette_query: String,
     palette_sel: usize,
+    /// Перевод черновика перед отправкой (`translateBeforeSend`).
+    draft_translating: bool,
+    translate_draft_popup: bool,
+    /// Живые результаты инлайн-бота (`@bot запрос`).
+    inline_bot_key: Option<(String, String)>,
+    inline_bot_at: Option<std::time::Instant>,
+    inline_bot_page: Option<rg_core::engine::InlineBotResultsPage>,
+    inline_bot_loading: bool,
+    inline_bot_error: String,
+    /// Доступные реакции сервера (для выбора быстрой реакции).
+    available_reactions: Vec<rg_core::engine::AvailableReactionRow>,
+    available_reactions_req: bool,
+    /// Окно выбора эмодзи-статуса аккаунта и его таймера.
+    emoji_status_open: bool,
+    default_emoji_statuses: Vec<i64>,
+    default_emoji_statuses_req: bool,
+    emoji_status_ttl: i32,
+    /// Детали сообщения: активная вкладка (0=Мета, 1=Прочитали, 2=Реакции) и загруженные списки.
+    details_tab: u8,
+    msg_activity: Option<(i32, Vec<rg_core::engine::ReadParticipantRow>, Vec<rg_core::engine::MessageReactionPeerRow>)>,
 }
 
 pub(crate) struct ShotModal {
@@ -618,7 +655,6 @@ impl App {
             ev,
             stage: Stage::Starting,
             me: String::new(),
-            phone: String::new(),
             code: String::new(),
             password: String::new(),
             dialogs: Vec::new(),
@@ -819,11 +855,16 @@ impl App {
             highlight_msg: None,
             login_country_idx: 0,
             login_dial: "+7".to_owned(),
+            login_phone_full: "+7 ".to_owned(),
+            login_keep_signed_in: true,
+            login_code_hint: String::new(),
             login_country_open: false,
             login_country_query: String::new(),
             login_busy: false,
             login_last_phone: String::new(),
             login_code_sent_at: None,
+            android_webview_open: false,
+            android_input_pending: false,
             autoscroll_holding: false,
             autoscroll_dragged: false,
             voice_rec: None,
@@ -862,6 +903,16 @@ impl App {
             filtered_cache_key: (u64::MAX, String::new(), false, None),
             filtered_cache: Vec::new(),
             archived_total_cache: 0,
+            folder_tabs_cache_key: (u64::MAX, 0, false, false, false),
+            folder_tabs_cache: Vec::new(),
+            archive_summary_cache_key: (u64::MAX, false),
+            archive_summary_cache: (String::new(), 0),
+            tray_unread_cache: ((u64::MAX, false, false), 0, false),
+            last_win_icon: None,
+            last_capture_excluded: None,
+            wallpaper_failed_path: String::new(),
+            visible_tgs_msgs: HashSet::new(),
+            pending_tex_uploads: VecDeque::new(),
             participants_total: HashMap::new(),
             media_editor: None,
             android_pick_target: None,
@@ -936,6 +987,21 @@ impl App {
             palette_open: false,
             palette_query: String::new(),
             palette_sel: 0,
+            draft_translating: false,
+            translate_draft_popup: false,
+            inline_bot_key: None,
+            inline_bot_at: None,
+            inline_bot_page: None,
+            inline_bot_loading: false,
+            inline_bot_error: String::new(),
+            available_reactions: Vec::new(),
+            available_reactions_req: false,
+            emoji_status_open: false,
+            default_emoji_statuses: Vec::new(),
+            default_emoji_statuses_req: false,
+            emoji_status_ttl: 0,
+            details_tab: 0,
+            msg_activity: None,
         }
     }
 
@@ -1977,6 +2043,8 @@ impl App {
 
     fn reset_chat_state(&mut self) {
         self.cached_media.clear();
+        self.visible_tgs_msgs.clear();
+        self.pending_tex_uploads.retain(|ev| !matches!(ev, Ev::Image(..)));
         self.gif_paths.clear();
         self.gif_auto_req.clear();
         self.inline_gif_rect = None;
@@ -2012,6 +2080,14 @@ impl App {
         self.topic_msgs = None;
         self.discussion = None;
         self.comment_input.clear();
+        self.draft_translating = false;
+        self.translate_draft_popup = false;
+        self.inline_bot_key = None;
+        self.inline_bot_at = None;
+        self.inline_bot_page = None;
+        self.inline_bot_loading = false;
+        self.inline_bot_error.clear();
+        self.msg_activity = None;
         self.user_filter = None;
         self.cmd_popup_open = false;
         self.ttl_popup_open = false;
@@ -2165,28 +2241,34 @@ impl App {
         win::show_from_tray();
     }
 
-    fn current_tray_state(&self) -> tray::TrayState {
-        let mut unread = 0i32;
-        let mut unmuted_unread = 0i32;
-        for d in &self.dialogs {
-            let add = if self.settings.notify.badge_count_messages {
-                d.unread
-            } else {
-                i32::from(d.unread > 0)
-            };
-            if !d.muted {
-                unmuted_unread += add;
-                unread += add;
-            } else if self.settings.notify.badge_include_muted {
-                unread += add;
+    fn current_tray_state(&mut self) -> tray::TrayState {
+        let count_msgs = self.settings.notify.badge_count_messages;
+        let inc_muted = self.settings.notify.badge_include_muted;
+        let key = (self.dialogs_gen, count_msgs, inc_muted);
+        let (unread, unread_muted) = if self.tray_unread_cache.0 == key {
+            (self.tray_unread_cache.1, self.tray_unread_cache.2)
+        } else {
+            let mut total = 0i32;
+            let mut unmuted_unread = 0i32;
+            for d in &self.dialogs {
+                let add = if count_msgs { d.unread } else { i32::from(d.unread > 0) };
+                if !d.muted {
+                    unmuted_unread += add;
+                    total += add;
+                } else if inc_muted {
+                    total += add;
+                }
             }
-        }
+            let um = total > 0 && unmuted_unread == 0;
+            self.tray_unread_cache = (key, total, um);
+            (total, um)
+        };
         tray::TrayState {
             enabled: self.settings.work_mode != rg_settings::WorkMode::WindowOnly,
             window_visible: !self.hidden_to_tray && win::is_window_visible(),
             icon_idx: self.settings.ayu.app_icon.parse().unwrap_or(0),
             unread,
-            unread_muted: unread > 0 && unmuted_unread == 0,
+            unread_muted,
             hide_badge: self.settings.ayu.hide_notification_badge,
             desktop_notify: self.settings.notify.desktop_notifications,
             ghost_active: self.settings.ghost.active,
@@ -2197,9 +2279,15 @@ impl App {
     }
 
     fn sync_tray_and_window(&mut self, ctx: &egui::Context) {
-        win::set_capture_excluded(self.settings.ayu.streamer_mode);
+        let streamer = self.settings.ayu.streamer_mode;
+        if self.last_capture_excluded != Some(streamer) {
+            self.last_capture_excluded = Some(streamer);
+            win::set_capture_excluded(streamer);
+        }
         let st = self.current_tray_state();
-        if !self.is_demo {
+        let icon_key = (st.icon_idx, st.unread, st.unread_muted, st.hide_badge);
+        if !self.is_demo && self.last_win_icon != Some(icon_key) {
+            self.last_win_icon = Some(icon_key);
             win::set_window_icon(st.icon_idx, st.unread, st.unread_muted, st.hide_badge);
         }
         if self.is_demo || !st.enabled {
@@ -2259,8 +2347,17 @@ impl App {
         }
         // Не нагружаем CPU в фоне, когда окно свёрнуто в трей или не в фокусе.
         let focused = !self.hidden_to_tray && ctx.input(|i| i.focused);
-        if self.tgs_frame_cache.len() > 750 {
-            self.tgs_frame_cache.clear();
+        if self.tgs_frame_cache.len() > 600 {
+            let drop_keys: Vec<(i64, usize)> = self
+                .tgs_frame_cache
+                .keys()
+                .enumerate()
+                .filter(|(idx, _)| idx % 2 == 0)
+                .map(|(_, k)| *k)
+                .collect();
+            for k in drop_keys {
+                self.tgs_frame_cache.remove(&k);
+            }
         }
         let speed = f64::from(self.settings.anim_speed) / 100.0;
         let t = if speed <= 0.01 || !focused {
@@ -2269,6 +2366,8 @@ impl App {
             ctx.input(|i| i.time) * speed
         };
         let mut active = false;
+        let mut rendered_this_frame = 0usize;
+        const MAX_TGS_RASTERS_PER_FRAME: usize = 2;
 
         // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`) на плавных 30 FPS:
         // если панель эмодзи закрыта, рендерим только 0-й кадр один раз (0% нагрузки CPU в простое!).
@@ -2285,24 +2384,36 @@ impl App {
                 continue;
             }
             let key = (doc_id, bucket);
-            let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
+            if let Some(tex) = self.tgs_frame_cache.get(&key) {
+                self.sticker_tex.insert(doc_id, tex.clone());
+            } else if rendered_this_frame < MAX_TGS_RASTERS_PER_FRAME || !self.sticker_tex.contains_key(&doc_id) {
+                rendered_this_frame += 1;
                 let img = anim.render_frame(bucket as f32, 64);
-                ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
-            });
-            self.sticker_tex.insert(doc_id, tex.clone());
+                let tex = ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR);
+                self.tgs_frame_cache.insert(key, tex.clone());
+                self.sticker_tex.insert(doc_id, tex);
+            }
         }
 
-        // Обновляем анимированные TGS-стикеры в открытом чате (`tgs_msgs`, плавные 30 FPS).
+        // Обновляем анимированные TGS-стикеры в видимой области открытого чата (`tgs_msgs`).
         if focused {
+            let has_vis = !self.visible_tgs_msgs.is_empty();
             for (&msg_id, anim) in &self.tgs_msgs {
+                if has_vis && !self.visible_tgs_msgs.contains(&msg_id) {
+                    continue;
+                }
                 let f = anim.frame_at_time(t);
                 let bucket = (f.round() as usize / 2) * 2;
                 let key = (-i64::from(msg_id) - 1_000_000, bucket);
-                let tex = self.tgs_frame_cache.entry(key).or_insert_with(|| {
+                if let Some(tex) = self.tgs_frame_cache.get(&key) {
+                    self.textures.insert(msg_id, tex.clone());
+                } else if rendered_this_frame < MAX_TGS_RASTERS_PER_FRAME || !self.textures.contains_key(&msg_id) {
+                    rendered_this_frame += 1;
                     let img = anim.render_frame(bucket as f32, 160);
-                    ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR)
-                });
-                self.textures.insert(msg_id, tex.clone());
+                    let tex = ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR);
+                    self.tgs_frame_cache.insert(key, tex.clone());
+                    self.textures.insert(msg_id, tex);
+                }
                 active = true;
             }
         }
@@ -2326,11 +2437,40 @@ impl App {
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
+        let mut tex_left: usize = 6;
+        for _ in 0..self.pending_tex_uploads.len().min(tex_left) {
+            if let Some(ev) = self.pending_tex_uploads.pop_front() {
+                tex_left = tex_left.saturating_sub(1);
+                self.handle_event(ctx, ev);
+            }
+        }
         while let Ok(e) = self.ev.try_recv() {
-            match e {
+            if matches!(
+                e,
+                Ev::StickerImg(..) | Ev::Image(..) | Ev::Avatar(..) | Ev::StoryImage(..)
+            ) {
+                if tex_left == 0 {
+                    self.pending_tex_uploads.push_back(e);
+                    continue;
+                }
+                tex_left -= 1;
+            }
+            self.handle_event(ctx, e);
+        }
+        if !self.pending_tex_uploads.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn handle_event(&mut self, ctx: &egui::Context, e: Ev) {
+        match e {
                 Ev::Stage(s) => {
+                    let changed = std::mem::discriminant(&self.stage) != std::mem::discriminant(&s);
+                    let is_ready = s == Stage::Ready;
                     self.stage = s;
-                    self.error.clear();
+                    if changed || is_ready {
+                        self.error.clear();
+                    }
                 }
                 Ev::Me(n) => self.me = n,
                 Ev::Dialogs(d) => {
@@ -2363,6 +2503,7 @@ impl App {
                         self.folder = None;
                     }
                     self.folders = f;
+                    self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
                 }
                 Ev::Contacts(c) => self.contacts = c,
                 Ev::Select(id) => {
@@ -2584,6 +2725,8 @@ impl App {
                 }
                 Ev::ResetSession => {
                     self.reset_chat_state();
+                    self.pending_tex_uploads.clear();
+                    self.visible_tgs_msgs.clear();
                     self.selected = None;
                     self.dialogs.clear();
                     self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
@@ -2613,7 +2756,6 @@ impl App {
                     self.transcribing.clear();
                     self.me.clear();
                     self.stage = Stage::Starting;
-                    self.phone.clear();
                     self.code.clear();
                     self.password.clear();
                     self.error.clear();
@@ -2758,6 +2900,9 @@ impl App {
                     self.login_busy = b;
                     ctx.request_repaint();
                 }
+                Ev::CodeDeliveryHint(h) => {
+                    self.login_code_hint = h;
+                }
                 Ev::StoryImage(sid, img) => {
                     let tex = ctx.load_texture(format!("story-{sid}"), *img, egui::TextureOptions::LINEAR);
                     self.story_textures.insert(sid, tex);
@@ -2852,6 +2997,52 @@ impl App {
                     self.update_progress = None;
                     self.status = msg;
                 }
+                Ev::DraftTranslated(tr) => {
+                    self.draft_translating = false;
+                    self.translate_draft_popup = false;
+                    if !tr.is_empty() || !self.input.is_empty() {
+                        self.input = tr;
+                    }
+                }
+                Ev::InlineBotResults {
+                    bot,
+                    query,
+                    append,
+                    page,
+                } => {
+                    self.inline_bot_loading = false;
+                    self.inline_bot_error.clear();
+                    if self.inline_bot_key.as_ref() == Some(&(bot, query)) {
+                        if append && let Some(prev) = self.inline_bot_page.as_mut() {
+                            prev.query_id = page.query_id;
+                            prev.next_offset = page.next_offset;
+                            for r in page.results {
+                                if !prev.results.iter().any(|x| x.id == r.id) {
+                                    prev.results.push(r);
+                                }
+                            }
+                        } else {
+                            self.inline_bot_page = Some(page);
+                        }
+                    }
+                }
+                Ev::InlineBotError(e) => {
+                    self.inline_bot_loading = false;
+                    self.inline_bot_error = e;
+                }
+                Ev::AvailableReactions(list) => {
+                    self.available_reactions = list;
+                }
+                Ev::DefaultEmojiStatuses(ids) => {
+                    self.default_emoji_statuses = ids;
+                }
+                Ev::MessageActivity {
+                    msg_id,
+                    readers,
+                    reactions,
+                } => {
+                    self.msg_activity = Some((msg_id, readers, reactions));
+                }
                 Ev::Status(s) => {
                     self.status = s;
                     self.bot_btn_pending = None;
@@ -2859,26 +3050,219 @@ impl App {
                 Ev::Error(e) => {
                     self.error = e;
                     self.error_at = self.now;
+                    self.login_busy = false;
                     self.bot_btn_pending = None;
                 }
-            }
         }
     }
 
-    // ---------- вход (в стиле официального Telegram + матовое стекло, 0 лагов на Android) ----------
+    // ---------- вход (как в официальном Telegram + анимации + поддержка нативной Android-клавиатуры) ----------
+
+    fn tg_login_accent() -> Color32 {
+        Color32::from_rgb(135, 116, 225) // #8774E1 (Telegram Desktop/Web accent)
+    }
+
+    fn tg_login_blue() -> Color32 {
+        Color32::from_rgb(42, 171, 238) // #2AABEE
+    }
+
+    fn paint_telegram_login_logo(ui: &mut egui::Ui, busy: bool, enter_k: f32) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(126.0), Sense::hover());
+        let c = rect.center();
+        let p = ui.painter();
+        let spring_k = ios_spring_bounce(enter_k.clamp(0.0, 1.0));
+        let scale = 0.78 + 0.22 * spring_k;
+        let r = 54.0 * scale;
+        let blue = Self::tg_login_blue();
+
+        // Мягкое пульсирующее кольцо при загрузке/отправке.
+        if busy {
+            let pulse = (ui.input(|i| i.time) * 3.8).sin() as f32 * 0.5 + 0.5;
+            p.circle_stroke(
+                c,
+                r + 6.0 + 7.0 * pulse,
+                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), (130.0 * (1.0 - pulse)) as u8)),
+            );
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        p.circle_filled(
+            c,
+            r + 4.0,
+            Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), (32.0 * enter_k) as u8),
+        );
+        p.circle_filled(c, r, blue);
+        // Верхний мягкий блик круга Telegram.
+        p.circle_filled(
+            c + Vec2::new(-r * 0.12, -r * 0.22),
+            r * 0.68,
+            Color32::from_rgba_unmultiplied(120, 214, 255, 42),
+        );
+
+        // Многогранный бумажный самолётик Telegram с лёгким полётным смещением при появлении/ожидании.
+        let bob = if busy {
+            (ui.input(|i| i.time) * 5.0).sin() as f32 * 2.2
+        } else {
+            (1.0 - spring_k) * 14.0
+        };
+        let pc = c + Vec2::new(-bob * 0.4, bob);
+        let k = r / 54.0;
+        let p_left = pc + Vec2::new(-28.0, 2.0) * k;
+        let p_tip = pc + Vec2::new(25.0, -19.0) * k;
+        let p_bot = pc + Vec2::new(14.0, 22.0) * k;
+        let p_fold_top = pc + Vec2::new(-8.0, 7.0) * k;
+        let p_fold_mid = pc + Vec2::new(-5.0, 17.0) * k;
+
+        // Верхнее белое крыло.
+        p.add(egui::Shape::convex_polygon(
+            vec![p_left, p_tip, p_fold_top],
+            Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
+        // Нижнее крыло.
+        p.add(egui::Shape::convex_polygon(
+            vec![p_fold_top, p_tip, p_bot],
+            Color32::from_rgb(244, 248, 252),
+            egui::Stroke::NONE,
+        ));
+        // Внутренний сгиб и тень самолётика (как у официального логотипа Telegram).
+        p.add(egui::Shape::convex_polygon(
+            vec![p_fold_top, p_tip, p_fold_mid],
+            Color32::from_rgb(200, 218, 234),
+            egui::Stroke::NONE,
+        ));
+        p.add(egui::Shape::convex_polygon(
+            vec![p_fold_mid, p_tip, pc + Vec2::new(1.0, 12.0) * k],
+            Color32::from_rgb(169, 201, 221),
+            egui::Stroke::NONE,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn outlined_login_field<R>(
+        ui: &mut egui::Ui,
+        id_tag: &str,
+        width: f32,
+        height: f32,
+        label: &str,
+        active: bool,
+        accent: Color32,
+        bg_cut: Color32,
+        inner: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> (egui::Rect, R) {
+        let focus_k = theme::tween(ui.ctx(), ("lg-fld", id_tag), f32::from(u8::from(active)), 0.14);
+        let stroke_c = lerp_color(Color32::from_white_alpha(52), accent, focus_k);
+        let stroke_w = 1.0 + 0.85 * focus_k;
+        let label_c = lerp_color(Color32::from_rgb(154, 154, 164), accent, focus_k);
+
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height + 6.0), Sense::hover());
+        let box_rect = egui::Rect::from_min_max(rect.min + Vec2::new(0.0, 6.0), rect.max);
+        let p = ui.painter();
+        p.rect_filled(box_rect, egui::CornerRadius::same(11), Color32::from_white_alpha(7));
+        p.rect_stroke(
+            box_rect,
+            egui::CornerRadius::same(11),
+            egui::Stroke::new(stroke_w, stroke_c),
+            egui::StrokeKind::Inside,
+        );
+        // Вырез и плавающая подпись на верхней кромке рамки (как в Telegram Web/Desktop).
+        let galley = p.layout_no_wrap(label.to_owned(), FontId::proportional(11.5), label_c);
+        let cut_rect = egui::Rect::from_min_size(
+            egui::pos2(box_rect.left() + 12.0, box_rect.top() - 7.0),
+            Vec2::new(galley.size().x + 10.0, 14.0),
+        );
+        p.rect_filled(cut_rect, egui::CornerRadius::same(3), bg_cut);
+        p.galley(
+            egui::pos2(cut_rect.left() + 5.0, cut_rect.top()),
+            galley,
+            label_c,
+        );
+
+        let content_rect = box_rect.shrink2(Vec2::new(14.0, 6.0));
+        let res = ui.scope_builder(
+            egui::UiBuilder::new().max_rect(content_rect),
+            |ui| {
+                ui.set_min_size(content_rect.size());
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    inner(ui)
+                })
+                .inner
+            },
+        );
+        (box_rect, res.inner)
+    }
+
+    fn paint_android_keypad(ui: &mut egui::Ui, width: f32, target: &mut String, allow_plus: bool, max_digits: usize) -> bool {
+        let mut changed = false;
+        let rows: [&[&str]; 4] = [
+            &["1", "2", "3"],
+            &["4", "5", "6"],
+            &["7", "8", "9"],
+            &[if allow_plus { "+" } else { "Стереть" }, "0", "⌫"],
+        ];
+        let gap = 6.0;
+        let kw = ((width - gap * 2.0) / 3.0).max(52.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = gap;
+            for row in rows {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for &key in row {
+                        let btn = egui::Button::new(RichText::new(key).size(16.0).strong().color(WHITE))
+                            .fill(Color32::from_white_alpha(18))
+                            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
+                            .corner_radius(egui::CornerRadius::same(10));
+                        if ui.add_sized([kw, 40.0], btn).clicked() {
+                            match key {
+                                "⌫" => {
+                                    target.pop();
+                                    changed = true;
+                                }
+                                "Стереть" => {
+                                    target.clear();
+                                    changed = true;
+                                }
+                                "+" => {
+                                    if !target.contains('+') {
+                                        target.insert(0, '+');
+                                        changed = true;
+                                    }
+                                }
+                                d => {
+                                    let cur_digits = target.chars().filter(char::is_ascii_digit).count();
+                                    if cur_digits < max_digits {
+                                        target.push_str(d);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        changed
+    }
 
     fn login_ui(&mut self, ui: &mut egui::Ui) {
+        let accent = if theme::palette().customized {
+            c_orange()
+        } else {
+            Self::tg_login_accent()
+        };
+        let bg_cut = Color32::from_rgb(24, 25, 30);
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             if self.login_busy {
-                ui.add(egui::Spinner::new().size(15.0).color(c_orange()));
+                ui.add(egui::Spinner::new().size(15.0).color(Self::tg_login_blue()));
                 ui.label(RichText::new("Связь с Telegram…").size(12.5).color(SUBTEXT));
+            } else if !self.status.is_empty() {
+                ui.label(RichText::new(&self.status).size(12.0).color(SUBTEXT));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(16.0);
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("Прокси / Сеть").size(13.0).strong().color(c_orange()))
+                        egui::Button::new(RichText::new("Прокси / Сеть").size(13.0).strong().color(accent))
                             .frame(false),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2890,19 +3274,24 @@ impl App {
         });
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                let top_gap = (ui.available_height() * 0.06).clamp(8.0, 48.0);
+                let compact = ui.available_width() < 520.0;
+                let top_gap = (ui.available_height() * if compact { 0.03 } else { 0.07 }).clamp(6.0, 56.0);
                 ui.add_space(top_gap);
-                let card_w = ui.available_width().clamp(296.0, 410.0);
+                let col_w = (ui.available_width() - 28.0).clamp(288.0, 360.0);
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 20, 26, (185.0 * opacity_f32().max(0.55)) as u8))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
-                    .corner_radius(egui::CornerRadius::same(22))
-                    .inner_margin(egui::Margin::symmetric(24, 26))
+                    .fill(if cfg!(target_os = "android") || compact {
+                        Color32::from_rgba_unmultiplied(24, 25, 30, 250)
+                    } else {
+                        Color32::from_rgba_unmultiplied(24, 25, 30, (220.0 * opacity_f32().max(0.65)) as u8)
+                    })
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(20)))
+                    .corner_radius(egui::CornerRadius::same(20))
+                    .inner_margin(egui::Margin::symmetric(20, 22))
                     .show(ui, |ui| {
-                        ui.set_width(card_w - 48.0);
+                        ui.set_width(col_w);
                         ui.vertical_centered(|ui| match self.stage.clone() {
-                            Stage::Qr(url) => self.qr_screen(ui, &url),
-                            _ => self.form_screen(ui),
+                            Stage::Qr(url) => self.qr_screen(ui, &url, accent),
+                            _ => self.form_screen(ui, accent, bg_cut),
                         });
                     });
                 if !self.error.is_empty() {
@@ -2913,7 +3302,7 @@ impl App {
                         .corner_radius(egui::CornerRadius::same(12))
                         .inner_margin(egui::Margin::symmetric(14, 10))
                         .show(ui, |ui| {
-                            ui.set_max_width(340.0);
+                            ui.set_max_width(col_w + 20.0);
                             ui.label(RichText::new(&self.error).size(12.5).color(Color32::from_rgb(255, 175, 175)));
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
@@ -2930,7 +3319,7 @@ impl App {
                                 }
                                 if ui
                                     .add(
-                                        egui::Button::new(RichText::new("Прокси").size(12.0).color(c_orange()))
+                                        egui::Button::new(RichText::new("Прокси").size(12.0).color(accent))
                                             .frame(false),
                                     )
                                     .clicked()
@@ -2947,7 +3336,7 @@ impl App {
                     .find(|a| a.slot != self.settings.active_account && a.is_authorized_hint())
                     .cloned()
                 {
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
                     if link(ui, &format!("← Вернуться к {}", prev.title())).clicked() {
                         let cur = self.settings.active_account;
                         if cur > 0 {
@@ -2957,24 +3346,23 @@ impl App {
                         }
                     }
                 }
-                ui.add_space(18.0);
+                ui.add_space(16.0);
                 ui.label(
                     RichText::new(format!("Rustgramm v{} · Zero Telemetry", env!("CARGO_PKG_VERSION")))
                         .color(SUBTEXT)
-                        .size(12.0),
+                        .size(11.5),
                 );
-                ui.add_space(18.0);
+                ui.add_space(16.0);
             });
         });
         self.proxy_window(ui.ctx());
     }
 
-    /// Фирменный интерактивный смайл-талисман входа Telegram (как на экране авторизации Telegram).
+    /// Фирменный интерактивный смайл-талисман входа Telegram (конверт / обезьянка 2FA).
     fn paint_login_mascot(ui: &mut egui::Ui, emoji_char: &str, ring_accent: Color32, emoji_atlas: Option<&emoji::Emoji>) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(104.0), Sense::hover());
         let c = rect.center();
         let p = ui.painter();
-        // Мягкое матовое свечение вокруг медальона.
         p.circle_filled(
             c,
             50.0,
@@ -3010,17 +3398,18 @@ impl App {
         }
     }
 
-    fn qr_screen(&mut self, ui: &mut egui::Ui, url: &str) {
+    fn qr_screen(&mut self, ui: &mut egui::Ui, url: &str, accent: Color32) {
+        let qr_side = (ui.available_width() - 24.0).clamp(184.0, 248.0);
         let pop_k = theme::tween(ui.ctx(), "login-qr-pop", if url.is_empty() { 0.0 } else { 1.0 }, 0.28);
         if url.is_empty() {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(214.0), Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(qr_side), Sense::hover());
             ui.painter()
-                .rect_filled(rect, egui::CornerRadius::same(22), Color32::from_white_alpha(18));
-            ui.put(rect, egui::Spinner::new().size(28.0).color(c_orange()));
+                .rect_filled(rect, egui::CornerRadius::same(20), Color32::from_white_alpha(16));
+            ui.put(rect, egui::Spinner::new().size(28.0).color(Self::tg_login_blue()));
         } else {
-            let _ = theme::draw_styled_qr(ui, url, 214.0, c_orange(), pop_k);
+            let _ = theme::draw_styled_qr(ui, url, qr_side, Self::tg_login_blue(), pop_k);
         }
-        ui.add_space(18.0);
+        ui.add_space(16.0);
         ui.label(
             RichText::new("Вход по QR-коду")
                 .size(21.0)
@@ -3035,7 +3424,7 @@ impl App {
         ] {
             ui.horizontal(|ui| {
                 let (br, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                ui.painter().circle_filled(br.center(), 9.5, c_orange());
+                ui.painter().circle_filled(br.center(), 9.5, Self::tg_login_blue());
                 ui.painter().text(
                     br.center(),
                     egui::Align2::CENTER_CENTER,
@@ -3044,18 +3433,32 @@ impl App {
                     Color32::WHITE,
                 );
                 ui.add_space(4.0);
-                ui.label(RichText::new(text).size(13.5).color(WHITE));
+                ui.label(RichText::new(text).size(13.0).color(WHITE));
             });
             ui.add_space(4.0);
         }
-        ui.add_space(20.0);
+        if !url.is_empty() {
+            ui.add_space(8.0);
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Скопировать ссылку входа").size(12.5).color(SUBTEXT))
+                        .frame(false),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                ui.ctx().copy_text(url.to_owned());
+                self.status = "Ссылка QR-входа скопирована".to_owned();
+            }
+        }
+        ui.add_space(14.0);
         if ui
             .add_sized(
-                [296.0, 40.0],
-                egui::Button::new(RichText::new("Войти по номеру телефона").size(14.0).strong().color(c_orange()))
-                    .fill(Color32::from_rgba_unmultiplied(c_orange().r(), c_orange().g(), c_orange().b(), 26))
-                    .stroke(egui::Stroke::new(1.0, c_orange().gamma_multiply(0.5)))
-                    .corner_radius(egui::CornerRadius::same(12)),
+                [ui.available_width().min(316.0), 42.0],
+                egui::Button::new(RichText::new("ВОЙТИ ПО НОМЕРУ ТЕЛЕФОНА").size(13.0).strong().color(accent))
+                    .fill(Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 22))
+                    .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.45)))
+                    .corner_radius(egui::CornerRadius::same(11)),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
@@ -3065,21 +3468,29 @@ impl App {
         }
     }
 
-    fn form_screen(&mut self, ui: &mut egui::Ui) {
-        let form_w = ui.available_width().min(316.0);
+    fn form_screen(&mut self, ui: &mut egui::Ui, accent: Color32, bg_cut: Color32) {
+        let form_w = ui.available_width().min(324.0);
         match self.stage.clone() {
             Stage::Starting => {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(92.0), Sense::hover());
-                icons::logo(ui.painter(), rect.center(), 44.0, c_orange());
-                ui.add_space(12.0);
-                ui.label(RichText::new("Rustgramm").size(26.0).strong().color(WHITE));
-                ui.add_space(8.0);
-                ui.label(RichText::new("Подключение к серверам Telegram…").size(13.5).color(SUBTEXT));
+                let enter_k = theme::tween(ui.ctx(), "lg-logo-start", 1.0, 0.36);
+                Self::paint_telegram_login_logo(ui, true, enter_k);
                 ui.add_space(10.0);
-                ui.add(egui::Spinner::new().size(22.0).color(c_orange()));
+                ui.label(RichText::new("Telegram").size(26.0).strong().color(WHITE));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Подключение к серверам Telegram…").size(13.5).color(SUBTEXT));
+                ui.add_space(12.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Войти по номеру вручную").size(13.0).color(accent))
+                            .frame(false),
+                    )
+                    .clicked()
+                {
+                    self.stage = Stage::NeedPhone;
+                }
             }
             Stage::NeedKeys => {
-                Self::paint_login_mascot(ui, "🔑", c_orange(), self.emoji.as_ref());
+                Self::paint_login_mascot(ui, "🔑", accent, self.emoji.as_ref());
                 ui.add_space(10.0);
                 ui.label(RichText::new("Ключи API Telegram").size(20.0).strong().color(WHITE));
                 ui.label(
@@ -3097,140 +3508,249 @@ impl App {
                         .desired_width(form_w),
                 );
                 ui.add_space(10.0);
-                if orange_button(ui, "Сохранить и продолжить", Vec2::new(form_w, 42.0)).clicked() {
+                if orange_button(ui, "Сохранить и продолжить", Vec2::new(form_w, 44.0)).clicked() {
                     let hash = std::mem::take(&mut self.key_hash);
                     self.send(Cmd::Keys(self.key_id.clone(), hash));
                 }
             }
             Stage::NeedPhone => {
+                let enter_k = theme::tween(ui.ctx(), "lg-logo-phone", 1.0, 0.38);
+                Self::paint_telegram_login_logo(ui, self.login_busy, enter_k);
+                ui.add_space(6.0);
+                ui.label(RichText::new("Telegram").size(28.0).strong().color(WHITE));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Проверьте код страны и введите свой номер\nтелефона.")
+                        .size(13.5)
+                        .color(Color32::from_rgb(162, 162, 172)),
+                );
+                ui.add_space(20.0);
+
                 let country = countries::COUNTRIES
                     .get(self.login_country_idx)
                     .copied()
                     .unwrap_or(countries::COUNTRIES[0]);
-                Self::paint_login_mascot(ui, "👋", c_orange(), self.emoji.as_ref());
-                ui.add_space(12.0);
-                ui.label(RichText::new("Вход в Telegram").size(22.0).strong().color(WHITE));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Выберите страну и введите ваш номер телефона")
-                        .size(13.0)
-                        .color(SUBTEXT),
+
+                // Поле 1: «Страна» (outlined floating label + шеврон, как на скрине).
+                let (c_rect, _) = Self::outlined_login_field(
+                    ui,
+                    "country",
+                    form_w,
+                    48.0,
+                    "Страна",
+                    self.login_country_open,
+                    accent,
+                    bg_cut,
+                    |ui| {
+                        ui.label(RichText::new(country.name).size(15.0).color(WHITE));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            icons::chevron(ui.painter(), ui.cursor().center(), self.login_country_open, SUBTEXT);
+                        });
+                    },
                 );
-                ui.add_space(14.0);
-                // Кнопка выбора страны (с виртуализированным списком — 0 лагов на Android!).
-                let cbtn = egui::Button::new(
-                    RichText::new(format!("{}  {} ({})  ▾", country.iso, country.name, country.dial))
-                        .size(14.0)
-                        .color(WHITE),
-                )
-                .fill(t(SIDEBAR_BG))
-                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(30)))
-                .corner_radius(egui::CornerRadius::same(12));
-                if ui
-                    .add_sized([form_w, 42.0], cbtn)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
+                let c_resp = ui
+                    .interact(c_rect, ui.make_persistent_id("lg-country-btn"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if c_resp.clicked() {
                     self.login_country_open = !self.login_country_open;
                     self.login_country_query.clear();
                 }
+
                 if self.login_country_open {
                     ui.add_space(6.0);
                     egui::Frame::new()
-                        .fill(t2(WINDOW_BG))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(30)))
+                        .fill(Color32::from_rgb(30, 31, 38))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(32)))
                         .corner_radius(egui::CornerRadius::same(12))
                         .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
                             ui.set_width(form_w - 16.0);
-                            ui.add(
+                            let qresp = ui.add(
                                 egui::TextEdit::singleline(&mut self.login_country_query)
                                     .hint_text("Поиск страны или кода (+7, +1)…")
                                     .desired_width(form_w - 20.0),
                             );
+                            if cfg!(target_os = "android") && qresp.clicked() {
+                                self.android_input_pending = true;
+                                android_jni::prompt_text_input(
+                                    "country_search",
+                                    "Поиск страны",
+                                    "Например: Россия или +7",
+                                    &self.login_country_query,
+                                    0,
+                                );
+                            }
                             ui.add_space(4.0);
                             let matches = countries::filter_countries(&self.login_country_query);
                             egui::ScrollArea::vertical()
                                 .max_height(168.0)
                                 .id_salt("country-picker")
-                                .show_rows(ui, 28.0, matches.len(), |ui, range| {
+                                .show_rows(ui, 30.0, matches.len(), |ui, range| {
                                     for row_i in range {
                                         let idx = matches[row_i];
                                         let c = countries::COUNTRIES[idx];
                                         let sel = idx == self.login_country_idx;
-                                        let lbl = format!("{}  {}  {}", c.iso, c.name, c.dial);
+                                        let lbl = format!("{}  {}  ({})", c.iso, c.name, c.dial);
                                         if ui
                                             .selectable_label(
                                                 sel,
                                                 RichText::new(lbl)
                                                     .size(13.5)
-                                                    .color(if sel { c_orange() } else { WHITE }),
+                                                    .color(if sel { accent } else { WHITE }),
                                             )
                                             .clicked()
                                         {
+                                            let old_dial = country.dial;
                                             self.login_country_idx = idx;
                                             self.login_dial = c.dial.to_owned();
+                                            self.login_phone_full = countries::replace_dial_in_phone(
+                                                &self.login_phone_full,
+                                                old_dial,
+                                                c.dial,
+                                            );
                                             self.login_country_open = false;
                                         }
                                     }
                                 });
                         });
                 }
-                ui.add_space(8.0);
+
+                ui.add_space(12.0);
+
+                // Поле 2: «Номер телефона» (единый ввод `+7 ...` с фиолетовой подсветкой фокуса, как на скрине).
+                let phone_focus_id = ui.make_persistent_id("lg-phone-te");
+                let phone_focused = ui.memory(|m| m.has_focus(phone_focus_id)) || !self.login_phone_full.trim().is_empty();
                 let mut enter_pressed = false;
+                let (p_rect, (pr, native_btn_clicked)) = Self::outlined_login_field(
+                    ui,
+                    "phone",
+                    form_w,
+                    48.0,
+                    "Номер телефона",
+                    phone_focused,
+                    accent,
+                    bg_cut,
+                    |ui| {
+                        let edit_w = (form_w - 58.0).max(160.0);
+                        let pr = ui.add_sized(
+                            [edit_w, 32.0],
+                            egui::TextEdit::singleline(&mut self.login_phone_full)
+                                .id(phone_focus_id)
+                                .frame(egui::Frame::NONE)
+                                .font(FontId::proportional(15.5))
+                                .hint_text(format!("{} {}", country.dial, country.hint)),
+                        );
+                        let kb_btn = ui
+                            .add(
+                                egui::Button::new(RichText::new("⌨").size(14.0).color(SUBTEXT))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Открыть клавиатуру / ввод")
+                            .clicked();
+                        (pr, kb_btn)
+                    },
+                );
+                if cfg!(target_os = "android") && (pr.clicked() || native_btn_clicked || ui.interact(p_rect, ui.make_persistent_id("lg-phone-tap"), Sense::click()).clicked()) {
+                    self.android_input_pending = true;
+                    android_jni::prompt_text_input(
+                        "login_phone",
+                        "Номер телефона",
+                        "+7 999 123-45-67",
+                        &self.login_phone_full,
+                        1,
+                    );
+                } else if native_btn_clicked {
+                    pr.request_focus();
+                }
+                if pr.changed() {
+                    self.login_phone_full = countries::format_phone_input(&self.login_phone_full);
+                    if let Some(idx) = countries::detect_country_from_full(&self.login_phone_full) {
+                        self.login_country_idx = idx;
+                        self.login_dial = countries::COUNTRIES[idx].dial.to_owned();
+                    }
+                }
+                if (pr.lost_focus() || pr.has_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_pressed = true;
+                }
+
+                // Встроенная цифровая клавиатура на Android / узких экранах — работает даже если системная IME не отвечает.
+                if cfg!(target_os = "android") {
+                    ui.add_space(8.0);
+                    if Self::paint_android_keypad(ui, form_w, &mut self.login_phone_full, true, 15) {
+                        self.login_phone_full = countries::format_phone_input(&self.login_phone_full);
+                        if let Some(idx) = countries::detect_country_from_full(&self.login_phone_full) {
+                            self.login_country_idx = idx;
+                            self.login_dial = countries::COUNTRIES[idx].dial.to_owned();
+                        }
+                    }
+                }
+
+                ui.add_space(12.0);
+
+                // Чекбокс «Оставаться в системе» (Keep me signed in — как на скрине).
                 ui.allocate_ui_with_layout(
-                    Vec2::new(form_w, 42.0),
+                    Vec2::new(form_w, 28.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let dr = ui.add_sized(
-                            [78.0, 42.0],
-                            egui::TextEdit::singleline(&mut self.login_dial)
-                                .hint_text("+7")
-                                .margin(Vec2::new(10.0, 10.0)),
+                        let (chk_r, chk_resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+                        let chk_k = theme::tween(ui.ctx(), "lg-keep-chk", f32::from(u8::from(self.login_keep_signed_in)), 0.14);
+                        let box_r = egui::Rect::from_center_size(chk_r.center(), Vec2::splat(18.0));
+                        let box_bg = lerp_color(Color32::TRANSPARENT, accent, chk_k);
+                        ui.painter().rect_filled(box_r, egui::CornerRadius::same(5), box_bg);
+                        ui.painter().rect_stroke(
+                            box_r,
+                            egui::CornerRadius::same(5),
+                            egui::Stroke::new(1.5, lerp_color(SUBTEXT, accent, chk_k)),
+                            egui::StrokeKind::Inside,
                         );
-                        if dr.changed() {
-                            if !self.login_dial.starts_with('+') && !self.login_dial.is_empty() {
-                                let d: String = self.login_dial.chars().filter(char::is_ascii_digit).collect();
-                                self.login_dial = format!("+{d}");
-                            }
-                            if let Some(idx) = countries::find_country_by_dial(&self.login_dial) {
-                                self.login_country_idx = idx;
-                            }
+                        if chk_k > 0.25 {
+                            let a = (255.0 * chk_k) as u8;
+                            let tick_col = Color32::from_white_alpha(a);
+                            let c = box_r.center();
+                            ui.painter().add(egui::Shape::line(
+                                vec![
+                                    c + Vec2::new(-4.5, 0.2),
+                                    c + Vec2::new(-1.2, 3.6),
+                                    c + Vec2::new(4.8, -3.5),
+                                ],
+                                egui::Stroke::new(2.0, tick_col),
+                            ));
                         }
-                        let pr = ui.add_sized(
-                            [(form_w - 86.0).max(160.0), 42.0],
-                            egui::TextEdit::singleline(&mut self.phone)
-                                .hint_text(country.hint)
-                                .margin(Vec2::new(10.0, 10.0)),
+                        ui.add_space(8.0);
+                        let lbl_resp = ui.add(
+                            egui::Label::new(RichText::new("Оставаться в системе").size(14.0).color(WHITE))
+                                .sense(Sense::click()),
                         );
-                        if pr.changed()
-                            && let Some((idx, dial, local)) = countries::split_full_phone(&self.phone)
-                        {
-                            self.login_country_idx = idx;
-                            self.login_dial = dial.to_owned();
-                            self.phone = local;
-                        }
-                        if (pr.lost_focus() || dr.lost_focus())
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
-                            enter_pressed = true;
+                        if chk_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || lbl_resp.clicked() {
+                            self.login_keep_signed_in = !self.login_keep_signed_in;
+                            self.send(Cmd::SetKeepSignedIn(self.login_keep_signed_in));
                         }
                     },
                 );
-                ui.add_space(14.0);
-                let btn_lbl = if self.login_busy { "ОТПРАВКА КОДА…" } else { "ПРОДОЛЖИТЬ" };
-                let clicked = ui
-                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(form_w, 44.0)))
-                    .inner
-                    .clicked();
-                if (clicked || enter_pressed) && !self.login_busy {
-                    match countries::normalize_phone(&self.login_dial, &self.phone) {
+
+                ui.add_space(16.0);
+
+                let btn_lbl = if self.login_busy { "ОТПРАВКА КОДА…" } else { "ДАЛЕЕ" };
+                let btn_fill = if self.login_busy {
+                    accent.gamma_multiply(0.55)
+                } else {
+                    accent
+                };
+                let go_btn = ui.add_enabled(
+                    !self.login_busy,
+                    egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
+                        .fill(btn_fill)
+                        .corner_radius(egui::CornerRadius::same(11))
+                        .min_size(Vec2::new(form_w, 46.0)),
+                );
+                if (go_btn.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || enter_pressed) && !self.login_busy {
+                    match countries::normalize_phone(&self.login_dial, &self.login_phone_full) {
                         Ok(full_phone) => {
                             self.error.clear();
                             self.login_last_phone = full_phone.clone();
                             self.login_code_sent_at = Some(std::time::Instant::now());
                             self.login_busy = true;
+                            self.send(Cmd::SetKeepSignedIn(self.login_keep_signed_in));
                             self.send(Cmd::RequestCode(full_phone));
                         }
                         Err(msg) => {
@@ -3239,14 +3759,22 @@ impl App {
                         }
                     }
                 }
-                ui.add_space(16.0);
-                if link(ui, "Войти по QR-коду").clicked() {
+
+                ui.add_space(18.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("ВХОД ПО QR-КОДУ").size(13.5).strong().color(accent))
+                            .frame(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
                     self.error.clear();
                     self.send(Cmd::UseQr);
                 }
             }
             Stage::NeedCode => {
-                Self::paint_login_mascot(ui, "📩", c_orange(), self.emoji.as_ref());
+                Self::paint_login_mascot(ui, "📩", Self::tg_login_blue(), self.emoji.as_ref());
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(if self.login_last_phone.is_empty() {
@@ -3259,24 +3787,65 @@ impl App {
                     .color(WHITE),
                 );
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Мы отправили код в приложение Telegram на другом устройстве или по SMS")
-                        .size(12.5)
-                        .color(SUBTEXT),
-                );
+                let hint_txt = if self.login_code_hint.is_empty() {
+                    "Мы отправили код в приложение Telegram на другом устройстве или по SMS"
+                } else {
+                    self.login_code_hint.as_str()
+                };
+                ui.label(RichText::new(hint_txt).size(12.5).color(SUBTEXT));
                 ui.add_space(14.0);
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.code)
-                        .hint_text("5 цифр кода")
-                        .desired_width(form_w)
-                        .margin(Vec2::new(12.0, 11.0)),
+
+                let (_, r) = Self::outlined_login_field(
+                    ui,
+                    "code",
+                    form_w,
+                    48.0,
+                    "Код из Telegram",
+                    true,
+                    accent,
+                    bg_cut,
+                    |ui| {
+                        ui.add_sized(
+                            [(form_w - 34.0).max(160.0), 32.0],
+                            egui::TextEdit::singleline(&mut self.code)
+                                .frame(egui::Frame::NONE)
+                                .font(FontId::proportional(17.0))
+                                .hint_text("5 цифр кода"),
+                        )
+                    },
                 );
-                ui.add_space(12.0);
+                if cfg!(target_os = "android") && r.clicked() {
+                    self.android_input_pending = true;
+                    android_jni::prompt_text_input(
+                        "login_code",
+                        "Код подтверждения",
+                        "Введите 5 цифр кода",
+                        &self.code,
+                        2,
+                    );
+                }
+                let mut auto_submit = false;
+                if cfg!(target_os = "android") {
+                    ui.add_space(8.0);
+                    if Self::paint_android_keypad(ui, form_w, &mut self.code, false, 6) {
+                        let digits: String = self.code.chars().filter(char::is_ascii_digit).collect();
+                        if digits.len() == 5 {
+                            auto_submit = true;
+                        }
+                    }
+                }
+                ui.add_space(14.0);
                 let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ВОЙТИ" };
                 let go = ui
-                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(form_w, 44.0)))
-                    .inner
+                    .add_enabled(
+                        !self.login_busy,
+                        egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
+                            .fill(if self.login_busy { accent.gamma_multiply(0.55) } else { accent })
+                            .corner_radius(egui::CornerRadius::same(11))
+                            .min_size(Vec2::new(form_w, 46.0)),
+                    )
                     .clicked()
+                    || auto_submit
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if go && !self.code.trim().is_empty() && !self.login_busy {
                     self.error.clear();
@@ -3308,9 +3877,8 @@ impl App {
                 });
             }
             Stage::NeedPassword(hint) => {
-                // Классическая интерактивная обезьянка Telegram 2FA: закрывает глаза при скрытом пароле и подглядывает при показе!
                 let mascot = if self.login_show_password { "🐵" } else { "🙈" };
-                Self::paint_login_mascot(ui, mascot, c_orange(), self.emoji.as_ref());
+                Self::paint_login_mascot(ui, mascot, accent, self.emoji.as_ref());
                 ui.add_space(12.0);
                 ui.label(RichText::new("Введите облачный пароль").size(20.0).strong().color(WHITE));
                 if !hint.is_empty() && hint != "нет" {
@@ -3318,37 +3886,62 @@ impl App {
                 }
                 ui.add_space(14.0);
                 let mut enter_pw = false;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(form_w, 42.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                let (_, r_pw) = Self::outlined_login_field(
+                    ui,
+                    "password",
+                    form_w,
+                    48.0,
+                    "Облачный пароль",
+                    true,
+                    accent,
+                    bg_cut,
                     |ui| {
                         let r = ui.add_sized(
-                            [(form_w - 48.0).max(180.0), 42.0],
+                            [(form_w - 76.0).max(140.0), 32.0],
                             egui::TextEdit::singleline(&mut self.password)
                                 .password(!self.login_show_password)
-                                .hint_text("Облачный пароль")
-                                .margin(Vec2::new(12.0, 10.0)),
+                                .frame(egui::Frame::NONE)
+                                .hint_text("Пароль 2FA"),
                         );
                         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             enter_pw = true;
                         }
-                        let eye = egui::Button::new(
-                            RichText::new(if self.login_show_password { "Скр." } else { "Пок." })
-                                .size(11.5)
-                                .color(SUBTEXT),
-                        )
-                        .fill(t(SIDEBAR_BG))
-                        .corner_radius(egui::CornerRadius::same(10));
-                        if ui.add_sized([40.0, 42.0], eye).clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(if self.login_show_password { "Скр." } else { "Пок." })
+                                        .size(11.5)
+                                        .color(accent),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
                             self.login_show_password = !self.login_show_password;
                         }
+                        r
                     },
                 );
-                ui.add_space(12.0);
-                let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ПРОДОЛЖИТЬ" };
+                if cfg!(target_os = "android") && r_pw.clicked() {
+                    self.android_input_pending = true;
+                    android_jni::prompt_text_input(
+                        "login_password",
+                        "Облачный пароль",
+                        "Введите пароль 2FA",
+                        &self.password,
+                        3,
+                    );
+                }
+                ui.add_space(14.0);
+                let btn_lbl = if self.login_busy { "ПРОВЕРКА…" } else { "ВОЙТИ" };
                 let go = ui
-                    .add_enabled_ui(!self.login_busy, |ui| orange_button(ui, btn_lbl, Vec2::new(form_w, 44.0)))
-                    .inner
+                    .add_enabled(
+                        !self.login_busy,
+                        egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
+                            .fill(if self.login_busy { accent.gamma_multiply(0.55) } else { accent })
+                            .corner_radius(egui::CornerRadius::same(11))
+                            .min_size(Vec2::new(form_w, 46.0)),
+                    )
                     .clicked()
                     || enter_pw;
                 if go && !self.password.is_empty() && !self.login_busy {
@@ -3514,12 +4107,35 @@ impl App {
             if archive_header(ui) {
                 toggle_archive = true;
             }
-        } else if (archived_total > 0 || !self.archive_loaded)
-            && needle.is_empty()
-            && active_folder.is_none()
-            && archive_row(ui, &self.dialogs, self.archive_loaded)
-        {
-            toggle_archive = true;
+        } else if (archived_total > 0 || !self.archive_loaded) && needle.is_empty() && active_folder.is_none() {
+            let arch_key = (self.dialogs_gen, self.archive_loaded);
+            if self.archive_summary_cache_key != arch_key {
+                self.archive_summary_cache_key = arch_key;
+                let names: Vec<&str> = self
+                    .dialogs
+                    .iter()
+                    .filter(|d| d.archived)
+                    .take(3)
+                    .map(|d| d.name.as_str())
+                    .collect();
+                let sub = if !names.is_empty() {
+                    names.join(", ")
+                } else if self.archive_loaded {
+                    "Архив пуст".to_owned()
+                } else {
+                    "Нажмите, чтобы загрузить архивные чаты".to_owned()
+                };
+                let unread: i32 = self
+                    .dialogs
+                    .iter()
+                    .filter(|d| d.archived && !d.muted)
+                    .map(|d| d.unread)
+                    .sum();
+                self.archive_summary_cache = (sub, unread);
+            }
+            if archive_row(ui, &self.archive_summary_cache.0, self.archive_summary_cache.1) {
+                toggle_archive = true;
+            }
         }
         let show_global = !needle.is_empty() && !self.global_results.is_empty();
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
@@ -3630,15 +4246,11 @@ impl App {
                     } else {
                         String::new()
                     };
-                    let date_w = p
-                        .layout_no_wrap(date.clone(), FontId::proportional(13.0), date_c)
-                        .size()
-                        .x;
-                    p.text(
-                        egui::pos2(rect.right() - 12.0, rect.top() + 12.0),
-                        egui::Align2::RIGHT_TOP,
-                        &date,
-                        FontId::proportional(13.0),
+                    let date_galley = p.layout_no_wrap(date, FontId::proportional(13.0), date_c);
+                    let date_w = date_galley.size().x;
+                    p.galley(
+                        egui::pos2(rect.right() - 12.0 - date_w, rect.top() + 12.0),
+                        date_galley,
                         date_c,
                     );
                     let clip_right = (rect.right() - 12.0 - date_w - 8.0).max(rect.left() + 70.0);
@@ -3648,15 +4260,11 @@ impl App {
                         egui::pos2(right.max(rect.left() + 70.0), rect.max.y),
                     );
                     let title_str = if d.saved { "Избранное" } else { d.name.as_str() };
-                    let title_w = p
-                        .layout_no_wrap(title_str.to_owned(), FontId::proportional(15.0), name_c)
-                        .size()
-                        .x;
-                    p.with_clip_rect(name_clip).text(
+                    let title_galley = p.layout_no_wrap(title_str.to_owned(), FontId::proportional(15.0), name_c);
+                    let title_w = title_galley.size().x;
+                    p.with_clip_rect(name_clip).galley(
                         rect.left_top() + Vec2::new(68.0, 12.0),
-                        egui::Align2::LEFT_TOP,
-                        title_str,
-                        FontId::proportional(15.0),
+                        title_galley,
                         name_c,
                     );
                     // Значки после имени: Premium-эмодзи статус / галочка / Premium / без звука (как в AyuGram!).
@@ -3837,7 +4445,7 @@ fn paint_archive_icon(p: &egui::Painter, c: egui::Pos2, size: f32) {
 }
 
 /// Строка «Архив» в начале списка; `true` — нажата. Архив грузится лениво по клику.
-fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow], loaded: bool) -> bool {
+fn archive_row(ui: &mut egui::Ui, sub: &str, unread: i32) -> bool {
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT),
         Sense::click(),
@@ -3853,19 +4461,6 @@ fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow], loaded: bool) -> bool {
         FontId::proportional(15.0),
         WHITE,
     );
-    let names: Vec<&str> = dialogs
-        .iter()
-        .filter(|d| d.archived)
-        .take(3)
-        .map(|d| d.name.as_str())
-        .collect();
-    let sub = if !names.is_empty() {
-        names.join(", ")
-    } else if loaded {
-        "Архив пуст".to_owned()
-    } else {
-        "Нажмите, чтобы загрузить архивные чаты".to_owned()
-    };
     p.with_clip_rect(egui::Rect::from_min_max(
         rect.min,
         egui::pos2(rect.right() - 60.0, rect.max.y),
@@ -3877,7 +4472,6 @@ fn archive_row(ui: &mut egui::Ui, dialogs: &[DialogRow], loaded: bool) -> bool {
         FontId::proportional(13.5),
         DIALOG_TEXT,
     );
-    let unread: i32 = dialogs.iter().filter(|d| d.archived && !d.muted).map(|d| d.unread).sum();
     if unread > 0 {
         let label = if unread > 999 { "999+".to_owned() } else { unread.to_string() };
         let w = (label.chars().count() as f32 * 7.5 + 12.0).max(19.0);
@@ -3910,7 +4504,14 @@ fn archive_header(ui: &mut egui::Ui) -> bool {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        #[cfg(target_os = "android")]
+        {
+            [0.055, 0.055, 0.063, 1.0]
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            [0.0, 0.0, 0.0, 0.0]
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -4125,7 +4726,12 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 let wp_path = self.settings.theme.wallpaper_path.clone();
-                if !wp_path.is_empty() && self.wallpaper_tex.as_ref().is_none_or(|(p, _)| p != &wp_path) {
+                if wp_path.is_empty() {
+                    self.wallpaper_tex = None;
+                    self.wallpaper_failed_path.clear();
+                } else if self.wallpaper_tex.as_ref().is_none_or(|(p, _)| p != &wp_path)
+                    && self.wallpaper_failed_path != wp_path
+                {
                     if let Ok(bytes) = std::fs::read(&wp_path)
                         && let Ok(img) = image::load_from_memory(&bytes)
                     {
@@ -4136,8 +4742,10 @@ impl eframe::App for App {
                         );
                         let tex = ctx.load_texture("rg-wallpaper", ci, egui::TextureOptions::LINEAR);
                         self.wallpaper_tex = Some((wp_path, tex));
+                        self.wallpaper_failed_path.clear();
                     } else {
                         self.wallpaper_tex = None;
+                        self.wallpaper_failed_path = wp_path;
                     }
                 }
                 let wp_tex = self.wallpaper_tex.as_ref().map(|(_, t)| t);
@@ -4178,7 +4786,6 @@ impl App {
         self.create_window(ctx);
         self.settings_window(ctx);
         self.tg_settings_window(ctx);
-        self.my_profile_window(ctx);
         self.proxy_window(ctx);
         self.story_composer_window(ctx);
         self.call_window(ctx);
@@ -4189,6 +4796,7 @@ impl App {
         self.paid_reaction_modal(ctx);
         self.business_window(ctx);
         self.themes_window(ctx);
+        self.emoji_status_window(ctx);
         self.scheduled_window(ctx);
         self.todo_creator_window(ctx);
         self.poll_creator_window(ctx);
@@ -4210,7 +4818,9 @@ impl App {
         }
         #[cfg(target_os = "android")]
         {
-            if let Some(picked) = android_jni::poll_picked_file() {
+            if self.android_pick_target.is_some()
+                && let Some(picked) = android_jni::poll_picked_file()
+            {
                 match self.android_pick_target.take() {
                     Some(AndroidPickTarget::Story) => {
                         self.story_file_path = picked.to_string_lossy().into_owned();
@@ -4230,11 +4840,41 @@ impl App {
                     }
                 }
             }
-            if let Some(tgu) = android_jni::poll_pending_link() {
+            if self.android_webview_open
+                && let Some(tgu) = android_jni::poll_pending_link()
+            {
                 if let Some(parsed) = rg_core::engine::parse_tg_link(&tgu) {
                     self.send(Cmd::OpenTgLink(parsed));
                 }
+                self.android_webview_open = false;
                 self.miniapp_modal = None;
+            }
+            if self.android_input_pending
+                && let Some((tag, val)) = android_jni::poll_text_input()
+            {
+                self.android_input_pending = false;
+                match tag.as_str() {
+                    "login_phone" => {
+                        self.login_phone_full = countries::format_phone_input(&val);
+                        if let Some(idx) = countries::detect_country_from_full(&self.login_phone_full) {
+                            self.login_country_idx = idx;
+                            self.login_dial = countries::COUNTRIES[idx].dial.to_owned();
+                        }
+                    }
+                    "country_search" => {
+                        self.login_country_query = val;
+                    }
+                    "login_code" => {
+                        self.code = val.chars().filter(char::is_ascii_digit).collect();
+                    }
+                    "login_password" => {
+                        self.password = val;
+                    }
+                    "chat_input" => {
+                        self.input = val;
+                    }
+                    _ => {}
+                }
             }
         }
         self.toasts_overlay(ctx);
@@ -4249,6 +4889,7 @@ impl App {
         {
             let _ = frame;
             if let Some((title, url)) = self.miniapp_modal.take() {
+                self.android_webview_open = true;
                 android_jni::open_webview(&url, &title, self.settings.ayu.spoof_webview_as_android);
             }
         }
@@ -4547,6 +5188,10 @@ fn demo_app(mode: &str) -> App {
     app.is_demo = true;
     if qr {
         app.stage = Stage::Qr("tg://login?token=Zm9vYmFyYmF6RGVtb1Rva2VuRm9yU2NyZWVuc2hvdA".to_owned());
+        return app;
+    }
+    if mode == "login" {
+        app.stage = Stage::NeedPhone;
         return app;
     }
     app.stage = Stage::Ready;
@@ -4859,5 +5504,61 @@ mod tests {
         for (name, y) in &chat_ys {
             assert!(*y > 100.0 && *y < 700.0, "chat '{name}' offscreen at y={y}");
         }
+    }
+
+    #[test]
+    fn login_screen_renders_cleanly_on_desktop_and_narrow_phone() {
+        for (w, h) in [(1200.0_f32, 760.0_f32), (380.0_f32, 780.0_f32)] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut app = demo_app("login");
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.login_ui(ui));
+            });
+            out.textures_delta.clear();
+
+            let mut texts = String::new();
+            fn collect_text(shape: &egui::Shape, buf: &mut String) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        buf.push_str(t.galley.text());
+                        buf.push('\n');
+                    }
+                    egui::Shape::Vec(v) => {
+                        for s in v {
+                            collect_text(s, buf);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                collect_text(&cs.shape, &mut texts);
+            }
+            assert!(texts.contains("Telegram"), "viewport {w}x{h} missing title: {texts}");
+            assert!(texts.contains("Страна"), "viewport {w}x{h} missing Country label: {texts}");
+            assert!(texts.contains("Номер телефона"), "viewport {w}x{h} missing Phone label: {texts}");
+            assert!(texts.contains("QR-КОДУ"), "viewport {w}x{h} missing QR switch: {texts}");
+        }
+    }
+
+    #[test]
+    fn qr_demo_screen_renders_without_panicking() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("qr");
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(390.0, 820.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.login_ui(ui));
+        });
+        out.textures_delta.clear();
+        assert!(!out.shapes.is_empty());
     }
 }

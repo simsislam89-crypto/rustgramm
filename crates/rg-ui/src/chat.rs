@@ -27,7 +27,7 @@ pub(crate) enum Act {
     Edit(i32, String),
     Forward(i32),
     Pin(i32, bool),
-    React(i32, &'static str),
+    React(i32, String),
     Delete(i32),
     Repeat(String),
     Details(i32),
@@ -35,6 +35,10 @@ pub(crate) enum Act {
     AddFilter(String),
     CopyId(i32),
     Save(i32),
+    /// Сохранить сообщение в «Избранное» (или скачать медиа по двойному клику).
+    SaveToSaved(i32),
+    /// Скопировать фото сообщения в системный буфер обмена (на ПК).
+    CopyPhoto(i32),
     History(i32),
     Goto(i32),
     OpenUrl(String),
@@ -83,6 +87,8 @@ struct Env<'a> {
     has_discussion: bool,
     format_secs: bool,
     double_tap_action: i32,
+    double_tap_action_out: i32,
+    default_reaction: &'a str,
     arrived: &'a HashMap<i32, f64>,
     img_arrived: &'a HashMap<i32, f64>,
     time: f64,
@@ -129,6 +135,17 @@ fn time_label(ts: i64, seconds: bool) -> String {
 fn short(text: &str, n: usize) -> String {
     let one: String = text.chars().filter(|c| *c != '\n').take(n).collect();
     if text.chars().count() > n { format!("{one}…") } else { one }
+}
+
+/// Разбирает ввод вида `@bot запрос` для запуска встроенного инлайн-бота (`messages.getInlineBotResults`).
+pub fn parse_inline_bot_input(input: &str) -> Option<(String, String)> {
+    let trimmed = input.trim_start();
+    let after_at = trimmed.strip_prefix('@')?;
+    let (bot, q) = after_at.split_once([' ', '\t'])?;
+    if bot.len() < 3 || bot.len() > 32 || !bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((bot.to_ascii_lowercase(), q.to_owned()))
 }
 
 impl App {
@@ -741,7 +758,19 @@ impl App {
                 if !info.invite_link.is_empty() {
                     row(ui, "menu/link", &info.invite_link, "Ссылка-приглашение", true);
                 }
-                row(ui, "menu/profile", &mask_streamer(&format!("{}", d.id), streamer), "ID", !streamer);
+                if self.settings.extera.show_id_and_dc != 0 {
+                    let id_dc = match info.dc_id {
+                        Some(dc) => format!("{} · DC{} ({})", d.id, dc, rg_core::media::dc_location(dc)),
+                        None => d.id.to_string(),
+                    };
+                    row(
+                        ui,
+                        "menu/profile",
+                        &mask_streamer(&id_dc, streamer),
+                        if info.dc_id.is_some() { "ID · DC" } else { "ID" },
+                        !streamer,
+                    );
+                }
             } else {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| ui.label(RichText::new("Загрузка сведений…").color(SUBTEXT)));
@@ -1427,6 +1456,162 @@ impl App {
                 });
             ui.add_space(3.0);
         }
+        // Всплывающие результаты инлайн-бота (`@bot запрос`).
+        if let Some((bot, query)) = parse_inline_bot_input(&self.input) {
+            let key = (bot.clone(), query.clone());
+            if self.inline_bot_key.as_ref() != Some(&key) {
+                self.inline_bot_key = Some(key);
+                self.inline_bot_at = Some(std::time::Instant::now());
+                self.inline_bot_error.clear();
+            }
+            if let Some(at) = self.inline_bot_at {
+                if at.elapsed().as_millis() >= 320 {
+                    self.inline_bot_at = None;
+                    self.inline_bot_loading = true;
+                    self.send(Cmd::QueryInlineBot {
+                        bot: bot.clone(),
+                        query: query.clone(),
+                        offset: String::new(),
+                    });
+                } else {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+                }
+            }
+            let reply_id = self.reply.as_ref().map(|(id, _)| *id);
+            let mut chosen_result: Option<(i64, String)> = None;
+            let mut next_offset_req: Option<String> = None;
+            let page_opt = self
+                .inline_bot_page
+                .as_ref()
+                .filter(|p| p.bot_username == bot);
+            if self.inline_bot_loading || !self.inline_bot_error.is_empty() || page_opt.is_some() {
+                egui::Frame::new()
+                    .fill(t2(WINDOW_BG))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(28)))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("@{bot}")).strong().size(12.5).color(c_orange()));
+                            if self.inline_bot_loading {
+                                ui.add(egui::Spinner::new().size(12.0).color(c_orange()));
+                            }
+                            if !self.inline_bot_error.is_empty() {
+                                ui.label(RichText::new(&self.inline_bot_error).size(12.0).color(DANGER));
+                            }
+                        });
+                        if let Some(page) = page_opt {
+                            if page.results.is_empty() && !self.inline_bot_loading {
+                                ui.label(RichText::new("Нет результатов").size(12.5).color(SUBTEXT));
+                            } else {
+                                egui::ScrollArea::vertical().id_salt("inline-bot-popup").max_height(190.0).show(ui, |ui| {
+                                    for res in &page.results {
+                                        let title = if res.title.is_empty() {
+                                            short(&res.send_text, 48)
+                                        } else {
+                                            res.title.clone()
+                                        };
+                                        let sub = if !res.description.is_empty() {
+                                            short(&res.description, 64)
+                                        } else if !res.send_text.is_empty() {
+                                            short(&res.send_text, 64)
+                                        } else {
+                                            res.kind.clone()
+                                        };
+                                        let lbl = if sub.is_empty() {
+                                            title
+                                        } else {
+                                            format!("{title} — {sub}")
+                                        };
+                                        if ui.selectable_label(false, lbl).clicked() {
+                                            chosen_result = Some((page.query_id, res.id.clone()));
+                                        }
+                                    }
+                                    if !page.next_offset.is_empty() && ui.small_button("Ещё результаты…").clicked() {
+                                        next_offset_req = Some(page.next_offset.clone());
+                                    }
+                                });
+                            }
+                        }
+                    });
+                ui.add_space(3.0);
+            }
+            if let Some((qid, rid)) = chosen_result {
+                self.send(Cmd::SendInlineResult {
+                    query_id: qid,
+                    id: rid,
+                    reply_to: reply_id,
+                });
+                self.input.clear();
+                self.reply = None;
+                self.inline_bot_key = None;
+                self.inline_bot_page = None;
+                self.inline_bot_at = None;
+            } else if let Some(off) = next_offset_req {
+                self.inline_bot_loading = true;
+                self.send(Cmd::QueryInlineBot {
+                    bot,
+                    query,
+                    offset: off,
+                });
+            }
+        } else if self.inline_bot_key.is_some() || self.inline_bot_page.is_some() || !self.inline_bot_error.is_empty() {
+            self.inline_bot_key = None;
+            self.inline_bot_at = None;
+            self.inline_bot_page = None;
+            self.inline_bot_loading = false;
+            self.inline_bot_error.clear();
+        }
+        // Плашка «Перевести перед отправкой» (`translateBeforeSend`).
+        if self.translate_draft_popup && !self.input.trim().is_empty() {
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(28)))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Язык:").size(12.0).color(SUBTEXT));
+                        for code in ["en", "ru", "uk", "de", "es", "fr", "zh", "ja", "tr", "ar"] {
+                            let sel = self.settings.extera.target_language.eq_ignore_ascii_case(code);
+                            if ui.selectable_label(sel, code).clicked() {
+                                self.settings.extera.target_language = code.to_owned();
+                                self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                            }
+                        }
+                        if self.draft_translating {
+                            ui.add(egui::Spinner::new().size(13.0).color(c_orange()));
+                        } else {
+                            let lang = self.settings.extera.target_language.clone();
+                            let draft = self.input.trim().to_owned();
+                            let rep = self.reply.as_ref().map(|(id, _)| *id);
+                            if ui.small_button("Перевести в поле").clicked() {
+                                self.draft_translating = true;
+                                self.send(Cmd::TranslateDraft {
+                                    text: draft.clone(),
+                                    to_lang: lang.clone(),
+                                    send_after: false,
+                                    reply_to: None,
+                                });
+                            }
+                            if orange_button(ui, "Перевести и отправить", Vec2::new(164.0, 26.0)).clicked() {
+                                self.draft_translating = true;
+                                self.reply = None;
+                                self.send(Cmd::TranslateDraft {
+                                    text: draft,
+                                    to_lang: lang,
+                                    send_after: true,
+                                    reply_to: rep,
+                                });
+                            }
+                        }
+                        if ui.small_button("×").clicked() {
+                            self.translate_draft_popup = false;
+                        }
+                    });
+                });
+            ui.add_space(3.0);
+        }
 
         let mut attach = false;
         let has_send_as = cur_dlg_info
@@ -1540,8 +1725,10 @@ impl App {
                 }
             }
             // Точный расчёт правой части — все слоты 36×40, визуальные иконки 19×19.
+            let has_draft = !self.input.trim().is_empty();
             let right_w = 40.0
                 + 36.0
+                + if has_draft { 36.0 } else { 0.0 }
                 + if has_reply_kb { 36.0 } else { 0.0 }
                 + if s.field_emoji_button { 38.0 } else { 0.0 }
                 + if s.field_auto_delete_button { 36.0 } else { 0.0 };
@@ -1612,6 +1799,16 @@ impl App {
                 self.composer_sel = Some((cr.primary.index.into(), cr.secondary.index.into()));
             }
             let r = text_out.response;
+            if cfg!(target_os = "android") && r.clicked() {
+                self.android_input_pending = true;
+                super::android_jni::prompt_text_input(
+                    "chat_input",
+                    "Сообщение",
+                    "Написать сообщение…",
+                    &self.input,
+                    0,
+                );
+            }
             if r.changed() && self.input != before_input {
                 if self.input_undo.last() != Some(&before_input) {
                     self.input_undo.push(before_input);
@@ -1641,6 +1838,29 @@ impl App {
                 if resp.on_hover_text("Форматирование (**жирный**, __курсив__, `код`, ||спойлер||)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.format_bar_open = !self.format_bar_open;
                 }
+            }
+            if has_draft {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
+                let th = tween(ui.ctx(), "cmp-tr-h", f32::from(u8::from(resp.hovered() || self.translate_draft_popup)), 0.12);
+                if th > 0.02 {
+                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(th));
+                }
+                icons::tg_sized(
+                    ui.painter(),
+                    "settings/language",
+                    rect.center(),
+                    Vec2::splat(18.0),
+                    if self.translate_draft_popup { c_orange() } else { lerp_color(DIALOG_DATE, WHITE, th) },
+                );
+                if resp
+                    .on_hover_text("Перевести перед отправкой")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.translate_draft_popup = !self.translate_draft_popup;
+                }
+            } else {
+                self.translate_draft_popup = false;
             }
             if has_reply_kb {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
@@ -2450,7 +2670,7 @@ impl App {
             .map(|x| x.bot_description.clone())
             .unwrap_or_default();
         let mut measured_heights: Vec<(i32, f32)> = Vec::new();
-        let out = {
+        let (out, out_rendered) = {
             let topic_slice = self.active_topic.and_then(|tid| {
                 self.topic_msgs
                     .as_ref()
@@ -2513,6 +2733,12 @@ impl App {
                 has_discussion,
                 format_secs: self.settings.ayu.show_message_seconds || self.settings.extera.format_time_with_seconds,
                 double_tap_action: self.settings.extera.double_tap_action,
+                double_tap_action_out: self.settings.extera.double_tap_action_out_owner,
+                default_reaction: if self.settings.extera.default_reaction.is_empty() {
+                    "👍"
+                } else {
+                    self.settings.extera.default_reaction.as_str()
+                },
                 arrived: &self.arrived,
                 img_arrived: &self.img_arrived,
                 time: ui.input(|i| i.time),
@@ -2524,7 +2750,8 @@ impl App {
             let blocked_ids = &self.blocked_ids;
             let user_filter = self.user_filter.as_ref().map(|(id, _)| *id);
             let heights = &self.msg_heights;
-            egui::ScrollArea::vertical()
+            let mut rendered_ids: Vec<i32> = Vec::with_capacity(32);
+            let scroll_out = egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .stick_to_bottom(!searching && self.autoscroll_anchor.is_none() && self.active_topic.is_none())
                 .show_viewport(ui, |ui, viewport| {
@@ -2587,7 +2814,7 @@ impl App {
                         let new_day = prev_date.is_none_or(|p| !same_day(p, m.date));
                         prev_date = Some(m.date);
                         // Виртуализация для больших чатов: сообщения далеко за пределами видимого окна
-                        // с известной высотой не пересчитывают верстку текста/карточек и не грузят CPU.
+                        // с известной высотой пропускаются без виджетов (ui.add_space) и не грузят CPU.
                         let cur_rel_y = ui.cursor().min.y - origin_y;
                         if album.len() == 1
                             && env.scroll_to != Some(m.id)
@@ -2596,15 +2823,17 @@ impl App {
                                 || cur_rel_y > viewport.max.y + 360.0)
                         {
                             if new_day {
-                                ui.allocate_exact_size(Vec2::new(env.avail, 34.0), Sense::hover());
+                                ui.add_space(34.0);
                             }
-                            ui.allocate_exact_size(Vec2::new(env.avail, cached_h), Sense::hover());
-                            ui.add_space(4.0);
+                            ui.add_space(cached_h + 4.0);
                             i = j;
                             continue;
                         }
                         if new_day {
                             day_pill(ui, env.avail, day_label(m.date, now));
+                        }
+                        for item in album {
+                            rendered_ids.push(item.id);
                         }
                         let y_before = ui.cursor().min.y;
                         if album.len() > 1 {
@@ -2619,10 +2848,14 @@ impl App {
                         i = j;
                     }
                     ui.add_space(8.0);
-                })
+                });
+            (scroll_out, rendered_ids)
         };
-        if self.msg_heights.len() > 2400 {
-            self.msg_heights.clear();
+        self.visible_tgs_msgs.clear();
+        self.visible_tgs_msgs.extend(out_rendered);
+        if self.msg_heights.len() > 4000 {
+            let live: std::collections::HashSet<i32> = self.messages.iter().map(|m| m.id).collect();
+            self.msg_heights.retain(|id, _| live.contains(id));
         }
         for (mid, h) in measured_heights {
             self.msg_heights.insert(mid, h);
@@ -2857,14 +3090,17 @@ impl App {
             }
             Act::Forward(id) => self.forward = Some(id),
             Act::Pin(id, on) => self.send(Cmd::Pin(id, on)),
-            Act::React(id, e) => self.send(Cmd::React(id, e.to_owned())),
+            Act::React(id, e) => self.send(Cmd::React(id, e)),
             Act::PaidReact(id) => self.paid_react_msg = Some(id),
             Act::Delete(id) => self.confirm_delete = Some(id),
             Act::Repeat(text) => self.send(Cmd::Send(text, None)),
             Act::Details(id) => {
                 self.details = Some(id);
+                self.details_tab = 0;
                 self.edit_history = None;
+                self.msg_activity = None;
                 self.send(Cmd::EditHistory(id));
+                self.send(Cmd::LoadMessageActivity(id));
             }
             Act::Hide(id) => {
                 self.hidden.insert(id);
@@ -2882,6 +3118,15 @@ impl App {
             }
             Act::CopyId(id) => ctx.copy_text(id.to_string()),
             Act::Save(id) => self.send(Cmd::Download(id)),
+            Act::SaveToSaved(id) => {
+                if let Some(saved_idx) = self.dialogs.iter().position(|d| d.saved) {
+                    self.send(Cmd::Forward(id, saved_idx, false));
+                    self.status = "Сохранено в «Избранное»".to_owned();
+                } else {
+                    self.send(Cmd::Download(id));
+                }
+            }
+            Act::CopyPhoto(id) => self.send(Cmd::CopyPhoto(id)),
             Act::Open(id) => self.send(Cmd::OpenFile(id)),
             Act::CancelFetch(id) => self.send(Cmd::CancelFetch(id)),
             Act::Viewer(id) => {
@@ -2890,7 +3135,11 @@ impl App {
             }
             Act::History(id) => {
                 self.details = Some(id);
+                self.details_tab = 0;
+                self.edit_history = None;
+                self.msg_activity = None;
                 self.send(Cmd::EditHistory(id));
+                self.send(Cmd::LoadMessageActivity(id));
             }
             Act::Goto(id) => {
                 self.scroll_to = Some(id);
@@ -3016,7 +3265,17 @@ impl App {
                         self.status = "Скопировано в буфер обмена".to_owned();
                     }
                     K::SwitchInline { query, .. } => {
-                        self.input = query;
+                        let uname = self
+                            .selected
+                            .and_then(|i| self.dialogs.get(i))
+                            .and_then(|d| self.peer_infos.get(&d.id))
+                            .map(|p| p.username.trim().trim_start_matches('@'))
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        self.input = match uname {
+                            Some(bot) => format!("@{bot} {query}"),
+                            None => query,
+                        };
                     }
                     K::UserProfile(uid) => {
                         self.send(Cmd::OpenTgLink(rg_core::engine::TgLink::UserId(uid)));
@@ -3066,16 +3325,28 @@ impl App {
                     );
                     ui.checkbox(&mut self.forward_no_author, "Скрыть автора (без подписи)");
                     let needle = self.forward_filter.to_lowercase();
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for (i, d) in self.dialogs.iter().enumerate() {
-                            if !needle.is_empty() && !d.name.to_lowercase().contains(&needle) {
-                                continue;
+                    let matched: Vec<usize> = self
+                        .dialogs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                        .map(|(i, _)| i)
+                        .collect();
+                    egui::ScrollArea::vertical().max_height(320.0).show_rows(
+                        ui,
+                        22.0,
+                        matched.len(),
+                        |ui, range| {
+                            for idx in range {
+                                if let Some(&di) = matched.get(idx)
+                                    && let Some(d) = self.dialogs.get(di)
+                                    && ui.selectable_label(false, &d.name).clicked()
+                                {
+                                    chosen = Some(di);
+                                }
                             }
-                            if ui.selectable_label(false, &d.name).clicked() {
-                                chosen = Some(i);
-                            }
-                        }
-                    });
+                        },
+                    );
                 });
             if let Some(i) = chosen {
                 self.send(Cmd::Forward(id, i, self.forward_no_author));
@@ -3142,47 +3413,163 @@ impl App {
         if let Some(id) = self.details {
             let mut open = true;
             let m = self.messages.iter().chain(self.found.iter().flatten()).find(|m| m.id == id).cloned();
+            let mut tab = self.details_tab;
+            let mut copied_lbl: Option<String> = None;
+            let activity = self.msg_activity.as_ref().filter(|(mid, _, _)| *mid == id);
             egui::Window::new("Сведения о сообщении")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .default_width(360.0)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     let Some(m) = m else {
                         ui.label("Сообщение недоступно");
                         return;
                     };
-                    ui.label(format!("ID: {}", m.id));
-                    ui.label(format!("Отправлено: {}", full_date(m.date)));
-                    if let Some(e) = m.edit_date {
-                        ui.label(format!("Изменено: {}", full_date(e)));
-                    }
-                    if !m.sender.is_empty() {
-                        ui.label(format!("Отправитель: {}", m.sender));
-                    }
-                    if let Some(f) = &m.forwarded_from {
-                        ui.label(format!("Переслано от: {f}"));
-                    }
-                    if let Some(v) = m.views {
-                        ui.label(format!("Просмотры: {v}"));
-                    }
-                    if m.reactions > 0 {
-                        ui.label(format!("Реакции: {}", m.reactions));
-                    }
-                    if let Some((eid, versions)) = &self.edit_history
-                        && *eid == id
-                        && !versions.is_empty()
-                    {
-                        ui.separator();
-                        ui.label(RichText::new("Прежние версии").strong());
-                        for (n, v) in versions.iter().enumerate() {
-                            ui.label(format!("{}. {}", n + 1, short(v, 200)));
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut tab, 0, "Метаданные");
+                        ui.selectable_value(
+                            &mut tab,
+                            1,
+                            match activity {
+                                Some((_, readers, _)) => format!("Прочитали ({})", readers.len()),
+                                None => "Прочитали".to_owned(),
+                            },
+                        );
+                        ui.selectable_value(
+                            &mut tab,
+                            2,
+                            match activity {
+                                Some((_, _, reacts)) => format!("Реакции ({})", reacts.len()),
+                                None => "Реакции".to_owned(),
+                            },
+                        );
+                    });
+                    ui.separator();
+                    match tab {
+                        1 => {
+                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                                match activity {
+                                    None => {
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new().size(14.0).color(c_orange()));
+                                            ui.label(RichText::new("Загрузка списка…").color(SUBTEXT));
+                                        });
+                                    }
+                                    Some((_, readers, _)) if readers.is_empty() => {
+                                        ui.label(RichText::new("Нет сведений (доступно для своих сообщений в группах)").color(SUBTEXT));
+                                    }
+                                    Some((_, readers, _)) => {
+                                        for r in readers {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(&r.name).color(WHITE));
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.label(RichText::new(full_date(i64::from(r.date))).size(11.5).color(SUBTEXT));
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        2 => {
+                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                                match activity {
+                                    None => {
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new().size(14.0).color(c_orange()));
+                                            ui.label(RichText::new("Загрузка реакций…").color(SUBTEXT));
+                                        });
+                                    }
+                                    Some((_, _, reacts)) if reacts.is_empty() => {
+                                        ui.label(RichText::new("Реакций нет").color(SUBTEXT));
+                                    }
+                                    Some((_, _, reacts)) => {
+                                        for r in reacts {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(&r.reaction).size(15.0));
+                                                ui.label(RichText::new(&r.name).color(WHITE));
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.label(RichText::new(full_date(i64::from(r.date))).size(11.5).color(SUBTEXT));
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        _ => {
+                            let mut copy_row = |ui: &mut egui::Ui, label: &str, val: &str| {
+                                if ui
+                                    .selectable_label(false, format!("{label}: {val}"))
+                                    .on_hover_text("Нажмите, чтобы скопировать")
+                                    .clicked()
+                                {
+                                    ctx.copy_text(val.to_owned());
+                                    copied_lbl = Some(label.to_owned());
+                                }
+                            };
+                            copy_row(ui, "ID сообщения", &m.id.to_string());
+                            copy_row(ui, "Отправлено", &full_date(m.date));
+                            if let Some(e) = m.edit_date {
+                                copy_row(ui, "Изменено", &full_date(e));
+                            }
+                            if !m.sender.is_empty() {
+                                copy_row(ui, "Отправитель", &format!("{} (ID {})", m.sender, m.sender_id));
+                            } else if m.sender_id != 0 {
+                                copy_row(ui, "ID отправителя", &m.sender_id.to_string());
+                            }
+                            if let Some(f) = &m.forwarded_from {
+                                copy_row(ui, "Переслано от", f);
+                            }
+                            if let Some(v) = m.views {
+                                ui.label(format!("Просмотры: {v}"));
+                            }
+                            if m.reactions > 0 {
+                                ui.label(format!("Реакции: {}", m.reactions));
+                            }
+                            if let Some(mi) = &m.media {
+                                ui.separator();
+                                ui.label(RichText::new("Медиа").strong());
+                                if !mi.name.is_empty() {
+                                    copy_row(ui, "Файл", &mi.name);
+                                }
+                                if let Some(dc) = mi.dc_id {
+                                    copy_row(ui, "Дата-центр", &format!("DC{dc} ({})", rg_core::media::dc_location(dc)));
+                                }
+                                if !mi.mime.is_empty() {
+                                    copy_row(ui, "MIME", &mi.mime);
+                                }
+                                if mi.size > 0 {
+                                    ui.label(format!("Размер: {} байт", mi.size));
+                                }
+                                if mi.dims.0 > 0 && mi.dims.1 > 0 {
+                                    ui.label(format!("Разрешение: {}×{}", mi.dims.0, mi.dims.1));
+                                }
+                            }
+                            if let Some((eid, versions)) = &self.edit_history
+                                && *eid == id
+                                && !versions.is_empty()
+                            {
+                                ui.separator();
+                                ui.label(RichText::new("Прежние версии").strong());
+                                for (n, v) in versions.iter().enumerate() {
+                                    ui.label(format!("{}. {}", n + 1, short(v, 200)));
+                                }
+                            }
                         }
                     }
                 });
+            self.details_tab = tab;
+            if let Some(lbl) = copied_lbl {
+                self.status = format!("Скопировано: {lbl}");
+            }
             if !open {
                 self.details = None;
+                self.details_tab = 0;
                 self.edit_history = None;
+                self.msg_activity = None;
             }
         }
         // Пакетная пересылка выделенных сообщений (`ayu_forward.cpp`).
@@ -3202,16 +3589,28 @@ impl App {
                     );
                     ui.checkbox(&mut self.forward_no_author, "Скрыть автора (без подписи)");
                     let needle = self.forward_filter.to_lowercase();
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for (i, d) in self.dialogs.iter().enumerate() {
-                            if !needle.is_empty() && !d.name.to_lowercase().contains(&needle) {
-                                continue;
+                    let matched: Vec<usize> = self
+                        .dialogs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                        .map(|(i, _)| i)
+                        .collect();
+                    egui::ScrollArea::vertical().max_height(320.0).show_rows(
+                        ui,
+                        22.0,
+                        matched.len(),
+                        |ui, range| {
+                            for idx in range {
+                                if let Some(&di) = matched.get(idx)
+                                    && let Some(d) = self.dialogs.get(di)
+                                    && ui.selectable_label(false, &d.name).clicked()
+                                {
+                                    chosen = Some(di);
+                                }
                             }
-                            if ui.selectable_label(false, &d.name).clicked() {
-                                chosen = Some(i);
-                            }
-                        }
-                    });
+                        },
+                    );
                 });
             if let Some(i) = chosen {
                 self.send(Cmd::ForwardBatch(ids, i, self.forward_no_author));
@@ -4005,12 +4404,15 @@ impl App {
                 }
                 let bar = Rect::from_center_size(
                     egui::pos2(rect.center().x, rect.bottom() - 36.0),
-                    Vec2::new(360.0, 38.0),
+                    Vec2::new(470.0_f32.min(rect.width() - 24.0), 38.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
                     ui.horizontal(|ui| {
                         if orange_button(ui, "Сохранить", Vec2::new(105.0, 32.0)).clicked() {
                             acts.push(Act::Save(id));
+                        }
+                        if ui.button("Копировать фото").clicked() {
+                            acts.push(Act::CopyPhoto(id));
                         }
                         if ui.button("Открыть оригинал").clicked() {
                             acts.push(Act::Open(id));
@@ -4338,10 +4740,10 @@ fn bubble(
                             env.spoilers,
                         ));
                     } else if !m.text.is_empty() {
-                        match env.emoji {
+                        match env.emoji.filter(|e| e.contains(&m.text)) {
                             Some(e) => e.rich_label(ui, &m.text, 15.0, text_c),
                             None => {
-                                ui.label(RichText::new(&m.text).color(text_c));
+                                ui.add(egui::Label::new(galley));
                             }
                         }
                     }
@@ -4577,13 +4979,9 @@ fn bubble(
             acts.push(Act::Spoiler(m.id, *i));
         }
         if resp.double_clicked() && !m.deleted {
-            match env.double_tap_action {
-                1 => acts.push(Act::React(m.id, "👍")),
-                2 => acts.push(Act::Reply(m.id, m.text.clone())),
-                3 if !m.text.is_empty() => acts.push(Act::Copy(m.text.clone())),
-                4 => acts.push(Act::Forward(m.id)),
-                5 if m.outgoing && !m.text.is_empty() => acts.push(Act::Edit(m.id, m.text.clone())),
-                _ => {}
+            let code = if m.outgoing { env.double_tap_action_out } else { env.double_tap_action };
+            if let Some(a) = double_tap_act_for(code, m.outgoing, m.id, &m.text, env.default_reaction) {
+                acts.push(a);
             }
         } else if resp.clicked() {
             let ctrl = ui.ctx().input(|i| i.modifiers.command);
@@ -4735,6 +5133,23 @@ fn reactions_visible(s: &AyuSettings) -> bool {
     s.show_private_chat_reactions || s.show_group_reactions || s.show_channel_reactions
 }
 
+/// Выбор действия при двойном клике по сообщению (входящие vs свои).
+fn double_tap_act_for(code: i32, outgoing: bool, msg_id: i32, text: &str, default_reaction: &str) -> Option<Act> {
+    match code {
+        1 => Some(Act::React(
+            msg_id,
+            if default_reaction.is_empty() { "👍".to_owned() } else { default_reaction.to_owned() },
+        )),
+        2 => Some(Act::Reply(msg_id, text.to_owned())),
+        3 if !text.is_empty() => Some(Act::Copy(text.to_owned())),
+        4 => Some(Act::Forward(msg_id)),
+        5 if outgoing && !text.is_empty() => Some(Act::Edit(msg_id, text.to_owned())),
+        6 => Some(Act::SaveToSaved(msg_id)),
+        7 if !text.is_empty() => Some(Act::Translate(msg_id, text.to_owned())),
+        _ => None,
+    }
+}
+
 /// Контекстное меню сообщения: обычные пункты Telegram и пункты AyuGram по их видимости.
 fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     let s = env.s;
@@ -4750,7 +5165,7 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                         .clicked(),
                 };
                 if clicked {
-                    acts.push(Act::React(m.id, e));
+                    acts.push(Act::React(m.id, (*e).to_owned()));
                     ui.close();
                 }
             }
@@ -4775,6 +5190,9 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     }
     if s.show_message_shot && (!m.text.is_empty() || m.media.is_some()) {
         item(ui, "menu/photo", "Снимок сообщения", Act::Shot(m.id));
+    }
+    if m.media.as_ref().is_some_and(|i| i.kind == rg_core::media::MediaKind::Photo) {
+        item(ui, "menu/copy", "Копировать фото", Act::CopyPhoto(m.id));
     }
     if m.media.as_ref().is_some_and(|i| i.is_downloadable()) {
         item(ui, "menu/download", "Сохранить файл", Act::Save(m.id));
@@ -5047,5 +5465,47 @@ fn render_rich_blocks(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_inline_bot_input_handles_valid_and_invalid_queries() {
+        assert_eq!(parse_inline_bot_input(""), None);
+        assert_eq!(parse_inline_bot_input("@ab cats"), None);
+        assert_eq!(parse_inline_bot_input("@gif"), None);
+        assert_eq!(parse_inline_bot_input("hello @gif cats"), None);
+        assert_eq!(
+            parse_inline_bot_input("@gif "),
+            Some(("gif".to_owned(), String::new()))
+        );
+        assert_eq!(
+            parse_inline_bot_input("@My_Bot cats cute"),
+            Some(("my_bot".to_owned(), "cats cute".to_owned()))
+        );
+    }
+
+    #[test]
+    fn double_tap_act_for_separates_incoming_and_outgoing_actions() {
+        assert!(matches!(
+            double_tap_act_for(1, false, 10, "hi", "🔥"),
+            Some(Act::React(10, ref e)) if e == "🔥"
+        ));
+        assert!(double_tap_act_for(5, false, 10, "hi", "👍").is_none());
+        assert!(matches!(
+            double_tap_act_for(5, true, 10, "hi", "👍"),
+            Some(Act::Edit(10, ref t)) if t == "hi"
+        ));
+        assert!(matches!(
+            double_tap_act_for(6, false, 11, "x", "👍"),
+            Some(Act::SaveToSaved(11))
+        ));
+        assert!(matches!(
+            double_tap_act_for(7, false, 12, "bonjour", "👍"),
+            Some(Act::Translate(12, ref t)) if t == "bonjour"
+        ));
     }
 }

@@ -2104,6 +2104,420 @@ impl Engine {
         .map_err(|e| format!("Медленный режим: {e}"))?;
         Ok(())
     }
+
+    // =========================================================================
+    // Инлайн-боты, быстрые реакции, эмодзи-статус и активность сообщений
+    // =========================================================================
+
+    /// Запрос результатов инлайн-бота (`@bot запрос`) с кэшированием `InputUser` бота.
+    pub async fn inline_bot_results(
+        &self,
+        peer: PeerRef,
+        bot_username: &str,
+        query: &str,
+        offset: &str,
+    ) -> Result<InlineBotResultsPage, String> {
+        let clean_user = bot_username.trim().trim_start_matches('@').to_ascii_lowercase();
+        if clean_user.len() < 3 {
+            return Err("Некорректное имя бота".to_owned());
+        }
+        let cached = self
+            .inline_bots_cache
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&clean_user).cloned());
+        let bot_input = if let Some(u) = cached {
+            u
+        } else {
+            let res = self
+                .client
+                .invoke(&tl::functions::contacts::ResolveUsername {
+                    username: clean_user.clone(),
+                    referer: None,
+                })
+                .await
+                .map_err(|e| format!("Поиск @{clean_user}: {e}"))?;
+            let tl::enums::contacts::ResolvedPeer::Peer(rp) = res;
+            let resolved_user = rp
+                .users
+                .iter()
+                .find_map(|u| match u {
+                    tl::enums::User::User(x) => {
+                        let uname = x.username.as_deref().unwrap_or_default();
+                        if x.bot && uname.eq_ignore_ascii_case(&clean_user) {
+                            x.access_hash.map(|ah| {
+                                tl::enums::InputUser::User(tl::types::InputUser {
+                                    user_id: x.id,
+                                    access_hash: ah,
+                                })
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| format!("Инлайн-бот @{clean_user} не найден"))?;
+            if let Ok(mut g) = self.inline_bots_cache.lock() {
+                if g.len() > 64 {
+                    g.clear();
+                }
+                g.insert(clean_user.clone(), resolved_user.clone());
+            }
+            resolved_user
+        };
+        let tl::enums::messages::BotResults::Results(res) = self
+            .invoke_retry(
+                "messages.getInlineBotResults",
+                &tl::functions::messages::GetInlineBotResults {
+                    bot: bot_input,
+                    peer: peer.into(),
+                    geo_point: None,
+                    query: query.to_owned(),
+                    offset: offset.to_owned(),
+                },
+            )
+            .await
+            .map_err(|e| format!("Инлайн-бот @{clean_user}: {e}"))?;
+        let mut results = Vec::with_capacity(res.results.len());
+        for item in res.results {
+            match item {
+                tl::enums::BotInlineResult::Result(r) => {
+                    let thumb_url = r.thumb.as_ref().map(|w| match w {
+                        tl::enums::WebDocument::Document(d) => d.url.clone(),
+                        tl::enums::WebDocument::NoProxy(d) => d.url.clone(),
+                    });
+                    results.push(InlineBotResultRow {
+                        id: r.id,
+                        kind: r.r#type,
+                        title: r.title.unwrap_or_default(),
+                        description: r.description.unwrap_or_default(),
+                        thumb_url,
+                        send_text: extract_inline_send_text(&r.send_message),
+                    });
+                }
+                tl::enums::BotInlineResult::BotInlineMediaResult(r) => {
+                    results.push(InlineBotResultRow {
+                        id: r.id,
+                        kind: r.r#type,
+                        title: r.title.unwrap_or_default(),
+                        description: r.description.unwrap_or_default(),
+                        thumb_url: None,
+                        send_text: extract_inline_send_text(&r.send_message),
+                    });
+                }
+            }
+        }
+        Ok(InlineBotResultsPage {
+            query_id: res.query_id,
+            gallery: res.gallery,
+            next_offset: res.next_offset.unwrap_or_default(),
+            results,
+            bot_username: clean_user,
+        })
+    }
+
+    /// Отправить выбранный результат инлайн-бота (`messages.sendInlineBotResult`).
+    pub async fn send_inline_bot_result(
+        &self,
+        peer: PeerRef,
+        query_id: i64,
+        id: &str,
+        reply_to: Option<i32>,
+    ) -> Result<(), grammers_client::InvocationError> {
+        self.client
+            .invoke(&tl::functions::messages::SendInlineBotResult {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                hide_via: false,
+                peer: peer.into(),
+                reply_to: reply_to.map(|mid| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id: mid,
+                        top_msg_id: None,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                        quote_rich: None,
+                    })
+                }),
+                random_id: rand_i64(),
+                query_id,
+                id: id.to_owned(),
+                schedule_date: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                allow_paid_stars: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Список доступных реакций Telegram (`messages.getAvailableReactions`).
+    pub async fn available_reactions(
+        &self,
+    ) -> Result<Vec<AvailableReactionRow>, grammers_client::InvocationError> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetAvailableReactions { hash: 0 })
+            .await?;
+        let tl::enums::messages::AvailableReactions::Reactions(r) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(r.reactions
+            .into_iter()
+            .filter_map(|ar| {
+                let tl::enums::AvailableReaction::Reaction(x) = ar;
+                if x.inactive || x.reaction.is_empty() {
+                    None
+                } else {
+                    Some(AvailableReactionRow {
+                        emoji: x.reaction,
+                        title: x.title,
+                        premium: x.premium,
+                    })
+                }
+            })
+            .collect())
+    }
+
+    /// Задать быструю реакцию по умолчанию на сервере Telegram (`messages.setDefaultReaction`).
+    pub async fn set_default_reaction(
+        &self,
+        emoji: &str,
+    ) -> Result<(), grammers_client::InvocationError> {
+        self.client
+            .invoke(&tl::functions::messages::SetDefaultReaction {
+                reaction: tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                    emoticon: emoji.to_owned(),
+                }),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Список стандартных эмодзи-статусов аккаунта (`account.getDefaultEmojiStatuses`).
+    pub async fn default_emoji_statuses(&self) -> Result<Vec<i64>, grammers_client::InvocationError> {
+        let res = self
+            .client
+            .invoke(&tl::functions::account::GetDefaultEmojiStatuses { hash: 0 })
+            .await?;
+        let tl::enums::account::EmojiStatuses::Statuses(s) = res else {
+            return Ok(Vec::new());
+        };
+        Ok(s.statuses
+            .into_iter()
+            .filter_map(|st| match st {
+                tl::enums::EmojiStatus::Status(x) => Some(x.document_id),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Обновить эмодзи-статус текущего аккаунта (`account.updateEmojiStatus`).
+    pub async fn update_emoji_status(
+        &self,
+        document_id: Option<i64>,
+        until: Option<i32>,
+    ) -> Result<(), grammers_client::InvocationError> {
+        let emoji_status = match document_id {
+            Some(id) => tl::enums::EmojiStatus::Status(tl::types::EmojiStatus {
+                document_id: id,
+                until,
+            }),
+            None => tl::enums::EmojiStatus::Empty,
+        };
+        self.client
+            .invoke(&tl::functions::account::UpdateEmojiStatus { emoji_status })
+            .await?;
+        Ok(())
+    }
+
+    /// Кто прочитал сообщение в группе/канале (`messages.getMessageReadParticipants`).
+    pub async fn message_read_participants(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+    ) -> Result<Vec<ReadParticipantRow>, String> {
+        let list = self
+            .client
+            .invoke(&tl::functions::messages::GetMessageReadParticipants {
+                peer: peer.into(),
+                msg_id,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut raw: Vec<(i64, i32)> = Vec::with_capacity(list.len());
+        let mut inputs: Vec<tl::enums::InputUser> = Vec::with_capacity(list.len().min(50));
+        for item in list {
+            let tl::enums::ReadParticipantDate::Date(d) = item;
+            raw.push((d.user_id, d.date));
+            if inputs.len() < 50 {
+                inputs.push(tl::enums::InputUser::User(tl::types::InputUser {
+                    user_id: d.user_id,
+                    access_hash: 0,
+                }));
+            }
+        }
+        let mut names = std::collections::HashMap::new();
+        if !inputs.is_empty()
+            && let Ok(users) = self.client.invoke(&tl::functions::users::GetUsers { id: inputs }).await
+        {
+            for u in users {
+                if let tl::enums::User::User(x) = u {
+                    let full = [x.first_name.as_deref(), x.last_name.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let label = if !full.trim().is_empty() {
+                        full
+                    } else if let Some(un) = x.username.as_deref().filter(|s| !s.is_empty()) {
+                        format!("@{un}")
+                    } else {
+                        format!("ID {}", x.id)
+                    };
+                    names.insert(x.id, label);
+                }
+            }
+        }
+        Ok(raw
+            .into_iter()
+            .map(|(user_id, date)| ReadParticipantRow {
+                name: names.remove(&user_id).unwrap_or_else(|| format!("ID {user_id}")),
+                user_id,
+                date,
+            })
+            .collect())
+    }
+
+    /// Список поставивших реакции на сообщение (`messages.getMessageReactionsList`).
+    pub async fn message_reactions_list(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+    ) -> Result<Vec<MessageReactionPeerRow>, String> {
+        let tl::enums::messages::MessageReactionsList::List(l) = self
+            .client
+            .invoke(&tl::functions::messages::GetMessageReactionsList {
+                peer: peer.into(),
+                id: msg_id,
+                reaction: None,
+                offset: None,
+                limit: 50,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut peer_names = std::collections::HashMap::<i64, String>::new();
+        for u in &l.users {
+            if let tl::enums::User::User(x) = u {
+                let full = [x.first_name.as_deref(), x.last_name.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let label = if !full.trim().is_empty() {
+                    full
+                } else if let Some(un) = x.username.as_deref().filter(|s| !s.is_empty()) {
+                    format!("@{un}")
+                } else {
+                    format!("ID {}", x.id)
+                };
+                peer_names.insert(x.id, label);
+            }
+        }
+        for c in &l.chats {
+            match c {
+                tl::enums::Chat::Chat(x) => {
+                    peer_names.insert(-x.id, x.title.clone());
+                }
+                tl::enums::Chat::Channel(x) => {
+                    peer_names.insert(-1_000_000_000_000 - x.id, x.title.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(l.reactions
+            .into_iter()
+            .map(|mr| {
+                let tl::enums::MessagePeerReaction::Reaction(r) = mr;
+                let peer_id = match r.peer_id {
+                    tl::enums::Peer::User(u) => u.user_id,
+                    tl::enums::Peer::Chat(c) => -c.chat_id,
+                    tl::enums::Peer::Channel(c) => -1_000_000_000_000 - c.channel_id,
+                };
+                let reaction = match r.reaction {
+                    tl::enums::Reaction::Emoji(e) => e.emoticon,
+                    tl::enums::Reaction::CustomEmoji(c) => format!("✨#{}", c.document_id),
+                    tl::enums::Reaction::Paid => "⭐".to_owned(),
+                    tl::enums::Reaction::Empty => String::new(),
+                };
+                MessageReactionPeerRow {
+                    name: peer_names
+                        .get(&peer_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("ID {peer_id}")),
+                    peer_id,
+                    reaction,
+                    date: r.date,
+                }
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineBotResultRow {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub description: String,
+    pub thumb_url: Option<String>,
+    pub send_text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineBotResultsPage {
+    pub query_id: i64,
+    pub gallery: bool,
+    pub next_offset: String,
+    pub results: Vec<InlineBotResultRow>,
+    pub bot_username: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AvailableReactionRow {
+    pub emoji: String,
+    pub title: String,
+    pub premium: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadParticipantRow {
+    pub user_id: i64,
+    pub name: String,
+    pub date: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageReactionPeerRow {
+    pub peer_id: i64,
+    pub name: String,
+    pub reaction: String,
+    pub date: i32,
+}
+
+fn extract_inline_send_text(msg: &tl::enums::BotInlineMessage) -> String {
+    match msg {
+        tl::enums::BotInlineMessage::MediaAuto(m) => m.message.clone(),
+        tl::enums::BotInlineMessage::Text(m) => m.message.clone(),
+        _ => String::new(),
+    }
 }
 
 /// Локальная офлайн-расшифровка голосового сообщения (без лимитов и без сторонних хостов):

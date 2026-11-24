@@ -72,14 +72,22 @@ impl MessageStore {
 
     async fn init(db: libsql::Database) -> Result<Self> {
         let conn = db.connect()?;
-        // Журнал WAL ускоряет запись; ошибка не критична (например, для памяти).
+        // Журнал WAL и настройки скорости записи без лишних fsync на каждый коммит.
         let _ = conn.query("PRAGMA journal_mode=WAL", ()).await;
+        let _ = conn.execute_batch(
+            "PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-8000;",
+        ).await;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages(
                  peer INTEGER NOT NULL, msg_id INTEGER NOT NULL,
                  text TEXT NOT NULL, date INTEGER NOT NULL,
                  deleted INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY(peer, msg_id));
+             CREATE INDEX IF NOT EXISTS idx_messages_msg_peer ON messages(msg_id, peer);
+             CREATE INDEX IF NOT EXISTS idx_messages_peer_del_date ON messages(peer, deleted, date);
              CREATE TABLE IF NOT EXISTS edits(
                  peer INTEGER NOT NULL, msg_id INTEGER NOT NULL,
                  rev INTEGER NOT NULL, old_text TEXT NOT NULL, edited_at INTEGER NOT NULL,
@@ -103,7 +111,9 @@ impl MessageStore {
                  text TEXT NOT NULL,
                  date INTEGER NOT NULL,
                  ttl_secs INTEGER NOT NULL DEFAULT 0,
-                 expires_at INTEGER NOT NULL DEFAULT 0);",
+                 expires_at INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS idx_secret_msgs_chat_date ON secret_messages(chat_id, date, id);
+             CREATE INDEX IF NOT EXISTS idx_secret_msgs_expires ON secret_messages(expires_at);",
         )
         .await?;
         Ok(Self { _db: db, conn })
@@ -163,33 +173,57 @@ impl MessageStore {
         Ok(out)
     }
 
-    /// Пометить удалёнными; возвращает, сколько из них у нас сохранено.
+    /// Пометить удалёнными одной транзакцией; возвращает, сколько из них у нас сохранено.
     pub async fn mark_deleted(&self, peer: i64, ids: &[i32]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute("BEGIN", ()).await?;
         let mut n = 0;
         for id in ids {
-            n += self
+            match self
                 .conn
                 .execute(
                     "UPDATE messages SET deleted=1 WHERE peer=?1 AND msg_id=?2",
                     params![peer, i64::from(*id)],
                 )
-                .await?;
+                .await
+            {
+                Ok(v) => n += v,
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
         }
+        self.conn.execute("COMMIT", ()).await?;
         Ok(n)
     }
 
-    /// Удаление без указания чата (личные чаты и обычные группы): id уникальны на аккаунт.
+    /// Удаление без указания чата (личные чаты и обычные группы) одной транзакцией.
     pub async fn mark_deleted_private(&self, ids: &[i32]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute("BEGIN", ()).await?;
         let mut n = 0;
         for id in ids {
-            n += self
+            match self
                 .conn
                 .execute(
                     "UPDATE messages SET deleted=1 WHERE msg_id=?1 AND peer>?2",
                     params![i64::from(*id), CHANNEL_BOUND],
                 )
-                .await?;
+                .await
+            {
+                Ok(v) => n += v,
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
         }
+        self.conn.execute("COMMIT", ()).await?;
         Ok(n)
     }
 
@@ -318,8 +352,22 @@ impl MessageStore {
             .await
     }
 
-    /// Все сохранённые удалённые или изменённые сообщения чата с историей правок (`ayu/ui/message_history`).
+    /// Все сохранённые удалённые или изменённые сообщения чата с историей правок (`ayu/ui/message_history`) без N+1 запросов.
     pub async fn audit_peer(&self, peer: i64) -> Result<Vec<SavedAudit>> {
+        let mut edits_by_msg: std::collections::HashMap<i32, Vec<(String, i64)>> =
+            std::collections::HashMap::new();
+        let mut erows = self
+            .conn
+            .query(
+                "SELECT msg_id, old_text, edited_at FROM edits WHERE peer=?1 ORDER BY msg_id, rev",
+                params![peer],
+            )
+            .await?;
+        while let Some(er) = erows.next().await? {
+            let mid = i32::try_from(er.get::<i64>(0)?).unwrap_or_default();
+            edits_by_msg.entry(mid).or_default().push((er.get(1)?, er.get(2)?));
+        }
+
         let mut rows = self
             .conn
             .query(
@@ -337,17 +385,7 @@ impl MessageStore {
             let text: String = r.get(1)?;
             let date: i64 = r.get(2)?;
             let deleted = r.get::<i64>(3)? != 0;
-            let mut erows = self
-                .conn
-                .query(
-                    "SELECT old_text, edited_at FROM edits WHERE peer=?1 AND msg_id=?2 ORDER BY rev",
-                    params![peer, i64::from(msg_id)],
-                )
-                .await?;
-            let mut edits = Vec::new();
-            while let Some(er) = erows.next().await? {
-                edits.push((er.get(0)?, er.get(1)?));
-            }
+            let edits = edits_by_msg.remove(&msg_id).unwrap_or_default();
             out.push(SavedAudit { msg_id, text, date, deleted, edits });
         }
         Ok(out)
@@ -661,5 +699,31 @@ mod tests {
         s.delete_secret_chat(777).await.unwrap();
         assert!(s.list_secret_chats().await.unwrap().is_empty());
         assert!(s.secret_messages(777, 1020).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_indexes_present_for_messages_and_secrets() {
+        let s = MessageStore::in_memory().await.unwrap();
+        let mut rows = s
+            .conn
+            .query("SELECT name FROM sqlite_master WHERE type='index'", ())
+            .await
+            .unwrap();
+        let mut names = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            let n: String = r.get(0).unwrap();
+            names.push(n);
+        }
+        for req in [
+            "idx_messages_msg_peer",
+            "idx_messages_peer_del_date",
+            "idx_secret_msgs_chat_date",
+            "idx_secret_msgs_expires",
+        ] {
+            assert!(
+                names.iter().any(|n| n == req),
+                "missing expected SQLite index {req} in {names:?}"
+            );
+        }
     }
 }
