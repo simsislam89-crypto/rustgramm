@@ -122,6 +122,19 @@
 | Переход к дате (календарь + `messages.getHistory { offset_date }`) | ✅ `Engine::history_at_date`, `parse_date_dmy`, `date_jump_window` (быстрые кнопки + сетка календаря + ввод ДД.ММ.ГГГГ), кликабельные пилюли даты | `engine_ext.rs`, `worker.rs`, `features_ui.rs`, `chat.rs` |
 | Общие группы + добавление/правка/удаление контакта в профиле | ✅ `Engine::common_chats` (`messages.getCommonChats`), `add_contact` / `delete_contact`, вкладка «Общие» и блок контакта в `info_ui` | `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs` |
 
+## Новые функции этапа 35 (v0.23.0)
+
+| Функция | Статус | Где |
+|---|---|---|
+| Исправление мобильного интерфейса входа и нативного Android-ввода во всех полях | ✅ безопасные отступы `android-safe-top = 54.0` / `android-safe-bottom = 18.0`, выравнивание клавиатуры `paint_android_keypad` и ширины колонки `col_w`, центрирование текста `.align(Align2::LEFT_CENTER)`, модальное окно выбора страны `country_picker_window`, глобальный `poll_android_bridge` в начале `App::ui` и хуки `open_android_input`/`hook_android_text` в чате/поиске/настройках/модалках | `lib.rs`, `chat.rs`, `tg_settings.rs` |
+| Исправление входа по QR-коду (`ExportLoginToken`, cross-DC 2FA и чёткость QR) | ✅ устранено 2-сек перезаписывание токена (ожидание `has_login_token_update` + `sleep_until` по expiry), `password_step_in_dc` для 2FA после `MigrateTo`, кнопка «Обновить QR», сплошные модули `render_qr_image` и уменьшенный центр-бейдж `rg-qr-tex-cache-v4` с сохранением шаблона выравнивания Version 7 QR | `qr.rs`, `theme.rs`, `worker.rs`, `lib.rs` |
+| Надёжное сохранение удалённых сообщений (свои + офлайн + перезапуски) | ✅ столбцы `outgoing` и `sender` в `Saved`, `remember_full`/`remember_many_full`/`upsert_deleted`/`mark_missing_deleted`/`deleted_in_range` без перезаписи `deleted=1`, `UpdatesConfiguration { catch_up: true }`, `delete_with_backup`, слияние удалённых в `history_before`, сохранение `messages.db*` в `wipe_if_logged_out`, фоновая синхронизация 10 верхних чатов | `rg-ayu/src/store.rs`, `engine.rs`, `engine_ext.rs`, `worker.rs`, `chat.rs`, `lib.rs` |
+| Глобальный поиск сообщений (`messages.searchGlobal`) | ✅ `Engine::search_global_messages` (`GlobalMessageHit`), переключатель `Чаты и люди` / `Сообщения` и фильтры `Все`/`Личные`/`Группы`/`Каналы` в левой колонке, переход в чат с подсветкой (`pending_jump_to_msg`) | `engine_ext.rs`, `worker.rs`, `lib.rs` |
+| Очистка истории чата и выход из группы/канала | ✅ `Engine::clear_history` (`messages.deleteHistory`/`channels.deleteHistory`) и `Engine::leave_chat` (`channels.leaveChannel`/`messages.deleteChatUser`), пункты в контекстном меню и `⋮`, диалог подтверждения `chat_action_confirm_window` | `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs`, `features_ui.rs` |
+| Список всех закреплённых сообщений + «Открепить все» | ✅ `Engine::pinned_messages` (`InputMessagesFilterPinned`) и `Engine::unpin_all_messages` (`messages.unpinAllMessages`), кнопка «Все» в плашке закрепа и меню `⋮`, модалка `pinned_list_window` | `engine_ext.rs`, `worker.rs`, `chat.rs`, `features_ui.rs` |
+| Расширенная пересылка AyuGram (`ForwardOptions`) | ✅ `Engine::forward_advanced` (`drop_author`, `drop_media_captions`, `silent`) и 3 чекбокса в окнах одиночной и пакетной пересылки | `engine_ext.rs`, `worker.rs`, `chat.rs` |
+| Ссылки на папки Telegram (`chatlists.*` + `t.me/addlist/...`) | ✅ `TgLink::ChatlistInvite`, `export_folder_invite`/`check_folder_invite`/`join_folder_invite`, «Поделиться ссылкой» и «Добавить папку по ссылке» в настройках папок, предпросмотр и подключение `folder_invite_window` | `engine.rs`, `engine_ext.rs`, `worker.rs`, `tg_settings.rs`, `features_ui.rs`, `lib.rs` |
+
 ## Порядок дальнейших этапов
 1. **Этап 9 — лента как у Telegram:** форматирование текста и ссылки, GIF/видео/голосовые, анимированные стикеры, альбомы.
 2. **Этап 10 — навигация:** папки, архив, контакты, избранное, профили, глобальный поиск.

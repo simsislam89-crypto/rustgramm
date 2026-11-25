@@ -352,13 +352,15 @@ impl App {
                         ui.painter().circle_filled(Pos2::new(c.x, c.y + dy), r_dot, dc);
                     }
                 }
-                let sel = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.pinned, d.muted, d.archived, d.saved, d.unread)));
+                let sel = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.id, d.name.clone(), d.kind, d.pinned, d.muted, d.archived, d.saved, d.unread)));
                 let mut act: Option<Cmd> = None;
                 let mut search = false;
                 let mut open_sched = false;
                 let mut open_date_jump = false;
                 let mut open_global_deleted = false;
                 let mut do_local_read = false;
+                let mut open_pinned_list: Option<i64> = None;
+                let mut ask_chat_action: Option<(i64, String, bool)> = None;
                 egui::Popup::menu(&dots.on_hover_cursor(egui::CursorIcon::PointingHand)).show(|ui| {
                     ui.set_min_width(220.0);
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -374,7 +376,11 @@ impl App {
                         open_sched = true;
                         ui.close();
                     }
-                    if let Some((i, pinned, muted, archived, saved, unread)) = sel {
+                    if let Some((i, did, dname, dkind, pinned, muted, archived, saved, unread)) = sel.clone() {
+                        if kit::menu_item(ui, "menu/pin", "Все закреплённые", false) {
+                            open_pinned_list = Some(did);
+                            ui.close();
+                        }
                         if kit::menu_item(ui, if pinned { "menu/unpin" } else { "menu/pin" }, if pinned { "Открепить" } else { "Закрепить" }, false) {
                             act = Some(Cmd::PinDialog(i, !pinned));
                             ui.close();
@@ -410,8 +416,27 @@ impl App {
                             act = Some(Cmd::Archive(i, !archived));
                             ui.close();
                         }
+                        if kit::menu_item(ui, "menu/delete", "Очистить историю", false) {
+                            ask_chat_action = Some((did, dname.clone(), false));
+                            ui.close();
+                        }
+                        if !saved
+                            && matches!(dkind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel)
+                            && kit::menu_item(ui, "menu/leave", "Покинуть чат / канал", false)
+                        {
+                            ask_chat_action = Some((did, dname, true));
+                            ui.close();
+                        }
                     }
                 });
+                if let Some(did) = open_pinned_list {
+                    self.pinned_list_open = true;
+                    self.pinned_list_did = Some(did);
+                    self.send(Cmd::LoadPinnedMessages(did));
+                }
+                if let Some((did, dname, is_leave)) = ask_chat_action {
+                    self.confirm_chat_action = Some((did, dname, is_leave, false));
+                }
                 if open_date_jump {
                     self.date_jump_open = true;
                 }
@@ -1180,7 +1205,9 @@ impl App {
                     .hint_text("Поиск сообщений")
                     .margin(Vec2::new(8.0, 6.0)),
             );
+            #[cfg(not(target_os = "android"))]
             r.request_focus();
+            self.hook_android_text(&r, "chat_search", "Поиск по чату", "Текст сообщения", &self.chat_search.clone(), 0);
             let go = orange_button(ui, "Найти", Vec2::new(72.0, 30.0)).clicked()
                 || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
@@ -1970,16 +1997,7 @@ impl App {
                 self.composer_sel = Some((cr.primary.index.into(), cr.secondary.index.into()));
             }
             let r = text_out.response;
-            if cfg!(target_os = "android") && r.clicked() {
-                self.android_input_pending = true;
-                super::android_jni::prompt_text_input(
-                    "chat_input",
-                    "Сообщение",
-                    "Написать сообщение…",
-                    &self.input,
-                    0,
-                );
-            }
+            self.hook_android_text(&r, "chat_input", "Сообщение", "Написать сообщение…", &self.input.clone(), 0);
             if r.changed() && self.input != before_input {
                 if self.input_undo.last() != Some(&before_input) {
                     self.input_undo.push(before_input);
@@ -2712,7 +2730,7 @@ impl App {
                         ui.horizontal(|ui| {
                             let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 28.0), Sense::hover());
                             ui.painter().rect_filled(bar, 1.5, ORANGE);
-                            let txt_w = (ui.available_width() - 32.0).max(80.0);
+                            let txt_w = (ui.available_width() - 72.0).max(80.0);
                             let preview = if pin.text.is_empty() {
                                 "Вложение".to_owned()
                             } else {
@@ -2733,6 +2751,11 @@ impl App {
                                 } else {
                                     self.status = "Закреплённое сообщение выше в истории".to_owned();
                                 }
+                            }
+                            if ui.small_button("Все").on_hover_text("Все закреплённые").clicked() {
+                                self.pinned_list_open = true;
+                                self.pinned_list_did = Some(cid);
+                                self.send(Cmd::LoadPinnedMessages(cid));
                             }
                             if ui.small_button("✕").on_hover_text("Открепить").clicked() {
                                 self.send(Cmd::Pin(pin.id, false));
@@ -3526,6 +3549,7 @@ impl App {
                     .desired_width(iw)
                     .margin(Vec2::new(10.0, 8.0)),
             );
+            self.hook_android_text(&te, "comment_input", "Комментарий", "Написать комментарий…", &self.comment_input.clone(), 0);
             let pressed_enter = (te.has_focus() || te.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let clicked_send = orange_button(ui, "➤", Vec2::new(36.0, 34.0)).clicked();
             if (clicked_send || pressed_enter) && !self.comment_input.trim().is_empty() {
@@ -3873,12 +3897,15 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.add(
+                    let r_fwd = ui.add(
                         egui::TextEdit::singleline(&mut self.forward_filter)
                             .hint_text("Поиск чата")
                             .desired_width(300.0),
                     );
+                    self.hook_android_text(&r_fwd, "forward_filter", "Поиск чата", "Имя чата или группы", &self.forward_filter.clone(), 0);
                     ui.checkbox(&mut self.forward_no_author, "Скрыть автора (без подписи)");
+                    ui.checkbox(&mut self.forward_no_captions, "Скрыть подписи к медиа");
+                    ui.checkbox(&mut self.forward_silent, "Отправить без звука");
                     let needle = self.forward_filter.to_lowercase();
                     let matched: Vec<usize> = self
                         .dialogs
@@ -3904,7 +3931,13 @@ impl App {
                     );
                 });
             if let Some(i) = chosen {
-                self.send(Cmd::Forward(id, i, self.forward_no_author));
+                self.send(Cmd::ForwardAdvanced {
+                    ids: vec![id],
+                    to_idx: i,
+                    drop_author: self.forward_no_author,
+                    drop_media_captions: self.forward_no_captions,
+                    silent: self.forward_silent,
+                });
                 open = false;
             }
             if !open {
@@ -3953,7 +3986,27 @@ impl App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
-                            self.send(Cmd::Delete(id));
+                            let backup = self
+                                .messages
+                                .iter()
+                                .chain(self.found.iter().flatten())
+                                .find(|m| m.id == id)
+                                .map(|m| {
+                                    let txt = if !m.text.trim().is_empty() {
+                                        m.text.clone()
+                                    } else if let Some(med) = &m.media {
+                                        format!("[{}]", med.name)
+                                    } else {
+                                        String::new()
+                                    };
+                                    (txt, m.date, m.outgoing, m.sender.clone())
+                                });
+                            if self.settings.ayu.save_deleted_messages {
+                                for m in self.messages.iter_mut().filter(|m| m.id == id) {
+                                    m.deleted = true;
+                                }
+                            }
+                            self.send(Cmd::Delete { id, backup });
                             close = true;
                         }
                         if ui.button("Отмена").clicked() {
@@ -4137,12 +4190,15 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.add(
+                    let r_fwd = ui.add(
                         egui::TextEdit::singleline(&mut self.forward_filter)
                             .hint_text("Поиск чата")
                             .desired_width(300.0),
                     );
+                    self.hook_android_text(&r_fwd, "forward_filter", "Поиск чата", "Имя чата или группы", &self.forward_filter.clone(), 0);
                     ui.checkbox(&mut self.forward_no_author, "Скрыть автора (без подписи)");
+                    ui.checkbox(&mut self.forward_no_captions, "Скрыть подписи к медиа");
+                    ui.checkbox(&mut self.forward_silent, "Отправить без звука");
                     let needle = self.forward_filter.to_lowercase();
                     let matched: Vec<usize> = self
                         .dialogs
@@ -4168,7 +4224,13 @@ impl App {
                     );
                 });
             if let Some(i) = chosen {
-                self.send(Cmd::ForwardBatch(ids, i, self.forward_no_author));
+                self.send(Cmd::ForwardAdvanced {
+                    ids,
+                    to_idx: i,
+                    drop_author: self.forward_no_author,
+                    drop_media_captions: self.forward_no_captions,
+                    silent: self.forward_silent,
+                });
                 self.selected_msgs.clear();
                 open = false;
             }
@@ -4709,6 +4771,19 @@ impl App {
                                     .frame(egui::Frame::NONE)
                                     .desired_width(reply_r.width() - 20.0),
                             );
+                            if cfg!(target_os = "android")
+                                && !self.android_input_pending
+                                && (r.clicked() || r.gained_focus())
+                            {
+                                self.android_input_pending = true;
+                                super::android_jni::prompt_text_input(
+                                    "story_reply",
+                                    "Ответ на историю",
+                                    "Ответить…",
+                                    &self.story_reply_text,
+                                    0,
+                                );
+                            }
                             if r.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 && !self.story_reply_text.trim().is_empty()

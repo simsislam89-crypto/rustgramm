@@ -33,6 +33,7 @@ pub enum Cmd {
     Proxy(String),
     UsePhone,
     UseQr,
+    RefreshQr,
     Preview(usize, i32),
     /// Загрузить фото профиля чата с индексом.
     Avatar(usize),
@@ -96,7 +97,11 @@ pub enum Cmd {
     SendFile(PathBuf, String, Option<i32>),
     /// Прежние версии текста сообщения.
     EditHistory(i32),
-    Delete(i32),
+    /// Удалить сообщение (с резервной копией для гарантированного сохранения при самоудалении).
+    Delete {
+        id: i32,
+        backup: Option<(String, i64, bool, String)>,
+    },
     /// Переслать сообщение в чат с таким индексом списка (`true` — без автора, функция AyuGram).
     Forward(i32, usize, bool),
     /// Перевести текст сообщения встроенным переводчиком Telegram.
@@ -544,6 +549,34 @@ pub enum Cmd {
     },
     /// Удалить пользователя из контактов (`contacts.deleteContacts`).
     DeleteContact(usize),
+    /// 1. Глобальный поиск по тексту сообщений во всех чатах (`messages.searchGlobal`).
+    SearchGlobalMessages(String, u8),
+    /// 2а. Очистить историю чата (`dialog_id`, `revoke`).
+    ClearHistory(i64, bool),
+    /// 2б. Покинуть группу или канал (`dialog_id`).
+    LeaveChat(i64),
+    /// 3а. Загрузить все закреплённые сообщения чата (`dialog_id`).
+    LoadPinnedMessages(i64),
+    /// 3б. Открепить все закреплённые сообщения чата (`dialog_id`).
+    UnpinAllMessages(i64),
+    /// 4. Расширенная пересылка AyuGram (`ids`, `to_idx`, без автора, без подписей к медиа, без звука).
+    ForwardAdvanced {
+        ids: Vec<i32>,
+        to_idx: usize,
+        drop_author: bool,
+        drop_media_captions: bool,
+        silent: bool,
+    },
+    /// 5а. Экспортировать пригласительную ссылку на папку чатов.
+    ExportFolderInvite {
+        folder_id: i32,
+        title: String,
+        peers: Vec<grammers_session::types::PeerRef>,
+    },
+    /// 5б. Проверить пригласительную ссылку на папку чатов (`t.me/addlist/...`).
+    CheckFolderInvite(String),
+    /// 5в. Присоединиться к папке чатов по ссылке.
+    JoinFolderInvite(String, Vec<grammers_session::types::PeerRef>),
     Settings(Box<Settings>),
 }
 
@@ -756,6 +789,20 @@ pub enum Ev {
     CommonChats(i64, Vec<ContactRow>),
     /// Обновление статуса контакта (`user_id`, в контактах, отображаемое имя).
     ContactUpdated(i64, bool, String),
+    /// 1. Результаты глобального поиска сообщений во всех чатах.
+    GlobalMessages(String, Vec<rg_core::engine::GlobalMessageHit>),
+    /// 2а. История чата очищена (`dialog_id`).
+    HistoryCleared(i64),
+    /// 2б. Пользователь покинул группу/канал (`dialog_id`).
+    LeftChat(i64),
+    /// 3а. Список всех закреплённых сообщений чата.
+    PinnedMessagesList(i64, Vec<MessageRow>),
+    /// 3б. Все сообщения в чате откреплены (`dialog_id`).
+    AllUnpinned(i64),
+    /// 5а. Готовая пригласительная ссылка на папку чатов (`t.me/addlist/...`).
+    FolderInviteUrl(String),
+    /// 5б. Предпросмотр папки по приглашению `t.me/addlist/...`.
+    FolderInvitePreview(rg_core::engine::FolderInvitePreview),
     Status(String),
     Error(String),
 }
@@ -835,8 +882,8 @@ fn keys_from_file(home: &std::path::Path) -> Option<Config> {
     .ok()
 }
 
-/// После выхода из аккаунта удаляет сессию, базу сообщений и кэш предыдущего аккаунта.
-/// Вызывается до подключения: файлы ещё не открыты. Настройки и загрузки остаются.
+/// После выхода из аккаунта удаляет сессию и кэш предыдущего входа, но СОХРАНЯЕТ `messages.db`,
+/// чтобы архив удалённых сообщений и правок переживал перезаход в аккаунт.
 fn wipe_if_logged_out(home: &std::path::Path) {
     let flag = home.join("logout.flag");
     if !flag.exists() {
@@ -846,9 +893,6 @@ fn wipe_if_logged_out(home: &std::path::Path) {
         "main.session",
         "main.session-shm",
         "main.session-wal",
-        "messages.db",
-        "messages.db-shm",
-        "messages.db-wal",
         "dialogs_cache.json",
     ] {
         let _ = std::fs::remove_file(home.join(name));
@@ -1430,7 +1474,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         Err(_) => out.err("Сервер Telegram не ответил за 20 с — проверьте сеть или SOCKS5 прокси"),
                     }
                 }
-                Cmd::UseQr => {
+                Cmd::UseQr | Cmd::RefreshQr => {
                     qr_mode = true;
                     out.send(Ev::Stage(Stage::Qr(String::new())));
                 }
@@ -1445,13 +1489,26 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             qr_mode = true;
             out.send(Ev::Stage(Stage::Qr(String::new())));
         }
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut qr_next_poll_at = tokio::time::Instant::now();
         let mut last_url = String::new();
 
         #[allow(clippy::never_loop)]
         let switch_now: bool = loop {
         let cmd = tokio::select! {
             c = cmds.recv() => match c { Some(c) => c, None => break false },
+            maybe_upd = async {
+                match updates.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if qr_mode && updates.is_some() => {
+                if let Some(upd) = maybe_upd
+                    && rg_core::qr::has_login_token_update(&upd)
+                {
+                    qr_next_poll_at = tokio::time::Instant::now();
+                }
+                continue;
+            }
             Some((batch, done)) = dialog_stream_rx.recv() => {
                 if !batch.is_empty() {
                     let mut known: std::collections::HashSet<i64> = dialogs.iter().map(|d| d.id).collect();
@@ -1477,21 +1534,20 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 }
                 continue;
             }
-            _ = tick.tick(), if qr_mode => {
-                if qr_fail_streak > 0 {
-                    qr_fail_streak = qr_fail_streak.saturating_sub(1);
-                    if !qr_fail_streak.is_multiple_of(2) {
-                        continue;
-                    }
-                }
+            _ = tokio::time::sleep_until(qr_next_poll_at), if qr_mode => {
                 let qr_res = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(15),
                     rg_core::qr::poll(&connected.client, &*connected.session, cfg.api_id, &cfg.api_hash),
                 )
                 .await;
                 match qr_res {
-                    Ok(Ok(rg_core::qr::QrStep::Token { url, .. })) => {
+                    Ok(Ok(rg_core::qr::QrStep::Token { url, expires })) => {
                         qr_fail_streak = 0;
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs() as i64);
+                        let rem = (i64::from(expires) - now_unix - 1).clamp(12, 26) as u64;
+                        qr_next_poll_at = tokio::time::Instant::now() + std::time::Duration::from_secs(rem);
                         if url != last_url {
                             last_url = url.clone();
                             out.send(Ev::Stage(Stage::Qr(url)));
@@ -1499,6 +1555,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                     Ok(Ok(rg_core::qr::QrStep::Expired)) => {
                         qr_fail_streak = 0;
+                        qr_next_poll_at = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
                     }
                     Ok(Ok(rg_core::qr::QrStep::Done)) => {
                         qr_mode = false;
@@ -1511,16 +1568,16 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         out.send(Ev::Stage(Stage::NeedPassword(hint)));
                     }
                     Ok(Err(e)) => {
-                        qr_fail_streak = (qr_fail_streak + 1).min(4);
-                        if last_url.is_empty() {
-                            out.err(friendly_login_error(&e.to_string()));
-                        }
+                        qr_fail_streak = (qr_fail_streak + 1).min(5);
+                        let wait_s = u64::from(qr_fail_streak) * 3;
+                        qr_next_poll_at = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_s);
+                        out.err(friendly_login_error(&e.to_string()));
                     }
                     Err(_) => {
-                        qr_fail_streak = (qr_fail_streak + 1).min(4);
-                        if last_url.is_empty() {
-                            out.err("Таймаут загрузки QR-кода — проверьте сеть или прокси");
-                        }
+                        qr_fail_streak = (qr_fail_streak + 1).min(5);
+                        let wait_s = u64::from(qr_fail_streak) * 3;
+                        qr_next_poll_at = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_s);
+                        out.err("Таймаут загрузки QR-кода — проверьте сеть или прокси");
                     }
                 }
                 continue;
@@ -1557,9 +1614,10 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 out.send(Ev::LoginBusy(false));
                 out.send(Ev::Stage(Stage::NeedPhone));
             }
-            Cmd::UseQr => {
+            Cmd::UseQr | Cmd::RefreshQr => {
                 qr_mode = true;
                 qr_fail_streak = 0;
+                qr_next_poll_at = tokio::time::Instant::now();
                 last_url.clear();
                 out.send(Ev::LoginBusy(false));
                 out.send(Ev::Stage(Stage::Qr(String::new())));
@@ -2372,12 +2430,18 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                 });
             }
-            Cmd::Delete(id) => {
+            Cmd::Delete { id, backup } => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
                 let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
                 tokio::spawn(async move {
-                    match eng.delete(peer, &[id]).await {
+                    let res = if let Some((text, date, outgoing, sender)) = backup {
+                        eng.delete_with_backup(peer, &[(id, text, date, outgoing, sender)])
+                            .await
+                    } else {
+                        eng.delete(peer, &[id]).await
+                    };
+                    match res {
                         Ok(_) => reload(&eng, &out, peer, i).await,
                         Err(e) => out.err(format!("Не удалено: {e}")),
                     }
@@ -3019,6 +3083,19 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             }
                             Err(e) => out.err(format!("Приглашение: {e}")),
                         }
+                    }
+                    L::ChatlistInvite(slug) => {
+                        let (eng, out) = (engine.clone(), out.clone());
+                        out.send(Ev::Status("Проверка папки…".into()));
+                        tokio::spawn(async move {
+                            match eng.check_folder_invite(&slug).await {
+                                Ok(prev) => {
+                                    out.send(Ev::Status(String::new()));
+                                    out.send(Ev::FolderInvitePreview(prev));
+                                }
+                                Err(e) => out.err(e),
+                            }
+                        });
                     }
                     L::Resolve {
                         domain,
@@ -4568,6 +4645,145 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     Err(e) => out.err(e),
                 }
             }
+            Cmd::SearchGlobalMessages(q, scope) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.search_global_messages(&q, scope, 40).await {
+                        Ok(hits) => out.send(Ev::GlobalMessages(q, hits)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ClearHistory(did, revoke) => {
+                let Some((idx, peer)) = dialogs.iter().enumerate().find(|(_, d)| d.id == did).map(|(i, d)| (i, d.peer)) else { continue };
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.clear_history(peer, revoke).await {
+                        Ok(()) => {
+                            out.send(Ev::HistoryCleared(did));
+                            out.send(Ev::Status("История чата очищена".into()));
+                            reload(&eng, &out, peer, idx).await;
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LeaveChat(did) => {
+                let Some(pos) = dialogs.iter().position(|d| d.id == did) else { continue };
+                let peer = dialogs[pos].peer;
+                match engine.leave_chat(peer).await {
+                    Ok(()) => {
+                        let open_id = current.and_then(|c| dialogs.get(c)).map(|d| d.id);
+                        dialogs.remove(pos);
+                        current = open_id.filter(|&oid| oid != did).and_then(|oid| dialogs.iter().position(|d| d.id == oid));
+                        if !engine.settings().privacy_shield.ephemeral_local_cache {
+                            save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                        }
+                        out.send(Ev::LeftChat(did));
+                        out.send(Ev::Dialogs(dialogs.clone()));
+                        out.send(Ev::Status("Вы покинули чат".into()));
+                    }
+                    Err(e) => out.err(e),
+                }
+            }
+            Cmd::LoadPinnedMessages(did) => {
+                let Some(peer) = dialogs.iter().find(|d| d.id == did).map(|d| d.peer) else { continue };
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.pinned_messages(peer, 80).await {
+                        Ok(rows) => out.send(Ev::PinnedMessagesList(did, rows)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::UnpinAllMessages(did) => {
+                let Some((idx, peer)) = dialogs.iter().enumerate().find(|(_, d)| d.id == did).map(|(i, d)| (i, d.peer)) else { continue };
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.unpin_all_messages(peer).await {
+                        Ok(()) => {
+                            out.send(Ev::AllUnpinned(did));
+                            out.send(Ev::Status("Все закрепления сняты".into()));
+                            reload(&eng, &out, peer, idx).await;
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ForwardAdvanced {
+                ids,
+                to_idx,
+                drop_author,
+                drop_media_captions,
+                silent,
+            } => {
+                let Some(i) = current else { continue };
+                let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to_idx)) else { continue };
+                let (eng, out, fp, tp, dname) =
+                    (engine.clone(), out.clone(), from.peer, dest.peer, dest.name.clone());
+                tokio::spawn(async move {
+                    let opts = rg_core::engine::ForwardOptions {
+                        drop_author,
+                        drop_media_captions,
+                        silent,
+                    };
+                    match eng.forward_advanced(fp, tp, &ids, opts).await {
+                        Ok(()) => {
+                            let mut tags = Vec::new();
+                            if drop_author {
+                                tags.push("без автора");
+                            }
+                            if drop_media_captions {
+                                tags.push("без подписи");
+                            }
+                            if silent {
+                                tags.push("тихо");
+                            }
+                            let note = if tags.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", tags.join(", "))
+                            };
+                            out.send(Ev::Status(format!("Переслано{note}: {dname}")));
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ExportFolderInvite {
+                folder_id,
+                title,
+                peers,
+            } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.export_folder_invite(folder_id, &title, &peers).await {
+                        Ok(url) => out.send(Ev::FolderInviteUrl(url)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::CheckFolderInvite(slug_or_url) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.check_folder_invite(&slug_or_url).await {
+                        Ok(prev) => out.send(Ev::FolderInvitePreview(prev)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::JoinFolderInvite(slug, peers) => {
+                match engine.join_folder_invite(&slug, &peers).await {
+                    Ok(()) => {
+                        if let Ok(f) = engine.folders().await {
+                            cached_folders = f.clone();
+                            out.send(Ev::Folders(f));
+                        }
+                        out.send(Ev::Status("Папка добавлена".into()));
+                    }
+                    Err(e) => out.err(e),
+                }
+            }
             Cmd::Settings(s) => {
                 let s = *s;
                 rg_core::diag::set_enabled(s.diag_logging);
@@ -4629,10 +4845,16 @@ async fn refresh_keep(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>, 
     *current = keep.and_then(|id| dialogs.iter().position(|d| d.id == id));
 }
 
-/// Перечитать последние сообщения открытого чата (передаётся стабильный Bot API `dialog_id`).
+/// Перечитать последние сообщения открытого чата и обновить локальный дисковый кэш (сохраняя deleted=true).
 async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerRef, _idx: usize) {
+    let did = peer.id.bot_api_dialog_id_unchecked();
     if let Ok(rows) = engine.history(peer, 45).await {
-        out.send(Ev::History(peer.id.bot_api_dialog_id_unchecked(), rows));
+        if !engine.settings().privacy_shield.ephemeral_local_cache {
+            let acc_dir = account_home(&home(), engine.settings().active_account);
+            let rows_save = rows.clone();
+            tokio::task::spawn_blocking(move || save_history_cache(&acc_dir, did, &rows_save));
+        }
+        out.send(Ev::History(did, rows));
     }
 }
 
@@ -4800,19 +5022,23 @@ async fn enter(
             }
         });
     }
-    // 4. Прогрев кэша истории первых 3 чатов (0 мс при открытии).
+    // 4. Прогрев локальной БД и кэша истории первых 10 чатов (0 мс при открытии + перехват оффлайн-удалений).
     let prefetch: Vec<(grammers_session::types::PeerRef, i64)> = dialogs
         .iter()
         .filter(|d| !d.archived)
-        .take(3)
+        .take(10)
         .map(|d| (d.peer, d.id))
         .collect();
     if !prefetch.is_empty() && !engine.settings().privacy_shield.ephemeral_local_cache {
         let eng = engine.clone();
         let h_dir = home.to_owned();
         tokio::spawn(async move {
-            for (peer, id) in prefetch {
-                if let Ok(rows) = eng.history(peer, 45).await {
+            for (idx, (peer, id)) in prefetch.into_iter().enumerate() {
+                if idx >= 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                }
+                let lim = if idx < 3 { 45 } else { 25 };
+                if let Ok(rows) = eng.history(peer, lim).await {
                     let h2 = h_dir.clone();
                     let _ = tokio::task::spawn_blocking(move || save_history_cache(&h2, id, &rows)).await;
                 }

@@ -200,6 +200,8 @@ pub enum TgLink {
     Proxy(String),
     /// Приглашение в группу/канал (`t.me/+HASH`, `t.me/joinchat/HASH`, `tg://join?invite=HASH`).
     Invite(String),
+    /// Ссылка-приглашение на папку чатов (`t.me/addlist/SLUG`, `tg://addlist?slug=SLUG`).
+    ChatlistInvite(String),
     /// Ссылка на пост приватного канала/группы (`t.me/c/<channel_id>/<msg_id>`, `tg://privatepost?...`).
     PrivatePost { channel_id: i64, msg_id: Option<i32> },
     /// Открыть пользователя по ID (`tg://user?id=<id>`).
@@ -252,6 +254,7 @@ pub fn parse_tg_link(raw: &str) -> Option<TgLink> {
         return match path {
             "settings" => Some(TgLink::Settings),
             "join" => query_param(q, "invite").map(TgLink::Invite),
+            "addlist" => query_param(q, "slug").map(TgLink::ChatlistInvite),
             "user" => query_param(q, "id")
                 .and_then(|v| v.parse::<i64>().ok())
                 .map(TgLink::UserId),
@@ -308,6 +311,12 @@ pub fn parse_tg_link(raw: &str) -> Option<TgLink> {
     if let Some(hash) = path.strip_prefix("joinchat/") {
         if !hash.is_empty() {
             return Some(TgLink::Invite(hash.to_owned()));
+        }
+        return None;
+    }
+    if let Some(slug) = path.strip_prefix("addlist/") {
+        if !slug.is_empty() {
+            return Some(TgLink::ChatlistInvite(slug.to_owned()));
         }
         return None;
     }
@@ -1004,6 +1013,52 @@ impl Engine {
         self
     }
 
+    /// Извлекает текст для локального архива (если текст пуст — описание медиа/стикера/голоса).
+    pub(crate) fn archive_text_from_row(r: &MessageRow) -> String {
+        if !r.text.trim().is_empty() {
+            return r.text.clone();
+        }
+        if let Some(m) = &r.media {
+            let tag = match &m.kind {
+                media::MediaKind::Photo => "Фото",
+                media::MediaKind::Video => "Видео",
+                media::MediaKind::Audio => "Аудио",
+                media::MediaKind::Gif => "GIF",
+                media::MediaKind::Sticker | media::MediaKind::AnimatedSticker => "Стикер",
+                media::MediaKind::Round => "Видеосообщение",
+                media::MediaKind::Voice => "Голосовое",
+                media::MediaKind::Poll { question, .. } => {
+                    return format!("[Опрос: {}]", question.trim());
+                }
+                media::MediaKind::File => "Файл",
+                media::MediaKind::WebPage { .. } => "Ссылка",
+                media::MediaKind::Dice { emoticon, .. } => {
+                    return format!("[Бросок {emoticon}]");
+                }
+                media::MediaKind::Other(s) => s.as_str(),
+            };
+            if m.name.trim().is_empty() {
+                format!("[{tag}]")
+            } else {
+                format!("[{tag}: {}]", m.name.trim())
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    pub(crate) async fn remember_row_sync(&self, peer: PeerRef, row: &MessageRow) {
+        if row.id <= 0 || !self.settings().ayu.save_deleted_messages {
+            return;
+        }
+        let key = peer_key(&peer);
+        let archive = Self::archive_text_from_row(row);
+        let _ = self
+            .store
+            .remember_full(key, row.id, &archive, row.date, row.outgoing, &row.sender)
+            .await;
+    }
+
     /// Фоновая пост-обработка после успешной отправки сообщения: отметка прочтения и «не в сети» по политике призрака + сохранение в локальную БД.
     pub(crate) fn spawn_after_send(
         &self,
@@ -1015,15 +1070,18 @@ impl Engine {
         let eng = self.clone();
         let peer_id = peer_key(&peer);
         let msg_id = row.id;
-        let text = row.text.clone();
+        let text = Self::archive_text_from_row(row);
         let date = row.date;
+        let outgoing = row.outgoing;
+        let sender = row.sender.clone();
         tokio::spawn(async move {
             if mark_read_after && ghost::should_mark_read_after_action(&ghost_mode) {
                 let _ = eng.client.mark_as_read(peer).await;
             }
             eng.send_offline_if_needed(&ghost_mode).await;
             if msg_id > 0 {
-                eng.remember(peer_id, msg_id, &text, date).await;
+                eng.remember_full(peer_id, msg_id, &text, date, outgoing, &sender)
+                    .await;
             }
         });
     }
@@ -2044,32 +2102,72 @@ impl Engine {
             let Some(m) = it.next().await? else { break };
             msgs.push(m);
         }
-        // Правки одним запросом; запись в базу — в фоне пачкой, лента не ждёт диск.
+        // Загрузка сообщений и синхронная фиксация в локальную БД + выявление оффлайн-удалений.
         let counts = self.store.edit_counts(key).await.unwrap_or_default();
         let cfg = self.settings();
         let is_bot_chat = msgs.iter().any(|m| {
             !m.outgoing()
                 && matches!(m.sender(), Some(grammers_client::peer::Peer::User(u)) if u.is_bot())
         });
-        if cfg.ayu.save_deleted_messages && (!is_bot_chat || cfg.ayu.save_for_bots) {
-            let batch: Vec<(i32, String, i64)> = msgs
-                .iter()
-                .map(|m| (m.id(), m.text().to_owned(), m.date().as_second()))
-                .collect();
-            let store = self.store.clone();
-            tokio::spawn(async move {
-                let _ = store.remember_many(key, &batch).await;
-            });
-        }
         let mut rows: Vec<MessageRow> = msgs
             .iter()
             .map(|m| Self::row(key, m, counts.get(&m.id()).copied().unwrap_or(0)))
             .collect();
-        if before_id == 0 {
-            // Удалённые, но сохранённые у нас, возвращаем на место по времени.
-            for s in self.deleted(key).await {
+        let save_ok = cfg.ayu.save_deleted_messages && (!is_bot_chat || cfg.ayu.save_for_bots);
+        let (win_min, win_max) = if before_id == 0 {
+            let min_id = rows.iter().map(|r| r.id).min().unwrap_or(1);
+            let wmin = if rows.is_empty() || rows.len() < limit {
+                1
+            } else {
+                min_id
+            };
+            (wmin, i32::MAX)
+        } else {
+            let min_id = rows.iter().map(|r| r.id).min().unwrap_or(before_id);
+            let wmin = if rows.is_empty() || rows.len() < limit {
+                1
+            } else {
+                min_id
+            };
+            (wmin, before_id.saturating_sub(1))
+        };
+        if save_ok {
+            let present_ids: Vec<i32> = rows.iter().filter(|r| r.id > 0).map(|r| r.id).collect();
+            let _ = self
+                .store
+                .mark_missing_deleted(key, win_min, win_max, &present_ids)
+                .await;
+            let batch: Vec<(i32, String, i64, bool, String)> = rows
+                .iter()
+                .filter(|r| r.id > 0)
+                .map(|r| {
+                    (
+                        r.id,
+                        Self::archive_text_from_row(r),
+                        r.date,
+                        r.outgoing,
+                        r.sender.clone(),
+                    )
+                })
+                .collect();
+            let _ = self.store.remember_many_full(key, &batch).await;
+        }
+        if save_ok {
+            let saved_del = if before_id == 0 {
+                self.deleted(key).await
+            } else if win_min <= win_max {
+                self.store
+                    .deleted_in_range(key, win_min, win_max)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            // Удалённые (кем угодно и когда угодно, включая оффлайн и самоудаление) возвращаем на место по времени.
+            for s in saved_del {
                 if !rows.iter().any(|r| r.id == s.msg_id) {
-                    let mut r = MessageRow::plain(s.msg_id, s.text, false, s.date);
+                    let mut r = MessageRow::plain(s.msg_id, s.text, s.outgoing, s.date);
+                    r.sender = s.sender;
                     r.deleted = true;
                     r.edits = counts.get(&s.msg_id).copied().unwrap_or(0);
                     rows.push(r);
@@ -2262,6 +2360,7 @@ impl Engine {
             .into_iter()
             .next()
             .unwrap_or_else(|| Self::row(key, &sent, 0));
+        self.remember_row_sync(peer, &row).await;
         self.spawn_after_send(peer, ghost_mode, &row, true);
         Ok(row)
     }
@@ -2370,7 +2469,10 @@ impl Engine {
                 ttl_seconds: opts.ttl_seconds,
             })
         };
-        self.client.send_message(peer, msg).await?;
+        let sent = self.client.send_message(peer, msg).await?;
+        let key = peer_key(&peer);
+        let row = Self::row(key, &sent, 0);
+        self.remember_row_sync(peer, &row).await;
         self.send_offline_if_needed(&ghost_mode).await;
         Ok(())
     }
@@ -2386,13 +2488,37 @@ impl Engine {
         self.client.edit_message(peer, id, msg).await
     }
 
-    /// Удалить сообщения. Копия в локальном хранилище остаётся (функция AyuGram).
+    /// Удалить сообщения. Копия в локальном хранилище остаётся, даже если удалил сам пользователь.
     pub async fn delete(
         &self,
         peer: PeerRef,
         ids: &[i32],
     ) -> Result<usize, grammers_client::InvocationError> {
+        if self.settings().ayu.save_deleted_messages && !ids.is_empty() {
+            let _ = self.store.mark_deleted(peer_key(&peer), ids).await;
+        }
         self.client.delete_messages(peer, ids).await
+    }
+
+    /// Удалить сообщения на сервере с гарантированным сохранением текста и метаданных у себя (self-delete AyuGram).
+    pub async fn delete_with_backup(
+        &self,
+        peer: PeerRef,
+        backups: &[(i32, String, i64, bool, String)],
+    ) -> Result<usize, grammers_client::InvocationError> {
+        let key = peer_key(&peer);
+        let ids: Vec<i32> = backups.iter().map(|b| b.0).filter(|&id| id > 0).collect();
+        if self.settings().ayu.save_deleted_messages {
+            for (id, text, date, outgoing, sender) in backups {
+                if *id > 0 {
+                    let _ = self
+                        .store
+                        .upsert_deleted(key, *id, text, *date, *outgoing, sender)
+                        .await;
+                }
+            }
+        }
+        self.client.delete_messages(peer, &ids).await
     }
 
     /// Переслать сообщения в другой чат.
@@ -2866,9 +2992,20 @@ impl Engine {
         Ok(())
     }
 
-    async fn remember(&self, peer: i64, id: i32, text: &str, date: i64) {
-        if self.settings().ayu.save_deleted_messages {
-            let _ = self.store.remember(peer, id, text, date).await;
+    pub(crate) async fn remember_full(
+        &self,
+        peer: i64,
+        id: i32,
+        text: &str,
+        date: i64,
+        outgoing: bool,
+        sender: &str,
+    ) {
+        if id > 0 && self.settings().ayu.save_deleted_messages {
+            let _ = self
+                .store
+                .remember_full(peer, id, text, date, outgoing, sender)
+                .await;
         }
     }
 
@@ -2927,7 +3064,7 @@ impl Engine {
     ) -> Result<(), BoxErr> {
         let mut stream = self
             .client
-            .stream_updates(updates, UpdatesConfiguration { catch_up: false })
+            .stream_updates(updates, UpdatesConfiguration { catch_up: true })
             .await?;
         crate::diag::info("UPD", "Поток live-обновлений запущен (0-ms dispatch)");
         let mut consecutive_err = 0u32;
@@ -3083,7 +3220,9 @@ impl Engine {
         match upd {
             Update::NewMessage(m) if cfg.ayu.save_deleted_messages && (!is_bot_msg(m) || cfg.ayu.save_for_bots) => {
                 let key = m.peer_id().bot_api_dialog_id_unchecked();
-                self.remember(key, m.id(), m.text(), m.date().as_second())
+                let r = Self::row(key, m, 0);
+                let txt = Self::archive_text_from_row(&r);
+                self.remember_full(key, r.id, &txt, r.date, r.outgoing, &r.sender)
                     .await;
             }
             Update::MessageEdited(m) if cfg.ayu.save_messages_history && (!is_bot_msg(m) || cfg.ayu.save_for_bots) => {
@@ -3657,6 +3796,7 @@ impl Engine {
             .into_iter()
             .next()
             .unwrap_or_else(|| Self::row(key, &sent, 0));
+        self.remember_row_sync(peer, &row).await;
         self.spawn_after_send(peer, ghost_mode, &row, true);
         Ok(row)
     }
@@ -4220,6 +4360,7 @@ impl Engine {
             })
             .await?;
         let row = self.row_from_tl_updates(peer, &updates, &st.emoji, silent);
+        self.remember_row_sync(peer, &row).await;
         self.spawn_after_send(peer, ghost, &row, true);
         Ok(row)
     }
@@ -6221,6 +6362,14 @@ mod tests {
                 start: None,
                 startapp: None,
             })
+        );
+        assert_eq!(
+            parse_tg_link("https://t.me/addlist/RustList42"),
+            Some(TgLink::ChatlistInvite("RustList42".to_owned()))
+        );
+        assert_eq!(
+            parse_tg_link("tg://addlist?slug=DevChats99"),
+            Some(TgLink::ChatlistInvite("DevChats99".to_owned()))
         );
         assert_eq!(parse_tg_link("mailto:test@localhost"), None);
     }

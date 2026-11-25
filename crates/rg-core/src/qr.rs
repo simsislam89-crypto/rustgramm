@@ -44,10 +44,32 @@ fn needs_password(e: &InvocationError) -> bool {
     matches!(e, InvocationError::Rpc(r) if r.name == "SESSION_PASSWORD_NEEDED")
 }
 
-async fn password_step(client: &Client) -> Result<QrStep, InvocationError> {
-    let tl::enums::account::Password::Password(p) = client
-        .invoke(&tl::functions::account::GetPassword {})
-        .await?;
+/// Проверяет, содержит ли входящее обновление Telegram сигнал `Update::LoginToken`
+/// (подтверждение QR-входа со второго устройства).
+pub fn has_login_token_update(upd: &grammers_session::updates::UpdatesLike) -> bool {
+    use grammers_session::updates::UpdatesLike;
+    use tl::enums::{Update as U, Updates as Us};
+    match upd {
+        UpdatesLike::Updates(Us::UpdateShort(s)) => matches!(s.update, U::LoginToken),
+        UpdatesLike::Updates(Us::Updates(u)) => {
+            u.updates.iter().any(|x| matches!(x, U::LoginToken))
+        }
+        UpdatesLike::Updates(Us::Combined(u)) => {
+            u.updates.iter().any(|x| matches!(x, U::LoginToken))
+        }
+        _ => false,
+    }
+}
+
+async fn password_step_in_dc(client: &Client, dc_id: Option<i32>) -> Result<QrStep, InvocationError> {
+    let tl::enums::account::Password::Password(p) = match dc_id {
+        Some(dc) => {
+            client
+                .invoke_in_dc(dc, &tl::functions::account::GetPassword {})
+                .await?
+        }
+        None => client.invoke(&tl::functions::account::GetPassword {}).await?,
+    };
     Ok(QrStep::NeedPassword(PasswordToken::new(p)))
 }
 
@@ -68,7 +90,7 @@ pub async fn poll<S: Session>(
         .await;
     let token = match res {
         Ok(t) => t,
-        Err(e) if needs_password(&e) => return password_step(client).await,
+        Err(e) if needs_password(&e) => return password_step_in_dc(client, None).await,
         Err(InvocationError::Rpc(ref r)) if r.name == "AUTH_TOKEN_EXPIRED" => {
             return Ok(QrStep::Expired);
         }
@@ -98,7 +120,7 @@ pub async fn poll<S: Session>(
                     Ok(QrStep::Done)
                 }
                 Ok(_) => Ok(QrStep::Done),
-                Err(e) if needs_password(&e) => password_step(client).await,
+                Err(e) if needs_password(&e) => password_step_in_dc(client, Some(m.dc_id)).await,
                 Err(InvocationError::Rpc(ref r)) if r.name == "AUTH_TOKEN_EXPIRED" => {
                     Ok(QrStep::Expired)
                 }
@@ -138,5 +160,27 @@ mod tests {
             QrStep::Token { ref url, expires: 1_800_000_000 } if url == "tg://login?token=YWJj"
         ));
         assert!(matches!(QrStep::Expired, QrStep::Expired));
+    }
+
+    #[test]
+    fn detects_login_token_updates_only() {
+        use grammers_session::updates::UpdatesLike;
+        let short = UpdatesLike::Updates(tl::enums::Updates::UpdateShort(tl::types::UpdateShort {
+            update: tl::enums::Update::LoginToken,
+            date: 1,
+        }));
+        assert!(has_login_token_update(&short));
+
+        let full = UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+            updates: vec![tl::enums::Update::LoginToken],
+            users: vec![],
+            chats: vec![],
+            date: 1,
+            seq: 0,
+        }));
+        assert!(has_login_token_update(&full));
+
+        let empty = UpdatesLike::Updates(tl::enums::Updates::TooLong);
+        assert!(!has_login_token_update(&empty));
     }
 }

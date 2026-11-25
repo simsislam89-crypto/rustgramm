@@ -1087,3 +1087,33 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --features plugins` и `--no-default-features` — **OK**.
 - `cargo test --workspace` — **2 160 тестов пройдено, 0 провалено, 1 ignored** (`renders_local_cached_tgs_if_present`, пройдена отдельно `1 passed` по реальному кэшу `.tgs`).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.22.0`) собран (**20 527 616 байт**); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` и живой запуск на реальной сессии (>8 с, без новых дампов) — **OK**.
+
+## Этап 35 (2026-11-25, v0.23.0)
+
+### Исправление Android-интерфейса входа/ввода и QR-кода, полное сохранение удалённых (свои + офлайн + перезапуски) и 5 новых функций Telegram/AyuGram
+
+1. **Android-интерфейс входа, выбор страны и нативный ввод во всех полях (`crates/rg-ui/src/{lib,chat,tg_settings}.rs`)**:
+   - *Причина и исправление раскладки:* безопасные отступы увеличенны до `android-safe-top = 54.0` и `android-safe-bottom = 18.0`, ширина колонки `col_w` унифицирована с `form_w` (до `336.0`), сетка клавиатуры `paint_android_keypad` центрирована по ширине (`kw = ((width - 12.0) / 3.0).floor()`), введён `outlined_login_button` с правым слотом `LoginButtonRight` (активная стрелка раскрытия вместо невидимого курсорного глифа), в полях ввода устаревший `vertical_align` заменён на `.align(egui::Align2::LEFT_CENTER)`, а выбор страны вынесен из вложенного `ScrollArea` в отдельное модальное окно `country_picker_window` с полем поиска.
+   - *Причина и исправление ввода на Android:* `poll_android_bridge` (`"login_phone"`, `"country_search"`, `"login_code"`, `"login_password"`, `"proxy"`, `"key_id"`, `"key_hash"`, `"lock_input"`, `"dialogs_search"`, `"chat_input"`, `"chat_search"`, `"comment_input"`, `"forward_filter"`, `"story_reply"`, `"tgs_folder_link"` + `request_repaint_after(120ms)`) вынесен в самое начало `App::ui` до ранних выходов экранов входа/блокировки; через `open_android_input` и `hook_android_text` подключены все поля входа, поиска, чата, комментариев, пересылки, историй и ссылок папок.
+
+2. **Исправление входа по QR-коду (`crates/rg-core/src/qr.rs`, `crates/rg-ui/src/{theme,worker,lib}.rs`)**:
+   - *Протокол:* в `worker.rs` убран опрос `ExportLoginToken` каждые 2 секунды (он сбрасывал действующий QR прямо во время сканирования) — теперь используется немедленная реакция на `Update::LoginToken` (`qr::has_login_token_update`) и сон `sleep_until(qr_next_poll_at)` по сроку жизни токена (`clamp(12, 26)` сек), добавлена кнопка «Обновить QR» (`Cmd::RefreshQr`) и вывод ошибок через `out.err(...)`; `password_step_in_dc` в `qr.rs` запрашивает 2FA-соль через `invoke_in_dc` на правильном дата-центре после `MigrateTo`.
+   - *Отрисовка QR:* в `theme.rs::render_qr_image` (`rg-qr-tex-cache-v4`) модули заменены на чёткие сплошные квадраты (`cell + 0.25`), а радиус очистки центра (`center_clear_r`, `badge_px_r`) уменьшен, чтобы не затирать внутренний шаблон выравнивания QR Version 7.
+
+3. **Неубиваемое сохранение удалённых сообщений — свои, офлайн и после перезапусков (`crates/rg-ayu/src/store.rs`, `crates/rg-core/src/{engine,engine_ext}.rs`, `crates/rg-ui/src/{worker,chat,lib}.rs`)**:
+   - В SQLite-таблицу `messages` (`store.rs`) добавлены столбцы `outgoing` и `sender` (с обратной миграцией `ALTER TABLE`), методы `remember_full`, `remember_many_full` (не сбрасывают `deleted = 1` и не затирают непустой текст), `upsert_deleted`, `mark_missing_deleted`, `deleted_in_range` и `mark_all_peer_deleted`.
+   - Включён `UpdatesConfiguration { catch_up: true }` в `run_updates`, добавлены синхронное сохранение исходящих (`remember_row_sync`) во все методы отправки и `delete_with_backup` при ручном удалении своих/чужих сообщений (`confirm_delete` в `chat.rs` оптимистично помечает `m.deleted = true`); `history_before` синхронно дожидается `mark_missing_deleted` + `remember_many_full` для обоих направлений ленты, выявляя удаления пользователей за время офлайна; `wipe_if_logged_out` больше не стирает `messages.db*`, а `enter()` фоново подтягивает историю до 10 верхних неархивных диалогов.
+
+4. **5 новых функций Telegram / AyuGram (`engine.rs`, `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs`, `tg_settings.rs`, `features_ui.rs`)**:
+   - **Глобальный поиск сообщений (`messages.searchGlobal`)**: `GlobalMessageHit`, `Engine::search_global_messages`, переключатель `Чаты и люди` / `Сообщения` с фильтрами `Все` / `Личные` / `Группы` / `Каналы` в левой панели и прыжок к найденному сообщению (`pending_jump_to_msg`).
+   - **Очистка истории чата и выход из групп/каналов**: `Engine::clear_history` (`messages.deleteHistory` / `channels.deleteHistory`) и `Engine::leave_chat` (`channels.leaveChannel` / `messages.deleteChatUser`), пункты в контекстном меню и меню `⋮`, подтверждение `chat_action_confirm_window`.
+   - **Список всех закреплённых сообщений + «Открепить все»**: `Engine::pinned_messages` (`InputMessagesFilterPinned`) и `Engine::unpin_all_messages` (`messages.unpinAllMessages`), кнопка «Все» в баннере закрепа и пункт в `⋮`, модальное окно `pinned_list_window`.
+   - **Расширенная пересылка AyuGram (`ForwardOptions`)**: `Engine::forward_advanced` (`drop_author`, `drop_media_captions`, `silent`) + чекбоксы «Скрыть автора», «Скрыть подпись к медиа» и «Отправить без звука» в одиночной и пакетной пересылке.
+   - **Публичные ссылки на папки (`chatlists.*` + `t.me/addlist/...`)**: `TgLink::ChatlistInvite`, `export_folder_invite`, `check_folder_invite`, `join_folder_invite`, кнопки в настройках папок и модальное окно предпросмотра/добавления `folder_invite_window`.
+
+### Проверки (v0.23.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `-p rg-ui -p rg-desktop -p rg-android --no-default-features --all-targets -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `cargo check -p rg-android --features plugins` и `--no-default-features` — **OK**.
+- `cargo test --workspace` — **2 165 тестов пройдено, 0 провалено, 1 ignored** (`renders_local_cached_tgs_if_present`, пройдена отдельно `1 passed` по реальному кэшу `.tgs`; включая `no_foreign_hosts`, `self_delete_and_offline_deletions_persist_across_reopen`, `detects_login_token_updates_only`, `login_keypad_and_country_picker_math_and_alignment`, `extract_chatlist_slug_handles_urls_and_raw_slugs`, `peer_lookup_maps_users_groups_and_channels`, `parse_tg_link_routes_all_telegram_formats`).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.23.0`) собран (**20 752 384 байта**); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` и живой запуск (6 с, 0 новых дампов) — **OK**.

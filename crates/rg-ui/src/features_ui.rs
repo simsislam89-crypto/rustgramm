@@ -2379,4 +2379,220 @@ impl App {
             self.date_jump_open = false;
         }
     }
+
+    #[allow(deprecated)]
+    pub(crate) fn chat_action_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some((did, name, is_leave, mut revoke)) = self.confirm_chat_action.clone() else {
+            return;
+        };
+        let mut close = false;
+        let title = if is_leave { "Покинуть чат?" } else { "Очистить историю?" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                if is_leave {
+                    ui.label(format!("Вы действительно хотите выйти из «{name}»?"));
+                } else {
+                    ui.label(format!("Очистить историю сообщений в чате «{name}» в Telegram?"));
+                    if self.settings.ayu.save_deleted_messages {
+                        ui.weak("Локальный архив удалённых сообщений останется у вас.");
+                    }
+                    if did > 0 {
+                        ui.checkbox(&mut revoke, "Удалить историю также у собеседника");
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let act_lbl = if is_leave { "Покинуть" } else { "Очистить" };
+                    if ui.button(RichText::new(act_lbl).color(DANGER).strong()).clicked() {
+                        if is_leave {
+                            self.send(Cmd::LeaveChat(did));
+                        } else {
+                            self.send(Cmd::ClearHistory(did, revoke));
+                        }
+                        close = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.confirm_chat_action = None;
+        } else {
+            self.confirm_chat_action = Some((did, name, is_leave, revoke));
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn pinned_list_window(&mut self, ctx: &egui::Context) {
+        if !self.pinned_list_open {
+            return;
+        }
+        let Some(did) = self.pinned_list_did else {
+            self.pinned_list_open = false;
+            return;
+        };
+        let mut open = self.pinned_list_open;
+        let mut jump_to: Option<i32> = None;
+        let mut unpin_one: Option<i32> = None;
+        let mut unpin_all = false;
+        egui::Window::new("Закреплённые сообщения")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                if self.pinned_list.is_empty() {
+                    ui.label(RichText::new("Нет закреплённых сообщений").color(SUBTEXT));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Всего: {}", self.pinned_list.len())).size(12.5).color(SUBTEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(RichText::new("Открепить все").color(DANGER)).clicked() {
+                                unpin_all = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for m in &self.pinned_list {
+                            let body = if !m.text.trim().is_empty() {
+                                m.text.replace('\n', " ")
+                            } else if let Some(med) = &m.media {
+                                format!("[{}]", med.name)
+                            } else {
+                                "[Сообщение]".to_owned()
+                            };
+                            let snippet: String = body.chars().take(76).collect();
+                            let ts = hhmm(m.date);
+                            egui::Frame::new()
+                                .fill(Color32::from_white_alpha(8))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.set_max_width(290.0);
+                                            if !m.sender.is_empty() {
+                                                ui.label(RichText::new(format!("{} · {ts}", m.sender)).size(11.5).color(ORANGE));
+                                            } else {
+                                                ui.label(RichText::new(ts).size(11.5).color(SUBTEXT));
+                                            }
+                                            if ui
+                                                .add(egui::Label::new(RichText::new(&snippet).size(13.0).color(WHITE)).sense(Sense::click()))
+                                                .clicked()
+                                            {
+                                                jump_to = Some(m.id);
+                                            }
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("✕").on_hover_text("Открепить").clicked() {
+                                                unpin_one = Some(m.id);
+                                            }
+                                        });
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
+                    });
+                }
+            });
+        self.pinned_list_open = open;
+        if let Some(mid) = jump_to {
+            self.pinned_list_open = false;
+            if self.messages.iter().any(|m| m.id == mid) {
+                self.scroll_to = Some(mid);
+                self.highlight_msg = Some((mid, ctx.input(|i| i.time)));
+            } else {
+                self.status = "Загрузите более старую историю чата для перехода".to_owned();
+            }
+        }
+        if let Some(mid) = unpin_one {
+            self.pinned_list.retain(|m| m.id != mid);
+            self.send(Cmd::Pin(mid, false));
+        }
+        if unpin_all {
+            self.send(Cmd::UnpinAllMessages(did));
+            self.pinned_list_open = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pinned_list_open = false;
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn folder_invite_window(&mut self, ctx: &egui::Context) {
+        if let Some(url) = self.folder_invite_url.clone() {
+            let mut open = true;
+            egui::Window::new("Ссылка на папку создана")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Любой пользователь Telegram сможет добавить вашу папку с выбранными чатами:");
+                    ui.add_space(4.0);
+                    ui.monospace(&url);
+                    ui.add_space(8.0);
+                    if orange_button(ui, "Скопировать", Vec2::new(140.0, 32.0)).clicked() {
+                        ctx.copy_text(url);
+                        self.folder_invite_url = None;
+                    }
+                });
+            if !open {
+                self.folder_invite_url = None;
+            }
+        }
+        let Some(prev) = self.folder_invite_preview.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut join_now = false;
+        egui::Window::new(format!("Папка «{}»", prev.title))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(350.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(if prev.already_joined {
+                        "Эта папка уже добавлена (доступные чаты ниже):"
+                    } else {
+                        "Чаты и каналы в папке:"
+                    })
+                    .size(12.5)
+                    .color(SUBTEXT),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (_, _, title) in &prev.peers {
+                        ui.label(RichText::new(format!("• {title}")).size(13.5).color(WHITE));
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if !prev.already_joined
+                        && orange_button(ui, "Добавить папку", Vec2::new(160.0, 34.0)).clicked()
+                    {
+                        join_now = true;
+                    }
+                    if ui.button("Закрыть").clicked() {
+                        self.folder_invite_preview = None;
+                    }
+                });
+            });
+        if join_now {
+            let peers: Vec<grammers_session::types::PeerRef> = prev.peers.iter().map(|(p, _, _)| *p).collect();
+            self.send(Cmd::JoinFolderInvite(prev.slug, peers));
+            self.folder_invite_preview = None;
+        } else if !open {
+            self.folder_invite_preview = None;
+        }
+    }
 }

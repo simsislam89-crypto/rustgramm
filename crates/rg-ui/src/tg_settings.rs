@@ -128,6 +128,8 @@ pub(crate) struct State {
     /// Отдельное модальное окно «Мой профиль» (как в AyuGram, без переброса в «Избранное»).
     pub profile_open: bool,
     pub profile_at: Option<std::time::Instant>,
+    /// Строка приглашения на папку чатов (`t.me/addlist/...`) в разделе «Папки».
+    pub folder_invite_link: String,
 }
 
 /// Фоновый подсчёт размера кэша и загрузок (без блокировки UI).
@@ -193,6 +195,9 @@ struct Actions {
     copy_logs: bool,
     set_default_reaction: Option<String>,
     request_available_reactions: bool,
+    export_folder_invite: Option<(i32, String, Vec<grammers_session::types::PeerRef>)>,
+    check_folder_invite: Option<String>,
+    prompt_folder_link: bool,
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -710,6 +715,25 @@ impl App {
         if act.request_available_reactions && !self.available_reactions_req {
             self.available_reactions_req = true;
             self.send(Cmd::LoadAvailableReactions);
+        }
+        if let Some((folder_id, title, peers)) = act.export_folder_invite {
+            self.send(Cmd::ExportFolderInvite {
+                folder_id,
+                title,
+                peers,
+            });
+        }
+        if let Some(link) = act.check_folder_invite {
+            self.send(Cmd::CheckFolderInvite(link));
+        }
+        if act.prompt_folder_link {
+            self.open_android_input(
+                "tgs_folder_link",
+                "Добавить папку по ссылке",
+                "https://t.me/addlist/...",
+                &self.tgs.folder_invite_link.clone(),
+                0,
+            );
         }
         if act.open_logs_dir {
             let dir = worker::home().join("logs");
@@ -1738,9 +1762,22 @@ fn folders_page(
         ui.horizontal(|ui| {
             ui.add_space(kit::PAD);
             if orange_button_enabled(ui, valid, "Сохранить", Vec2::new(130.0, 34.0)).clicked() {
-                let mut clean = cloned;
+                let mut clean = cloned.clone();
                 clean.title = clean.title.trim().chars().take(12).collect();
                 act.save_folder = Some(clean);
+            }
+            if !is_new && !cloned.include.is_empty() {
+                ui.add_space(8.0);
+                let inc = cloned.include.clone();
+                let title = cloned.title.clone();
+                if ui.button("Поделиться ссылкой").clicked() {
+                    let peers: Vec<grammers_session::types::PeerRef> = dialogs
+                        .iter()
+                        .filter(|d| inc.contains(&d.id))
+                        .map(|d| d.peer)
+                        .collect();
+                    act.export_folder_invite = Some((id, title, peers));
+                }
             }
             ui.add_space(8.0);
             if !is_new && ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
@@ -1784,7 +1821,27 @@ fn folders_page(
         }
     });
     ui.add_space(10.0);
-    desc(ui, "Папки синхронизируются с серверами Telegram. Нажмите на папку, чтобы изменить её правила или удалить.");
+    divider(ui);
+    section(ui, "Добавить папку по ссылке");
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        let iw = (ui.available_width() - 2.0 * kit::PAD - 110.0).max(120.0);
+        let r_fl = ui.add_sized(
+            [iw, 32.0],
+            egui::TextEdit::singleline(&mut st.folder_invite_link)
+                .hint_text("https://t.me/addlist/...")
+                .margin(Vec2::new(8.0, 6.0)),
+        );
+        if cfg!(target_os = "android") && (r_fl.clicked() || r_fl.gained_focus()) {
+            act.prompt_folder_link = true;
+        }
+        ui.add_space(6.0);
+        if orange_button_enabled(ui, !st.folder_invite_link.trim().is_empty(), "Открыть", Vec2::new(96.0, 32.0)).clicked() {
+            act.check_folder_invite = Some(st.folder_invite_link.trim().to_owned());
+        }
+    });
+    ui.add_space(10.0);
+    desc(ui, "Папки синхронизируются с серверами Telegram. Нажмите на папку, чтобы изменить её, поделиться ссылкой или удалить.");
 }
 
 fn appearance_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings) {

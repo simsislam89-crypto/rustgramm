@@ -13,6 +13,8 @@ pub struct Saved {
     pub text: String,
     pub date: i64,
     pub deleted: bool,
+    pub outgoing: bool,
+    pub sender: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,8 @@ impl MessageStore {
                  peer INTEGER NOT NULL, msg_id INTEGER NOT NULL,
                  text TEXT NOT NULL, date INTEGER NOT NULL,
                  deleted INTEGER NOT NULL DEFAULT 0,
+                 outgoing INTEGER NOT NULL DEFAULT 0,
+                 sender TEXT NOT NULL DEFAULT '',
                  PRIMARY KEY(peer, msg_id));
              CREATE INDEX IF NOT EXISTS idx_messages_msg_peer ON messages(msg_id, peer);
              CREATE INDEX IF NOT EXISTS idx_messages_peer_del_date ON messages(peer, deleted, date);
@@ -116,34 +120,81 @@ impl MessageStore {
              CREATE INDEX IF NOT EXISTS idx_secret_msgs_expires ON secret_messages(expires_at);",
         )
         .await?;
+        // Обратная совместимость со старыми базами messages.db (добавляем колонки без потери данных).
+        let _ = conn
+            .execute("ALTER TABLE messages ADD COLUMN outgoing INTEGER NOT NULL DEFAULT 0", ())
+            .await;
+        let _ = conn
+            .execute("ALTER TABLE messages ADD COLUMN sender TEXT NOT NULL DEFAULT ''", ())
+            .await;
         Ok(Self { _db: db, conn })
     }
 
     /// Запомнить сообщение (новое или обновлённое).
     pub async fn remember(&self, peer: i64, msg_id: i32, text: &str, date: i64) -> Result<()> {
+        self.remember_full(peer, msg_id, text, date, false, "").await
+    }
+
+    /// Запомнить сообщение с признаком исходящего и именем отправителя.
+    /// Никогда не сбрасывает `deleted=1` и не затирает непустой текст/отправителя пустыми значениями.
+    pub async fn remember_full(
+        &self,
+        peer: i64,
+        msg_id: i32,
+        text: &str,
+        date: i64,
+        outgoing: bool,
+        sender: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO messages(peer,msg_id,text,date) VALUES(?1,?2,?3,?4)
-                 ON CONFLICT(peer,msg_id) DO UPDATE SET text=excluded.text",
-                params![peer, i64::from(msg_id), text, date],
+                "INSERT INTO messages(peer,msg_id,text,date,outgoing,sender) VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(peer,msg_id) DO UPDATE SET
+                   text=CASE WHEN excluded.text!='' THEN excluded.text ELSE messages.text END,
+                   outgoing=CASE WHEN excluded.outgoing!=0 THEN 1 ELSE messages.outgoing END,
+                   sender=CASE WHEN excluded.sender!='' THEN excluded.sender ELSE messages.sender END",
+                params![peer, i64::from(msg_id), text, date, i64::from(u8::from(outgoing)), sender],
             )
             .await?;
         Ok(())
     }
 
-    /// Запомнить пачку сообщений одной транзакцией (в разы быстрее поштучной записи).
+    /// Запомнить пачку сообщений одной транзакцией (удобная обёртка без метаданных отправителя).
     pub async fn remember_many(&self, peer: i64, items: &[(i32, String, i64)]) -> Result<()> {
+        let full: Vec<(i32, String, i64, bool, String)> = items
+            .iter()
+            .map(|(id, text, date)| (*id, text.clone(), *date, false, String::new()))
+            .collect();
+        self.remember_many_full(peer, &full).await
+    }
+
+    /// Запомнить пачку сообщений одной транзакцией с `outgoing` и `sender` (без сброса `deleted=1`).
+    pub async fn remember_many_full(
+        &self,
+        peer: i64,
+        items: &[(i32, String, i64, bool, String)],
+    ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         self.conn.execute("BEGIN", ()).await?;
-        for (id, text, date) in items {
+        for (id, text, date, outgoing, sender) in items {
             let r = self
                 .conn
                 .execute(
-                    "INSERT INTO messages(peer,msg_id,text,date) VALUES(?1,?2,?3,?4)
-                     ON CONFLICT(peer,msg_id) DO UPDATE SET text=excluded.text",
-                    params![peer, i64::from(*id), text.as_str(), *date],
+                    "INSERT INTO messages(peer,msg_id,text,date,outgoing,sender) VALUES(?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(peer,msg_id) DO UPDATE SET
+                       text=CASE WHEN excluded.text!='' THEN excluded.text ELSE messages.text END,
+                       outgoing=CASE WHEN excluded.outgoing!=0 THEN 1 ELSE messages.outgoing END,
+                       sender=CASE WHEN excluded.sender!='' THEN excluded.sender ELSE messages.sender END",
+                    params![
+                        peer,
+                        i64::from(*id),
+                        text.as_str(),
+                        *date,
+                        i64::from(u8::from(*outgoing)),
+                        sender.as_str()
+                    ],
                 )
                 .await;
             if let Err(e) = r {
@@ -152,6 +203,30 @@ impl MessageStore {
             }
         }
         self.conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    /// Атомарно сохранить и пометить сообщение удалённым (для собственного удаления пользователем и резервных копий).
+    pub async fn upsert_deleted(
+        &self,
+        peer: i64,
+        msg_id: i32,
+        text: &str,
+        date: i64,
+        outgoing: bool,
+        sender: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO messages(peer,msg_id,text,date,deleted,outgoing,sender) VALUES(?1,?2,?3,?4,1,?5,?6)
+                 ON CONFLICT(peer,msg_id) DO UPDATE SET
+                   deleted=1,
+                   text=CASE WHEN messages.text!='' THEN messages.text ELSE excluded.text END,
+                   outgoing=CASE WHEN messages.outgoing!=0 THEN messages.outgoing ELSE excluded.outgoing END,
+                   sender=CASE WHEN messages.sender!='' THEN messages.sender ELSE excluded.sender END",
+                params![peer, i64::from(msg_id), text, date, i64::from(u8::from(outgoing)), sender],
+            )
+            .await?;
         Ok(())
     }
 
@@ -198,6 +273,47 @@ impl MessageStore {
         }
         self.conn.execute("COMMIT", ()).await?;
         Ok(n)
+    }
+
+    /// Выявить сообщения, удалённые в оффлайне: среди всех сохранённых записей чата в диапазоне
+    /// `[min_id..=max_id]` с `deleted=0` помечает удалёнными те, которых больше нет в ответе сервера.
+    pub async fn mark_missing_deleted(
+        &self,
+        peer: i64,
+        min_id: i32,
+        max_id: i32,
+        present_ids: &[i32],
+    ) -> Result<u64> {
+        if min_id > max_id {
+            return Ok(0);
+        }
+        let present: std::collections::HashSet<i32> = present_ids.iter().copied().collect();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT msg_id FROM messages
+                 WHERE peer=?1 AND deleted=0 AND msg_id>=?2 AND msg_id<=?3",
+                params![peer, i64::from(min_id), i64::from(max_id)],
+            )
+            .await?;
+        let mut missing = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let mid = i32::try_from(r.get::<i64>(0)?).unwrap_or_default();
+            if mid > 0 && !present.contains(&mid) {
+                missing.push(mid);
+            }
+        }
+        self.mark_deleted(peer, &missing).await
+    }
+
+    /// Пометить все сохранённые сообщения данного чата как удалённые (при очистке истории чата).
+    pub async fn mark_all_peer_deleted(&self, peer: i64) -> Result<u64> {
+        self.conn
+            .execute(
+                "UPDATE messages SET deleted=1 WHERE peer=?1 AND deleted=0",
+                params![peer],
+            )
+            .await
     }
 
     /// Удаление без указания чата (личные чаты и обычные группы) одной транзакцией.
@@ -264,7 +380,7 @@ impl MessageStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT peer,msg_id,text,date,deleted FROM messages WHERE peer=?1 AND msg_id=?2",
+                "SELECT peer,msg_id,text,date,deleted,outgoing,sender FROM messages WHERE peer=?1 AND msg_id=?2",
                 params![peer, i64::from(msg_id)],
             )
             .await?;
@@ -279,9 +395,29 @@ impl MessageStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT peer,msg_id,text,date,deleted FROM messages
+                "SELECT peer,msg_id,text,date,deleted,outgoing,sender FROM messages
                  WHERE peer=?1 AND deleted=1 ORDER BY date, msg_id",
                 params![peer],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(row(&r)?);
+        }
+        Ok(out)
+    }
+
+    /// Удалённые сообщения чата в диапазоне `msg_id` (для догрузки старых страниц истории).
+    pub async fn deleted_in_range(&self, peer: i64, min_id: i32, max_id: i32) -> Result<Vec<Saved>> {
+        if min_id > max_id {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT peer,msg_id,text,date,deleted,outgoing,sender FROM messages
+                 WHERE peer=?1 AND deleted=1 AND msg_id>=?2 AND msg_id<=?3 ORDER BY date, msg_id",
+                params![peer, i64::from(min_id), i64::from(max_id)],
             )
             .await?;
         let mut out = Vec::new();
@@ -400,7 +536,7 @@ impl MessageStore {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT peer,msg_id,text,date,deleted FROM messages
+                    "SELECT peer,msg_id,text,date,deleted,outgoing,sender FROM messages
                      WHERE deleted=1 ORDER BY date DESC, msg_id DESC LIMIT ?1",
                     params![cap],
                 )
@@ -412,7 +548,7 @@ impl MessageStore {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT peer,msg_id,text,date,deleted FROM messages
+                    "SELECT peer,msg_id,text,date,deleted,outgoing,sender FROM messages
                      WHERE deleted=1 ORDER BY date DESC, msg_id DESC",
                     (),
                 )
@@ -597,6 +733,8 @@ fn row(r: &Row) -> Result<Saved> {
         text: r.get(2)?,
         date: r.get(3)?,
         deleted: r.get::<i64>(4)? != 0,
+        outgoing: r.get::<i64>(5).unwrap_or(0) != 0,
+        sender: r.get::<String>(6).unwrap_or_default(),
     })
 }
 
@@ -855,5 +993,56 @@ mod tests {
         let js = export_audit_json("Тест чат", &audit);
         let parsed: serde_json::Value = serde_json::from_str(&js).unwrap();
         assert_eq!(parsed["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn self_delete_and_offline_deletions_persist_across_reopen() {
+        let dir = std::env::temp_dir().join("rg-store-persist-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("persist.db");
+        let _ = std::fs::remove_file(&db_path);
+        let path_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let s = MessageStore::open(&path_str).await.unwrap();
+            // 1. Входящие и исходящие сообщения до выхода в оффлайн.
+            s.remember_many_full(
+                777,
+                &[
+                    (10, "привет от друга".to_owned(), 1000, false, "Алекс".to_owned()),
+                    (11, "удалят пока я оффлайн".to_owned(), 1010, false, "Алекс".to_owned()),
+                    (12, "осталось на месте".to_owned(), 1020, true, "Я".to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+            // 2. Пользователь сам удалил только что отправленное сообщение #13.
+            s.upsert_deleted(777, 13, "моё самоудалённое", 1030, true, "Я")
+                .await
+                .unwrap();
+            // 3. Пользователь вернулся в сеть, сервер прислал [10, 12] — #11 исчезло в оффлайне!
+            let caught = s.mark_missing_deleted(777, 10, i32::MAX, &[10, 12]).await.unwrap();
+            assert_eq!(caught, 1);
+            // Повторное запоминание #11 не сбрасывает флаг deleted=1.
+            s.remember_full(777, 11, "", 1010, false, "").await.unwrap();
+        }
+
+        // Закрываем и заново открываем БД — как при перезапуске/перезаходе в Rustgramm.
+        {
+            let s2 = MessageStore::open(&path_str).await.unwrap();
+            let del = s2.deleted(777).await.unwrap();
+            assert_eq!(del.len(), 2);
+            assert_eq!(del[0].msg_id, 11);
+            assert_eq!(del[0].text, "удалят пока я оффлайн");
+            assert!(!del[0].outgoing);
+            assert_eq!(del[0].sender, "Алекс");
+            assert!(del[0].deleted);
+
+            assert_eq!(del[1].msg_id, 13);
+            assert_eq!(del[1].text, "моё самоудалённое");
+            assert!(del[1].outgoing);
+            assert!(del[1].deleted);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

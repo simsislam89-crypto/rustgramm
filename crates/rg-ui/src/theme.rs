@@ -427,15 +427,14 @@ pub fn render_qr_image(url: &str, badge_accent: Color32) -> Option<egui::ColorIm
     let cell = IMG_SIDE as f32 / total_mods as f32;
     let origin = quiet_mods as f32 * cell;
     let mid = (n as f32 - 1.0) * 0.5;
-    let center_clear_r = (n as f32 * 0.145).max(3.2);
-    let badge_px_r = (center_clear_r * cell * 0.90).clamp(24.0, 44.0);
+    let center_clear_r = (n as f32 * 0.085).clamp(2.2, 3.4);
+    let badge_px_r = (center_clear_r * cell * 0.85).clamp(18.0, 28.0);
     let center_px = IMG_SIDE as f32 * 0.5;
 
     let is_finder = |x: usize, y: usize| -> bool {
         (x < 7 && y < 7) || (x + 7 >= n && y < 7) || (x < 7 && y + 7 >= n)
     };
 
-    let dark = Color32::from_rgb(10, 12, 16);
     let pure_black = Color32::BLACK;
 
     let fill_disk = |pixels: &mut [Color32], cx: f32, cy: f32, r: f32, col: Color32| {
@@ -497,8 +496,8 @@ pub fn render_qr_image(url: &str, badge_accent: Color32) -> Option<egui::ColorIm
         }
     };
 
-    // Модули данных: контрастные тёмные округлые точки с перемычками (легко читаются любыми камерами).
-    let mod_r = (cell * 0.45).max(1.4);
+    // Чёткие контрастные квадратные модули без разрывов (мгновенное распознавание камерами).
+    let mod_rad = (cell * 0.10).min(1.5);
     for y in 0..n {
         for x in 0..n {
             if is_finder(x, y) || code[(x, y)] != qrcode::Color::Dark {
@@ -509,37 +508,17 @@ pub fn render_qr_image(url: &str, badge_accent: Color32) -> Option<egui::ColorIm
             if (dx * dx + dy * dy).sqrt() < center_clear_r {
                 continue;
             }
-            let cx = origin + (x as f32 + 0.5) * cell;
-            let cy = origin + (y as f32 + 0.5) * cell;
-            fill_disk(&mut pixels, cx, cy, mod_r, dark);
-            if x + 1 < n && !is_finder(x + 1, y) && code[(x + 1, y)] == qrcode::Color::Dark {
-                let dx2 = (x + 1) as f32 - mid;
-                if (dx2 * dx2 + dy * dy).sqrt() >= center_clear_r {
-                    fill_round_rect(
-                        &mut pixels,
-                        cx,
-                        cy - mod_r * 0.84,
-                        cx + cell,
-                        cy + mod_r * 0.84,
-                        1.0,
-                        dark,
-                    );
-                }
-            }
-            if y + 1 < n && !is_finder(x, y + 1) && code[(x, y + 1)] == qrcode::Color::Dark {
-                let dy2 = (y + 1) as f32 - mid;
-                if (dx * dx + dy2 * dy2).sqrt() >= center_clear_r {
-                    fill_round_rect(
-                        &mut pixels,
-                        cx - mod_r * 0.84,
-                        cy,
-                        cx + mod_r * 0.84,
-                        cy + cell,
-                        1.0,
-                        dark,
-                    );
-                }
-            }
+            let x0 = origin + x as f32 * cell;
+            let y0 = origin + y as f32 * cell;
+            fill_round_rect(
+                &mut pixels,
+                x0 - 0.15,
+                y0 - 0.15,
+                x0 + cell + 0.25,
+                y0 + cell + 0.25,
+                mod_rad,
+                pure_black,
+            );
         }
     }
 
@@ -569,7 +548,7 @@ pub fn render_qr_image(url: &str, badge_accent: Color32) -> Option<egui::ColorIm
     }
 
     // Белый ободок и центральный синий/акцентный кружок медальона.
-    fill_disk(&mut pixels, center_px, center_px, badge_px_r + 5.0, Color32::WHITE);
+    fill_disk(&mut pixels, center_px, center_px, badge_px_r + 3.5, Color32::WHITE);
     fill_disk(&mut pixels, center_px, center_px, badge_px_r, badge_accent);
 
     Some(egui::ColorImage {
@@ -585,7 +564,7 @@ pub fn draw_styled_qr(ui: &mut egui::Ui, url: &str, size: f32, accent: Color32, 
     if url.is_empty() {
         return false;
     }
-    let cache_id = egui::Id::new("rg-qr-tex-cache-v3");
+    let cache_id = egui::Id::new("rg-qr-tex-cache-v4");
     let badge_col = accent;
     let tex: Option<egui::TextureHandle> = ui.ctx().data(|d| {
         d.get_temp::<(String, Color32, egui::TextureHandle)>(cache_id)

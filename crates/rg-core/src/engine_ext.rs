@@ -342,7 +342,8 @@ impl Engine {
             })
         });
         self.apply_traffic_jitter().await;
-        self.client
+        let updates = self
+            .client
             .invoke(&tl::functions::messages::SendMedia {
                 silent: cfg.ghost.should_send_without_sound(),
                 background: false,
@@ -368,6 +369,8 @@ impl Engine {
             })
             .await
             .map_err(|e| format!("Отправка голосового: {e}"))?;
+        let row = self.row_from_tl_updates(peer, &updates, "[Голосовое сообщение]", cfg.ghost.should_send_without_sound());
+        self.remember_row_sync(peer, &row).await;
         self.send_offline_if_needed(&cfg.ghost).await;
         Ok(())
     }
@@ -1689,6 +1692,7 @@ impl Engine {
         if row.effect.is_none() {
             row.effect = effect;
         }
+        self.remember_row_sync(peer, &row).await;
         self.spawn_after_send(peer, cfg.ghost, &row, true);
         Ok(row)
     }
@@ -2694,6 +2698,7 @@ impl Engine {
             .await
             .map_err(|e| format!("Бросок: {e}"))?;
         let row = self.row_from_tl_updates(peer, &updates, "", silent);
+        self.remember_row_sync(peer, &row).await;
         self.spawn_after_send(peer, cfg.ghost, &row, true);
         Ok(row)
     }
@@ -3286,6 +3291,464 @@ impl Engine {
         .map_err(|e| format!("Удаление контакта: {e}"))?;
         Ok(())
     }
+
+    // =========================================================================
+    // v0.23.0 — 5 новых функций: глобальный поиск сообщений, очистка/выход,
+    // панель закрепов + открепить все, расширенная пересылка AyuGram, папки-ссылки
+    // =========================================================================
+
+    /// 1. Глобальный поиск по тексту сообщений во всех чатах (`messages.searchGlobal`).
+    ///
+    /// `scope`: `0` = все, `1` = личные, `2` = группы, `3` = каналы.
+    pub async fn search_global_messages(
+        &self,
+        query: &str,
+        scope: u8,
+        limit: i32,
+    ) -> Result<Vec<GlobalMessageHit>, String> {
+        let q = query.trim();
+        if q.chars().count() < 2 {
+            return Ok(Vec::new());
+        }
+        let res = self
+            .invoke_retry(
+                "messages.searchGlobal",
+                &tl::functions::messages::SearchGlobal {
+                    broadcasts_only: scope == 3,
+                    groups_only: scope == 2,
+                    users_only: scope == 1,
+                    folder_id: None,
+                    community: None,
+                    q: q.to_owned(),
+                    filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+                    min_date: 0,
+                    max_date: 0,
+                    offset_rate: 0,
+                    offset_peer: tl::enums::InputPeer::Empty,
+                    offset_id: 0,
+                    limit: limit.clamp(1, 60),
+                },
+            )
+            .await
+            .map_err(|e| format!("Поиск по сообщениям: {e}"))?;
+        let (msgs, chats, users) = match &res {
+            tl::enums::messages::Messages::Messages(x) => (&x.messages, &x.chats, &x.users),
+            tl::enums::messages::Messages::Slice(x) => (&x.messages, &x.chats, &x.users),
+            tl::enums::messages::Messages::ChannelMessages(x) => (&x.messages, &x.chats, &x.users),
+            tl::enums::messages::Messages::NotModified(_) => return Ok(Vec::new()),
+        };
+        if let Some(sess) = &self.session {
+            crate::cache_tl_peers(&**sess, users, chats).await;
+        }
+        let peer_map = build_tl_peer_lookup(users, chats);
+        let mut out = Vec::new();
+        for m in msgs {
+            let tl::enums::Message::Message(x) = m else {
+                continue;
+            };
+            let did = match &x.peer_id {
+                tl::enums::Peer::User(u) => u.user_id,
+                tl::enums::Peer::Chat(c) => -c.chat_id,
+                tl::enums::Peer::Channel(c) => -1_000_000_000_000 - c.channel_id,
+            };
+            let Some((peer, peer_name)) = peer_map.get(&did).cloned() else {
+                continue;
+            };
+            let snippet = if !x.message.is_empty() {
+                x.message.clone()
+            } else {
+                "[Медиа / Вложение]".to_owned()
+            };
+            out.push(GlobalMessageHit {
+                peer,
+                dialog_id: did,
+                peer_name,
+                msg_id: x.id,
+                text: snippet,
+                date: i64::from(x.date),
+                outgoing: x.out,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 2а. Очистить историю чата (`messages.deleteHistory` или `channels.deleteHistory`).
+    /// Если включено «Сохранять удалённые», все локально сохранённые сообщения чата отмечаются `deleted=1`.
+    pub async fn clear_history(&self, peer: PeerRef, revoke: bool) -> Result<(), String> {
+        if self.settings().ayu.save_deleted_messages {
+            let _ = self
+                .store
+                .mark_all_peer_deleted(super::peer_key(&peer))
+                .await;
+        }
+        match peer_to_input_channel(peer) {
+            Ok(channel) => {
+                self.invoke_retry(
+                    "channels.deleteHistory",
+                    &tl::functions::channels::DeleteHistory {
+                        for_everyone: revoke,
+                        channel,
+                        max_id: 0,
+                    },
+                )
+                .await
+                .map_err(|e| format!("Очистка истории: {e}"))?;
+            }
+            Err(_) => {
+                self.invoke_retry(
+                    "messages.deleteHistory",
+                    &tl::functions::messages::DeleteHistory {
+                        just_clear: true,
+                        revoke,
+                        peer: peer.into(),
+                        max_id: 0,
+                        min_date: None,
+                        max_date: None,
+                    },
+                )
+                .await
+                .map_err(|e| format!("Очистка истории: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 2б. Покинуть группу, супергруппу или канал (`channels.leaveChannel` / `messages.deleteChatUser`).
+    pub async fn leave_chat(&self, peer: PeerRef) -> Result<(), String> {
+        match peer_to_input_channel(peer) {
+            Ok(channel) => {
+                self.invoke_retry(
+                    "channels.leaveChannel",
+                    &tl::functions::channels::LeaveChannel { channel },
+                )
+                .await
+                .map_err(|e| format!("Выход из канала/группы: {e}"))?;
+                Ok(())
+            }
+            Err(_) => {
+                let id = super::peer_key(&peer);
+                if id < 0 && id > -1_000_000_000_000 {
+                    self.invoke_retry(
+                        "messages.deleteChatUser",
+                        &tl::functions::messages::DeleteChatUser {
+                            revoke_history: false,
+                            chat_id: -id,
+                            user_id: tl::enums::InputUser::UserSelf,
+                        },
+                    )
+                    .await
+                    .map_err(|e| format!("Выход из группы: {e}"))?;
+                    Ok(())
+                } else {
+                    Err("Нельзя покинуть личный диалог".to_owned())
+                }
+            }
+        }
+    }
+
+    /// 3а. Загрузить все закреплённые сообщения чата (`messages.search` + `InputMessagesFilterPinned`).
+    pub async fn pinned_messages(
+        &self,
+        peer: PeerRef,
+        limit: i32,
+    ) -> Result<Vec<super::MessageRow>, String> {
+        let res = self
+            .invoke_retry(
+                "messages.search(pinned)",
+                &tl::functions::messages::Search {
+                    peer: peer.into(),
+                    q: String::new(),
+                    from_id: None,
+                    saved_peer_id: None,
+                    saved_reaction: None,
+                    top_msg_id: None,
+                    filter: tl::enums::MessagesFilter::InputMessagesFilterPinned,
+                    min_date: 0,
+                    max_date: 0,
+                    offset_id: 0,
+                    add_offset: 0,
+                    limit: limit.clamp(1, 100),
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                },
+            )
+            .await
+            .map_err(|e| format!("Закреплённые сообщения: {e}"))?;
+        let mut rows = super::tl_messages_to_rows(&res);
+        rows.sort_by_key(|m| (-m.date, -m.id));
+        Ok(rows)
+    }
+
+    /// 3б. Открепить все закреплённые сообщения чата (`messages.unpinAllMessages`).
+    pub async fn unpin_all_messages(&self, peer: PeerRef) -> Result<(), String> {
+        self.invoke_retry(
+            "messages.unpinAllMessages",
+            &tl::functions::messages::UnpinAllMessages {
+                peer: peer.into(),
+                top_msg_id: None,
+                saved_peer_id: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Открепление всех сообщений: {e}"))?;
+        Ok(())
+    }
+
+    /// 4. Расширенная пересылка AyuGram: без автора, без подписей к медиа, без звука и пачкой (`messages.forwardMessages`).
+    pub async fn forward_advanced(
+        &self,
+        from: PeerRef,
+        to: PeerRef,
+        ids: &[i32],
+        opts: ForwardOptions,
+    ) -> Result<(), String> {
+        let clean: Vec<i32> = ids.iter().copied().filter(|&id| id > 0).collect();
+        if clean.is_empty() {
+            return Err("Не выбраны сообщения для пересылки".to_owned());
+        }
+        let cfg = self.settings();
+        let random_id: Vec<i64> = clean.iter().map(|_| rand_i64()).collect();
+        let silent = opts.silent || cfg.ghost.should_send_without_sound();
+        self.apply_traffic_jitter().await;
+        self.invoke_retry(
+            "messages.forwardMessages(adv)",
+            &tl::functions::messages::ForwardMessages {
+                silent,
+                background: false,
+                with_my_score: false,
+                drop_author: opts.drop_author,
+                drop_media_captions: opts.drop_media_captions,
+                noforwards: false,
+                allow_paid_floodskip: false,
+                from_ephemeral: false,
+                from_peer: from.into(),
+                id: clean,
+                random_id,
+                to_peer: to.into(),
+                top_msg_id: None,
+                reply_to: None,
+                schedule_date: ghost::schedule_date(&cfg.ghost),
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                video_timestamp: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Пересылка: {e}"))?;
+        self.send_offline_if_needed(&cfg.ghost).await;
+        Ok(())
+    }
+
+    /// 5а. Экспорт пригласительной ссылки на папку чатов (`chatlists.exportChatlistInvite`).
+    pub async fn export_folder_invite(
+        &self,
+        folder_id: i32,
+        title: &str,
+        peers: &[PeerRef],
+    ) -> Result<String, String> {
+        let input_peers: Vec<tl::enums::InputPeer> = peers.iter().copied().map(Into::into).collect();
+        if input_peers.is_empty() {
+            return Err("Добавьте хотя бы один чат в папку (явные чаты), чтобы поделиться ссылкой".to_owned());
+        }
+        let res = self
+            .invoke_retry(
+                "chatlists.exportChatlistInvite",
+                &tl::functions::chatlists::ExportChatlistInvite {
+                    chatlist: tl::enums::InputChatlist::DialogFilter(
+                        tl::types::InputChatlistDialogFilter { filter_id: folder_id },
+                    ),
+                    title: title.trim().to_owned(),
+                    peers: input_peers,
+                },
+            )
+            .await
+            .map_err(|e| format!("Экспорт папки: {e}"))?;
+        let tl::enums::chatlists::ExportedChatlistInvite::Invite(exp) = res;
+        let tl::enums::ExportedChatlistInvite::Invite(inv) = exp.invite;
+        Ok(inv.url)
+    }
+
+    /// 5б. Проверить пригласительную ссылку на папку чатов (`chatlists.checkChatlistInvite`).
+    pub async fn check_folder_invite(&self, slug_or_url: &str) -> Result<FolderInvitePreview, String> {
+        let slug = extract_chatlist_slug(slug_or_url)
+            .ok_or_else(|| "Неверный формат ссылки на папку (нужен t.me/addlist/...)".to_owned())?;
+        let res = self
+            .invoke_retry(
+                "chatlists.checkChatlistInvite",
+                &tl::functions::chatlists::CheckChatlistInvite { slug: slug.clone() },
+            )
+            .await
+            .map_err(|e| format!("Проверка папки: {e}"))?;
+        match res {
+            tl::enums::chatlists::ChatlistInvite::Invite(inv) => {
+                if let Some(sess) = &self.session {
+                    crate::cache_tl_peers(&**sess, &inv.users, &inv.chats).await;
+                }
+                let lookup = build_tl_peer_lookup(&inv.users, &inv.chats);
+                let tl::enums::TextWithEntities::Entities(twe) = inv.title;
+                let peers = resolve_peer_list(&inv.peers, &lookup);
+                Ok(FolderInvitePreview {
+                    slug,
+                    title: twe.text,
+                    peers,
+                    already_joined: false,
+                })
+            }
+            tl::enums::chatlists::ChatlistInvite::Already(al) => {
+                if let Some(sess) = &self.session {
+                    crate::cache_tl_peers(&**sess, &al.users, &al.chats).await;
+                }
+                let lookup = build_tl_peer_lookup(&al.users, &al.chats);
+                let mut combined = al.missing_peers;
+                combined.extend(al.already_peers);
+                let peers = resolve_peer_list(&combined, &lookup);
+                Ok(FolderInvitePreview {
+                    slug,
+                    title: format!("Папка #{}", al.filter_id),
+                    peers,
+                    already_joined: true,
+                })
+            }
+        }
+    }
+
+    /// 5в. Присоединиться к папке чатов по ссылке (`chatlists.joinChatlistInvite`).
+    pub async fn join_folder_invite(&self, slug: &str, peers: &[PeerRef]) -> Result<(), String> {
+        let clean_slug = extract_chatlist_slug(slug).unwrap_or_else(|| slug.trim().to_owned());
+        let input_peers: Vec<tl::enums::InputPeer> = peers.iter().copied().map(Into::into).collect();
+        self.invoke_retry(
+            "chatlists.joinChatlistInvite",
+            &tl::functions::chatlists::JoinChatlistInvite {
+                slug: clean_slug,
+                peers: input_peers,
+            },
+        )
+        .await
+        .map_err(|e| format!("Добавление папки: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Результат глобального поиска сообщений (`messages.searchGlobal`).
+#[derive(Debug, Clone)]
+pub struct GlobalMessageHit {
+    pub peer: PeerRef,
+    pub dialog_id: i64,
+    pub peer_name: String,
+    pub msg_id: i32,
+    pub text: String,
+    pub date: i64,
+    pub outgoing: bool,
+}
+
+/// Параметры расширенной пересылки сообщений (AyuGram Forward).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForwardOptions {
+    pub drop_author: bool,
+    pub drop_media_captions: bool,
+    pub silent: bool,
+}
+
+/// Предпросмотр приглашения в общую папку чатов (`t.me/addlist/...`).
+#[derive(Debug, Clone)]
+pub struct FolderInvitePreview {
+    pub slug: String,
+    pub title: String,
+    pub peers: Vec<(PeerRef, i64, String)>,
+    pub already_joined: bool,
+}
+
+pub fn extract_chatlist_slug(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(after) = s.split("addlist/").nth(1) {
+        let slug = after.split(['?', '#', '/']).next()?.trim();
+        return (!slug.is_empty()).then(|| slug.to_owned());
+    }
+    if let Some(after) = s.split("slug=").nth(1) {
+        let slug = after.split(['&', '#']).next()?.trim();
+        return (!slug.is_empty()).then(|| slug.to_owned());
+    }
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') && s.len() >= 3 {
+        return Some(s.to_owned());
+    }
+    None
+}
+
+fn build_tl_peer_lookup(
+    users: &[tl::enums::User],
+    chats: &[tl::enums::Chat],
+) -> std::collections::HashMap<i64, (PeerRef, String)> {
+    use grammers_session::types::{PeerAuth, PeerId};
+    let mut map = std::collections::HashMap::with_capacity(users.len() + chats.len());
+    for u in users {
+        if let tl::enums::User::User(x) = u
+            && let Some(pid) = PeerId::user(x.id)
+        {
+            let name = format!(
+                "{} {}",
+                x.first_name.as_deref().unwrap_or(""),
+                x.last_name.as_deref().unwrap_or("")
+            )
+            .trim()
+            .to_owned();
+            let peer = PeerRef {
+                id: pid,
+                auth: PeerAuth::from_hash(x.access_hash.unwrap_or(0)),
+            };
+            map.insert(x.id, (peer, if name.is_empty() { format!("User {}", x.id) } else { name }));
+        }
+    }
+    for c in chats {
+        match c {
+            tl::enums::Chat::Channel(x) => {
+                if let Some(pid) = PeerId::channel(x.id) {
+                    let did = -1_000_000_000_000 - x.id;
+                    let peer = PeerRef {
+                        id: pid,
+                        auth: PeerAuth::from_hash(x.access_hash.unwrap_or(0)),
+                    };
+                    map.insert(did, (peer, x.title.clone()));
+                }
+            }
+            tl::enums::Chat::Chat(x) => {
+                if let Some(pid) = PeerId::chat(x.id) {
+                    let peer = PeerRef {
+                        id: pid,
+                        auth: PeerAuth::default(),
+                    };
+                    map.insert(-x.id, (peer, x.title.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn resolve_peer_list(
+    peers: &[tl::enums::Peer],
+    lookup: &std::collections::HashMap<i64, (PeerRef, String)>,
+) -> Vec<(PeerRef, i64, String)> {
+    let mut out = Vec::with_capacity(peers.len());
+    for p in peers {
+        let did = match p {
+            tl::enums::Peer::User(u) => u.user_id,
+            tl::enums::Peer::Chat(c) => -c.chat_id,
+            tl::enums::Peer::Channel(c) => -1_000_000_000_000 - c.channel_id,
+        };
+        if let Some((pr, name)) = lookup.get(&did) {
+            out.push((*pr, did, name.clone()));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3300,5 +3763,82 @@ mod v22_ext_tests {
         assert!(parse_date_dmy("29.02.2025").is_none());
         assert!(parse_date_dmy("32.01.2026").is_none());
         assert!(parse_date_dmy("abc").is_none());
+    }
+
+    #[test]
+    fn extract_chatlist_slug_handles_urls_and_raw_slugs() {
+        assert_eq!(
+            extract_chatlist_slug("https://t.me/addlist/RustPack_1"),
+            Some("RustPack_1".to_owned())
+        );
+        assert_eq!(
+            extract_chatlist_slug("tg://addlist?slug=MyFolder99&ref=1"),
+            Some("MyFolder99".to_owned())
+        );
+        assert_eq!(
+            extract_chatlist_slug("JustSlug-12"),
+            Some("JustSlug-12".to_owned())
+        );
+        assert_eq!(extract_chatlist_slug("https://example.com/foo"), None);
+    }
+
+    #[test]
+    fn peer_lookup_maps_users_groups_and_channels() {
+        let u = tl::enums::User::User(tl::types::User {
+            is_self: false,
+            contact: false,
+            mutual_contact: false,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            bot_forum_can_manage_topics: false,
+            bot_can_manage_bots: false,
+            bot_guestchat: false,
+            bot_guard: false,
+            bot_forum_sidebar: false,
+            id: 42,
+            access_hash: Some(999),
+            first_name: Some("Анна".to_owned()),
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+            linked_community_id: None,
+        });
+        let map = build_tl_peer_lookup(&[u], &[]);
+        assert_eq!(map.get(&42).map(|(_, n)| n.as_str()), Some("Анна"));
     }
 }
