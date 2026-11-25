@@ -585,8 +585,8 @@ pub fn draw_styled_qr(ui: &mut egui::Ui, url: &str, size: f32, accent: Color32, 
     if url.is_empty() {
         return false;
     }
-    let cache_id = egui::Id::new("rg-qr-tex-cache-v2");
-    let badge_col = Color32::from_rgb(42, 171, 238);
+    let cache_id = egui::Id::new("rg-qr-tex-cache-v3");
+    let badge_col = accent;
     let tex: Option<egui::TextureHandle> = ui.ctx().data(|d| {
         d.get_temp::<(String, Color32, egui::TextureHandle)>(cache_id)
             .filter(|(u, c, _)| u == url && *c == badge_col)

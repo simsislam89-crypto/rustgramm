@@ -122,8 +122,9 @@ pub async fn request_login_code<S: Session>(
 }
 
 /// Проверка введённого кода подтверждения и переход к 2FA при необходимости.
-pub async fn sign_in(
+pub async fn sign_in<S: Session>(
     client: &Client,
+    session: &S,
     phone: &str,
     phone_code_hash: &str,
     code: &str,
@@ -136,7 +137,10 @@ pub async fn sign_in(
         email_verification: None,
     };
     match client.invoke(&req).await {
-        Ok(tl::enums::auth::Authorization::Authorization(_)) => Ok(SignInOutcome::SignedIn),
+        Ok(auth @ tl::enums::auth::Authorization::Authorization(_)) => {
+            crate::cache_tl_auth_user(session, &auth).await;
+            Ok(SignInOutcome::SignedIn)
+        }
         Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => Ok(SignInOutcome::SignUpRequired),
         Err(err) if err.is("SESSION_PASSWORD_NEEDED") => {
             let tl::enums::account::Password::Password(p) = client

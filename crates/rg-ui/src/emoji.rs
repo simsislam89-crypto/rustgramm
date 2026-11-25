@@ -231,9 +231,20 @@ impl Emoji {
         out
     }
 
-    /// Есть ли в тексте хотя бы один эмодзи из атласа.
+    /// Быстрая проверка, может ли символ находиться в атласе эмодзи (отсекает ASCII и кириллицу в O(1)).
+    #[inline]
+    pub fn might_be_atlas_char(c: char) -> bool {
+        let u = c as u32;
+        u >= 0x00A9 && !(0x0100..=0x2000).contains(&u)
+    }
+
+    /// Есть ли в тексте хотя бы один эмодзи из атласа (ASCII fast-path + пропуск кириллицы без хэша).
+    #[inline]
     pub fn contains(&self, text: &str) -> bool {
-        text.chars().any(|c| self.has(c))
+        if text.is_ascii() {
+            return false;
+        }
+        text.chars().any(|c| Self::might_be_atlas_char(c) && self.has(c))
     }
 
     /// Выводит текст с картинками вместо эмодзи (переносится по ширине контейнера).
@@ -436,5 +447,38 @@ mod tests {
         let has_fire = BUILTIN_KEYWORDS.iter().any(|(kw, em)| kw.contains("огонь") && kw.contains("fire") && em.contains('🔥'));
         let has_heart = BUILTIN_KEYWORDS.iter().any(|(kw, em)| kw.contains("сердце") && kw.contains("heart") && em.contains('❤'));
         assert!(has_fire && has_heart);
+    }
+
+    #[test]
+    fn fast_emoji_precheck_matches_entire_atlas_equivalently() {
+        let mut idx = HashMap::new();
+        for (n, line) in ATLAS_IDX.lines().enumerate() {
+            if let Some(c) = u32::from_str_radix(line.trim(), 16).ok().and_then(char::from_u32) {
+                assert!(
+                    Emoji::might_be_atlas_char(c),
+                    "atlas char U+{:X} missed by fast-path filter",
+                    c as u32
+                );
+                idx.insert(c, n);
+            }
+        }
+        let samples = [
+            "",
+            "Plain ASCII message 12345!",
+            "Обычное русское сообщение без эмодзи, но длинное и чатов много!",
+            "Привет 🔥 как дела?",
+            "❤",
+            "café naïve résumé",
+        ];
+        let t0 = std::time::Instant::now();
+        for _ in 0..1000 {
+            for s in &samples {
+                let ref_hit = s.chars().any(|c| idx.contains_key(&c));
+                let fast_hit = !s.is_ascii()
+                    && s.chars().any(|c| Emoji::might_be_atlas_char(c) && idx.contains_key(&c));
+                assert_eq!(fast_hit, ref_hit, "mismatch on sample {s:?}");
+            }
+        }
+        let _elapsed = t0.elapsed();
     }
 }

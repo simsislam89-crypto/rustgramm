@@ -1636,7 +1636,7 @@ impl Engine {
         effect: Option<i64>,
         send_as: Option<PeerRef>,
         force_silent: bool,
-    ) -> Result<(), String> {
+    ) -> Result<super::MessageRow, String> {
         let cfg = self.settings();
         let tl_ents = super::entities_to_tl(text, entities);
         let reply_header = reply_to.map(|mid| {
@@ -1655,36 +1655,42 @@ impl Engine {
         });
         let silent = force_silent || cfg.ghost.should_send_without_sound();
         self.apply_traffic_jitter().await;
-        self.invoke_retry(
-            "messages.sendMessage(adv)",
-            &tl::functions::messages::SendMessage {
-                no_webpage: false,
-                silent,
-                background: false,
-                clear_draft: true,
-                noforwards: false,
-                update_stickersets_order: false,
-                invert_media: false,
-                allow_paid_floodskip: false,
-                peer: peer.into(),
-                reply_to: reply_header,
-                message: text.to_owned(),
-                random_id: rand_i64(),
-                reply_markup: None,
-                entities: (!tl_ents.is_empty()).then_some(tl_ents),
-                schedule_date,
-                schedule_repeat_period: None,
-                send_as: send_as.map(Into::into),
-                quick_reply_shortcut: None,
-                effect,
-                allow_paid_stars: None,
-                suggested_post: None,
-                rich_message: None,
-            },
-        )
-        .await
-        .map_err(|e| format!("Отправка: {e}"))?;
-        Ok(())
+        let updates = self
+            .invoke_retry(
+                "messages.sendMessage(adv)",
+                &tl::functions::messages::SendMessage {
+                    no_webpage: false,
+                    silent,
+                    background: false,
+                    clear_draft: true,
+                    noforwards: false,
+                    update_stickersets_order: false,
+                    invert_media: false,
+                    allow_paid_floodskip: false,
+                    peer: peer.into(),
+                    reply_to: reply_header,
+                    message: text.to_owned(),
+                    random_id: rand_i64(),
+                    reply_markup: None,
+                    entities: (!tl_ents.is_empty()).then_some(tl_ents),
+                    schedule_date,
+                    schedule_repeat_period: None,
+                    send_as: send_as.map(Into::into),
+                    quick_reply_shortcut: None,
+                    effect,
+                    allow_paid_stars: None,
+                    suggested_post: None,
+                    rich_message: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("Отправка: {e}"))?;
+        let mut row = self.row_from_tl_updates(peer, &updates, text, silent);
+        if row.effect.is_none() {
+            row.effect = effect;
+        }
+        self.spawn_after_send(peer, cfg.ghost, &row, true);
+        Ok(row)
     }
 
     /// Загружает очередь отложенных сообщений и напоминаний чата (`messages.getScheduledHistory`).
@@ -2468,6 +2474,465 @@ impl Engine {
                 }
             })
             .collect())
+    }
+
+    // =========================================================================
+    // Новые 5 функций v0.21.0:
+    // 1) Облачные черновики (`messages.saveDraft` / `messages.getAllDrafts`)
+    // 2) Отметить непрочитанным + непрочитанные `@` и `❤` (`messages.markDialogUnread`, `getUnreadMentions`, `getUnreadReactions`)
+    // 3) Игры / кости в чате (`InputMediaDice`: 🎲 🎯 🏀 ⚽ 🎰 🎳)
+    // 4) Просмотр, установка и удаление набора стикеров (`messages.getStickerSet`, `installStickerSet`, `uninstallStickerSet`)
+    // 5) Редактор дня рождения (`account.updateBirthday`) и `@username`
+    // =========================================================================
+
+    /// 1. Сохраняет облачный черновик чата на сервере Telegram (`messages.saveDraft`).
+    pub async fn save_draft(
+        &self,
+        peer: PeerRef,
+        text: &str,
+        reply_to: Option<i32>,
+    ) -> Result<(), String> {
+        let reply_hdr = reply_to.map(|id| {
+            tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                reply_to_msg_id: id,
+                top_msg_id: None,
+                reply_to_peer_id: None,
+                quote_text: None,
+                quote_entities: None,
+                quote_offset: None,
+                monoforum_peer_id: None,
+                todo_item_id: None,
+                poll_option: None,
+                quote_rich: None,
+            })
+        });
+        self.client
+            .invoke(&tl::functions::messages::SaveDraft {
+                no_webpage: false,
+                invert_media: false,
+                reply_to: reply_hdr,
+                peer: peer.into(),
+                message: text.to_owned(),
+                entities: None,
+                media: None,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map_err(|e| format!("Черновик: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает все облачные черновики аккаунта (`messages.getAllDrafts`).
+    pub async fn get_all_drafts(&self) -> Result<Vec<DraftRow>, String> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetAllDrafts {})
+            .await
+            .map_err(|e| format!("Черновики: {e}"))?;
+        let upds = match res {
+            tl::enums::Updates::Updates(u) => u.updates,
+            tl::enums::Updates::Combined(u) => u.updates,
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for u in upds {
+            if let tl::enums::Update::DraftMessage(dm) = u {
+                let peer_id = match dm.peer {
+                    tl::enums::Peer::User(x) => x.user_id,
+                    tl::enums::Peer::Chat(x) => -x.chat_id,
+                    tl::enums::Peer::Channel(x) => -1_000_000_000_000 - x.channel_id,
+                };
+                if let tl::enums::DraftMessage::Message(m) = dm.draft {
+                    let reply_to = m.reply_to.and_then(|rt| match rt {
+                        tl::enums::InputReplyTo::Message(x) => Some(x.reply_to_msg_id),
+                        _ => None,
+                    });
+                    if !m.message.is_empty() || reply_to.is_some() {
+                        out.push(DraftRow {
+                            peer_id,
+                            text: m.message,
+                            reply_to,
+                            date: m.date,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 2. Отмечает чат непрочитанным или прочитанным (`messages.markDialogUnread`).
+    pub async fn mark_dialog_unread(&self, peer: PeerRef, unread: bool) -> Result<(), String> {
+        self.client
+            .invoke(&tl::functions::messages::MarkDialogUnread {
+                unread,
+                parent_peer: None,
+                peer: tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer: peer.into() }),
+            })
+            .await
+            .map_err(|e| format!("Отметка непрочитанного: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает идентификаторы непрочитанных упоминаний `@` в чате (`messages.getUnreadMentions`).
+    pub async fn unread_mentions(&self, peer: PeerRef, limit: i32) -> Result<Vec<i32>, String> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetUnreadMentions {
+                peer: peer.into(),
+                top_msg_id: None,
+                offset_id: 0,
+                add_offset: 0,
+                limit: limit.clamp(1, 50),
+                max_id: 0,
+                min_id: 0,
+            })
+            .await
+            .map_err(|e| format!("Упоминания: {e}"))?;
+        Ok(super::tl_messages_to_rows(&res).into_iter().map(|m| m.id).collect())
+    }
+
+    /// Отмечает все упоминания `@` прочитанными (`messages.readMentions`).
+    pub async fn read_mentions(&self, peer: PeerRef) -> Result<(), String> {
+        self.client
+            .invoke(&tl::functions::messages::ReadMentions {
+                peer: peer.into(),
+                top_msg_id: None,
+            })
+            .await
+            .map_err(|e| format!("Чтение упоминаний: {e}"))?;
+        Ok(())
+    }
+
+    /// Загружает идентификаторы непрочитанных реакций `❤` в чате (`messages.getUnreadReactions`).
+    pub async fn unread_reactions(&self, peer: PeerRef, limit: i32) -> Result<Vec<i32>, String> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetUnreadReactions {
+                peer: peer.into(),
+                top_msg_id: None,
+                saved_peer_id: None,
+                offset_id: 0,
+                add_offset: 0,
+                limit: limit.clamp(1, 50),
+                max_id: 0,
+                min_id: 0,
+            })
+            .await
+            .map_err(|e| format!("Непрочитанные реакции: {e}"))?;
+        Ok(super::tl_messages_to_rows(&res).into_iter().map(|m| m.id).collect())
+    }
+
+    /// Отмечает все реакции `❤` прочитанными (`messages.readReactions`).
+    pub async fn read_reactions(&self, peer: PeerRef) -> Result<(), String> {
+        self.client
+            .invoke(&tl::functions::messages::ReadReactions {
+                peer: peer.into(),
+                top_msg_id: None,
+                saved_peer_id: None,
+            })
+            .await
+            .map_err(|e| format!("Чтение реакций: {e}"))?;
+        Ok(())
+    }
+
+    /// 3. Отправить анимированную мини-игру / бросок (`InputMediaDice`: 🎲 🎯 🏀 ⚽ 🎰 🎳) с мгновенным `MessageRow`.
+    pub async fn send_dice(
+        &self,
+        peer: PeerRef,
+        emoticon: &str,
+        reply_to: Option<i32>,
+    ) -> Result<super::MessageRow, String> {
+        let cfg = self.settings();
+        let silent = cfg.ghost.should_send_without_sound();
+        let reply_header = reply_to.map(|mid| {
+            tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                reply_to_msg_id: mid,
+                top_msg_id: None,
+                reply_to_peer_id: None,
+                quote_text: None,
+                quote_entities: None,
+                quote_offset: None,
+                monoforum_peer_id: None,
+                todo_item_id: None,
+                poll_option: None,
+                quote_rich: None,
+            })
+        });
+        self.apply_traffic_jitter().await;
+        let updates = self
+            .invoke_retry(
+                "messages.sendMedia(dice)",
+                &tl::functions::messages::SendMedia {
+                    silent,
+                    background: false,
+                    clear_draft: false,
+                    noforwards: false,
+                    update_stickersets_order: false,
+                    invert_media: false,
+                    allow_paid_floodskip: false,
+                    peer: peer.into(),
+                    reply_to: reply_header,
+                    media: tl::enums::InputMedia::Dice(tl::types::InputMediaDice {
+                        emoticon: emoticon.to_owned(),
+                    }),
+                    message: String::new(),
+                    random_id: rand_i64(),
+                    reply_markup: None,
+                    entities: None,
+                    schedule_date: None,
+                    schedule_repeat_period: None,
+                    send_as: None,
+                    quick_reply_shortcut: None,
+                    effect: None,
+                    allow_paid_stars: None,
+                    suggested_post: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("Бросок: {e}"))?;
+        let row = self.row_from_tl_updates(peer, &updates, "", silent);
+        self.spawn_after_send(peer, cfg.ghost, &row, true);
+        Ok(row)
+    }
+
+    /// 4. Подробная информация о наборе стикеров по `id` + `access_hash` (`messages.getStickerSet`).
+    pub async fn sticker_pack_details(
+        &self,
+        set_id: i64,
+        access_hash: i64,
+    ) -> Result<StickerPackDetails, String> {
+        let res = self
+            .invoke_retry(
+                "messages.getStickerSet",
+                &tl::functions::messages::GetStickerSet {
+                    stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
+                        id: set_id,
+                        access_hash,
+                    }),
+                    hash: 0,
+                },
+            )
+            .await
+            .map_err(|e| format!("Набор стикеров: {e}"))?;
+        let tl::enums::messages::StickerSet::Set(s) = res else {
+            return Err("Набор стикеров не найден".to_owned());
+        };
+        let tl::enums::StickerSet::Set(meta) = s.set;
+        let stickers = s
+            .documents
+            .iter()
+            .filter_map(|d| {
+                let tl::enums::Document::Document(doc) = d else { return None };
+                Some(super::sticker_row_of(doc))
+            })
+            .collect();
+        Ok(StickerPackDetails {
+            id: meta.id,
+            access_hash: meta.access_hash,
+            title: meta.title,
+            short_name: meta.short_name,
+            installed: meta.installed_date.is_some(),
+            emojis: meta.emojis,
+            stickers,
+        })
+    }
+
+    /// Установить набор стикеров по `id` и `access_hash`.
+    pub async fn install_sticker_pack(&self, set_id: i64, access_hash: i64) -> Result<(), String> {
+        self.client
+            .invoke(&tl::functions::messages::InstallStickerSet {
+                stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
+                    id: set_id,
+                    access_hash,
+                }),
+                archived: false,
+            })
+            .await
+            .map_err(|e| format!("Установка набора: {e}"))?;
+        Ok(())
+    }
+
+    /// Удалить набор стикеров по `id` и `access_hash` (`messages.uninstallStickerSet`).
+    pub async fn uninstall_sticker_pack(&self, set_id: i64, access_hash: i64) -> Result<(), String> {
+        self.client
+            .invoke(&tl::functions::messages::UninstallStickerSet {
+                stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
+                    id: set_id,
+                    access_hash,
+                }),
+            })
+            .await
+            .map_err(|e| format!("Удаление набора: {e}"))?;
+        Ok(())
+    }
+
+    /// 5. Обновить дату рождения в профиле (`account.updateBirthday`). `None` сбрасывает дату.
+    pub async fn update_birthday(&self, bday: Option<(i32, i32, Option<i32>)>) -> Result<(), String> {
+        let birthday = match bday {
+            Some((day, month, year)) => {
+                validate_birthday(day, month, year)?;
+                Some(tl::enums::Birthday::Birthday(tl::types::Birthday {
+                    day,
+                    month,
+                    year: year.filter(|&y| y >= 1900),
+                }))
+            }
+            None => None,
+        };
+        self.client
+            .invoke(&tl::functions::account::UpdateBirthday { birthday })
+            .await
+            .map_err(|e| format!("День рождения: {e}"))?;
+        Ok(())
+    }
+
+    /// Проверить и обновить публичный `@username` аккаунта (`account.updateUsername`).
+    pub async fn update_username_checked(&self, raw: &str) -> Result<String, String> {
+        let clean = validate_username(raw)?;
+        self.update_username(&clean)
+            .await
+            .map_err(|e| format!("Имя пользователя: {e}"))?;
+        Ok(clean)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftRow {
+    pub peer_id: i64,
+    pub text: String,
+    pub reply_to: Option<i32>,
+    pub date: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct StickerPackDetails {
+    pub id: i64,
+    pub access_hash: i64,
+    pub title: String,
+    pub short_name: String,
+    pub installed: bool,
+    pub emojis: bool,
+    pub stickers: Vec<super::StickerRow>,
+}
+
+/// Человекочитаемая расшифровка выпавшего результата для костей/игр Telegram (`MessageMediaDice`).
+pub fn dice_outcome_label(emoticon: &str, value: i32) -> String {
+    if value <= 0 {
+        return format!("{emoticon} Бросок…");
+    }
+    match emoticon.trim() {
+        "🎲" => format!("🎲 Выпало: {value}"),
+        "🎯" => match value {
+            6 => "🎯 В яблочко!".to_owned(),
+            1 => "🎯 Мимо!".to_owned(),
+            v => format!("🎯 Кольцо {v}/6"),
+        },
+        "🏀" => match value {
+            4 | 5 => "🏀 Гол в корзину!".to_owned(),
+            3 => "🏀 Отскок от кольца".to_owned(),
+            _ => "🏀 Мимо кольца".to_owned(),
+        },
+        "⚽" => match value {
+            3..=5 => "⚽ ГОООЛ!".to_owned(),
+            2 => "⚽ Штанга!".to_owned(),
+            _ => "⚽ Мимо ворот".to_owned(),
+        },
+        "🎳" => match value {
+            6 => "🎳 СТРАЙК!".to_owned(),
+            1 => "🎳 Все кегли мимо".to_owned(),
+            v => format!("🎳 Сбито кеглей: {v}"),
+        },
+        "🎰" => match value {
+            64 => "🎰 777 ДЖЕКПОТ!".to_owned(),
+            1 | 22 | 43 => "🎰 Три в ряд!".to_owned(),
+            _ => format!("🎰 Комбинация #{value}"),
+        },
+        _ => format!("{emoticon} Результат: {value}"),
+    }
+}
+
+/// Валидация `@username` по правилам Telegram (пустая строка — сброс, иначе 5..=32 ASCII `[a-zA-Z0-9_]`, начинается с буквы).
+pub fn validate_username(raw: &str) -> Result<String, String> {
+    let clean = raw.trim().trim_start_matches('@').to_owned();
+    if clean.is_empty() {
+        return Ok(String::new());
+    }
+    if !(5..=32).contains(&clean.len()) {
+        return Err("Username должен содержать от 5 до 32 символов".to_owned());
+    }
+    if !clean.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return Err("Username должен начинаться с латинской буквы".to_owned());
+    }
+    if !clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Допустимы только латинские буквы, цифры и '_'".to_owned());
+    }
+    if clean.ends_with('_') || clean.contains("__") {
+        return Err("Username не может заканчиваться на '_' или содержать '__'".to_owned());
+    }
+    Ok(clean)
+}
+
+/// Валидация даты рождения с учётом количества дней в месяце и високосных лет.
+pub fn validate_birthday(day: i32, month: i32, year: Option<i32>) -> Result<(), String> {
+    if !(1..=12).contains(&month) {
+        return Err("Месяц должен быть от 1 до 12".to_owned());
+    }
+    let leap = match year {
+        Some(y) if y >= 1900 => (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0),
+        Some(y) if y > 0 => return Err("Год должен быть не меньше 1900".to_owned()),
+        _ => true,
+    };
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if leap { 29 } else { 28 },
+        _ => 31,
+    };
+    if !(1..=max_day).contains(&day) {
+        return Err(format!("В выбранном месяце от 1 до {max_day} дней"));
+    }
+    if let Some(y) = year
+        && y > 2026
+    {
+        return Err("Укажите реальный год рождения".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod v21_ext_tests {
+    use super::*;
+
+    #[test]
+    fn dice_outcomes_cover_games() {
+        assert_eq!(dice_outcome_label("🎲", 6), "🎲 Выпало: 6");
+        assert!(dice_outcome_label("🎯", 6).contains("яблочко"));
+        assert!(dice_outcome_label("🏀", 5).contains("Гол"));
+        assert!(dice_outcome_label("⚽", 4).contains("ГОООЛ"));
+        assert!(dice_outcome_label("🎳", 6).contains("СТРАЙК"));
+        assert!(dice_outcome_label("🎰", 64).contains("ДЖЕКПОТ"));
+    }
+
+    #[test]
+    fn username_validation_matches_telegram_rules() {
+        assert_eq!(validate_username("  @Rust_Gramm  ").unwrap(), "Rust_Gramm");
+        assert_eq!(validate_username("").unwrap(), "");
+        assert!(validate_username("abcd").is_err());
+        assert!(validate_username("1badname").is_err());
+        assert!(validate_username("bad__name").is_err());
+        assert!(validate_username("badname_").is_err());
+    }
+
+    #[test]
+    fn birthday_validation_checks_calendar_bounds() {
+        assert!(validate_birthday(29, 2, Some(2000)).is_ok());
+        assert!(validate_birthday(29, 2, Some(2001)).is_err());
+        assert!(validate_birthday(31, 4, Some(1999)).is_err());
+        assert!(validate_birthday(15, 7, None).is_ok());
+        assert!(validate_birthday(1, 13, None).is_err());
     }
 }
 

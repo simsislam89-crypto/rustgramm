@@ -79,8 +79,13 @@ pub async fn poll<S: Session>(
             url: login_url(&t.token),
             expires: t.expires,
         }),
-        T::Success(_) => Ok(QrStep::Done),
+        T::Success(s) => {
+            crate::cache_tl_auth_user(session, &s.authorization).await;
+            Ok(QrStep::Done)
+        }
         T::MigrateTo(m) => {
+            // Основной дата-центр выставляем ДО подключения к целевому DC, чтобы home_sender == true.
+            let _ = session.set_home_dc_id(m.dc_id).await;
             let imported = client
                 .invoke_in_dc(
                     m.dc_id,
@@ -88,15 +93,12 @@ pub async fn poll<S: Session>(
                 )
                 .await;
             match imported {
-                Ok(_) => {
-                    // Основной дата-центр аккаунта — тот, куда нас перенаправили.
-                    let _ = session.set_home_dc_id(m.dc_id).await;
+                Ok(T::Success(s)) => {
+                    crate::cache_tl_auth_user(session, &s.authorization).await;
                     Ok(QrStep::Done)
                 }
-                Err(e) if needs_password(&e) => {
-                    let _ = session.set_home_dc_id(m.dc_id).await;
-                    password_step(client).await
-                }
+                Ok(_) => Ok(QrStep::Done),
+                Err(e) if needs_password(&e) => password_step(client).await,
                 Err(InvocationError::Rpc(ref r)) if r.name == "AUTH_TOKEN_EXPIRED" => {
                     Ok(QrStep::Expired)
                 }

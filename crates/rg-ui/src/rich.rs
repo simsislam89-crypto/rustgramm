@@ -218,24 +218,38 @@ fn normalize_url(raw: &str) -> String {
     }
 }
 
-/// Режет `text` на куски по границам `ents` (индексы в символах).
+/// Режет `text` на куски по границам `ents` (индексы в символах) за один проход по байтам без лишних аллокаций.
 pub fn build_runs(text: &str, ents: &[Entity]) -> Vec<Run> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut cuts: Vec<usize> = vec![0, chars.len()];
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if ents.is_empty() {
+        return vec![Run { text: text.to_owned(), ..Run::default() }];
+    }
+    let char_count = text.chars().count();
+    let mut char_to_byte: Vec<usize> = Vec::with_capacity(char_count + 1);
+    for (b_idx, _) in text.char_indices() {
+        char_to_byte.push(b_idx);
+    }
+    char_to_byte.push(text.len());
+
+    let mut cuts: Vec<usize> = Vec::with_capacity(ents.len() * 2 + 2);
+    cuts.push(0);
+    cuts.push(char_count);
     for e in ents {
-        cuts.push(e.start.min(chars.len()));
-        cuts.push(e.end.min(chars.len()));
+        cuts.push(e.start.min(char_count));
+        cuts.push(e.end.min(char_count));
     }
     cuts.sort_unstable();
     cuts.dedup();
-    let mut runs: Vec<Run> = Vec::new();
+    let mut runs: Vec<Run> = Vec::with_capacity(cuts.len().saturating_sub(1));
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if a == b {
             continue;
         }
-        let slice: String = chars[a..b].iter().collect();
-        let mut r = Run { text: slice.clone(), ..Run::default() };
+        let slice = &text[char_to_byte[a]..char_to_byte[b]];
+        let mut r = Run { text: slice.to_owned(), ..Run::default() };
         for e in ents.iter().filter(|e| e.start <= a && e.end >= b) {
             match e.kind {
                 EntityKind::Bold => r.bold = true,
@@ -250,7 +264,7 @@ pub fn build_runs(text: &str, ents: &[Entity]) -> Vec<Run> {
                 EntityKind::Spoiler => r.spoiler = true,
                 EntityKind::Quote => r.quote = true,
                 EntityKind::Link => {
-                    let url = e.url.clone().unwrap_or_else(|| normalize_url(&slice));
+                    let url = e.url.clone().unwrap_or_else(|| normalize_url(slice));
                     if is_safe_url(&url) {
                         r.url = Some(url);
                     }

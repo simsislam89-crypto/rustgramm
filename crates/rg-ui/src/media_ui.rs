@@ -100,7 +100,9 @@ pub fn card(
             let is_anim = info.kind == MediaKind::AnimatedSticker;
             if let Some(tex) = tex {
                 let r = ui.add(egui::Image::new(tex).max_width(w.min(180.0)).corner_radius(6)).rect;
-                if is_anim && info.mime == "video/webm" {
+                if let Some((set_id, access_hash)) = info.sticker_set {
+                    cards.push((r, Act::OpenStickerPack(set_id, access_hash)));
+                } else if is_anim && info.mime == "video/webm" {
                     cards.push((r, Act::Open(m.id)));
                 } else {
                     cards.push((r, Act::Viewer(m.id)));
@@ -119,7 +121,9 @@ pub fn card(
                     FontId::proportional(14.0),
                     date_c,
                 );
-                if is_anim && info.mime == "video/webm" {
+                if let Some((set_id, access_hash)) = info.sticker_set {
+                    cards.push((rect, Act::OpenStickerPack(set_id, access_hash)));
+                } else if is_anim && info.mime == "video/webm" {
                     cards.push((rect, Act::Open(m.id)));
                 }
             }
@@ -343,6 +347,36 @@ pub fn card(
                 ui.add_space(2.0);
             }
             ui.label(RichText::new(format!("Голосов: {total}")).size(12.0).color(date_c));
+        }
+        MediaKind::Dice { emoticon, value } => {
+            let now_t = ui.input(|i| i.time);
+            let started_at = ui.ctx().data_mut(|d| {
+                *d.get_temp_mut_or_insert_with(ui.make_persistent_id(("dice-anim", m.id)), || now_t)
+            });
+            let elapsed = (now_t - started_at) as f32;
+            let spinning = (0.0..0.72).contains(&elapsed) && *value <= 0
+                || (0.0..0.55).contains(&elapsed);
+            if spinning {
+                ui.ctx().request_repaint();
+            }
+            let wobble = if spinning {
+                ((elapsed * 22.0).sin() * 6.0, (elapsed * 18.0).cos().abs() * -5.0)
+            } else {
+                (0.0, 0.0)
+            };
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(w.clamp(120.0, 172.0), 86.0), Sense::hover());
+            let emoji_c = Pos2::new(rect.center().x + wobble.0, rect.top() + 30.0 + wobble.1);
+            ui.painter().text(emoji_c, Align2::CENTER_CENTER, emoticon, FontId::proportional(44.0), WHITE);
+            let outcome = if *value > 0 {
+                rg_core::engine::dice_outcome_label(emoticon, *value)
+            } else {
+                "Бросок…".to_owned()
+            };
+            let pill_col = if *value > 0 { t_btn(ORANGE) } else { t(WINDOW_OVER) };
+            let badge = Rect::from_center_size(Pos2::new(rect.center().x, rect.bottom() - 13.0), Vec2::new(rect.width() - 8.0, 22.0));
+            ui.painter().rect_filled(badge, CornerRadius::same(11), pill_col.gamma_multiply(0.24));
+            ui.painter().rect_stroke(badge, CornerRadius::same(11), Stroke::new(1.0, pill_col), egui::StrokeKind::Inside);
+            ui.painter().text(badge.center(), Align2::CENTER_CENTER, outcome, FontId::proportional(11.5), WHITE);
         }
         MediaKind::Other(_) => {
             ui.label(RichText::new(format!("[{}]", info.name)).color(date_c));

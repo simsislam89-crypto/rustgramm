@@ -45,6 +45,8 @@ fn dummy_dialog(
         emoji_status: None,
         verified: false,
         premium: false,
+        unread_mentions: 0,
+        unread_reactions: 0,
     }
 }
 
@@ -472,6 +474,7 @@ fn media_kind_preview_and_downloadable_matrix() {
         (MediaKind::Voice, true, false, true),
         (MediaKind::Audio, true, false, true),
         (MediaKind::File, true, false, true),
+        (MediaKind::Dice { emoticon: "🎲".into(), value: 6 }, false, false, false),
         (MediaKind::Other("x".into()), true, false, false),
     ];
     for (kind, has_thumb, exp_preview, exp_dl) in kinds {

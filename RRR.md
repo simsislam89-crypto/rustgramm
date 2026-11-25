@@ -1025,3 +1025,40 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --target aarch64-linux-android` (`--features plugins` и `--no-default-features`, NDK 27) — **0 ошибок**.
 - `cargo test --workspace` — **2 149 тестов пройдено, 0 провалено** (`rg-ayu`: 27+370+320, `rg-core`: 45+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 66+631; включая рендер-тесты нового экрана входа на 1200×760 и 380×780 и QR, бенчмарк `FilterSet` на 10k сообщений, `sqlite_indexes_present`, `stroke_contours` и `dc_location`).
 - `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.20.0`) собран (**19 885 056 байт**, release 4m 34s); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` — **OK** (`ALIVE_OK`).
+
+## Этап 33 (2026-11-25, v0.21.0)
+
+### Маскоты и оранжевый вход, исправление доставки сообщений, переработка комментариев каналов, ускорение (`fast-anything`) и 5 новых фич Telegram
+
+1. **Прозрачные HiDPI-маскоты входа без «мыла» и 100% оранжевый брендинг (`login_anim.rs`, `lib.rs`, `theme.rs`)**:
+   - Убраны статичные растровые эмодзи 54px в двойных кругах (`paint_login_mascot`) и старый синий логотип: реализован `crates/rg-ui/src/login_anim.rs` (векторный 60 FPS самолётик, «ключ», обезьянка ввода кода с бегающими за длиной кода глазами без фона и обезьянка 2FA, закрывающая/приоткрывающая лапу — 0% фона, чёткость на любом DPI).
+   - Полностью убраны фиолетовый `#8774E1` и синий `#2AABEE` со всех экранов входа/QR/спиннеров: акцент везде `c_orange()`, центр QR в `draw_styled_qr` (`rg-qr-tex-cache-v3`) оранжевый.
+   - Повышено разрешение растеризации анимированных TGS-стикеров в ленте в `tick_tgs` (`160` → `256` px).
+
+2. **Исправление потери и задержек входящих и исходящих сообщений (`rg-core/{lib,auth,qr,engine}.rs`, `worker.rs`, `lib.rs`, `chat.rs`)**:
+   - Расширен буфер канала обновлений `updates_channel_capacity = 2048`.
+   - `qr::poll` ставит `home_dc_id` ДО `ImportLoginToken`; `auth::sign_in`, `qr::poll` и `enter()` кэшируют `self_user` и пиров/channel `pts` в SQLite (`cache_tl_peers`, `cache_tl_auth_user`) ДО запуска `run_updates`, устраняя молчаливый сброс первых входящих апдейтов.
+   - `run_updates` сразу диспатчит `on_event` до асинхронного сохранения в БД; добавлена live-обработка `Live::{ReadInbox, Draft, MessageReactions}` + фоновая дозагрузка `Cmd::SyncOpenChat` после возврата фокуса (`>45с`).
+   - Исходящие текстовые сообщения, форматирование и комментарии больше не вызывают тяжёлый `reload()`: UI рисует пузырь мгновенно (`temp_id < 0`, значок `🕒`), а `worker.rs` возвращает `MessageRow` через `Ev::SentConfirm`/`Ev::SendFailed`/`Ev::CommentConfirmed`/`Ev::CommentFailed` с безопасной гоночной дедупликацией против `Live::Message`.
+
+3. **Переработка комментариев к постам и интерфейса каналов (`chat.rs`, `engine.rs`, `worker.rs`)**:
+   - Огромная оранжевая полоса снизу канала (`channel_bottom_bar`) заменена на аккуратную плоскую 42px панель Telegram с 1px разделителем и оранжевым текстом/иконкой.
+   - Кнопка под постом переделана в интегрированную строку с иконкой `history_comments`, счётчиком с русской плюрализацией (`m.replies_count`) и стрелкой `›`.
+   - Вместо тесного окна `420×460` комментариев реализована встроенная полноразмерная ветка обсуждения `discussion_panel` в основной колонке чата (шапка `← Комментарии · N`, карточка исходного поста, пузыри с ответами и реакциями, оптимистичная отправка).
+
+4. **Ускорение горячих участков по методологии `fast-anything` (`engine.rs`, `emoji.rs`, `rich.rs`, `chat.rs`)**:
+   - `fast-anything` CLI в системе не установлен и предназначен для портирования не-Rust кода на Rust; его методология (профилирование → оптимизация → доказательство эквивалентности) применена напрямую в Rust: O(N²)->O(N) `HashMap`-индексация `parse_raw_dialogs` и `tl_messages_to_rows`, быстрый отсев ASCII/кириллицы в `Emoji::contains` (`fast_emoji_precheck_matches_entire_atlas_equivalently`), однопроходный `rich::build_runs` на `char_indices` без `Vec<char>`, per-chat `rich_runs_cache` в `messages_ui`.
+
+5. **5 новых функций Telegram (`engine.rs`, `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs`, `media_ui.rs`, `panels.rs`, `tg_settings.rs`)**:
+   - **Облачные черновики (`messages.saveDraft` / `getAllDrafts` / `Update::DraftMessage`)**: дебаунс сохранения 1.2с, переключение между чатами, превью `Черновик:` в списке.
+   - **Отметка непрочитанным + фильтр и переход к `@`/`❤`**: `messages.markDialogUnread`, пилюля фильтра «Непрочитанные», плавающие FAB-кнопки `@` и `❤` над кнопкой прокрутки вниз (`unread_mentions`/`unread_reactions`, ЛКМ — прыжок к сообщению, ПКМ — прочитать все).
+   - **Анимированные мини-игры Dice (`InputMediaDice`: `🎲 🎯 🏀 ⚽ 🎰 🎳`)**: панель быстрого запуска в эмодзи-меню, анимация вращения и бейдж результата (`dice_outcome_label`).
+   - **Просмотр и установка наборов стикеров в 1 клик (`messages.getStickerSet` / `installStickerSet` / `uninstallStickerSet`)**: клик по стикеру в чате или пункт меню открывает сетку набора с кнопкой добавления/удаления.
+   - **Живой редактор `@username` и даты рождения (`account.updateBirthday` / `account.updateUsername`)**: валидация на лету и редактирование прямо из «Моего профиля» и Настроек аккаунта.
+
+### Проверки (v0.21.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `-p rg-ui -p rg-desktop --no-default-features --all-targets -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `cargo check -p rg-android --target aarch64-linux-android` (Full и Lite `--no-default-features`, NDK 27) — **0 ошибок**.
+- `cargo test --workspace` — **2 156 тестов пройдено, 0 провалено, 0 пропущено** (`rg-ayu`: 27+370+320, `rg-core`: 49+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 69+631; включая `cache_tl_peers_persists_channel_hash_and_self_user`, `fast_emoji_precheck_matches_entire_atlas_equivalently`, `optimistic_send_reconciles_confirm_and_fail_cleanly`, `live_read_inbox_draft_and_reactions_update_dialog_state`, тесты `dice_outcome_label`, `validate_username`, `validate_birthday`).
+- `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.21.0`) собран (**20 353 024 байта**, release 5m 07s); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` — **OK** (`ALIVE=True`).

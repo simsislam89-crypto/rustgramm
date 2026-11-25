@@ -89,6 +89,9 @@ pub(crate) struct State {
     pub last: String,
     pub about: String,
     pub username: String,
+    pub bday_day: String,
+    pub bday_month: String,
+    pub bday_year: String,
     pub filled: bool,
     /// Размеры кэша и загрузок (байт), обновляются в фоновом потоке без зависания интерфейса.
     pub size_probe: std::sync::Arc<SizeProbe>,
@@ -162,6 +165,7 @@ struct Actions {
     test_notify: bool,
     save_profile: bool,
     save_username: bool,
+    save_birthday: Option<Option<(i32, i32, Option<i32>)>>,
     save_folder: Option<rg_core::engine::FolderRow>,
     delete_folder: Option<i32>,
     clear_cache: bool,
@@ -595,7 +599,11 @@ impl App {
             st.filled = false;
         }
         if act.save_username {
-            self.send(Cmd::UpdateUsername(st.username.trim().to_owned()));
+            self.send(Cmd::UpdateUsernameChecked(st.username.trim().to_owned()));
+            st.filled = false;
+        }
+        if let Some(bday) = act.save_birthday {
+            self.send(Cmd::UpdateBirthday(bday));
             st.filled = false;
         }
         if let Some(f) = act.save_folder {
@@ -969,6 +977,10 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, act: &mut Actions, streamer: 
         st.last = l.to_owned();
         st.about = a.me.about.clone();
         st.username = a.me.username.clone();
+        let parts: Vec<&str> = a.me.birthday.split('.').collect();
+        st.bday_day = parts.first().copied().unwrap_or("").trim().to_owned();
+        st.bday_month = parts.get(1).copied().unwrap_or("").trim().to_owned();
+        st.bday_year = parts.get(2).copied().unwrap_or("").trim().to_owned();
         st.filled = true;
     }
     let a = st.account.clone().unwrap_or_default();
@@ -1016,10 +1028,67 @@ fn account_page(ui: &mut egui::Ui, st: &mut State, act: &mut Actions, streamer: 
     });
     ui.add_space(6.0);
     let un_changed = st.username.trim().trim_start_matches('@') != a.me.username;
+    let un_check = rg_core::engine::validate_username(&st.username);
+    if let Err(err) = &un_check
+        && !st.username.trim().is_empty()
+    {
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            ui.label(RichText::new(err).size(12.0).color(Color32::from_rgb(235, 92, 86)));
+        });
+        ui.add_space(4.0);
+    }
     ui.horizontal(|ui| {
         ui.add_space(kit::PAD);
-        if orange_button_enabled(ui, un_changed, "Обновить @имя", Vec2::new(150.0, 32.0)).clicked() {
+        if orange_button_enabled(ui, un_changed && un_check.is_ok(), "Обновить @имя", Vec2::new(150.0, 32.0)).clicked() {
             act.save_username = true;
+        }
+    });
+    ui.add_space(8.0);
+    divider(ui);
+    section(ui, "День рождения");
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        ui.add_sized([54.0, 30.0], egui::TextEdit::singleline(&mut st.bday_day).hint_text("ДД").margin(Vec2::new(6.0, 6.0)));
+        ui.add_sized([54.0, 30.0], egui::TextEdit::singleline(&mut st.bday_month).hint_text("ММ").margin(Vec2::new(6.0, 6.0)));
+        ui.add_sized([74.0, 30.0], egui::TextEdit::singleline(&mut st.bday_year).hint_text("ГГГГ").margin(Vec2::new(6.0, 6.0)));
+    });
+    ui.add_space(6.0);
+    let parsed_bday = if !st.bday_day.trim().is_empty() || !st.bday_month.trim().is_empty() {
+        match (st.bday_day.trim().parse::<i32>(), st.bday_month.trim().parse::<i32>()) {
+            (Ok(d), Ok(m)) => {
+                let y = if st.bday_year.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    st.bday_year.trim().parse::<i32>().map(Some).map_err(|_| "Год должен быть числом".to_owned())
+                };
+                match y {
+                    Ok(yv) => rg_core::engine::validate_birthday(d, m, yv).map(|()| Some((d, m, yv))),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Err("Укажите день и месяц числами".to_owned()),
+        }
+    } else {
+        Ok(None)
+    };
+    if let Err(err) = &parsed_bday {
+        ui.horizontal(|ui| {
+            ui.add_space(kit::PAD);
+            ui.label(RichText::new(err).size(12.0).color(Color32::from_rgb(235, 92, 86)));
+        });
+        ui.add_space(4.0);
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        let valid_some = matches!(parsed_bday, Ok(Some(_)));
+        if orange_button_enabled(ui, valid_some, "Сохранить ДР", Vec2::new(132.0, 32.0)).clicked()
+            && let Ok(Some(bd)) = parsed_bday
+        {
+            act.save_birthday = Some(Some(bd));
+        }
+        if !a.me.birthday.is_empty() && ui.button("Удалить ДР").clicked() {
+            act.save_birthday = Some(None);
         }
     });
     ui.add_space(8.0);
@@ -2340,6 +2409,8 @@ impl App {
         let mut open_emoji_status = false;
         let mut play_track: Option<rg_core::engine::AudioTrack> = None;
         let mut toggle_audio = false;
+        let mut save_prof_un: Option<String> = None;
+        let mut save_prof_bd: Option<Option<(i32, i32, Option<i32>)>> = None;
 
         egui::Area::new(egui::Id::new("my-prof-box"))
             .order(egui::Order::Tooltip)
@@ -2484,6 +2555,14 @@ impl App {
                         if !me_info.about.is_empty() {
                             field_row(ui, &me_info.about, "О себе", WHITE, false);
                         }
+                        if !self.profile_bday_synced {
+                            self.profile_bday_synced = true;
+                            self.profile_username_edit = me_info.username.clone();
+                            let parts: Vec<&str> = me_info.birthday.split('.').collect();
+                            self.profile_bday_day = parts.first().copied().unwrap_or("").trim().to_owned();
+                            self.profile_bday_month = parts.get(1).copied().unwrap_or("").trim().to_owned();
+                            self.profile_bday_year = parts.get(2).copied().unwrap_or("").trim().to_owned();
+                        }
                         if !me_info.username.is_empty()
                             && field_row(ui, &mask_streamer(&format!("@{}", me_info.username), streamer), "Имя пользователя", ORANGE, true)
                         {
@@ -2492,6 +2571,37 @@ impl App {
                         if !me_info.birthday.is_empty() {
                             field_row(ui, &me_info.birthday, "День рождения", WHITE, false);
                         }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(18.0);
+                            ui.add_sized([150.0, 26.0], egui::TextEdit::singleline(&mut self.profile_username_edit).hint_text("@username"));
+                            let un_ok = rg_core::engine::validate_username(&self.profile_username_edit).is_ok()
+                                && self.profile_username_edit.trim().trim_start_matches('@') != me_info.username;
+                            if ui.add_enabled(un_ok, egui::Button::new(RichText::new("@").size(12.0))).on_hover_text("Сохранить @username").clicked() {
+                                save_prof_un = Some(self.profile_username_edit.trim().to_owned());
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(18.0);
+                            ui.add_sized([36.0, 26.0], egui::TextEdit::singleline(&mut self.profile_bday_day).hint_text("ДД"));
+                            ui.add_sized([36.0, 26.0], egui::TextEdit::singleline(&mut self.profile_bday_month).hint_text("ММ"));
+                            ui.add_sized([54.0, 26.0], egui::TextEdit::singleline(&mut self.profile_bday_year).hint_text("ГГГГ"));
+                            let bd_parsed = match (self.profile_bday_day.trim().parse::<i32>(), self.profile_bday_month.trim().parse::<i32>()) {
+                                (Ok(d), Ok(m)) => {
+                                    let yv = self.profile_bday_year.trim().parse::<i32>().ok();
+                                    rg_core::engine::validate_birthday(d, m, yv).ok().map(|()| (d, m, yv))
+                                }
+                                _ => None,
+                            };
+                            if ui.add_enabled(bd_parsed.is_some(), egui::Button::new(RichText::new("🎂").size(12.0))).on_hover_text("Сохранить день рождения").clicked()
+                                && let Some(bd) = bd_parsed
+                            {
+                                save_prof_bd = Some(Some(bd));
+                            }
+                            if !me_info.birthday.is_empty() && ui.small_button("×").on_hover_text("Удалить день рождения").clicked() {
+                                save_prof_bd = Some(None);
+                            }
+                        });
                         if me_info.id != 0 {
                             let id_dc = match me_info.dc_id {
                                 Some(dc) => format!("{} · DC{} ({})", me_info.id, dc, rg_core::media::dc_location(dc)),
@@ -2540,6 +2650,12 @@ impl App {
                 paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
             });
 
+        if let Some(u) = save_prof_un {
+            self.send(Cmd::UpdateUsernameChecked(u));
+        }
+        if let Some(bd) = save_prof_bd {
+            self.send(Cmd::UpdateBirthday(bd));
+        }
         if let Some(tr) = play_track {
             self.send(Cmd::PlayTrack(tr));
         }

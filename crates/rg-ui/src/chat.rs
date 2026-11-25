@@ -73,6 +73,8 @@ pub(crate) enum Act {
     SearchHashtag(String),
     /// Повторить анимацию эффекта сообщения.
     ReplayEffect(i32),
+    /// Открыть окно просмотра и установки набора стикеров.
+    OpenStickerPack(i64, i64),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -126,6 +128,8 @@ struct Env<'a> {
     transcribing: &'a std::collections::HashSet<i32>,
     /// Активные вспышки эффектов сообщений (`msg_id -> время старта`).
     effect_bursts: &'a HashMap<i32, f64>,
+    /// Кэш разобранных прогонов форматирования по `(msg_id, len)`.
+    rich_cache: &'a HashMap<(i32, usize), Vec<super::rich::Run>>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -135,6 +139,22 @@ fn time_label(ts: i64, seconds: bool) -> String {
 fn short(text: &str, n: usize) -> String {
     let one: String = text.chars().filter(|c| *c != '\n').take(n).collect();
     if text.chars().count() > n { format!("{one}…") } else { one }
+}
+
+fn plural_comments(n: i32) -> String {
+    if n <= 0 {
+        return "Прокомментировать".to_owned();
+    }
+    let m10 = n % 10;
+    let m100 = n % 100;
+    let word = if m10 == 1 && m100 != 11 {
+        "комментарий"
+    } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
+        "комментария"
+    } else {
+        "комментариев"
+    };
+    format!("{n} {word}")
 }
 
 /// Разбирает ввод вида `@bot запрос` для запуска встроенного инлайн-бота (`messages.getInlineBotResults`).
@@ -1108,6 +1128,9 @@ impl App {
     }
 
     pub(crate) fn composer_ui(&mut self, ui: &mut egui::Ui) {
+        if self.discussion.is_some() {
+            return;
+        }
         self.channel_bottom_bar(ui);
         self.context_bar(ui);
         let s = self.settings.ayu.clone();
@@ -1817,6 +1840,9 @@ impl App {
                     }
                 }
                 self.input_redo.clear();
+                if let Some(idx) = self.selected {
+                    self.draft_dirty_at = Some((idx, ui.input(|i| i.time)));
+                }
             }
             if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
                 self.input_custom_emojis.clear();
@@ -2036,9 +2062,11 @@ impl App {
                             silent: send_silent_now,
                         });
                     } else if ents.is_empty() {
-                        self.send(Cmd::Send(clean, reply));
+                        let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
+                        self.send(Cmd::Send(clean, reply, temp_id));
                     } else {
-                        self.send(Cmd::SendFormatted(clean, ents, reply));
+                        let temp_id = self.push_optimistic_message(clean.clone(), ents.clone(), reply, None);
+                        self.send(Cmd::SendFormatted(clean, ents, reply, temp_id));
                     }
                 }
                 r.request_focus();
@@ -2194,7 +2222,26 @@ impl App {
                 }
             });
             ui.add_space(4.0);
-            let h = (ui.available_height() - 42.0).max(60.0);
+            let show_games = !self.emoji_add_open && self.emoji_pack.is_none() && self.emoji_search.is_empty();
+            if show_games {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Игры:").size(11.5).color(SUBTEXT));
+                    for em in ["🎲", "🎯", "🏀", "⚽", "🎰", "🎳"] {
+                        let r = ui.add(
+                            egui::Button::new(RichText::new(em).size(15.5))
+                                .fill(Color32::from_white_alpha(12))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .min_size(Vec2::new(30.0, 24.0)),
+                        );
+                        if r.on_hover_text(format!("Бросить {em}")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            sacts.push(super::panels::StickerAct::SendDice(em.to_owned()));
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
+            let h = (ui.available_height() - if show_games { 48.0 } else { 42.0 }).max(60.0);
             let query = self.emoji_search.clone();
             ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| {
                 if self.emoji_add_open {
@@ -2314,6 +2361,19 @@ impl App {
                         self.input_custom_emojis.push((start, len, doc_id));
                     }
                 }
+                A::SendDice(em) => {
+                    let reply = self.reply.take().map(|(r, _)| r);
+                    let media = rg_core::media::MediaInfo::basic(
+                        rg_core::media::MediaKind::Dice {
+                            emoticon: em.clone(),
+                            value: 0,
+                        },
+                        &em,
+                        0,
+                    );
+                    let temp_id = self.push_optimistic_message(String::new(), Vec::new(), reply, Some(media));
+                    self.send(Cmd::SendDice(em, reply, temp_id));
+                }
             }
         }
         if let Some(c) = picked {
@@ -2395,6 +2455,10 @@ impl App {
                     Color32::WHITE,
                 );
             });
+            return;
+        }
+        if self.discussion.is_some() {
+            self.discussion_panel(ui);
             return;
         }
         let fade = (self.chat_opened.elapsed().as_secs_f32() / 0.22).clamp(0.0, 1.0);
@@ -2670,6 +2734,30 @@ impl App {
             .map(|x| x.bot_description.clone())
             .unwrap_or_default();
         let mut measured_heights: Vec<(i32, f32)> = Vec::new();
+        // Кэшируем разбор форматирования до сборки immutable Env (0 переаллокаций на скролле).
+        if self.rich_runs_cache.len() > 2000 {
+            self.rich_runs_cache.clear();
+        }
+        {
+            let topic_slice = self.active_topic.and_then(|tid| {
+                self.topic_msgs
+                    .as_ref()
+                    .filter(|(mtid, _)| *mtid == tid)
+                    .map(|(_, rows)| rows.as_slice())
+            });
+            let src: &[MessageRow] = if searching {
+                self.found.as_deref().unwrap_or(&self.messages)
+            } else {
+                topic_slice.unwrap_or(&self.messages)
+            };
+            for m in src {
+                if !m.text.is_empty() && !m.entities.is_empty() {
+                    self.rich_runs_cache
+                        .entry((m.id, m.text.len()))
+                        .or_insert_with(|| super::rich::build_runs(&m.text, &m.entities));
+                }
+            }
+        }
         let (out, out_rendered) = {
             let topic_slice = self.active_topic.and_then(|tid| {
                 self.topic_msgs
@@ -2723,6 +2811,7 @@ impl App {
                 transcriptions: &self.transcriptions,
                 transcribing: &self.transcribing,
                 effect_bursts: &self.effect_bursts,
+                rich_cache: &self.rich_runs_cache,
                 avail: cur_avail,
                 s: &self.settings.ayu,
                 tex: &self.textures,
@@ -2870,6 +2959,68 @@ impl App {
             }
             self.cmd_popup_open = false;
             self.ttl_popup_open = false;
+        }
+        // Плавающие кнопки быстрых переходов (@ упоминания, ❤ реакции) и «Вниз».
+        if self.selected_msgs.is_empty() {
+            let show_cnt = !self.settings.ayu.hide_notification_counters;
+            let (mentions_cnt, reactions_cnt) = self
+                .selected
+                .and_then(|i| self.dialogs.get(i))
+                .map_or((0, 0), |d| (d.unread_mentions, d.unread_reactions));
+            let mut fab_y = clip_rect.bottom() - if self.scrolled_up { 78.0 } else { 28.0 };
+            let square = self.settings.extera.square_fab;
+            if mentions_cnt > 0 && let Some(sel) = self.selected {
+                let c = Pos2::new(clip_rect.right() - 28.0, fab_y);
+                let r = Rect::from_center_size(c, Vec2::splat(40.0));
+                let resp = ui.interact(r, ui.make_persistent_id("mention-jump-fab"), Sense::click());
+                let bg = if resp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
+                if square {
+                    ui.painter().rect_filled(r, egui::CornerRadius::same(13), bg);
+                    ui.painter().rect_stroke(r, egui::CornerRadius::same(13), egui::Stroke::new(1.0, Color32::from_white_alpha(32)), egui::StrokeKind::Inside);
+                } else {
+                    ui.painter().circle_filled(c, 20.0, bg);
+                    ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+                }
+                ui.painter().text(c, egui::Align2::CENTER_CENTER, "@", FontId::proportional(17.0), WHITE);
+                if show_cnt {
+                    let b = Rect::from_center_size(c - Vec2::new(0.0, 22.0), Vec2::new(24.0, 16.0));
+                    ui.painter().rect_filled(b, egui::CornerRadius::same(8), t_btn(ORANGE));
+                    ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, mentions_cnt.min(99).to_string(), FontId::proportional(10.5), Color32::WHITE);
+                }
+                if resp.clicked() {
+                    self.send(Cmd::JumpUnreadMention(sel));
+                } else if resp.secondary_clicked() {
+                    self.send(Cmd::ReadAllMentions(sel));
+                }
+                let _ = resp.on_hover_text("Следующее @упоминание (ПКМ — прочитать все)").on_hover_cursor(egui::CursorIcon::PointingHand);
+                fab_y -= 50.0;
+            }
+            if reactions_cnt > 0 && let Some(sel) = self.selected {
+                let c = Pos2::new(clip_rect.right() - 28.0, fab_y);
+                let r = Rect::from_center_size(c, Vec2::splat(40.0));
+                let resp = ui.interact(r, ui.make_persistent_id("react-jump-fab"), Sense::click());
+                let rose = Color32::from_rgb(232, 74, 95);
+                let bg = if resp.hovered() { rose } else { t2(WINDOW_BG) };
+                if square {
+                    ui.painter().rect_filled(r, egui::CornerRadius::same(13), bg);
+                    ui.painter().rect_stroke(r, egui::CornerRadius::same(13), egui::Stroke::new(1.0, Color32::from_white_alpha(32)), egui::StrokeKind::Inside);
+                } else {
+                    ui.painter().circle_filled(c, 20.0, bg);
+                    ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+                }
+                ui.painter().text(c, egui::Align2::CENTER_CENTER, "❤", FontId::proportional(15.0), WHITE);
+                if show_cnt {
+                    let b = Rect::from_center_size(c - Vec2::new(0.0, 22.0), Vec2::new(24.0, 16.0));
+                    ui.painter().rect_filled(b, egui::CornerRadius::same(8), rose);
+                    ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, reactions_cnt.min(99).to_string(), FontId::proportional(10.5), Color32::WHITE);
+                }
+                if resp.clicked() {
+                    self.send(Cmd::JumpUnreadReaction(sel));
+                } else if resp.secondary_clicked() {
+                    self.send(Cmd::ReadAllReactions(sel));
+                }
+                let _ = resp.on_hover_text("Следующая реакция ❤ (ПКМ — прочитать все)").on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
         }
         // Плавающая кнопка прокрутки вниз (учитывает настройку square_fab).
         if self.scrolled_up && self.selected_msgs.is_empty() {
@@ -3023,6 +3174,220 @@ impl App {
         }
     }
 
+    fn discussion_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(disc) = self.discussion.clone() else {
+            return;
+        };
+        let avail = ui.available_width();
+        let ch_name = if !disc.channel_name.is_empty() {
+            disc.channel_name.clone()
+        } else {
+            self.selected
+                .and_then(|i| self.dialogs.get(i))
+                .map(|d| d.name.clone())
+                .unwrap_or_default()
+        };
+        let post_txt = if !disc.post_preview.is_empty() {
+            disc.post_preview.clone()
+        } else {
+            self.messages
+                .iter()
+                .find(|m| m.id == disc.post_id)
+                .map(|m| m.text.clone())
+                .unwrap_or_default()
+        };
+        // Верхняя полоса ветки обсуждения (← Комментарии).
+        let mut go_back = false;
+        let (hdr, _) = ui.allocate_exact_size(Vec2::new(avail, 44.0), Sense::hover());
+        ui.painter().rect_filled(hdr, 0.0, t(WINDOW_BG));
+        ui.painter().line_segment(
+            [hdr.left_bottom(), hdr.right_bottom()],
+            egui::Stroke::new(1.0, Color32::from_white_alpha(18)),
+        );
+        let back_r = Rect::from_min_size(hdr.min + Vec2::new(8.0, 6.0), Vec2::splat(32.0));
+        let back_resp = ui.interact(back_r, ui.make_persistent_id("disc-back"), Sense::click());
+        if back_resp.hovered() {
+            ui.painter().circle_filled(back_r.center(), 15.0, t(WINDOW_OVER));
+        }
+        icons::tg(ui.painter(), "title_back", back_r.center(), if back_resp.hovered() { WHITE } else { ORANGE });
+        if back_resp.on_hover_text("Назад к каналу").on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            go_back = true;
+        }
+        ui.painter().text(
+            Pos2::new(back_r.right() + 10.0, hdr.center().y - 7.0),
+            egui::Align2::LEFT_CENTER,
+            format!("Комментарии · {}", disc.comments.len()),
+            FontId::proportional(15.0),
+            WHITE,
+        );
+        if !ch_name.is_empty() {
+            ui.painter().text(
+                Pos2::new(back_r.right() + 10.0, hdr.center().y + 9.0),
+                egui::Align2::LEFT_CENTER,
+                &ch_name,
+                FontId::proportional(12.0),
+                SUBTEXT,
+            );
+        }
+
+        let has_reply_bar = self.disc_reply_to.is_some();
+        let bottom_h = 54.0 + if has_reply_bar { 30.0 } else { 0.0 };
+        let body_h = (ui.available_height() - bottom_h).max(80.0);
+        let mut pick_reply: Option<(i32, String)> = None;
+        ui.allocate_ui(Vec2::new(avail, body_h), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(("disc-scroll", disc.post_id))
+                .auto_shrink([false; 2])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    // Карточка исходного поста сверху ленты комментариев.
+                    egui::Frame::new()
+                        .fill(t2(WINDOW_BG))
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_max_width((avail - 28.0).min(640.0));
+                            ui.horizontal(|ui| {
+                                let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 26.0), Sense::hover());
+                                ui.painter().rect_filled(bar, 1.5, ORANGE);
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(format!("Пост #{}", disc.post_id)).strong().size(12.5).color(ORANGE));
+                                    let body = if post_txt.trim().is_empty() {
+                                        "[Публикация с медиа]".to_owned()
+                                    } else {
+                                        short(&post_txt, 220)
+                                    };
+                                    ui.label(RichText::new(body).size(13.5).color(WHITE));
+                                });
+                            });
+                        });
+                    ui.add_space(6.0);
+                    day_pill(ui, avail, plural_comments(disc.comments.len() as i32));
+                    ui.add_space(4.0);
+                    if disc.comments.is_empty() {
+                        ui.add_space(28.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("Комментариев пока нет. Будьте первым!").size(14.0).color(SUBTEXT));
+                        });
+                    } else {
+                        for c in &disc.comments {
+                            let who = if c.outgoing && !self.me.is_empty() {
+                                self.me.clone()
+                            } else if c.sender.is_empty() {
+                                "Участник".to_owned()
+                            } else {
+                                c.sender.clone()
+                            };
+                            let is_out = c.outgoing;
+                            let layout = if is_out {
+                                Layout::right_to_left(Align::TOP)
+                            } else {
+                                Layout::left_to_right(Align::TOP)
+                            };
+                            ui.with_layout(layout, |ui| {
+                                ui.add_space(10.0);
+                                if !is_out {
+                                    avatar(ui, &who, c.sender_id, 30.0, self.avatars.get(&c.sender_id), self.settings.ayu.avatar_corners);
+                                    ui.add_space(4.0);
+                                }
+                                let bg = if is_out { t(MSG_OUT_BG) } else { t(MSG_IN_BG) };
+                                egui::Frame::new()
+                                    .fill(bg)
+                                    .corner_radius(egui::CornerRadius::same(13))
+                                    .inner_margin(egui::Margin::symmetric(11, 7))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width((avail * 0.72).clamp(180.0, 520.0));
+                                        ui.vertical(|ui| {
+                                            if !is_out {
+                                                ui.label(RichText::new(&who).strong().size(12.5).color(ORANGE));
+                                            }
+                                            if let Some((_, rp_txt)) = &c.reply_to {
+                                                ui.label(RichText::new(format!("↪ {}", short(rp_txt, 48))).size(11.5).color(ORANGE));
+                                            }
+                                            let body = if c.text.is_empty() { "[Вложение]" } else { c.text.as_str() };
+                                            ui.label(RichText::new(body).size(14.5).color(if is_out { MSG_OUT_TEXT } else { WHITE }));
+                                            ui.horizontal(|ui| {
+                                                let meta_c = if is_out { MSG_OUT_DATE } else { MSG_IN_DATE };
+                                                ui.label(RichText::new(hhmm(c.date)).size(11.5).color(meta_c));
+                                                if is_out && c.id < 0 {
+                                                    ui.label(RichText::new("🕒").size(11.0).color(meta_c));
+                                                }
+                                                if c.reactions > 0 {
+                                                    ui.label(RichText::new(format!("❤ {}", c.reactions)).size(11.5).color(ORANGE));
+                                                }
+                                                if c.id > 0
+                                                    && ui.add(egui::Button::new(RichText::new("Ответить").size(11.5).color(ORANGE)).frame(false)).clicked()
+                                                {
+                                                    pick_reply = Some((c.id, who.clone()));
+                                                }
+                                            });
+                                        });
+                                    });
+                            });
+                            ui.add_space(5.0);
+                        }
+                    }
+                    ui.add_space(8.0);
+                });
+        });
+
+        if let Some(pr) = pick_reply {
+            self.disc_reply_to = Some(pr);
+        }
+        // Нижняя строка ввода комментария на всю ширину панели.
+        let mut send_txt: Option<String> = None;
+        if let Some((_, ref rname)) = self.disc_reply_to.clone() {
+            let mut clr = false;
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(RichText::new(format!("Ответ: {rname}")).size(12.0).color(ORANGE));
+                if ui.small_button("✕").clicked() {
+                    clr = true;
+                }
+            });
+            if clr {
+                self.disc_reply_to = None;
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let iw = (ui.available_width() - 56.0).max(120.0);
+            let te = ui.add(
+                egui::TextEdit::singleline(&mut self.comment_input)
+                    .hint_text("Написать комментарий…")
+                    .desired_width(iw)
+                    .margin(Vec2::new(10.0, 8.0)),
+            );
+            let pressed_enter = (te.has_focus() || te.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked_send = orange_button(ui, "➤", Vec2::new(36.0, 34.0)).clicked();
+            if (clicked_send || pressed_enter) && !self.comment_input.trim().is_empty() {
+                send_txt = Some(std::mem::take(&mut self.comment_input).trim().to_owned());
+            }
+        });
+
+        if let Some(txt) = send_txt {
+            let reply_picked = self.disc_reply_to.take();
+            let target_reply = reply_picked.as_ref().map_or(disc.root_msg_id, |(id, _)| *id);
+            let tid = self.next_temp_id();
+            let mut opt_row = MessageRow::plain(tid, txt.clone(), true, self.now.max(1));
+            opt_row.sender = self.me.clone();
+            if let Some((rid, rname)) = reply_picked {
+                opt_row.reply_to = Some((rid, rname));
+            }
+            if let Some(cur_disc) = self.discussion.as_mut() {
+                cur_disc.comments.push(opt_row);
+            }
+            self.send(Cmd::SendComment(disc.disc_peer, target_reply, disc.post_id, txt, tid));
+        }
+        if go_back {
+            self.discussion = None;
+            self.disc_reply_to = None;
+        }
+    }
+
     fn channel_bottom_bar(&mut self, ui: &mut egui::Ui) {
         use rg_settings::ChannelBottomButton as CB;
         let btn_mode = self.settings.ayu.channel_bottom_button;
@@ -3047,22 +3412,40 @@ impl App {
         if btn_mode == CB::Discuss && !has_linked {
             return;
         }
-        ui.horizontal(|ui| {
-            let w = ui.available_width();
+        let w = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 42.0), Sense::click());
+        let hk = tween(ui.ctx(), ("ch-bar", idx), f32::from(u8::from(resp.hovered())), 0.12);
+        let bg = lerp_color(t(WINDOW_BG), t(WINDOW_OVER), hk);
+        ui.painter().rect_filled(rect, 0.0, bg);
+        ui.painter().line_segment(
+            [rect.left_top(), rect.right_top()],
+            egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+        );
+        let (lbl, icon_name) = if want_discuss {
+            ("ОБСУДИТЬ", "history_comments")
+        } else if muted {
+            ("ВКЛЮЧИТЬ ЗВУК", "menu/unmute")
+        } else {
+            ("ВЫКЛЮЧИТЬ ЗВУК", "menu/mute")
+        };
+        let label_g = ui.painter().layout_no_wrap(lbl.to_owned(), FontId::proportional(13.5), ORANGE);
+        let total_w = 18.0 + 6.0 + label_g.size().x;
+        let start_x = rect.center().x - total_w * 0.5;
+        icons::tg(ui.painter(), icon_name, Pos2::new(start_x + 9.0, rect.center().y), ORANGE);
+        ui.painter().galley(
+            Pos2::new(start_x + 24.0, rect.center().y - label_g.size().y * 0.5),
+            label_g,
+            ORANGE,
+        );
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             if want_discuss {
-                if orange_button(ui, "Обсудить", Vec2::new(w, 34.0)).clicked()
-                    && let Some(pid) = last_post_id
-                {
+                if let Some(pid) = last_post_id {
                     self.send(Cmd::Discussion(idx, pid));
                 }
             } else {
-                let lbl = if muted { "Включить звук" } else { "Выключить звук" };
-                if orange_button(ui, lbl, Vec2::new(w, 34.0)).clicked() {
-                    self.toggle_mute_dialog(idx, !muted);
-                }
+                self.toggle_mute_dialog(idx, !muted);
             }
-        });
-        ui.add_space(4.0);
+        }
     }
 
     fn open_shot_modal(&mut self, rows: Vec<MessageRow>) {
@@ -3093,7 +3476,13 @@ impl App {
             Act::React(id, e) => self.send(Cmd::React(id, e)),
             Act::PaidReact(id) => self.paid_react_msg = Some(id),
             Act::Delete(id) => self.confirm_delete = Some(id),
-            Act::Repeat(text) => self.send(Cmd::Send(text, None)),
+            Act::Repeat(text) => {
+                let tid = self.push_optimistic_message(text.clone(), Vec::new(), None, None);
+                self.send(Cmd::Send(text, None, tid));
+            }
+            Act::OpenStickerPack(set_id, access_hash) => {
+                self.send(Cmd::LoadStickerPack(set_id, access_hash));
+            }
             Act::Details(id) => {
                 self.details = Some(id);
                 self.details_tab = 0;
@@ -3237,7 +3626,8 @@ impl App {
                 use rg_core::engine::BotBtnKind as K;
                 match kind {
                     K::Text => {
-                        self.send(Cmd::Send(label, None));
+                        let tid = self.push_optimistic_message(label.clone(), Vec::new(), None, None);
+                        self.send(Cmd::Send(label, None, tid));
                     }
                     K::Callback(data) => {
                         if let Some(idx) = self.selected {
@@ -4193,7 +4583,9 @@ impl App {
                     && let Some(pos) = self.dialogs.iter().position(|d| d.id == st.peer_id)
                 {
                     self.open_dialog(pos);
-                    self.send(Cmd::Send(format!("Ответ на историю: {reply_txt}"), None));
+                    let msg = format!("Ответ на историю: {reply_txt}");
+                    let tid = self.push_optimistic_message(msg.clone(), Vec::new(), None, None);
+                    self.send(Cmd::Send(msg, None, tid));
                     self.status = "Ответ на историю отправлен".to_owned();
                 }
                 if close_viewer || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -4227,55 +4619,73 @@ impl App {
                 self.story_opened_at = None;
             }
         }
-        // Комментарии к посту канала (`messages.getDiscussionMessage` + `messages.getReplies`).
-        if let Some(disc) = self.discussion.clone() {
+        // Модальное окно просмотра и установки набора стикеров.
+        if let Some(pack) = self.sticker_pack_modal.clone() {
             let mut open = true;
-            let mut send_txt: Option<String> = None;
-            egui::Window::new(format!("Комментарии · пост #{}", disc.post_id))
+            let mut send_doc: Option<i64> = None;
+            let mut toggle_install: Option<bool> = None;
+            egui::Window::new(&pack.title)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([420.0, 460.0])
+                .default_size([380.0, 440.0])
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                        if disc.comments.is_empty() {
-                            ui.label(RichText::new("Комментариев пока нет. Будьте первым!").color(SUBTEXT));
-                        } else {
-                            for c in &disc.comments {
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        let who = if c.sender.is_empty() { "Участник" } else { c.sender.as_str() };
-                                        ui.label(RichText::new(who).strong().size(13.0).color(ORANGE));
-                                        ui.label(RichText::new(hhmm(c.date)).size(11.5).color(SUBTEXT));
-                                    });
-                                    let body = if c.text.is_empty() { "[Вложение]" } else { c.text.as_str() };
-                                    ui.label(RichText::new(body).color(WHITE));
-                                });
-                                ui.add_space(4.0);
-                            }
+                    ui.horizontal(|ui| {
+                        if !pack.short_name.is_empty() {
+                            ui.label(RichText::new(format!("t.me/addstickers/{}", pack.short_name)).size(12.0).color(SUBTEXT));
                         }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{} шт.", pack.stickers.len())).size(12.0).color(ORANGE));
+                        });
                     });
                     ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("stk-pack-grid", pack.id))
+                        .max_height(330.0)
+                        .show(ui, |ui| {
+                            let cols = 4usize;
+                            let cell = ((ui.available_width() - 8.0) / cols as f32).clamp(64.0, 92.0);
+                            for chunk in pack.stickers.chunks(cols) {
+                                ui.horizontal(|ui| {
+                                    for st in chunk {
+                                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(cell), Sense::click());
+                                        if resp.hovered() {
+                                            ui.painter().rect_filled(r.shrink(2.0), egui::CornerRadius::same(10), Color32::from_white_alpha(20));
+                                        }
+                                        let area = Rect::from_center_size(r.center(), Vec2::splat(cell - 12.0));
+                                        if let Some(tex) = self.sticker_tex.get(&st.id) {
+                                            egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
+                                        } else {
+                                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, if st.emoji.is_empty() { "🖼" } else { &st.emoji }, FontId::proportional(26.0), WHITE);
+                                        }
+                                        if resp.on_hover_text(format!("Отправить {}", st.emoji)).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                            send_doc = Some(st.id);
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.comment_input)
-                                .hint_text("Написать комментарий…")
-                                .desired_width(290.0),
-                        );
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (orange_button(ui, "Отправить", Vec2::new(96.0, 30.0)).clicked() || enter)
-                            && !self.comment_input.trim().is_empty()
-                        {
-                            send_txt = Some(std::mem::take(&mut self.comment_input).trim().to_owned());
+                        let btn_lbl = if pack.installed { "Удалить набор" } else { "Добавить стикеры" };
+                        if pack.installed {
+                            if ui.add_sized([ui.available_width(), 36.0], egui::Button::new(RichText::new(btn_lbl).color(Color32::from_rgb(235, 92, 86)))).clicked() {
+                                toggle_install = Some(false);
+                            }
+                        } else if orange_button(ui, btn_lbl, Vec2::new(ui.available_width(), 36.0)).clicked() {
+                            toggle_install = Some(true);
                         }
                     });
                 });
-            if let Some(txt) = send_txt {
-                self.send(Cmd::SendComment(disc.disc_peer, disc.root_msg_id, disc.post_id, txt));
-            }
-            if !open {
-                self.discussion = None;
+            if let Some(doc_id) = send_doc {
+                let reply = self.reply.take().map(|(r, _)| r);
+                self.sticker_pack_modal = None;
+                self.send(Cmd::SendSticker(doc_id, reply));
+            } else if let Some(install) = toggle_install {
+                self.send(Cmd::InstallStickerPack(pack.id, pack.access_hash, install));
+            } else if !open {
+                self.sticker_pack_modal = None;
             }
         }
         // Подтверждение перед отправкой стикера или GIF (`sticker_confirmation` / `gif_confirmation`).
@@ -4727,12 +5137,20 @@ fn bubble(
                     if !m.rich_blocks.is_empty() {
                         render_rich_blocks(ui, &m.rich_blocks, w, text_c, date_c, m.id, env, &mut hot);
                     } else if !m.text.is_empty() && !m.entities.is_empty() {
-                        let runs = super::rich::build_runs(&m.text, &m.entities);
+                        let cached = env.rich_cache.get(&(m.id, m.text.len()));
+                        let fallback;
+                        let runs = match cached {
+                            Some(r) => r.as_slice(),
+                            None => {
+                                fallback = super::rich::build_runs(&m.text, &m.entities);
+                                fallback.as_slice()
+                            }
+                        };
                         hot.extend(super::rich::render(
                             ui,
                             env.emoji,
                             env.custom_tex,
-                            &runs,
+                            runs,
                             15.0,
                             text_c,
                             c_orange(),
@@ -4869,8 +5287,12 @@ fn bubble(
                                 }
                                 ui.label(RichText::new(meta).size(12.0).color(if is_sticker_only { Color32::WHITE } else { date_c }));
                                 if m.outgoing {
-                                    let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 12.0), Sense::hover());
-                                    icons::tick(ui.painter(), r.center(), if is_sticker_only { Color32::WHITE } else { OUT_TICK }, m.id <= env.read_out);
+                                    if m.id < 0 {
+                                        ui.label(RichText::new("🕒").size(11.5).color(if is_sticker_only { Color32::WHITE } else { OUT_TICK }));
+                                    } else {
+                                        let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 12.0), Sense::hover());
+                                        icons::tick(ui.painter(), r.center(), if is_sticker_only { Color32::WHITE } else { OUT_TICK }, m.id <= env.read_out);
+                                    }
                                 }
                             });
                         }).response;
@@ -4878,16 +5300,37 @@ fn bubble(
                             cards.push((pill_resp.rect, Act::ReplayEffect(m.id)));
                         }
                     });
-                    if env.is_channel && env.has_discussion && !m.deleted {
-                        ui.add_space(2.0);
-                        ui.separator();
-                        let cr = ui.add(
-                            egui::Button::new(RichText::new("Комментарии").size(12.5).color(ORANGE))
-                                .frame(false),
+                    if ((env.is_channel && env.has_discussion) || m.has_comments) && !m.deleted && m.id > 0 {
+                        ui.add_space(3.0);
+                        let lbl = plural_comments(m.replies_count);
+                        let (row_r, row_resp) = ui.allocate_exact_size(Vec2::new(w.max(150.0), 28.0), Sense::click());
+                        ui.painter().line_segment(
+                            [row_r.left_top(), row_r.right_top()],
+                            egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
                         );
-                        if cr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                            acts.push(Act::Discuss(m.id));
+                        if row_resp.hovered() {
+                            ui.painter().rect_filled(
+                                row_r.shrink2(Vec2::new(0.0, 1.0)),
+                                egui::CornerRadius::same(6),
+                                Color32::from_rgba_unmultiplied(ORANGE.r(), ORANGE.g(), ORANGE.b(), 20),
+                            );
                         }
+                        icons::tg(ui.painter(), "history_comments", Pos2::new(row_r.left() + 10.0, row_r.center().y + 1.0), ORANGE);
+                        ui.painter().text(
+                            Pos2::new(row_r.left() + 26.0, row_r.center().y + 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            lbl,
+                            FontId::proportional(12.5),
+                            ORANGE,
+                        );
+                        ui.painter().text(
+                            Pos2::new(row_r.right() - 8.0, row_r.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            "›",
+                            FontId::proportional(16.0),
+                            ORANGE,
+                        );
+                        cards.push((row_r, Act::Discuss(m.id)));
                     }
                 });
             });
@@ -5237,8 +5680,11 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     {
         ui.label(RichText::new(format!("Просмотров: {v}")).size(12.5).color(SUBTEXT));
     }
-    if env.is_channel && env.has_discussion && !m.deleted {
+    if ((env.is_channel && env.has_discussion) || m.has_comments) && !m.deleted && m.id > 0 {
         item(ui, "menu/reply", "Комментарии", Act::Discuss(m.id));
+    }
+    if let Some((set_id, access_hash)) = m.media.as_ref().and_then(|i| i.sticker_set) {
+        item(ui, "menu/stickers", "Набор стикеров", Act::OpenStickerPack(set_id, access_hash));
     }
     if s.menu_user_messages.shown(env.shift) && env.group && m.sender_id != 0 {
         item(ui, "menu/search", "Сообщения участника", Act::FilterUser(m.sender_id, m.sender.clone()));

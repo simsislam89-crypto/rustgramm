@@ -35,6 +35,8 @@ pub(crate) enum StickerAct {
     ReloadSets,
     /// Принудительно перезагрузить GIF.
     ReloadGifs,
+    /// Отправить бросок/игру (`🎲`, `🎯`, `🏀`, `⚽`, `🎰`, `🎳`).
+    SendDice(String),
 }
 
 impl App {
@@ -148,13 +150,14 @@ impl App {
         ui.painter().rect_filled(line, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14));
     }
 
-    /// Полоса папок под строкой поиска: «Все чаты» и папки пользователя с счётчиками.
+    /// Полоса папок под строкой поиска: «Все чаты», папки пользователя и фильтр «Непрочитанные».
     pub(crate) fn folder_tabs(&mut self, ui: &mut egui::Ui) {
-        if self.folders.is_empty() {
+        let unread_dialogs = self.dialogs.iter().filter(|d| !d.archived && d.unread > 0).count();
+        if self.folders.is_empty() && unread_dialogs == 0 && !self.unread_filter_only {
             return;
         }
         let hide_all = self.settings.ayu.hide_all_chats_folder;
-        if hide_all && self.folder.is_none() {
+        if hide_all && self.folder.is_none() && !self.folders.is_empty() {
             self.folder = self.folders.first().map(|f| f.id);
         }
         let show_cnt = !self.settings.ayu.hide_notification_counters;
@@ -226,11 +229,40 @@ impl App {
                             chosen = Some(*id);
                         }
                     }
+                    // Кнопка быстрого фильтра «Непрочитанные».
+                    if unread_dialogs > 0 || self.unread_filter_only {
+                        ui.add_space(4.0);
+                        let lbl = if unread_dialogs > 0 {
+                            format!("Непрочитанные ({unread_dialogs})")
+                        } else {
+                            "Непрочитанные".to_owned()
+                        };
+                        let active = self.unread_filter_only;
+                        let bg = if active {
+                            t_btn(ORANGE)
+                        } else {
+                            Color32::from_white_alpha(12)
+                        };
+                        let fg = if active { Color32::WHITE } else { DIALOG_TEXT };
+                        let pill = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(lbl).size(12.0).color(fg))
+                                    .fill(bg)
+                                    .corner_radius(CornerRadius::same(11))
+                                    .min_size(Vec2::new(0.0, 24.0)),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if pill.clicked() {
+                            self.unread_filter_only = !self.unread_filter_only;
+                        }
+                        ui.add_space(8.0);
+                    }
                 });
             });
         if let Some(id) = chosen {
             self.folder = id;
             self.in_archive = false;
+            self.unread_filter_only = false;
         }
         let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
         ui.painter().rect_filled(line, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14));

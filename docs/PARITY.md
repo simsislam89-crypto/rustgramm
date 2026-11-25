@@ -102,6 +102,16 @@
 | Эмодзи-статус аккаунта и таймер | ✅ модальное окно из меню и «Мой профиль», загрузка стандартных/пользовательских эмодзи-статусов (`account.getDefaultEmojiStatuses`), установка с таймером (`account.updateEmojiStatus`) | `engine_ext.rs`, `worker.rs`, `features_ui.rs`, `settings_ui.rs`, `tg_settings.rs` |
 | Полные сведения о сообщении (3 вкладки + DC) и копирование фото в буфер | ✅ кликабельные метаданные + `DC` (`dc_location`), списки «Прочитали» (`messages.getMessageReadParticipants`) и «Реакции» (`messages.getMessageReactionsList`), ID·DC в профиле, `Act::CopyPhoto` (`arboard`) на ПК | `media.rs`, `engine.rs`, `engine_ext.rs`, `worker.rs`, `chat.rs` |
 
+## Новые функции этапа 33 (v0.21.0)
+
+| Функция | Статус | Где |
+|---|---|---|
+| Прозрачные 60 FPS маскоты входа (без фона и «мыльных» эмодзи) + оранжевый брендинг | ✅ векторные HiDPI маскоты (`login_anim.rs`: пульсирующий самолётик, следящая за длиной кода обезьянка, обезьянка 2FA с лапами/подглядыванием, левитирующий ключ), 100% оранжевый акцент на входе и QR (`c_orange()`, центр-бейдж `draw_styled_qr` v3) и TGS стикеры 256 px | `login_anim.rs`, `lib.rs`, `theme.rs` |
+| Надёжная и мгновенная доставка входящих и исходящих сообщений | ✅ буфер обновлений `updates_channel_capacity = 2048`, кэш `self_user` ДО старта `run_updates` и до `ImportLoginToken` (`cache_tl_peers`/`cache_tl_auth_user`), персист пиров/channel pts из `GetDialogs`/`GetDiscussionMessage`, диспатч `on_event` до фоновой БД; оптимистичная 0-мс отправка в ленту и обсуждение (`temp_id < 0`, `🕒`, `SentConfirm`/`SendFailed`) и автодозагрузка `SyncOpenChat` после простоя | `rg-core/{lib,auth,qr,engine}.rs`, `worker.rs`, `lib.rs`, `chat.rs` |
+| Ускорение горячих путей по методологии `fast-anything` | ✅ O(N) `HashMap`-индексация `parse_raw_dialogs` и `tl_messages_to_rows`, быстрый pre-check ASCII/Cyrillic в `Emoji::contains` с тестом эквивалентности, однопроходный `rich::build_runs` без `Vec<char>`, per-chat `rich_runs_cache` в `messages_ui` | `engine.rs`, `emoji.rs`, `rich.rs`, `chat.rs`, `lib.rs` |
+| Интерфейс каналов и полноценная ветка комментариев Telegram | ✅ плоская 42px нижняя полоса канала `channel_bottom_bar`, интегрированная строка комментариев поста (`history_comments` + счётчик с плюрализацией + `›`), встроенная на всю высоту панели ветка обсуждения (`discussion_panel`: `←`, карточка поста, пузыри с ответами и реакциями, оптимистичная отправка комментария) | `chat.rs`, `engine.rs`, `worker.rs`, `lib.rs` |
+| 5 новых функций Telegram (облачные черновики, отметка непрочитанным + `@`/`❤`, мини-игры Dice, просмотр и установка стикерпаков, редактор ДР/`@username`) | ✅ `saveDraft`/`getAllDrafts` + автосохранение + превью `Черновик:`; `markDialogUnread`, фильтр «Непрочитанные», FAB `@` и `❤`; `InputMediaDice` (`🎲 🎯 🏀 ⚽ 🎰 🎳`, анимация и расшифровка); `getStickerSet`/`installStickerSet`/`uninstallStickerSet` + модальное окно; `updateBirthday`/`updateUsername` с валидацией | `engine.rs`, `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs`, `media_ui.rs`, `panels.rs`, `tg_settings.rs` |
+
 ## Порядок дальнейших этапов
 1. **Этап 9 — лента как у Telegram:** форматирование текста и ссылки, GIF/видео/голосовые, анимированные стикеры, альбомы.
 2. **Этап 10 — навигация:** папки, архив, контакты, избранное, профили, глобальный поиск.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use grammers_session::Session;
-use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
+use grammers_session::types::{ChannelKind, DcOption, PeerAuth, PeerId, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::{BoxFuture, storages::SqliteSession};
 use rg_net::Guard;
 
@@ -175,7 +175,75 @@ pub fn privacy_params(proxy_url: Option<String>) -> grammers_mtsender::Connectio
         system_lang_code: "en".to_owned(),
         lang_code: "en".to_owned(),
         proxy_url,
+        updates_channel_capacity: std::num::NonZeroUsize::new(2048).expect("non-zero capacity"),
         ..grammers_mtsender::ConnectionParams::default()
+    }
+}
+
+/// Преобразует сырых пользователей и чаты Telegram в записи `PeerInfo` и сохраняет их в кэше сессии.
+/// Нужно вызывать после сырых `messages.getDialogs` / `auth.*`, чтобы `UpdatesReceiver` всегда имел
+/// `access_hash` каналов и запись текущего пользователя для быстрого получения live-обновлений без потерь.
+pub async fn cache_tl_peers<S: Session>(
+    session: &S,
+    users: &[grammers_client::tl::enums::User],
+    chats: &[grammers_client::tl::enums::Chat],
+) {
+    use grammers_client::tl::enums::{Chat as C, User as U};
+    let mut batch = Vec::with_capacity(users.len() + chats.len());
+    for u in users {
+        if let U::User(x) = u {
+            batch.push(PeerInfo::User {
+                id: x.id,
+                auth: x.access_hash.map(PeerAuth::from_hash),
+                bot: Some(x.bot),
+                is_self: Some(x.is_self),
+            });
+        }
+    }
+    for c in chats {
+        match c {
+            C::Chat(x) => batch.push(PeerInfo::Chat { id: x.id }),
+            C::Channel(x) => batch.push(PeerInfo::Channel {
+                id: x.id,
+                auth: x.access_hash.map(PeerAuth::from_hash),
+                kind: Some(if x.broadcast {
+                    ChannelKind::Broadcast
+                } else if x.gigagroup {
+                    ChannelKind::Gigagroup
+                } else {
+                    ChannelKind::Megagroup
+                }),
+            }),
+            C::Forbidden(x) => batch.push(PeerInfo::Chat { id: x.id }),
+            C::ChannelForbidden(x) => batch.push(PeerInfo::Channel {
+                id: x.id,
+                auth: Some(PeerAuth::from_hash(x.access_hash)),
+                kind: None,
+            }),
+            _ => {}
+        }
+    }
+    if !batch.is_empty() {
+        let _ = session.cache_peers(batch).await;
+    }
+}
+
+/// Сохраняет авторизованного пользователя из ответа `auth.Authorization` как `is_self = true`.
+pub async fn cache_tl_auth_user<S: Session>(
+    session: &S,
+    auth: &grammers_client::tl::enums::auth::Authorization,
+) {
+    if let grammers_client::tl::enums::auth::Authorization::Authorization(a) = auth
+        && let grammers_client::tl::enums::User::User(u) = &a.user
+    {
+        let _ = session
+            .cache_peer(PeerInfo::User {
+                id: u.id,
+                auth: u.access_hash.map(PeerAuth::from_hash),
+                bot: Some(u.bot),
+                is_self: Some(true),
+            })
+            .await;
     }
 }
 
@@ -308,5 +376,137 @@ mod tests {
         rt.block_on(session.set_dc_option(&evil)).ok();
         assert_eq!(session.blocked(), 1);
         assert!(session.dc_option(2).unwrap().is_some());
+    }
+
+    #[test]
+    fn cache_tl_peers_persists_channel_hash_and_self_user() {
+        use grammers_client::tl;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let inner = rt.block_on(SqliteSession::open(":memory:")).unwrap();
+        let session = GuardedSession::new(inner, Guard::new());
+        let self_user = tl::enums::User::User(tl::types::User {
+            is_self: true,
+            contact: false,
+            mutual_contact: false,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            bot_forum_can_manage_topics: false,
+            bot_can_manage_bots: false,
+            bot_guestchat: false,
+            bot_guard: false,
+            bot_forum_sidebar: false,
+            id: 777_001,
+            access_hash: Some(987_654),
+            first_name: Some("Tester".into()),
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+            linked_community_id: None,
+        });
+        let channel = tl::enums::Chat::Channel(tl::types::Channel {
+            creator: false,
+            left: false,
+            broadcast: true,
+            verified: false,
+            megagroup: false,
+            restricted: false,
+            signatures: false,
+            min: false,
+            scam: false,
+            has_link: true,
+            has_geo: false,
+            slowmode_enabled: false,
+            call_active: false,
+            call_not_empty: false,
+            fake: false,
+            gigagroup: false,
+            noforwards: false,
+            join_to_send: false,
+            join_request: false,
+            forum: false,
+            stories_hidden: false,
+            stories_hidden_min: false,
+            stories_unavailable: false,
+            signature_profiles: false,
+            autotranslation: false,
+            broadcast_messages_allowed: false,
+            monoforum: false,
+            forum_tabs: false,
+            in_news: false,
+            forum_sidebar: false,
+            id: 222_333,
+            access_hash: Some(555_666),
+            title: "News".into(),
+            username: None,
+            photo: tl::enums::ChatPhoto::Empty,
+            date: 1_700_000_000,
+            restriction_reason: None,
+            admin_rights: None,
+            banned_rights: None,
+            default_banned_rights: None,
+            participants_count: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            emoji_status: None,
+            level: None,
+            subscription_until_date: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+            linked_monoforum_id: None,
+            linked_community_id: None,
+            pinned_msg_id: None,
+        });
+        rt.block_on(cache_tl_peers(&session, &[self_user], &[channel]));
+        let cached_self = rt.block_on(session.peer(PeerId::self_user())).unwrap();
+        assert!(cached_self.is_some());
+        let cached_chan = rt
+            .block_on(session.peer(PeerId::channel_unchecked(222_333)))
+            .unwrap();
+        match cached_chan {
+            Some(PeerInfo::Channel { id, auth, kind }) => {
+                assert_eq!(id, 222_333);
+                assert_eq!(auth, Some(PeerAuth::from_hash(555_666)));
+                assert_eq!(kind, Some(ChannelKind::Broadcast));
+            }
+            other => panic!("unexpected channel peer: {other:?}"),
+        }
+        assert!(privacy_params(None).updates_channel_capacity.get() >= 2048);
     }
 }

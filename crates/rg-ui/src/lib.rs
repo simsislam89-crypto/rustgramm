@@ -10,6 +10,7 @@ mod features_ui;
 mod frame;
 pub mod icons;
 mod kit;
+mod login_anim;
 mod lottie;
 mod media_editor;
 mod media_ui;
@@ -373,7 +374,7 @@ struct App {
     miniapp_expanded: bool,
     /// Кэш фильтрации списка чатов для O(видимых_строк) при 5000+ чатах.
     dialogs_gen: u64,
-    filtered_cache_key: (u64, String, bool, Option<i32>),
+    filtered_cache_key: (u64, String, bool, Option<i32>, bool),
     filtered_cache: Vec<usize>,
     archived_total_cache: usize,
     folder_tabs_cache_key: (u64, usize, bool, bool, bool),
@@ -504,6 +505,31 @@ struct App {
     /// Детали сообщения: активная вкладка (0=Мета, 1=Прочитали, 2=Реакции) и загруженные списки.
     details_tab: u8,
     msg_activity: Option<(i32, Vec<rg_core::engine::ReadParticipantRow>, Vec<rg_core::engine::MessageReactionPeerRow>)>,
+    /// Генератор отрицательных временных ID для мгновенной оптимистичной отправки.
+    next_temp_msg_id: i32,
+    /// Облачные черновики по `dialog_id`: `(текст, reply_to)`.
+    drafts: HashMap<i64, (String, Option<i32>)>,
+    /// Отложенная отправка черновика на сервер `(dialog_idx, время_последней_правки)`.
+    draft_dirty_at: Option<(usize, f64)>,
+    /// Фильтр списка диалогов «Только непрочитанные».
+    unread_filter_only: bool,
+    /// Открытое модальное окно просмотра и установки набора стикеров.
+    sticker_pack_modal: Option<rg_core::engine::StickerPackDetails>,
+    /// Кэш разобранных текстовых прогонов `(msg_id, len)` для быстрого скролла ленты.
+    rich_runs_cache: HashMap<(i32, usize), Vec<rich::Run>>,
+    /// Отслеживание потери фокуса для мягкой дозагрузки пропущенного.
+    last_focus_lost_at: Option<f64>,
+    was_focused: bool,
+    /// Выбранный комментарий-цель ответа `(msg_id, имя_автора)` в ветке обсуждения.
+    disc_reply_to: Option<(i32, String)>,
+    /// Поля редактора `@username` и даты рождения в «Моём профиле».
+    profile_username_edit: String,
+    profile_bday_day: String,
+    profile_bday_month: String,
+    profile_bday_year: String,
+    profile_bday_synced: bool,
+    /// Время появления анимации броска/игры (`🎲 🎯 🏀 ⚽ 🎰 🎳`).
+    dice_spawn_times: HashMap<i32, f64>,
 }
 
 pub(crate) struct ShotModal {
@@ -900,7 +926,7 @@ impl App {
             #[cfg(windows)]
             miniapp_expanded: false,
             dialogs_gen: 0,
-            filtered_cache_key: (u64::MAX, String::new(), false, None),
+            filtered_cache_key: (u64::MAX, String::new(), false, None, false),
             filtered_cache: Vec::new(),
             archived_total_cache: 0,
             folder_tabs_cache_key: (u64::MAX, 0, false, false, false),
@@ -1002,6 +1028,21 @@ impl App {
             emoji_status_ttl: 0,
             details_tab: 0,
             msg_activity: None,
+            next_temp_msg_id: -1,
+            drafts: HashMap::new(),
+            draft_dirty_at: None,
+            unread_filter_only: false,
+            sticker_pack_modal: None,
+            rich_runs_cache: HashMap::new(),
+            last_focus_lost_at: None,
+            was_focused: true,
+            disc_reply_to: None,
+            profile_username_edit: String::new(),
+            profile_bday_day: String::new(),
+            profile_bday_month: String::new(),
+            profile_bday_year: String::new(),
+            profile_bday_synced: false,
+            dice_spawn_times: HashMap::new(),
         }
     }
 
@@ -1098,18 +1139,39 @@ impl App {
                     if self.known.insert(row.id) {
                         self.arrived.insert(row.id, now_t);
                     }
+                    if row
+                        .media
+                        .as_ref()
+                        .is_some_and(|m| matches!(m.kind, rg_core::media::MediaKind::Dice { .. }))
+                    {
+                        self.dice_spawn_times.insert(row.id, now_t);
+                    }
                     self.request_previews(idx, std::slice::from_ref(&row));
                     let incoming = !row.outgoing;
-                    match self.messages.iter_mut().find(|m| m.id == row.id) {
-                        Some(old) => {
-                            let (deleted, edits) = (old.deleted, old.edits);
-                            *old = row;
-                            old.deleted = deleted;
-                            old.edits = edits + usize::from(old.edit_date.is_some());
-                        }
-                        None => {
-                            self.messages.push(row);
-                            self.messages.sort_by_key(|m| (m.date, m.id));
+                    let already_present = self.messages.iter().any(|m| m.id == row.id);
+                    if !already_present
+                        && row.outgoing
+                        && let Some(temp_pos) = self
+                            .messages
+                            .iter()
+                            .position(|m| m.id < 0 && m.outgoing && m.text == row.text)
+                    {
+                        let temp_id = self.messages[temp_pos].id;
+                        self.rich_runs_cache.retain(|k, _| k.0 != temp_id);
+                        self.messages[temp_pos] = row;
+                    } else {
+                        match self.messages.iter_mut().find(|m| m.id == row.id) {
+                            Some(old) => {
+                                let (deleted, edits) = (old.deleted, old.edits);
+                                *old = row;
+                                old.deleted = deleted;
+                                old.edits = edits + usize::from(old.edit_date.is_some());
+                                self.rich_runs_cache.retain(|k, _| k.0 != old.id);
+                            }
+                            None => {
+                                self.messages.push(row);
+                                self.messages.sort_by_key(|m| (m.date, m.id));
+                            }
                         }
                     }
                     // Окно в фокусе и чат открыт: отмечаем прочитанным (режим призрака учитывается).
@@ -1158,6 +1220,33 @@ impl App {
             Live::ReadOutbox(key, max) => {
                 if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key) {
                     d.read_out = d.read_out.max(max);
+                }
+            }
+            Live::ReadInbox(key, max_id) => {
+                if max_id > 0
+                    && let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key)
+                {
+                    d.unread = 0;
+                    self.dialogs_gen += 1;
+                }
+            }
+            Live::Draft(key, text, reply_to) => {
+                if text.trim().is_empty() && reply_to.is_none() {
+                    self.drafts.remove(&key);
+                } else {
+                    self.drafts.insert(key, (text.clone(), reply_to));
+                }
+                if open_id == Some(key) && self.draft_dirty_at.is_none() {
+                    self.input = text;
+                }
+                self.dialogs_gen += 1;
+            }
+            Live::MessageReactions(key, _msg_id, delta) => {
+                if delta > 0
+                    && let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key)
+                {
+                    d.unread_reactions = d.unread_reactions.saturating_add(delta);
+                    self.dialogs_gen += 1;
                 }
             }
             Live::Typing(key, lbl) => {
@@ -1999,8 +2088,106 @@ impl App {
         }
     }
 
+    /// Следующий временный отрицательный ID для оптимистичной отправки (< 0).
+    pub(crate) fn next_temp_id(&mut self) -> i32 {
+        let id = self.next_temp_msg_id;
+        self.next_temp_msg_id = if self.next_temp_msg_id <= -1_000_000 {
+            -1
+        } else {
+            self.next_temp_msg_id - 1
+        };
+        id
+    }
+
+    /// Мгновенно добавляет исходящее сообщение (id < 0) в ленту и превью списка чатов.
+    pub(crate) fn push_optimistic_message(
+        &mut self,
+        text: String,
+        entities: Vec<rg_core::engine::Entity>,
+        reply_to: Option<i32>,
+        media: Option<rg_core::media::MediaInfo>,
+    ) -> i32 {
+        let temp_id = self.next_temp_id();
+        let reply_preview = reply_to.map(|rid| {
+            let txt = self
+                .messages
+                .iter()
+                .find(|m| m.id == rid)
+                .map_or_else(|| format!("#{rid}"), |r| {
+                    let who = if r.outgoing { self.me.as_str() } else { r.sender.as_str() };
+                    let snippet: String = r.text.chars().take(80).collect();
+                    if who.is_empty() { snippet } else { format!("{who}: {snippet}") }
+                });
+            (rid, txt)
+        });
+        let row = MessageRow {
+            entities,
+            reply_to: reply_preview,
+            media,
+            ..MessageRow::plain(temp_id, text.clone(), true, self.now.max(1))
+        };
+        self.messages.push(row.clone());
+        self.scrolled_up = false;
+        self.scroll_to = Some(temp_id);
+        if let Some(sel) = self.selected
+            && let Some(d) = self.dialogs.get_mut(sel)
+        {
+            let did = d.id;
+            let preview: String = if !text.is_empty() {
+                text.chars().take(80).collect()
+            } else {
+                row.media.as_ref().map(|m| m.name.clone()).unwrap_or_default()
+            };
+            if !preview.is_empty() {
+                d.last = preview;
+            }
+            d.date = d.date.max(row.date);
+            self.drafts.remove(&did);
+            self.draft_dirty_at = None;
+            self.dialogs_gen += 1;
+        }
+        temp_id
+    }
+
+    /// Сохраняет изменённый черновик на сервер при паузе ввода или смене чата/фокуса.
+    pub(crate) fn flush_draft_if_dirty(&mut self, force: bool, ui_time: f64) {
+        let Some((idx, at)) = self.draft_dirty_at else {
+            return;
+        };
+        if !force && ui_time - at < 1.2 {
+            return;
+        }
+        self.draft_dirty_at = None;
+        let reply_to = if self.selected == Some(idx) {
+            self.reply.as_ref().map(|(id, _)| *id)
+        } else {
+            None
+        };
+        let text = if self.selected == Some(idx) {
+            self.input.clone()
+        } else if let Some(d) = self.dialogs.get(idx) {
+            self.drafts.get(&d.id).map(|(t, _)| t.clone()).unwrap_or_default()
+        } else {
+            return;
+        };
+        self.send(Cmd::SaveDraft(idx, text, reply_to));
+    }
+
     /// Открыть чат из списка (мгновенно из кэша в памяти, если уже открывался).
     fn open_dialog(&mut self, i: usize) {
+        self.flush_draft_if_dirty(true, 0.0);
+        if let Some(prev_idx) = self.selected
+            && let Some(prev_d) = self.dialogs.get(prev_idx)
+            && self.dialogs.get(i).is_none_or(|d| d.id != prev_d.id)
+        {
+            if self.input.trim().is_empty() && self.reply.is_none() {
+                self.drafts.remove(&prev_d.id);
+            } else {
+                self.drafts
+                    .insert(prev_d.id, (self.input.clone(), self.reply.as_ref().map(|(id, _)| *id)));
+            }
+            self.dialogs_gen += 1;
+        }
         if !self.nav_jumping
             && let Some(prev_id) = self.selected.and_then(|cur| self.dialogs.get(cur)).map(|d| d.id)
             && self.dialogs.get(i).is_none_or(|d| d.id != prev_id)
@@ -2016,6 +2203,12 @@ impl App {
         self.reset_chat_state();
         self.selected = Some(i);
         if let Some(id) = self.dialogs.get(i).map(|d| d.id) {
+            if let Some((draft_txt, draft_reply)) = self.drafts.get(&id).cloned() {
+                self.input = draft_txt;
+                self.reply = draft_reply.map(|rid| (rid, format!("#{rid}")));
+            } else {
+                self.input.clear();
+            }
             if self.info_req.insert(id) {
                 self.send(Cmd::PeerInfo(i));
             }
@@ -2030,6 +2223,7 @@ impl App {
                 self.history_loading = true;
             }
         } else {
+            self.input.clear();
             self.history_loading = true;
         }
         self.send(Cmd::Open(i));
@@ -2079,7 +2273,10 @@ impl App {
         self.active_topic = None;
         self.topic_msgs = None;
         self.discussion = None;
+        self.disc_reply_to = None;
         self.comment_input.clear();
+        self.rich_runs_cache.clear();
+        self.dice_spawn_times.clear();
         self.draft_translating = false;
         self.translate_draft_popup = false;
         self.inline_bot_key = None;
@@ -2409,7 +2606,7 @@ impl App {
                     self.textures.insert(msg_id, tex.clone());
                 } else if rendered_this_frame < MAX_TGS_RASTERS_PER_FRAME || !self.textures.contains_key(&msg_id) {
                     rendered_this_frame += 1;
-                    let img = anim.render_frame(bucket as f32, 160);
+                    let img = anim.render_frame(bucket as f32, 256);
                     let tex = ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR);
                     self.tgs_frame_cache.insert(key, tex.clone());
                     self.textures.insert(msg_id, tex);
@@ -2671,6 +2868,7 @@ impl App {
                     }
                 }
                 Ev::Discussion(thread) => {
+                    self.disc_reply_to = None;
                     self.discussion = Some(thread);
                 }
                 Ev::Stories(list) => {
@@ -3043,6 +3241,148 @@ impl App {
                 } => {
                     self.msg_activity = Some((msg_id, readers, reactions));
                 }
+                Ev::SentConfirm(did, temp_id, row) => {
+                    let row = *row;
+                    let now_t = ctx.input(|i| i.time);
+                    if row
+                        .media
+                        .as_ref()
+                        .is_some_and(|m| matches!(m.kind, rg_core::media::MediaKind::Dice { .. }))
+                    {
+                        self.dice_spawn_times.insert(row.id, now_t);
+                    }
+                    let preview: String = if !row.text.is_empty() {
+                        row.text.chars().take(80).collect()
+                    } else {
+                        row.media.as_ref().map(|m| m.name.clone()).unwrap_or_default()
+                    };
+                    if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == did) {
+                        if !preview.is_empty() {
+                            d.last = preview;
+                        }
+                        d.date = d.date.max(row.date);
+                        self.dialogs_gen += 1;
+                    }
+                    let is_open = self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did);
+                    if is_open {
+                        if let Some(idx) = self.selected {
+                            self.request_previews(idx, std::slice::from_ref(&row));
+                        }
+                        self.known.insert(row.id);
+                        self.arrived.entry(row.id).or_insert(now_t);
+                        self.rich_runs_cache.retain(|k, _| k.0 != temp_id && k.0 != row.id);
+                        if temp_id < 0 {
+                            if self.messages.iter().any(|m| m.id == row.id) {
+                                self.messages.retain(|m| m.id != temp_id);
+                            } else if let Some(slot) = self.messages.iter_mut().find(|m| m.id == temp_id) {
+                                *slot = row.clone();
+                            } else {
+                                self.messages.push(row.clone());
+                                self.messages.sort_by_key(|m| (m.date, m.id));
+                            }
+                        } else if let Some(slot) = self.messages.iter_mut().find(|m| m.id == row.id) {
+                            *slot = row.clone();
+                        } else {
+                            self.messages.push(row.clone());
+                            self.messages.sort_by_key(|m| (m.date, m.id));
+                        }
+                    }
+                    if let Some(cached) = self.history_cache.get_mut(&did) {
+                        if temp_id < 0 {
+                            cached.retain(|m| m.id != temp_id);
+                        }
+                        if let Some(slot) = cached.iter_mut().find(|m| m.id == row.id) {
+                            *slot = row;
+                        } else {
+                            cached.push(row);
+                            cached.sort_by_key(|m| (m.date, m.id));
+                        }
+                    }
+                }
+                Ev::SendFailed(did, temp_id, _err) => {
+                    self.rich_runs_cache.retain(|k, _| k.0 != temp_id);
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did) {
+                        self.messages.retain(|m| m.id != temp_id);
+                    }
+                    if let Some(cached) = self.history_cache.get_mut(&did) {
+                        cached.retain(|m| m.id != temp_id);
+                    }
+                }
+                Ev::CommentConfirmed(post_id, temp_id, row) => {
+                    let row = *row;
+                    if let Some(disc) = self.discussion.as_mut()
+                        && disc.post_id == post_id
+                    {
+                        if let Some(slot) = disc.comments.iter_mut().find(|c| c.id == temp_id) {
+                            *slot = row;
+                        } else if !disc.comments.iter().any(|c| c.id == row.id) {
+                            disc.comments.push(row);
+                        }
+                    }
+                    if let Some(post) = self.messages.iter_mut().find(|m| m.id == post_id) {
+                        post.replies_count = post.replies_count.saturating_add(1);
+                    }
+                }
+                Ev::CommentFailed(post_id, temp_id, _err) => {
+                    if let Some(disc) = self.discussion.as_mut()
+                        && disc.post_id == post_id
+                    {
+                        disc.comments.retain(|c| c.id != temp_id);
+                    }
+                }
+                Ev::Drafts(rows) => {
+                    for d in rows {
+                        if d.text.trim().is_empty() && d.reply_to.is_none() {
+                            self.drafts.remove(&d.peer_id);
+                        } else {
+                            self.drafts.insert(d.peer_id, (d.text.clone(), d.reply_to));
+                        }
+                    }
+                    if let Some(cur_id) = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id)
+                        && self.input.is_empty()
+                        && self.draft_dirty_at.is_none()
+                        && let Some((txt, r)) = self.drafts.get(&cur_id).cloned()
+                    {
+                        self.input = txt;
+                        if self.reply.is_none()
+                            && let Some(rid) = r
+                        {
+                            self.reply = Some((rid, format!("#{rid}")));
+                        }
+                    }
+                    self.dialogs_gen += 1;
+                }
+                Ev::JumpToMessage(did, msg_id) => {
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did) {
+                        if msg_id == 0 {
+                            if let Some(sel) = self.selected
+                                && let Some(d) = self.dialogs.get_mut(sel)
+                            {
+                                d.unread_mentions = 0;
+                                self.dialogs_gen += 1;
+                            }
+                        } else {
+                            self.scroll_to = Some(msg_id);
+                            self.highlight_msg = Some((msg_id, ctx.input(|i| i.time)));
+                        }
+                    }
+                }
+                Ev::StickerPack(pack) => {
+                    self.sticker_pack_modal = Some(*pack);
+                }
+                Ev::StickerPackInstalled(set_id, installed) => {
+                    if let Some(m) = self.sticker_pack_modal.as_mut()
+                        && m.id == set_id
+                    {
+                        m.installed = installed;
+                    }
+                }
+                Ev::UsernameUpdated(u) => {
+                    self.profile_username_edit = u;
+                }
+                Ev::BirthdayUpdated(_) => {
+                    self.profile_bday_synced = false;
+                }
                 Ev::Status(s) => {
                     self.status = s;
                     self.bot_btn_pending = None;
@@ -3057,85 +3397,6 @@ impl App {
     }
 
     // ---------- вход (как в официальном Telegram + анимации + поддержка нативной Android-клавиатуры) ----------
-
-    fn tg_login_accent() -> Color32 {
-        Color32::from_rgb(135, 116, 225) // #8774E1 (Telegram Desktop/Web accent)
-    }
-
-    fn tg_login_blue() -> Color32 {
-        Color32::from_rgb(42, 171, 238) // #2AABEE
-    }
-
-    fn paint_telegram_login_logo(ui: &mut egui::Ui, busy: bool, enter_k: f32) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(126.0), Sense::hover());
-        let c = rect.center();
-        let p = ui.painter();
-        let spring_k = ios_spring_bounce(enter_k.clamp(0.0, 1.0));
-        let scale = 0.78 + 0.22 * spring_k;
-        let r = 54.0 * scale;
-        let blue = Self::tg_login_blue();
-
-        // Мягкое пульсирующее кольцо при загрузке/отправке.
-        if busy {
-            let pulse = (ui.input(|i| i.time) * 3.8).sin() as f32 * 0.5 + 0.5;
-            p.circle_stroke(
-                c,
-                r + 6.0 + 7.0 * pulse,
-                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), (130.0 * (1.0 - pulse)) as u8)),
-            );
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-        }
-        p.circle_filled(
-            c,
-            r + 4.0,
-            Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), (32.0 * enter_k) as u8),
-        );
-        p.circle_filled(c, r, blue);
-        // Верхний мягкий блик круга Telegram.
-        p.circle_filled(
-            c + Vec2::new(-r * 0.12, -r * 0.22),
-            r * 0.68,
-            Color32::from_rgba_unmultiplied(120, 214, 255, 42),
-        );
-
-        // Многогранный бумажный самолётик Telegram с лёгким полётным смещением при появлении/ожидании.
-        let bob = if busy {
-            (ui.input(|i| i.time) * 5.0).sin() as f32 * 2.2
-        } else {
-            (1.0 - spring_k) * 14.0
-        };
-        let pc = c + Vec2::new(-bob * 0.4, bob);
-        let k = r / 54.0;
-        let p_left = pc + Vec2::new(-28.0, 2.0) * k;
-        let p_tip = pc + Vec2::new(25.0, -19.0) * k;
-        let p_bot = pc + Vec2::new(14.0, 22.0) * k;
-        let p_fold_top = pc + Vec2::new(-8.0, 7.0) * k;
-        let p_fold_mid = pc + Vec2::new(-5.0, 17.0) * k;
-
-        // Верхнее белое крыло.
-        p.add(egui::Shape::convex_polygon(
-            vec![p_left, p_tip, p_fold_top],
-            Color32::WHITE,
-            egui::Stroke::NONE,
-        ));
-        // Нижнее крыло.
-        p.add(egui::Shape::convex_polygon(
-            vec![p_fold_top, p_tip, p_bot],
-            Color32::from_rgb(244, 248, 252),
-            egui::Stroke::NONE,
-        ));
-        // Внутренний сгиб и тень самолётика (как у официального логотипа Telegram).
-        p.add(egui::Shape::convex_polygon(
-            vec![p_fold_top, p_tip, p_fold_mid],
-            Color32::from_rgb(200, 218, 234),
-            egui::Stroke::NONE,
-        ));
-        p.add(egui::Shape::convex_polygon(
-            vec![p_fold_mid, p_tip, pc + Vec2::new(1.0, 12.0) * k],
-            Color32::from_rgb(169, 201, 221),
-            egui::Stroke::NONE,
-        ));
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn outlined_login_field<R>(
@@ -3244,16 +3505,12 @@ impl App {
     }
 
     fn login_ui(&mut self, ui: &mut egui::Ui) {
-        let accent = if theme::palette().customized {
-            c_orange()
-        } else {
-            Self::tg_login_accent()
-        };
+        let accent = c_orange();
         let bg_cut = Color32::from_rgb(24, 25, 30);
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             if self.login_busy {
-                ui.add(egui::Spinner::new().size(15.0).color(Self::tg_login_blue()));
+                ui.add(egui::Spinner::new().size(15.0).color(accent));
                 ui.label(RichText::new("Связь с Telegram…").size(12.5).color(SUBTEXT));
             } else if !self.status.is_empty() {
                 ui.label(RichText::new(&self.status).size(12.0).color(SUBTEXT));
@@ -3358,46 +3615,6 @@ impl App {
         self.proxy_window(ui.ctx());
     }
 
-    /// Фирменный интерактивный смайл-талисман входа Telegram (конверт / обезьянка 2FA).
-    fn paint_login_mascot(ui: &mut egui::Ui, emoji_char: &str, ring_accent: Color32, emoji_atlas: Option<&emoji::Emoji>) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(104.0), Sense::hover());
-        let c = rect.center();
-        let p = ui.painter();
-        p.circle_filled(
-            c,
-            50.0,
-            Color32::from_rgba_unmultiplied(ring_accent.r(), ring_accent.g(), ring_accent.b(), 26),
-        );
-        p.circle_filled(
-            c,
-            42.0,
-            Color32::from_rgba_unmultiplied(ring_accent.r(), ring_accent.g(), ring_accent.b(), 44),
-        );
-        p.circle_stroke(
-            c,
-            42.0,
-            egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(ring_accent.r(), ring_accent.g(), ring_accent.b(), 150)),
-        );
-        let mut drew_atlas = false;
-        if let Some(atlas) = emoji_atlas
-            && let Some(ch) = emoji_char.chars().next()
-            && let Some(img) = atlas.image(ch, 54.0)
-        {
-            let er = egui::Rect::from_center_size(c, Vec2::splat(54.0));
-            img.paint_at(ui, er);
-            drew_atlas = true;
-        }
-        if !drew_atlas {
-            p.text(
-                c,
-                egui::Align2::CENTER_CENTER,
-                emoji_char,
-                FontId::proportional(46.0),
-                WHITE,
-            );
-        }
-    }
-
     fn qr_screen(&mut self, ui: &mut egui::Ui, url: &str, accent: Color32) {
         let qr_side = (ui.available_width() - 24.0).clamp(184.0, 248.0);
         let pop_k = theme::tween(ui.ctx(), "login-qr-pop", if url.is_empty() { 0.0 } else { 1.0 }, 0.28);
@@ -3405,9 +3622,9 @@ impl App {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(qr_side), Sense::hover());
             ui.painter()
                 .rect_filled(rect, egui::CornerRadius::same(20), Color32::from_white_alpha(16));
-            ui.put(rect, egui::Spinner::new().size(28.0).color(Self::tg_login_blue()));
+            ui.put(rect, egui::Spinner::new().size(28.0).color(accent));
         } else {
-            let _ = theme::draw_styled_qr(ui, url, qr_side, Self::tg_login_blue(), pop_k);
+            let _ = theme::draw_styled_qr(ui, url, qr_side, accent, pop_k);
         }
         ui.add_space(16.0);
         ui.label(
@@ -3424,7 +3641,7 @@ impl App {
         ] {
             ui.horizontal(|ui| {
                 let (br, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                ui.painter().circle_filled(br.center(), 9.5, Self::tg_login_blue());
+                ui.painter().circle_filled(br.center(), 9.5, accent);
                 ui.painter().text(
                     br.center(),
                     egui::Align2::CENTER_CENTER,
@@ -3473,7 +3690,7 @@ impl App {
         match self.stage.clone() {
             Stage::Starting => {
                 let enter_k = theme::tween(ui.ctx(), "lg-logo-start", 1.0, 0.36);
-                Self::paint_telegram_login_logo(ui, true, enter_k);
+                login_anim::paint_plane_mascot(ui, true, enter_k);
                 ui.add_space(10.0);
                 ui.label(RichText::new("Telegram").size(26.0).strong().color(WHITE));
                 ui.add_space(6.0);
@@ -3490,7 +3707,7 @@ impl App {
                 }
             }
             Stage::NeedKeys => {
-                Self::paint_login_mascot(ui, "🔑", accent, self.emoji.as_ref());
+                login_anim::paint_keys_mascot(ui);
                 ui.add_space(10.0);
                 ui.label(RichText::new("Ключи API Telegram").size(20.0).strong().color(WHITE));
                 ui.label(
@@ -3515,7 +3732,7 @@ impl App {
             }
             Stage::NeedPhone => {
                 let enter_k = theme::tween(ui.ctx(), "lg-logo-phone", 1.0, 0.38);
-                Self::paint_telegram_login_logo(ui, self.login_busy, enter_k);
+                login_anim::paint_plane_mascot(ui, self.login_busy, enter_k);
                 ui.add_space(6.0);
                 ui.label(RichText::new("Telegram").size(28.0).strong().color(WHITE));
                 ui.add_space(6.0);
@@ -3774,7 +3991,7 @@ impl App {
                 }
             }
             Stage::NeedCode => {
-                Self::paint_login_mascot(ui, "📩", Self::tg_login_blue(), self.emoji.as_ref());
+                login_anim::paint_code_monkey(ui, self.code.chars().count(), !self.error.is_empty());
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(if self.login_last_phone.is_empty() {
@@ -3877,8 +4094,11 @@ impl App {
                 });
             }
             Stage::NeedPassword(hint) => {
-                let mascot = if self.login_show_password { "🐵" } else { "🙈" };
-                Self::paint_login_mascot(ui, mascot, accent, self.emoji.as_ref());
+                login_anim::paint_password_monkey(
+                    ui,
+                    self.login_show_password,
+                    self.password.chars().count(),
+                );
                 ui.add_space(12.0);
                 ui.label(RichText::new("Введите облачный пароль").size(20.0).strong().color(WHITE));
                 if !hint.is_empty() && hint != "нет" {
@@ -4083,7 +4303,13 @@ impl App {
         let mut toggle_archive = false;
         let in_archive = self.in_archive;
         let active_folder = self.folders.iter().find(|f| Some(f.id) == self.folder).cloned();
-        let cache_key = (self.dialogs_gen, needle.clone(), in_archive, self.folder);
+        let cache_key = (
+            self.dialogs_gen,
+            needle.clone(),
+            in_archive,
+            self.folder,
+            self.unread_filter_only,
+        );
         if self.filtered_cache_key != cache_key {
             self.filtered_cache_key = cache_key;
             self.archived_total_cache = self.dialogs.iter().filter(|d| d.archived).count();
@@ -4096,7 +4322,9 @@ impl App {
                         Some(f) if !in_archive => folder_matches(f, d),
                         _ => d.archived == in_archive,
                     };
-                    in_scope && (needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                    in_scope
+                        && (!self.unread_filter_only || d.unread > 0)
+                        && (needle.is_empty() || d.name.to_lowercase().contains(&needle))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -4241,6 +4469,36 @@ impl App {
                         icons::tg(p, "dialogs/dialogs_pinned", c, date_c);
                         right = c.x - 12.0;
                     }
+                    if d.unread_mentions > 0 && !self.settings.ayu.hide_notification_counters {
+                        let b = egui::Rect::from_center_size(
+                            egui::pos2(right - 9.0, rect.bottom() - 23.5),
+                            Vec2::splat(18.0),
+                        );
+                        p.circle_filled(b.center(), 9.0, if selected { Color32::WHITE } else { ORANGE });
+                        p.text(
+                            b.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "@",
+                            FontId::proportional(11.5),
+                            if selected { t(DIALOG_ACTIVE) } else { Color32::WHITE },
+                        );
+                        right = b.left() - 5.0;
+                    }
+                    if d.unread_reactions > 0 && !self.settings.ayu.hide_notification_counters {
+                        let b = egui::Rect::from_center_size(
+                            egui::pos2(right - 9.0, rect.bottom() - 23.5),
+                            Vec2::splat(18.0),
+                        );
+                        p.circle_filled(b.center(), 9.0, if selected { Color32::WHITE } else { Color32::from_rgb(232, 74, 95) });
+                        p.text(
+                            b.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "❤",
+                            FontId::proportional(10.5),
+                            if selected { t(DIALOG_ACTIVE) } else { Color32::WHITE },
+                        );
+                        right = b.left() - 5.0;
+                    }
                     let date = if d.date > 0 {
                         dialog_date(d.date, now)
                     } else {
@@ -4305,6 +4563,28 @@ impl App {
                             FontId::proportional(14.0),
                             ORANGE,
                         );
+                    } else if let Some((draft_txt, _)) = self.drafts.get(&d.id).filter(|(t, _)| !t.trim().is_empty()) {
+                        let prefix = "Черновик: ";
+                        let pr_g = p.layout_no_wrap(
+                            prefix.to_owned(),
+                            FontId::proportional(14.0),
+                            if selected { Color32::WHITE } else { Color32::from_rgb(235, 92, 86) },
+                        );
+                        let pr_w = pr_g.size().x;
+                        let pos = rect.left_top() + Vec2::new(68.0, 35.0);
+                        p.with_clip_rect(text_clip).galley(
+                            pos,
+                            pr_g,
+                            if selected { Color32::WHITE } else { Color32::from_rgb(235, 92, 86) },
+                        );
+                        let one_line: String = draft_txt.chars().take(72).map(|c| if c == '\n' { ' ' } else { c }).collect();
+                        p.with_clip_rect(text_clip).text(
+                            pos + Vec2::new(pr_w, 0.0),
+                            egui::Align2::LEFT_TOP,
+                            one_line,
+                            FontId::proportional(14.0),
+                            text_c,
+                        );
                     } else {
                         match self.emoji.as_ref().filter(|e| e.contains(&d.last)) {
                             Some(e) => e.paint_line(
@@ -4360,6 +4640,8 @@ impl App {
                         );
                         if d.unread > 0 {
                             item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
+                        } else {
+                            item(ui, "menu/unread", "Отметить непрочитанным", DialogAct::Unread(true));
                         }
                     });
                 }
@@ -4384,8 +4666,16 @@ impl App {
                 DialogAct::Read => {
                     if let Some(d) = self.dialogs.get_mut(i) {
                         d.unread = 0;
+                        self.dialogs_gen += 1;
                     }
                     self.send(Cmd::ReadDialog(i));
+                }
+                DialogAct::Unread(on) => {
+                    if let Some(d) = self.dialogs.get_mut(i) {
+                        d.unread = if on { d.unread.max(1) } else { 0 };
+                        self.dialogs_gen += 1;
+                    }
+                    self.send(Cmd::MarkDialogUnread(i, on));
                 }
                 DialogAct::Archive(on) => self.send(Cmd::Archive(i, on)),
             }
@@ -4435,6 +4725,7 @@ enum DialogAct {
     Pin(bool),
     Mute(bool),
     Read,
+    Unread(bool),
     Archive(bool),
 }
 
@@ -4569,6 +4860,22 @@ impl eframe::App for App {
         self.flush_pending_notification(&ctx);
         self.tick_tgs(&ctx);
         self.handle_shortcuts(&ctx);
+        let ui_t = ctx.input(|i| i.time);
+        let focused = ctx.input(|i| i.focused);
+        if self.was_focused && !focused {
+            self.last_focus_lost_at = Some(ui_t);
+            self.flush_draft_if_dirty(true, ui_t);
+        } else if !self.was_focused
+            && focused
+            && let Some(lost) = self.last_focus_lost_at.take()
+            && ui_t - lost > 45.0
+            && self.stage == Stage::Ready
+            && !self.is_demo
+        {
+            self.send(Cmd::SyncOpenChat);
+        }
+        self.was_focused = focused;
+        self.flush_draft_if_dirty(false, ui_t);
         self.now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(self.now, |d| d.as_secs() as i64);
@@ -5227,6 +5534,8 @@ fn demo_app(mode: &str) -> App {
             emoji_status: None,
             verified: i == 0,
             premium: i == 1,
+            unread_mentions: 0,
+            unread_reactions: 0,
         });
     }
     for (i, (n, l)) in [("Старый чат", "Давно не писали"), ("Рассылка", "Скидки на всё")].iter().enumerate() {
@@ -5252,6 +5561,8 @@ fn demo_app(mode: &str) -> App {
             emoji_status: None,
             verified: false,
             premium: false,
+            unread_mentions: 0,
+            unread_reactions: 0,
         });
     }
     app.selected = Some(0);
@@ -5366,6 +5677,8 @@ mod tests {
             emoji_status: None,
             verified: false,
             premium: false,
+            unread_mentions: 0,
+            unread_reactions: 0,
         }
     }
 
@@ -5560,5 +5873,42 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(!out.shapes.is_empty());
+    }
+
+    #[test]
+    fn optimistic_send_reconciles_confirm_and_fail_cleanly() {
+        let mut app = demo_app("1");
+        let did = app.dialogs[0].id;
+        let tid = app.push_optimistic_message("Быстрое сообщение".to_owned(), Vec::new(), None, None);
+        assert!(tid < 0);
+        assert!(app.messages.iter().any(|m| m.id == tid && m.outgoing));
+        assert_eq!(app.dialogs[0].last, "Быстрое сообщение");
+
+        let confirmed = MessageRow::plain(9001, "Быстрое сообщение".to_owned(), true, app.now + 10);
+        let ctx = egui::Context::default();
+        app.handle_event(&ctx, Ev::SentConfirm(did, tid, Box::new(confirmed)));
+        assert!(!app.messages.iter().any(|m| m.id == tid), "temp row must be replaced");
+        assert!(app.messages.iter().any(|m| m.id == 9001), "confirmed row must exist");
+
+        let tid2 = app.push_optimistic_message("Ошибка сети".to_owned(), Vec::new(), None, None);
+        assert!(app.messages.iter().any(|m| m.id == tid2));
+        app.handle_event(&ctx, Ev::SendFailed(did, tid2, "timeout".to_owned()));
+        assert!(!app.messages.iter().any(|m| m.id == tid2), "failed temp row must be removed");
+    }
+
+    #[test]
+    fn live_read_inbox_draft_and_reactions_update_dialog_state() {
+        let mut app = demo_app("1");
+        let did = app.dialogs[0].id;
+        app.dialogs[0].unread = 5;
+        let ctx = egui::Context::default();
+        app.on_live(&ctx, rg_core::engine::Live::ReadInbox(did, 120));
+        assert_eq!(app.dialogs[0].unread, 0);
+
+        app.on_live(&ctx, rg_core::engine::Live::Draft(did, "черновик ответа".to_owned(), None));
+        assert_eq!(app.drafts.get(&did).map(|(t, _)| t.as_str()), Some("черновик ответа"));
+
+        app.on_live(&ctx, rg_core::engine::Live::MessageReactions(did, 5, 2));
+        assert_eq!(app.dialogs[0].unread_reactions, 2);
     }
 }

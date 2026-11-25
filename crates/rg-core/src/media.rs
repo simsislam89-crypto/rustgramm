@@ -37,6 +37,11 @@ pub enum MediaKind {
         closed: bool,
         quiz: bool,
     },
+    /// Анимированная игра (кубик 🎲, дартс 🎯, баскетбол 🏀, футбол ⚽, слоты 🎰, боулинг 🎳).
+    Dice {
+        emoticon: String,
+        value: i32,
+    },
     Other(String),
 }
 
@@ -63,6 +68,9 @@ pub struct MediaInfo {
     /// Номер дата-центра Telegram, хранящего этот медиафайл (`DC1..DC5`).
     #[serde(default)]
     pub dc_id: Option<i32>,
+    /// Идентификатор набора стикеров `(id, access_hash)`, если это стикер из набора.
+    #[serde(default)]
+    pub sticker_set: Option<(i64, i64)>,
 }
 
 impl MediaInfo {
@@ -79,6 +87,7 @@ impl MediaInfo {
             spoiler: false,
             ttl_seconds: None,
             dc_id: None,
+            sticker_set: None,
         }
     }
 
@@ -105,7 +114,7 @@ impl MediaInfo {
     pub fn is_downloadable(&self) -> bool {
         !matches!(
             self.kind,
-            MediaKind::Other(_) | MediaKind::WebPage { .. } | MediaKind::Poll { .. }
+            MediaKind::Other(_) | MediaKind::WebPage { .. } | MediaKind::Poll { .. } | MediaKind::Dice { .. }
         )
     }
 }
@@ -188,6 +197,9 @@ pub fn describe(media: &Media) -> MediaInfo {
             );
             info.has_thumb = !s.document.thumbs().is_empty();
             info.mime = mime;
+            if let tl::enums::InputStickerSet::Id(id) = &s.raw_attrs.stickerset {
+                info.sticker_set = Some((id.id, id.access_hash));
+            }
             if let Some(tl::enums::Document::Document(doc)) = &s.document.raw.document {
                 info.dc_id = Some(doc.dc_id);
             }
@@ -300,7 +312,14 @@ pub fn describe(media: &Media) -> MediaInfo {
             )
         }
         Media::Geo(_) | Media::Venue(_) | Media::GeoLive(_) => other("Место"),
-        Media::Dice(d) => other(&format!("{} ({})", d.raw.emoticon, d.raw.value)),
+        Media::Dice(d) => MediaInfo::basic(
+            MediaKind::Dice {
+                emoticon: d.raw.emoticon.clone(),
+                value: d.raw.value,
+            },
+            format!("{} ({})", d.raw.emoticon, d.raw.value),
+            0,
+        ),
         Media::WebPage(w) => match &w.raw.webpage {
             tl::enums::WebPage::Page(wp) => MediaInfo::basic(
                 MediaKind::WebPage {
