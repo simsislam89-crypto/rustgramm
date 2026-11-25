@@ -108,10 +108,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURRENT_TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release list --limit 200 --json tagName --jq '.[].tagName' | while IFS= read -r tag; do
+          gh release list -R "$REPO" --limit 200 --json tagName --jq '.[].tagName' | while IFS= read -r tag; do
             if [ -n "$tag" ] && [ "$tag" != "$CURRENT_TAG" ]; then
               echo "Deleting old release: $tag"
-              gh release delete "$tag" --yes --cleanup-tag || true
+              gh release delete "$tag" -R "$REPO" --yes --cleanup-tag || true
             fi
           done
