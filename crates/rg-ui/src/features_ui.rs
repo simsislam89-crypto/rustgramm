@@ -2164,4 +2164,219 @@ impl App {
             self.emoji_status_open = false;
         }
     }
+
+    #[allow(deprecated)]
+    pub(crate) fn global_deleted_window(&mut self, ctx: &egui::Context) {
+        if !self.global_deleted_open {
+            return;
+        }
+        let mut open = self.global_deleted_open;
+        let mut reload_q: Option<String> = None;
+        let mut jump_to: Option<(i64, i32)> = None;
+        egui::Window::new("Глобальный журнал удалённых")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([460.0, 480.0])
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let (tot, del, ed) = self.global_deleted_stats;
+                ui.label(
+                    RichText::new(format!("Сохранено: {tot} · Удалено: {del} · Правок: {ed}"))
+                        .size(12.0)
+                        .color(SUBTEXT),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.global_deleted_query)
+                            .hint_text("Поиск по тексту удалённых сообщений…")
+                            .desired_width(300.0),
+                    );
+                    if resp.changed() {
+                        reload_q = Some(self.global_deleted_query.clone());
+                    }
+                    if ui.button("Обновить").clicked() {
+                        reload_q = Some(self.global_deleted_query.clone());
+                    }
+                });
+                ui.separator();
+                if self.global_deleted_items.is_empty() {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Удалённых сообщений по запросу не найдено.").color(SUBTEXT));
+                    });
+                } else {
+                    egui::ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
+                        for item in &self.global_deleted_items {
+                            let chat_name = self
+                                .dialogs
+                                .iter()
+                                .find(|d| d.id == item.peer)
+                                .map_or_else(|| format!("Чат {}", item.peer), |d| d.name.clone());
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(chat_name).strong().color(ORANGE));
+                                    ui.label(
+                                        RichText::new(format!("#{} · {}", item.msg_id, full_date(item.date)))
+                                            .size(11.5)
+                                            .color(SUBTEXT),
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("Копия").clicked() {
+                                            ctx.copy_text(item.text.clone());
+                                        }
+                                        if self.dialogs.iter().any(|d| d.id == item.peer)
+                                            && ui.small_button("В чат").clicked()
+                                        {
+                                            jump_to = Some((item.peer, item.msg_id));
+                                        }
+                                    });
+                                });
+                                ui.label(RichText::new(&item.text).color(WHITE));
+                            });
+                            ui.add_space(3.0);
+                        }
+                    });
+                }
+            });
+        self.global_deleted_open = open;
+        if let Some(q) = reload_q {
+            self.send(Cmd::GlobalDeletedLog(q));
+        }
+        if let Some((pid, mid)) = jump_to {
+            self.global_deleted_open = false;
+            if let Some(i) = self.dialogs.iter().position(|d| d.id == pid) {
+                self.open_dialog(i);
+                self.scroll_to = Some(mid);
+                self.highlight_msg = Some((mid, ctx.input(|k| k.time)));
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.global_deleted_open = false;
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn date_jump_window(&mut self, ctx: &egui::Context) {
+        if !self.date_jump_open {
+            return;
+        }
+        let Some(sel) = self.selected else {
+            self.date_jump_open = false;
+            return;
+        };
+        let mut open = self.date_jump_open;
+        let mut target_ts: Option<i32> = None;
+        let now_i32 = i32::try_from(self.now).unwrap_or(i32::MAX);
+        egui::Window::new("Переход к дате")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(330.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Быстрый переход:").size(12.5).color(SUBTEXT));
+                ui.horizontal_wrapped(|ui| {
+                    for (lbl, ts) in [
+                        ("Сегодня", now_i32),
+                        ("Вчера", now_i32.saturating_sub(86_400)),
+                        ("Неделя", now_i32.saturating_sub(7 * 86_400)),
+                        ("Месяц", now_i32.saturating_sub(30 * 86_400)),
+                        ("Год", now_i32.saturating_sub(365 * 86_400)),
+                        ("Начало чата", 1),
+                    ] {
+                        if ui.button(lbl).clicked() {
+                            target_ts = Some(ts);
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.date_jump_input)
+                            .hint_text("ДД.ММ.ГГГГ")
+                            .desired_width(140.0),
+                    );
+                    if orange_button(ui, "Перейти", Vec2::new(110.0, 28.0)).clicked() {
+                        if let Some(ts) = rg_core::engine::parse_date_dmy(&self.date_jump_input) {
+                            target_ts = Some(ts);
+                        } else {
+                            self.error = "Введите дату в формате ДД.ММ.ГГГГ".to_owned();
+                            self.error_at = self.now;
+                        }
+                    }
+                });
+                ui.separator();
+                let month_names = [
+                    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+                ];
+                let m_name = month_names.get((self.date_jump_month as usize).saturating_sub(1)).copied().unwrap_or("");
+                ui.horizontal(|ui| {
+                    if ui.button("‹").clicked() {
+                        if self.date_jump_month <= 1 {
+                            self.date_jump_month = 12;
+                            self.date_jump_year -= 1;
+                        } else {
+                            self.date_jump_month -= 1;
+                        }
+                    }
+                    ui.label(RichText::new(format!("{m_name} {}", self.date_jump_year)).strong().color(WHITE));
+                    if ui.button("›").clicked() {
+                        if self.date_jump_month >= 12 {
+                            self.date_jump_month = 1;
+                            self.date_jump_year += 1;
+                        } else {
+                            self.date_jump_month += 1;
+                        }
+                    }
+                });
+                let total_days = rg_core::engine::days_in_month(self.date_jump_year, self.date_jump_month);
+                // День недели первого числа месяца (1970-01-01 был четверг -> +3 mod 7 для Пн=0).
+                let first_day_num = rg_core::engine::days_from_civil(
+                    i64::from(self.date_jump_year),
+                    i64::from(self.date_jump_month),
+                    1,
+                );
+                let start_wd = ((first_day_num + 3).rem_euclid(7)) as u32;
+                egui::Grid::new("date-jump-cal").spacing(Vec2::splat(4.0)).show(ui, |ui| {
+                    for wd in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"] {
+                        ui.label(RichText::new(wd).size(11.5).color(SUBTEXT));
+                    }
+                    ui.end_row();
+                    let mut col = 0u32;
+                    for _ in 0..start_wd {
+                        ui.label("");
+                        col += 1;
+                    }
+                    for day in 1..=total_days {
+                        if ui.add_sized([34.0, 26.0], egui::Button::new(day.to_string())).clicked() {
+                            let d = rg_core::engine::days_from_civil(
+                                i64::from(self.date_jump_year),
+                                i64::from(self.date_jump_month),
+                                i64::from(day),
+                            );
+                            if let Ok(ts) = i32::try_from(d * 86_400 + 86_399) {
+                                target_ts = Some(ts);
+                            }
+                        }
+                        col += 1;
+                        if col >= 7 {
+                            ui.end_row();
+                            col = 0;
+                        }
+                    }
+                });
+            });
+        self.date_jump_open = open;
+        if let Some(ts) = target_ts {
+            self.date_jump_open = false;
+            self.history_loading = true;
+            self.send(Cmd::JumpToDate(sel, ts));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.date_jump_open = false;
+        }
+    }
 }

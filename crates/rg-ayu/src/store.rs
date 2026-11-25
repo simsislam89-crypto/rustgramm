@@ -391,6 +391,65 @@ impl MessageStore {
         Ok(out)
     }
 
+    /// Глобальный поиск по всем сохранённым удалённым сообщениям во всех чатах (от свежих к старым).
+    pub async fn search_deleted_global(&self, query: &str, limit: usize) -> Result<Vec<Saved>> {
+        let q = query.trim().to_lowercase();
+        let cap = limit.clamp(1, 500) as i64;
+        let mut out = Vec::new();
+        if q.is_empty() {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT peer,msg_id,text,date,deleted FROM messages
+                     WHERE deleted=1 ORDER BY date DESC, msg_id DESC LIMIT ?1",
+                    params![cap],
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                out.push(row(&r)?);
+            }
+        } else {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT peer,msg_id,text,date,deleted FROM messages
+                     WHERE deleted=1 ORDER BY date DESC, msg_id DESC",
+                    (),
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                let item = row(&r)?;
+                if item.text.to_lowercase().contains(&q) {
+                    out.push(item);
+                    if out.len() >= limit.clamp(1, 500) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Общая статистика локального хранилища: `(всего_сообщений, удалено, записей_правок)`.
+    pub async fn stats(&self) -> Result<(usize, usize, usize)> {
+        let mut total = 0usize;
+        let mut deleted = 0usize;
+        let mut edits = 0usize;
+        let mut r1 = self
+            .conn
+            .query("SELECT COUNT(*), COALESCE(SUM(CASE WHEN deleted!=0 THEN 1 ELSE 0 END),0) FROM messages", ())
+            .await?;
+        if let Some(r) = r1.next().await? {
+            total = usize::try_from(r.get::<i64>(0)?).unwrap_or(0);
+            deleted = usize::try_from(r.get::<i64>(1)?).unwrap_or(0);
+        }
+        let mut r2 = self.conn.query("SELECT COUNT(*) FROM edits", ()).await?;
+        if let Some(r) = r2.next().await? {
+            edits = usize::try_from(r.get::<i64>(0)?).unwrap_or(0);
+        }
+        Ok((total, deleted, edits))
+    }
+
     /// Сохранить или обновить секретный чат E2E.
     pub async fn save_secret_chat(&self, c: &SecretChatRecord) -> Result<()> {
         self.conn
@@ -539,6 +598,48 @@ fn row(r: &Row) -> Result<Saved> {
         date: r.get(3)?,
         deleted: r.get::<i64>(4)? != 0,
     })
+}
+
+/// Экспорт журнала удалённых и изменённых сообщений чата в читаемый TXT.
+pub fn export_audit_txt(chat_title: &str, items: &[SavedAudit]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Журнал удалённых и правок: {chat_title}\nЗаписей: {}\n\n", items.len()));
+    for e in items {
+        let kind = if e.deleted { "УДАЛЕНО" } else { "ИЗМЕНЕНО" };
+        out.push_str(&format!("[{kind}] #{} (unix={})\n", e.msg_id, e.date));
+        for (idx, (old, at)) in e.edits.iter().enumerate() {
+            out.push_str(&format!("  Версия {} (unix={}): {}\n", idx + 1, at, old));
+        }
+        out.push_str(&format!("  Текст: {}\n\n", e.text));
+    }
+    out
+}
+
+/// Экспорт журнала удалённых и изменённых сообщений чата в JSON.
+pub fn export_audit_json(chat_title: &str, items: &[SavedAudit]) -> String {
+    let entries: Vec<serde_json::Value> = items
+        .iter()
+        .map(|e| {
+            let edits: Vec<serde_json::Value> = e
+                .edits
+                .iter()
+                .map(|(old, at)| serde_json::json!({ "text": old, "edited_at": at }))
+                .collect();
+            serde_json::json!({
+                "msg_id": e.msg_id,
+                "date": e.date,
+                "deleted": e.deleted,
+                "text": e.text,
+                "edits": edits,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "chat": chat_title,
+        "count": entries.len(),
+        "items": entries,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -725,5 +826,34 @@ mod tests {
                 "missing expected SQLite index {req} in {names:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn global_deleted_search_stats_and_exports_work() {
+        let s = MessageStore::in_memory().await.unwrap();
+        s.remember(101, 1, "секретный тест", 1000).await.unwrap();
+        s.remember(101, 2, "обычное сообщение", 1005).await.unwrap();
+        s.remember(202, 5, "другой удалённый тест", 1020).await.unwrap();
+        s.record_edit(101, 2, "обновлённое сообщение", 1010).await.unwrap();
+        s.mark_deleted(101, &[1]).await.unwrap();
+        s.mark_deleted(202, &[5]).await.unwrap();
+
+        let (total, deleted, edits) = s.stats().await.unwrap();
+        assert_eq!((total, deleted, edits), (3, 2, 1));
+
+        let all_del = s.search_deleted_global("", 50).await.unwrap();
+        assert_eq!(all_del.len(), 2);
+        assert_eq!(all_del[0].peer, 202);
+
+        let filtered = s.search_deleted_global("СЕКРЕТ", 50).await.unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].msg_id, 1);
+
+        let audit = s.audit_peer(101).await.unwrap();
+        let txt = export_audit_txt("Тест чат", &audit);
+        assert!(txt.contains("УДАЛЕНО") && txt.contains("ИЗМЕНЕНО"));
+        let js = export_audit_json("Тест чат", &audit);
+        let parsed: serde_json::Value = serde_json::from_str(&js).unwrap();
+        assert_eq!(parsed["count"], 2);
     }
 }

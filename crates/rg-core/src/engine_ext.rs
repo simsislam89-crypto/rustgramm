@@ -3055,3 +3055,250 @@ fn local_transcribe_audio(audio_path: &Path, whisper_dir: &Path) -> Result<Strin
         whisper_dir.display()
     ))
 }
+
+/// Строка похожего канала из `channels.getChannelRecommendations`.
+#[derive(Debug, Clone)]
+pub struct SimilarChannelRow {
+    pub peer: PeerRef,
+    pub id: i64,
+    pub title: String,
+    pub username: String,
+    pub participants: i32,
+}
+
+/// Разбирает дату формата `ДД.ММ.ГГГГ` в unix timestamp (конец указанного дня UTC, 23:59:59).
+pub fn parse_date_dmy(input: &str) -> Option<i32> {
+    let trimmed = input.trim();
+    let mut parts = trimmed.split(['.', '-', '/']);
+    let d: i64 = parts.next()?.trim().parse().ok()?;
+    let m: i64 = parts.next()?.trim().parse().ok()?;
+    let y: i64 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() || !(1970..=2099).contains(&y) || !(1..=12).contains(&m) {
+        return None;
+    }
+    let max_d = days_in_month(y as i32, m as u32) as i64;
+    if d < 1 || d > max_d {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    let ts = days * 86_400 + 86_399;
+    i32::try_from(ts).ok()
+}
+
+pub fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 30,
+    }
+}
+
+/// Преобразует дату (UTC) в число дней от 1970-01-01 (алгоритм Hinnant `days_from_civil`).
+pub fn days_from_civil(mut y: i64, m: i64, d: i64) -> i64 {
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+impl Engine {
+    /// Загружает похожие каналы (`channels.getChannelRecommendations`).
+    pub async fn similar_channels(&self, peer: PeerRef) -> Result<Vec<SimilarChannelRow>, String> {
+        use grammers_session::types::{PeerAuth, PeerId};
+        let input_ch = peer_to_input_channel(peer)?;
+        let res = self
+            .invoke_retry(
+                "channels.getChannelRecommendations",
+                &tl::functions::channels::GetChannelRecommendations {
+                    channel: Some(input_ch),
+                },
+            )
+            .await
+            .map_err(|e| format!("Похожие каналы: {e}"))?;
+        let chats = match res {
+            tl::enums::messages::Chats::Chats(c) => c.chats,
+            tl::enums::messages::Chats::Slice(c) => c.chats,
+        };
+        let mut out = Vec::new();
+        for ch in chats {
+            if let tl::enums::Chat::Channel(c) = ch
+                && let Some(pid) = PeerId::channel(c.id)
+            {
+                let peer = PeerRef {
+                    id: pid,
+                    auth: PeerAuth::from_hash(c.access_hash.unwrap_or(0)),
+                };
+                out.push(SimilarChannelRow {
+                    peer,
+                    id: -1_000_000_000_000 - c.id,
+                    title: c.title,
+                    username: c.username.unwrap_or_default(),
+                    participants: c.participants_count.unwrap_or(0),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Переход к сообщениям на указанную дату (`messages.getHistory { offset_date }`).
+    /// При `target_unix <= 1` загружает начало переписки.
+    pub async fn history_at_date(
+        &self,
+        peer: PeerRef,
+        target_unix: i32,
+    ) -> Result<Vec<super::MessageRow>, String> {
+        let (offset_id, offset_date, add_offset, limit) = if target_unix <= 1 {
+            (1, 0, -39, 40)
+        } else {
+            (0, target_unix, -15, 40)
+        };
+        let res = self
+            .invoke_retry(
+                "messages.getHistory(date)",
+                &tl::functions::messages::GetHistory {
+                    peer: peer.into(),
+                    offset_id,
+                    offset_date,
+                    add_offset,
+                    limit,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                },
+            )
+            .await
+            .map_err(|e| format!("Переход к дате: {e}"))?;
+        let mut rows = super::tl_messages_to_rows(&res);
+        rows.sort_by_key(|m| (m.date, m.id));
+        Ok(rows)
+    }
+
+    /// Общие группы/каналы с пользователем (`messages.getCommonChats`).
+    pub async fn common_chats(
+        &self,
+        user: PeerRef,
+        limit: i32,
+    ) -> Result<Vec<super::ContactRow>, String> {
+        use grammers_session::types::{PeerAuth, PeerId};
+        let user_id = peer_to_input_user(user)?;
+        let res = self
+            .invoke_retry(
+                "messages.getCommonChats",
+                &tl::functions::messages::GetCommonChats {
+                    user_id,
+                    max_id: 0,
+                    limit: limit.clamp(1, 100),
+                },
+            )
+            .await
+            .map_err(|e| format!("Общие группы: {e}"))?;
+        let chats = match res {
+            tl::enums::messages::Chats::Chats(c) => c.chats,
+            tl::enums::messages::Chats::Slice(c) => c.chats,
+        };
+        let mut out = Vec::new();
+        for ch in chats {
+            match ch {
+                tl::enums::Chat::Channel(c) => {
+                    let Some(pid) = PeerId::channel(c.id) else {
+                        continue;
+                    };
+                    let peer = PeerRef {
+                        id: pid,
+                        auth: PeerAuth::from_hash(c.access_hash.unwrap_or(0)),
+                    };
+                    let status = c
+                        .participants_count
+                        .map_or_else(|| "Супергруппа".to_owned(), |n| format!("{n} участников"));
+                    out.push(super::ContactRow {
+                        peer,
+                        id: -1_000_000_000_000 - c.id,
+                        name: c.title,
+                        status,
+                    });
+                }
+                tl::enums::Chat::Chat(c) => {
+                    let Some(pid) = PeerId::chat(c.id) else {
+                        continue;
+                    };
+                    let peer = PeerRef {
+                        id: pid,
+                        auth: PeerAuth::default(),
+                    };
+                    out.push(super::ContactRow {
+                        peer,
+                        id: -c.id,
+                        name: c.title,
+                        status: format!("{} участников", c.participants_count),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Добавить или обновить пользователя в списке контактов Telegram (`contacts.addContact`).
+    pub async fn add_contact(
+        &self,
+        user: PeerRef,
+        first_name: &str,
+        last_name: &str,
+        phone: &str,
+    ) -> Result<(), String> {
+        let first = first_name.trim();
+        if first.is_empty() {
+            return Err("Укажите имя контакта".to_owned());
+        }
+        let id = peer_to_input_user(user)?;
+        self.invoke_retry(
+            "contacts.addContact",
+            &tl::functions::contacts::AddContact {
+                add_phone_privacy_exception: false,
+                id,
+                first_name: first.to_owned(),
+                last_name: last_name.trim().to_owned(),
+                phone: phone.trim().to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Добавление контакта: {e}"))?;
+        Ok(())
+    }
+
+    /// Удалить пользователя из контактов Telegram (`contacts.deleteContacts`).
+    pub async fn delete_contact(&self, user: PeerRef) -> Result<(), String> {
+        let id = peer_to_input_user(user)?;
+        self.invoke_retry(
+            "contacts.deleteContacts",
+            &tl::functions::contacts::DeleteContacts { id: vec![id] },
+        )
+        .await
+        .map_err(|e| format!("Удаление контакта: {e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod v22_ext_tests {
+    use super::*;
+
+    #[test]
+    fn parses_dmy_dates_and_rejects_invalid_calendar() {
+        let t = parse_date_dmy("01.01.1970").unwrap();
+        assert_eq!(t, 86_399);
+        assert!(parse_date_dmy("29.02.2024").is_some());
+        assert!(parse_date_dmy("29.02.2025").is_none());
+        assert!(parse_date_dmy("32.01.2026").is_none());
+        assert!(parse_date_dmy("abc").is_none());
+    }
+}

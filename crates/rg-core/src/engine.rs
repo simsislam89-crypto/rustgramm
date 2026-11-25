@@ -2884,6 +2884,19 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Глобальный поиск по всем сохранённым удалённым сообщениям во всех чатах.
+    pub async fn global_deleted(&self, query: &str, limit: usize) -> Vec<rg_ayu::store::Saved> {
+        self.store
+            .search_deleted_global(query, limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Статистика локальной базы (всего сообщений, удалённых, правок).
+    pub async fn store_stats(&self) -> (usize, usize, usize) {
+        self.store.stats().await.unwrap_or((0, 0, 0))
+    }
+
     /// Окончательно удалить уже удалённое сообщение только у себя из локальной БД.
     pub async fn purge_local_deleted(&self, peer: &PeerRef, msg_id: i32) {
         let _ = self.store.purge_deleted(peer_key(peer), msg_id).await;

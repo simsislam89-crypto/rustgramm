@@ -530,6 +530,29 @@ struct App {
     profile_bday_synced: bool,
     /// Время появления анимации броска/игры (`🎲 🎯 🏀 ⚽ 🎰 🎳`).
     dice_spawn_times: HashMap<i32, f64>,
+    /// Похожие каналы (`channel_id -> список`), уже запрошенные каналы и раскрытые карточки.
+    similar_channels: HashMap<i64, Vec<rg_core::engine::SimilarChannelRow>>,
+    similar_req: HashSet<i64>,
+    similar_expanded: HashSet<i64>,
+    /// Глобальный журнал удалённых сообщений по всем чатам.
+    global_deleted_open: bool,
+    global_deleted_query: String,
+    global_deleted_items: Vec<rg_ayu::store::Saved>,
+    global_deleted_stats: (usize, usize, usize),
+    /// Локально прочитанные чаты в режиме призрака (`dialog_id -> date`).
+    local_read_dates: HashMap<i64, i64>,
+    /// Переход к дате (календарь + `messages.getHistory { offset_date }`).
+    date_jump_open: bool,
+    date_jump_input: String,
+    date_jump_year: i32,
+    date_jump_month: u32,
+    date_jump_active: bool,
+    /// Общие группы с собеседником и редактор контакта в правой панели.
+    common_chats: HashMap<i64, Vec<ContactRow>>,
+    common_chats_req: HashSet<i64>,
+    contact_edit_open: Option<i64>,
+    contact_first: String,
+    contact_last: String,
 }
 
 pub(crate) struct ShotModal {
@@ -1043,6 +1066,24 @@ impl App {
             profile_bday_year: String::new(),
             profile_bday_synced: false,
             dice_spawn_times: HashMap::new(),
+            similar_channels: HashMap::new(),
+            similar_req: HashSet::new(),
+            similar_expanded: HashSet::new(),
+            global_deleted_open: false,
+            global_deleted_query: String::new(),
+            global_deleted_items: Vec::new(),
+            global_deleted_stats: (0, 0, 0),
+            local_read_dates: HashMap::new(),
+            date_jump_open: false,
+            date_jump_input: String::new(),
+            date_jump_year: 2026,
+            date_jump_month: 11,
+            date_jump_active: false,
+            common_chats: HashMap::new(),
+            common_chats_req: HashSet::new(),
+            contact_edit_open: None,
+            contact_first: String::new(),
+            contact_last: String::new(),
         }
     }
 
@@ -1558,6 +1599,30 @@ impl App {
         }
         self.status = "Отмечаем чаты прочитанными на сервере…".to_owned();
         self.send(Cmd::ForceReadAll);
+    }
+
+    /// Отмечает один чат прочитанным локально (без отправки `ReadHistory` на сервер Telegram).
+    pub(crate) fn local_read_dialog(&mut self, idx: usize) {
+        if let Some(d) = self.dialogs.get_mut(idx) {
+            d.unread = 0;
+            d.unread_mentions = 0;
+            d.unread_reactions = 0;
+            self.local_read_dates.insert(d.id, d.date);
+            self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+            self.status = format!("«{}» прочитан локально (без отправки на сервер)", d.name);
+        }
+    }
+
+    /// Отмечает все чаты прочитанными локально без отправки статусов чтения на сервер Telegram.
+    pub(crate) fn local_read_all(&mut self) {
+        for d in &mut self.dialogs {
+            d.unread = 0;
+            d.unread_mentions = 0;
+            d.unread_reactions = 0;
+            self.local_read_dates.insert(d.id, d.date);
+        }
+        self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+        self.status = "Все чаты прочитаны локально (без отправки на сервер)".to_owned();
     }
 
     /// Мини-плеер музыки/аудио сверху чата (как в Telegram/AyuGram).
@@ -2267,6 +2332,7 @@ impl App {
         self.hidden.clear();
         self.older_pending = false;
         self.history_end = false;
+        self.date_jump_active = false;
         self.scroll_to = None;
         self.highlight_msg = None;
         self.autoscroll_anchor = None;
@@ -2670,9 +2736,18 @@ impl App {
                     }
                 }
                 Ev::Me(n) => self.me = n,
-                Ev::Dialogs(d) => {
+                Ev::Dialogs(mut d) => {
                     // Открытый чат ищем по идентификатору: порядок строк мог измениться.
                     let keep = self.selected.and_then(|i| self.dialogs.get(i)).map(|x| x.id);
+                    for row in &mut d {
+                        if let Some(&read_at) = self.local_read_dates.get(&row.id)
+                            && row.date <= read_at
+                        {
+                            row.unread = 0;
+                            row.unread_mentions = 0;
+                            row.unread_reactions = 0;
+                        }
+                    }
                     self.dialogs = d;
                     self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
                     if let Some(id) = keep {
@@ -2684,7 +2759,14 @@ impl App {
                     if !batch.is_empty() {
                         let mut known: HashSet<i64> = self.dialogs.iter().map(|d| d.id).collect();
                         let mut added = false;
-                        for row in batch {
+                        for mut row in batch {
+                            if let Some(&read_at) = self.local_read_dates.get(&row.id)
+                                && row.date <= read_at
+                            {
+                                row.unread = 0;
+                                row.unread_mentions = 0;
+                                row.unread_reactions = 0;
+                            }
                             if known.insert(row.id) {
                                 self.dialogs.push(row);
                                 added = true;
@@ -3382,6 +3464,54 @@ impl App {
                 }
                 Ev::BirthdayUpdated(_) => {
                     self.profile_bday_synced = false;
+                }
+                Ev::SimilarChannels(did, list) => {
+                    self.similar_channels.insert(did, list);
+                }
+                Ev::GlobalDeletedLog { query, items, stats } => {
+                    if query == self.global_deleted_query || self.global_deleted_items.is_empty() {
+                        self.global_deleted_items = items;
+                        self.global_deleted_stats = stats;
+                    }
+                }
+                Ev::DateJumpHistory(did, rows, _target_unix) => {
+                    if let Some(idx) = self
+                        .selected
+                        .filter(|&i| self.dialogs.get(i).is_some_and(|d| d.id == did))
+                    {
+                        self.known.clear();
+                        self.arrived.clear();
+                        let now_t = ctx.input(|i| i.time);
+                        for r in &rows {
+                            self.known.insert(r.id);
+                            self.arrived.insert(r.id, now_t);
+                        }
+                        self.request_previews(idx, &rows);
+                        self.scroll_to = rows.first().map(|r| r.id);
+                        self.messages = rows;
+                        self.history_loading = false;
+                        self.older_pending = false;
+                        self.date_jump_active = true;
+                    }
+                }
+                Ev::CommonChats(uid, list) => {
+                    self.common_chats.insert(uid, list);
+                }
+                Ev::ContactUpdated(uid, is_contact, name) => {
+                    if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == uid) {
+                        d.contact = is_contact;
+                        if is_contact && !name.is_empty() {
+                            d.name = name.clone();
+                        }
+                        self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+                    }
+                    if let Some(info) = self.peer_infos.get_mut(&uid)
+                        && is_contact
+                        && !name.is_empty()
+                    {
+                        info.name = name;
+                    }
+                    self.contact_edit_open = None;
                 }
                 Ev::Status(s) => {
                     self.status = s;
@@ -4639,6 +4769,7 @@ impl App {
                             DialogAct::Mute(!d.muted),
                         );
                         if d.unread > 0 {
+                            item(ui, "menu/read", "Прочитать локально", DialogAct::LocalRead);
                             item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
                         } else {
                             item(ui, "menu/unread", "Отметить непрочитанным", DialogAct::Unread(true));
@@ -4663,6 +4794,7 @@ impl App {
             match a {
                 DialogAct::Pin(on) => self.send(Cmd::PinDialog(i, on)),
                 DialogAct::Mute(on) => self.toggle_mute_dialog(i, on),
+                DialogAct::LocalRead => self.local_read_dialog(i),
                 DialogAct::Read => {
                     if let Some(d) = self.dialogs.get_mut(i) {
                         d.unread = 0;
@@ -4724,6 +4856,7 @@ fn notify_toast(title: &str, body: &str) {
 enum DialogAct {
     Pin(bool),
     Mute(bool),
+    LocalRead,
     Read,
     Unread(bool),
     Archive(bool),
@@ -5109,6 +5242,8 @@ impl App {
         self.poll_creator_window(ctx);
         self.hashtag_search_window(ctx);
         self.quick_switcher_window(ctx);
+        self.global_deleted_window(ctx);
+        self.date_jump_window(ctx);
         if let Some((path, caption, reply_to, opts)) =
             media_editor::media_editor_window(ctx, &mut self.media_editor, &worker::home().join("cache"))
         {
@@ -5460,6 +5595,7 @@ pub fn native_options() -> eframe::NativeOptions {
 
 /// Запуск интерфейса с готовыми параметрами (ПК и Android).
 pub fn run(options: eframe::NativeOptions) -> eframe::Result {
+    rg_core::diag::install_panic_hook();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ev_tx, ev_rx): (Sender<Ev>, Receiver<Ev>) = channel();
     eframe::run_native(
@@ -5910,5 +6046,30 @@ mod tests {
 
         app.on_live(&ctx, rg_core::engine::Live::MessageReactions(did, 5, 2));
         assert_eq!(app.dialogs[0].unread_reactions, 2);
+    }
+
+    #[test]
+    fn local_read_clears_unread_and_persists_until_newer_message() {
+        let mut app = demo_app("1");
+        let did = app.dialogs[1].id;
+        let orig_date = app.dialogs[1].date;
+        app.dialogs[1].unread = 7;
+        app.dialogs[1].unread_mentions = 2;
+        app.local_read_dialog(1);
+        assert_eq!(app.dialogs[1].unread, 0);
+        assert_eq!(app.dialogs[1].unread_mentions, 0);
+        assert_eq!(app.local_read_dates.get(&did), Some(&orig_date));
+
+        let ctx = egui::Context::default();
+        let mut refreshed = app.dialogs.clone();
+        refreshed[1].unread = 7;
+        app.handle_event(&ctx, Ev::Dialogs(refreshed));
+        assert_eq!(app.dialogs[1].unread, 0, "stale server refresh must stay locally read");
+
+        let mut newer = app.dialogs.clone();
+        newer[1].date = orig_date + 60;
+        newer[1].unread = 1;
+        app.handle_event(&ctx, Ev::Dialogs(newer));
+        assert_eq!(app.dialogs[1].unread, 1, "newer message must restore unread badge");
     }
 }

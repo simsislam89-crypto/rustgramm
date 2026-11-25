@@ -352,10 +352,13 @@ impl App {
                         ui.painter().circle_filled(Pos2::new(c.x, c.y + dy), r_dot, dc);
                     }
                 }
-                let sel = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.pinned, d.muted, d.archived, d.saved)));
+                let sel = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.pinned, d.muted, d.archived, d.saved, d.unread)));
                 let mut act: Option<Cmd> = None;
                 let mut search = false;
                 let mut open_sched = false;
+                let mut open_date_jump = false;
+                let mut open_global_deleted = false;
+                let mut do_local_read = false;
                 egui::Popup::menu(&dots.on_hover_cursor(egui::CursorIcon::PointingHand)).show(|ui| {
                     ui.set_min_width(220.0);
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -363,11 +366,15 @@ impl App {
                         search = true;
                         ui.close();
                     }
+                    if kit::menu_item(ui, "settings/timer", "Перейти к дате", false) {
+                        open_date_jump = true;
+                        ui.close();
+                    }
                     if kit::menu_item(ui, "settings/ttl", "Отложенные / Напоминания", false) {
                         open_sched = true;
                         ui.close();
                     }
-                    if let Some((i, pinned, muted, archived, saved)) = sel {
+                    if let Some((i, pinned, muted, archived, saved, unread)) = sel {
                         if kit::menu_item(ui, if pinned { "menu/unpin" } else { "menu/pin" }, if pinned { "Открепить" } else { "Закрепить" }, false) {
                             act = Some(Cmd::PinDialog(i, !pinned));
                             ui.close();
@@ -376,12 +383,20 @@ impl App {
                             act = Some(Cmd::MuteDialog(i, !muted));
                             ui.close();
                         }
+                        if unread > 0 && kit::menu_item(ui, "menu/read", "Прочитать локально", false) {
+                            do_local_read = true;
+                            ui.close();
+                        }
                         if kit::menu_item(ui, "menu/read", "Прочитать на сервере", false) {
                             act = Some(Cmd::ForceRead);
                             ui.close();
                         }
                         if kit::menu_item(ui, "menu/edited_status", "Удалённые и правки", false) {
                             act = Some(Cmd::SavedHistory);
+                            ui.close();
+                        }
+                        if kit::menu_item(ui, "menu/edited_status", "Глобальный журнал удалённых", false) {
+                            open_global_deleted = true;
                             ui.close();
                         }
                         if !saved
@@ -397,6 +412,16 @@ impl App {
                         }
                     }
                 });
+                if open_date_jump {
+                    self.date_jump_open = true;
+                }
+                if open_global_deleted {
+                    self.global_deleted_open = true;
+                    self.send(Cmd::GlobalDeletedLog(self.global_deleted_query.clone()));
+                }
+                if do_local_read && let Some(i) = self.selected {
+                    self.local_read_dialog(i);
+                }
                 if open_sched {
                     self.scheduled_open = true;
                     self.send(Cmd::LoadScheduled);
@@ -481,10 +506,18 @@ impl App {
             self.send(Cmd::PeerInfo(i));
         }
         let is_group = d.id < 0;
+        let is_user = !is_group && !d.saved && d.kind == rg_core::engine::DialogKind::User;
         if is_group && self.participants_req.insert(d.id) {
             self.send(Cmd::Participants(i));
         }
         let info = self.peer_infos.get(&d.id).cloned();
+        if is_group
+            && info.as_ref().is_some_and(|x| x.broadcast)
+            && !self.settings.ayu.hide_similar_channels
+            && self.similar_req.insert(d.id)
+        {
+            self.send(Cmd::SimilarChannels(i));
+        }
         let members_list = self.participants.get(&d.id).cloned().unwrap_or_default();
         let w = ui.available_width();
         ui.set_clip_rect(ui.max_rect());
@@ -797,9 +830,99 @@ impl App {
             }
 
             kit::divider(ui);
-            // Вкладки общих материалов и участников (Медиа / Файлы / Ссылки / Участники).
+            // Управление контактом для личного диалога (Добавить / Изменить / Удалить).
+            let mut contact_save: Option<(String, String, String)> = None;
+            let mut contact_del = false;
+            if is_user {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    if d.contact {
+                        if ui.button("Изменить контакт").clicked() {
+                            if self.contact_edit_open == Some(d.id) {
+                                self.contact_edit_open = None;
+                            } else {
+                                let mut sp = d.name.splitn(2, ' ');
+                                self.contact_first = sp.next().unwrap_or("").to_owned();
+                                self.contact_last = sp.next().unwrap_or("").to_owned();
+                                self.contact_edit_open = Some(d.id);
+                            }
+                        }
+                        if ui.button(RichText::new("Удалить контакт").color(DANGER)).clicked() {
+                            contact_del = true;
+                        }
+                    } else if orange_button(ui, "+ В контакты", Vec2::new(140.0, 28.0)).clicked() {
+                        if self.contact_edit_open == Some(d.id) {
+                            self.contact_edit_open = None;
+                        } else {
+                            let mut sp = d.name.splitn(2, ' ');
+                            self.contact_first = sp.next().unwrap_or("").to_owned();
+                            self.contact_last = sp.next().unwrap_or("").to_owned();
+                            self.contact_edit_open = Some(d.id);
+                        }
+                    }
+                });
+                if self.contact_edit_open == Some(d.id) {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.add(egui::TextEdit::singleline(&mut self.contact_first).hint_text("Имя").desired_width(110.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.contact_last).hint_text("Фамилия").desired_width(110.0));
+                        if orange_button(ui, "OK", Vec2::new(42.0, 26.0)).clicked() {
+                            let ph = info.as_ref().map_or_else(String::new, |x| x.phone.clone());
+                            contact_save = Some((self.contact_first.clone(), self.contact_last.clone(), ph));
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                kit::divider(ui);
+            }
+
+            // Похожие каналы (`channels.getChannelRecommendations`) с учётом hide / collapse.
+            if is_group
+                && info.as_ref().is_some_and(|x| x.broadcast)
+                && !self.settings.ayu.hide_similar_channels
+                && let Some(sim_list) = self.similar_channels.get(&d.id).cloned()
+                && !sim_list.is_empty()
+            {
+                let collapsed_def = self.settings.ayu.collapse_similar_channels;
+                let is_open_sim = !collapsed_def || self.similar_expanded.contains(&d.id);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    let lbl = if is_open_sim {
+                        format!("Похожие каналы ({}) ▾", sim_list.len())
+                    } else {
+                        format!("Похожие каналы ({}) ▸", sim_list.len())
+                    };
+                    if ui.button(RichText::new(lbl).color(ORANGE).size(12.5)).clicked() {
+                        if self.similar_expanded.contains(&d.id) {
+                            self.similar_expanded.remove(&d.id);
+                        } else {
+                            self.similar_expanded.insert(d.id);
+                        }
+                    }
+                });
+                if is_open_sim {
+                    for sc in sim_list.iter().take(12) {
+                        let sub_txt = if !sc.username.is_empty() {
+                            format!("@{}", sc.username)
+                        } else if sc.participants > 0 {
+                            format!("{} подп.", sc.participants)
+                        } else {
+                            String::new()
+                        };
+                        if kit::nav_row(ui, "menu/channel", &short(&sc.title, 26), &sub_txt) {
+                            open_contact = Some((sc.peer, sc.id, sc.title.clone()));
+                        }
+                    }
+                }
+                kit::divider(ui);
+            }
+
+            // Вкладки общих материалов, участников и общих групп.
             let tabs: &[(&str, usize)] = if is_group {
                 &[("Медиа", 0), ("Файлы", 1), ("Ссылки", 2), ("Люди", 3)]
+            } else if is_user {
+                &[("Медиа", 0), ("Файлы", 1), ("Ссылки", 2), ("Общие", 3)]
             } else {
                 &[("Медиа", 0), ("Файлы", 1), ("Ссылки", 2)]
             };
@@ -917,7 +1040,22 @@ impl App {
                     }
                 }
                 _ => {
-                    if members_list.is_empty() {
+                    if is_user {
+                        if self.common_chats_req.insert(d.id) {
+                            cmd_after = Some(Cmd::CommonChats(i));
+                        }
+                        let common = self.common_chats.get(&d.id).cloned().unwrap_or_default();
+                        if common.is_empty() {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| ui.label(RichText::new("Нет общих групп").size(12.5).color(SUBTEXT)));
+                        } else {
+                            for c in &common {
+                                if kit::nav_row(ui, "menu/group", &short(&c.name, 26), &c.status) {
+                                    open_contact = Some((c.peer, c.id, c.name.clone()));
+                                }
+                            }
+                        }
+                    } else if members_list.is_empty() {
                         ui.add_space(16.0);
                         ui.vertical_centered(|ui| ui.label(RichText::new("Список участников недоступен или пуст").size(12.5).color(SUBTEXT)));
                     } else {
@@ -950,6 +1088,16 @@ impl App {
                 }
             }
             ui.add_space(16.0);
+            if let Some((fnm, lnm, ph)) = contact_save {
+                cmd_after = Some(Cmd::AddContact {
+                    idx: i,
+                    first_name: fnm,
+                    last_name: lnm,
+                    phone: ph,
+                });
+            } else if contact_del {
+                cmd_after = Some(Cmd::DeleteContact(i));
+            }
         });
 
         self.info_tab = info_tab;
@@ -2641,6 +2789,23 @@ impl App {
                     });
                 });
         }
+        if self.date_jump_active
+            && let Some(idx) = self.selected
+        {
+            egui::Frame::new()
+                .fill(t2(WINDOW_BG))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Просмотр истории на выбранную дату").size(12.5).color(ORANGE));
+                        if ui.small_button("← К новым сообщениям").clicked() {
+                            self.date_jump_active = false;
+                            self.history_loading = true;
+                            self.send(Cmd::Open(idx));
+                        }
+                    });
+                });
+        }
         let viewport_h = ui.available_height();
         let clip_rect = ui.clip_rect();
         // Быстрый скролл при нажатии колёсика мыши (Middle Click Auto-Scroll) и ускорение колеса (Shift/Alt/Middle ×3.5).
@@ -2918,8 +3083,8 @@ impl App {
                             i = j;
                             continue;
                         }
-                        if new_day {
-                            day_pill(ui, env.avail, day_label(m.date, now));
+                        if new_day && day_pill(ui, env.avail, day_label(m.date, now)) {
+                            self.date_jump_open = true;
                         }
                         for item in album {
                             rendered_ids.push(item.id);
@@ -4145,18 +4310,36 @@ impl App {
         // Журнал удалённых и изменённых сообщений чата (`ayu/ui/message_history`).
         if let Some((_peer_id, entries)) = self.audit_history.clone() {
             let mut open = true;
+            let mut export_fmt: Option<bool> = None;
+            let mut open_global = false;
+            let chat_title = self
+                .selected
+                .and_then(|i| self.dialogs.get(i))
+                .map_or_else(|| "Чат".to_owned(), |d| d.name.clone());
             egui::Window::new("Удалённые и история правок")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([430.0, 460.0])
+                .default_size([440.0, 480.0])
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Экспорт TXT").clicked() {
+                            export_fmt = Some(false);
+                        }
+                        if ui.small_button("Экспорт JSON").clicked() {
+                            export_fmt = Some(true);
+                        }
+                        if ui.small_button("Глобальный журнал").clicked() {
+                            open_global = true;
+                        }
+                    });
+                    ui.separator();
                     if entries.is_empty() {
                         ui.label(RichText::new("В этом чате пока нет сохранённых удалённых сообщений или правок.").color(SUBTEXT));
                         return;
                     }
-                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
                         for e in &entries {
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
@@ -4184,7 +4367,14 @@ impl App {
                         }
                     });
                 });
-            if !open {
+            if let Some(as_json) = export_fmt {
+                self.send(Cmd::ExportChatAudit { chat_title, as_json });
+            }
+            if open_global {
+                self.audit_history = None;
+                self.global_deleted_open = true;
+                self.send(Cmd::GlobalDeletedLog(self.global_deleted_query.clone()));
+            } else if !open {
                 self.audit_history = None;
             }
         }
@@ -4850,16 +5040,21 @@ impl App {
     }
 }
 
-fn day_pill(ui: &mut egui::Ui, avail: f32, label: String) {
+fn day_pill(ui: &mut egui::Ui, avail: f32, label: String) -> bool {
     let galley = ui
         .painter()
         .layout_no_wrap(label, FontId::proportional(14.0), Color32::WHITE);
     let size = galley.size() + Vec2::new(24.0, 8.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, size.y + 8.0), Sense::hover());
     let pill = egui::Rect::from_center_size(rect.center(), size);
-    ui.painter().rect_filled(pill, egui::CornerRadius::same(14), t(SERVICE_BG));
+    let resp = ui.interact(pill, ui.make_persistent_id(("day-pill", rect.min.y as i32)), Sense::click());
+    let bg = if resp.hovered() { t_btn(ORANGE) } else { t(SERVICE_BG) };
+    ui.painter().rect_filled(pill, egui::CornerRadius::same(14), bg);
     ui.painter()
         .galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    resp.on_hover_text("Перейти к дате")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 /// Плавные переливающиеся скелетон-пузыри в стиле iOS, пока грузится история нового чата.

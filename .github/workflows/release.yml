@@ -80,7 +80,7 @@ jobs:
             dist/Rustgramm-Android-Lite.apk
 
   publish-release:
-    name: Publish GitHub Releases (1 Windows + 2 Android)
+    name: Publish Unified GitHub Release (3 Assets)
     needs: [windows-pc, android-apk]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -88,27 +88,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Publish Windows PC Release
+      - name: Publish Unified Release (Windows PC + Android Full & Lite)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "Rustgramm ${{ github.ref_name }} — Windows PC (x64)"
+          name: "Rustgramm ${{ github.ref_name }}"
+          make_latest: true
           generate_release_notes: true
+          body: |
+            Единый релиз Rustgramm ${{ github.ref_name }} (3 файла):
+            - `Rustgramm-Windows-x64.exe` — Windows PC (x64)
+            - `Rustgramm-Android-Full.apk` — Android (arm64, с плагинами)
+            - `Rustgramm-Android-Lite.apk` — Android (arm64, без плагинов)
           files: |
             artifacts/Rustgramm-Windows-x64/Rustgramm-Windows-x64.exe
-      - name: Publish Android Full Release (с плагинами)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "${{ github.ref_name }}-android-full"
-          name: "Rustgramm ${{ github.ref_name }} — Android Full (с плагинами)"
-          body: "Полная версия Rustgramm для Android (arm64) со встроенной системой плагинов exteraGram / AyuGram."
-          files: |
             artifacts/Rustgramm-Android-APKs/Rustgramm-Android-Full.apk
-      - name: Publish Android Lite Release (без плагинов)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "${{ github.ref_name }}-android-lite"
-          name: "Rustgramm ${{ github.ref_name }} — Android Lite (без плагинов)"
-          body: "Облегчённая версия Rustgramm для Android (arm64) без движка плагинов."
-          files: |
             artifacts/Rustgramm-Android-APKs/Rustgramm-Android-Lite.apk
+      - name: Cleanup Old GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          gh release list --limit 200 --json tagName --jq '.[].tagName' | while IFS= read -r tag; do
+            if [ -n "$tag" ] && [ "$tag" != "$CURRENT_TAG" ]; then
+              echo "Deleting old release: $tag"
+              gh release delete "$tag" --yes --cleanup-tag || true
+            fi
+          done

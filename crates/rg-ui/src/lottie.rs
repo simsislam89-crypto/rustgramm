@@ -348,19 +348,20 @@ impl TgsAnim {
     /// Декодирует `.tgs` (gzipped Lottie JSON) или обычный JSON.
     pub fn from_bytes(bytes: &[u8]) -> Option<Arc<Self>> {
         let json_bytes: Vec<u8> = if bytes.starts_with(&[0x1f, 0x8b]) {
-            let mut dec = GzDecoder::new(bytes);
+            let dec = GzDecoder::new(bytes);
             let mut out = Vec::new();
-            dec.read_to_end(&mut out).ok()?;
+            dec.take(8 * 1024 * 1024).read_to_end(&mut out).ok()?;
             out
         } else {
             bytes.to_vec()
         };
         let root: Value = serde_json::from_slice(&json_bytes).ok()?;
-        let fps = root.get("fr").and_then(Value::as_f64).unwrap_or(60.0).max(1.0) as f32;
-        let ip = root.get("ip").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-        let op = root.get("op").and_then(Value::as_f64).unwrap_or(60.0) as f32;
-        let width = root.get("w").and_then(Value::as_f64).unwrap_or(512.0).max(1.0) as f32;
-        let height = root.get("h").and_then(Value::as_f64).unwrap_or(512.0).max(1.0) as f32;
+        let finite_or = |v: f32, def: f32| if v.is_finite() { v } else { def };
+        let fps = finite_or(root.get("fr").and_then(Value::as_f64).unwrap_or(60.0) as f32, 60.0).clamp(1.0, 240.0);
+        let ip = finite_or(root.get("ip").and_then(Value::as_f64).unwrap_or(0.0) as f32, 0.0);
+        let op = finite_or(root.get("op").and_then(Value::as_f64).unwrap_or(60.0) as f32, 60.0);
+        let width = finite_or(root.get("w").and_then(Value::as_f64).unwrap_or(512.0) as f32, 512.0).clamp(1.0, 8192.0);
+        let height = finite_or(root.get("h").and_then(Value::as_f64).unwrap_or(512.0) as f32, 512.0).clamp(1.0, 8192.0);
         let layers = root
             .get("layers")
             .and_then(Value::as_array)
@@ -562,8 +563,11 @@ fn render_shape_list(
             ShapeItem::Rect { pos, size, radius } => {
                 let c = pos.eval(frame);
                 let sz = size.eval(frame);
-                let r = radius.eval(frame).min(sz[0].abs() * 0.5).min(sz[1].abs() * 0.5).max(0.0);
-                contours.push((rounded_rect_pts(c[0], c[1], sz[0], sz[1], r), true));
+                let r_raw = radius.eval(frame);
+                if c[0].is_finite() && c[1].is_finite() && sz[0].is_finite() && sz[1].is_finite() && r_raw.is_finite() {
+                    let r = r_raw.min(sz[0].abs() * 0.5).min(sz[1].abs() * 0.5).max(0.0);
+                    contours.push((rounded_rect_pts(c[0], c[1], sz[0], sz[1], r), true));
+                }
             }
             ShapeItem::Ellipse { pos, size } => {
                 let c = pos.eval(frame);
@@ -703,6 +707,9 @@ fn fill_contours(
     alpha: f32,
     even_odd: bool,
 ) {
+    if ss == 0 || !alpha.is_finite() || alpha <= 0.0 || !rgb[0].is_finite() || !rgb[1].is_finite() || !rgb[2].is_finite() {
+        return;
+    }
     let mut min_y = f32::MAX;
     let mut max_y = f32::MIN;
     let mut edges: Vec<(f32, f32, f32, f32, i32)> = Vec::new();
@@ -714,6 +721,9 @@ fn fill_contours(
         for i in 0..n {
             let a = pts[i];
             let b = pts[(i + 1) % n];
+            if !a[0].is_finite() || !a[1].is_finite() || !b[0].is_finite() || !b[1].is_finite() {
+                continue;
+            }
             min_y = min_y.min(a[1]);
             max_y = max_y.max(a[1]);
             if (a[1] - b[1]).abs() < 1e-5 {
@@ -728,11 +738,20 @@ fn fill_contours(
             edges.push((y0, y1, x0, (x1 - x0) / (y1 - y0), dir));
         }
     }
-    if edges.is_empty() {
+    if edges.is_empty() || !min_y.is_finite() || !max_y.is_finite() {
         return;
     }
-    let y_start = (min_y.floor() as isize).max(0) as usize;
-    let y_end = (max_y.ceil() as isize).clamp(0, ss as isize - 1) as usize;
+    let max_c = (ss as isize) - 1;
+    let y0_i = min_y.floor() as isize;
+    let y1_i = max_y.ceil() as isize;
+    if y1_i < 0 || y0_i > max_c {
+        return;
+    }
+    let y_start = y0_i.clamp(0, max_c) as usize;
+    let y_end = y1_i.clamp(0, max_c) as usize;
+    if y_start > y_end {
+        return;
+    }
     let mut hits: Vec<(f32, i32)> = Vec::new();
     let sr = rgb[0] * alpha;
     let sg = rgb[1] * alpha;
@@ -755,15 +774,17 @@ fn fill_contours(
         for pair in hits.windows(2) {
             winding += pair[0].1;
             let inside = if even_odd { (winding & 1) != 0 } else { winding != 0 };
-            if !inside {
+            if !inside || !pair[0].0.is_finite() || !pair[1].0.is_finite() {
                 continue;
             }
-            let x0 = (pair[0].0.ceil() as isize).max(0) as usize;
-            let x1 = (pair[1].0.floor() as isize).clamp(-1, ss as isize - 1);
-            if x1 < x0 as isize {
+            let x0_i = pair[0].0.ceil() as isize;
+            let x1_i = pair[1].0.floor() as isize;
+            if x1_i < 0 || x0_i > max_c || x1_i < x0_i {
                 continue;
             }
-            for x in x0..=(x1 as usize) {
+            let x0 = x0_i.clamp(0, max_c) as usize;
+            let x1 = x1_i.clamp(0, max_c) as usize;
+            for x in x0..=x1 {
                 let off = (y * ss + x) * 4;
                 fb[off] = sr + fb[off] * inv_a;
                 fb[off + 1] = sg + fb[off + 1] * inv_a;
@@ -782,7 +803,17 @@ fn stroke_contours(
     alpha: f32,
     width: f32,
 ) {
-    let half_r = (width * 0.5).max(0.6);
+    if ss == 0
+        || !width.is_finite()
+        || !alpha.is_finite()
+        || alpha <= 0.0
+        || !rgb[0].is_finite()
+        || !rgb[1].is_finite()
+        || !rgb[2].is_finite()
+    {
+        return;
+    }
+    let half_r = (width * 0.5).clamp(0.6, ss as f32);
     let r2 = half_r * half_r;
     let pad = half_r.ceil() as isize;
     let mut segs: Vec<([f32; 2], [f32; 2])> = Vec::new();
@@ -799,6 +830,9 @@ fn stroke_contours(
         for i in 0..cnt {
             let a = pts[i];
             let b = pts[(i + 1) % pts.len()];
+            if !a[0].is_finite() || !a[1].is_finite() || !b[0].is_finite() || !b[1].is_finite() {
+                continue;
+            }
             min_x = min_x.min(a[0]).min(b[0]);
             min_y = min_y.min(a[1]).min(b[1]);
             max_x = max_x.max(a[0]).max(b[0]);
@@ -806,13 +840,24 @@ fn stroke_contours(
             segs.push((a, b));
         }
     }
-    if segs.is_empty() {
+    if segs.is_empty() || !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
         return;
     }
-    let y0 = ((min_y.floor() as isize) - pad).max(0) as usize;
-    let y1 = ((max_y.ceil() as isize) + pad).clamp(0, ss as isize - 1) as usize;
-    let x0 = ((min_x.floor() as isize) - pad).max(0) as usize;
-    let x1 = ((max_x.ceil() as isize) + pad).clamp(0, ss as isize - 1) as usize;
+    let max_c = (ss as isize) - 1;
+    let x0_i = (min_x.floor() as isize).saturating_sub(pad);
+    let x1_i = (max_x.ceil() as isize).saturating_add(pad);
+    let y0_i = (min_y.floor() as isize).saturating_sub(pad);
+    let y1_i = (max_y.ceil() as isize).saturating_add(pad);
+    if x1_i < 0 || y1_i < 0 || x0_i > max_c || y0_i > max_c {
+        return;
+    }
+    let x0 = x0_i.clamp(0, max_c) as usize;
+    let x1 = x1_i.clamp(0, max_c) as usize;
+    let y0 = y0_i.clamp(0, max_c) as usize;
+    let y1 = y1_i.clamp(0, max_c) as usize;
+    if x0 > x1 || y0 > y1 {
+        return;
+    }
     let sr = rgb[0] * alpha;
     let sg = rgb[1] * alpha;
     let sb = rgb[2] * alpha;
@@ -821,13 +866,23 @@ fn stroke_contours(
     // Отмечаем только пиксели внутри bbox каждого сегмента (O(segs * seg_area) вместо O(W * H * segs)).
     let box_w = x1 - x0 + 1;
     let box_h = y1 - y0 + 1;
-    let mut mask = vec![0u8; box_w * box_h];
+    let Some(mask_len) = box_w.checked_mul(box_h) else {
+        return;
+    };
+    let mut mask = vec![0u8; mask_len];
     let pad_f = half_r + 1.0;
     for &(a, b) in &segs {
-        let sx0 = ((a[0].min(b[0]) - pad_f).floor() as isize).clamp(x0 as isize, x1 as isize) as usize;
-        let sx1 = ((a[0].max(b[0]) + pad_f).ceil() as isize).clamp(x0 as isize, x1 as isize) as usize;
-        let sy0 = ((a[1].min(b[1]) - pad_f).floor() as isize).clamp(y0 as isize, y1 as isize) as usize;
-        let sy1 = ((a[1].max(b[1]) + pad_f).ceil() as isize).clamp(y0 as isize, y1 as isize) as usize;
+        let sx0_i = (a[0].min(b[0]) - pad_f).floor() as isize;
+        let sx1_i = (a[0].max(b[0]) + pad_f).ceil() as isize;
+        let sy0_i = (a[1].min(b[1]) - pad_f).floor() as isize;
+        let sy1_i = (a[1].max(b[1]) + pad_f).ceil() as isize;
+        if sx1_i < x0 as isize || sx0_i > x1 as isize || sy1_i < y0 as isize || sy0_i > y1 as isize {
+            continue;
+        }
+        let sx0 = sx0_i.clamp(x0 as isize, x1 as isize) as usize;
+        let sx1 = sx1_i.clamp(x0 as isize, x1 as isize) as usize;
+        let sy0 = sy0_i.clamp(y0 as isize, y1 as isize) as usize;
+        let sy1 = sy1_i.clamp(y0 as isize, y1 as isize) as usize;
         let vx = b[0] - a[0];
         let vy = b[1] - a[1];
         let len2 = vx * vx + vy * vy;
@@ -900,6 +955,9 @@ fn ellipse_pts(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<[f32; 2]> {
 }
 
 fn polystar_pts(star: bool, pts_f: f32, cx: f32, cy: f32, or: f32, ir: f32, rot_deg: f32) -> Vec<[f32; 2]> {
+    if !pts_f.is_finite() || !cx.is_finite() || !cy.is_finite() || !or.is_finite() || !ir.is_finite() || !rot_deg.is_finite() {
+        return Vec::new();
+    }
     let n = (pts_f.round() as usize).clamp(3, 32);
     let base = rot_deg.to_radians() - std::f32::consts::FRAC_PI_2;
     let count = if star { n * 2 } else { n };
@@ -1326,5 +1384,50 @@ mod tests {
         let lit = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 0.5).count();
         assert!(lit > 300 && lit < 1800, "unexpected stroke pixel count: {lit}");
         assert!(elapsed.as_millis() < 250, "stroke_contours too slow: {elapsed:?}");
+    }
+
+    #[test]
+    fn stroke_and_fill_offscreen_and_non_finite_never_panic() {
+        let mut rgba = vec![0.0_f32; 64 * 64 * 4];
+        let cases = [
+            vec![[100.0, 100.0], [180.0, 180.0], [100.0, 180.0]],
+            vec![[-100.0, -100.0], [-40.0, -20.0], [-80.0, -20.0]],
+            vec![[10.0, 120.0], [30.0, 140.0], [50.0, 120.0]],
+            vec![[120.0, 10.0], [140.0, 30.0], [120.0, 50.0]],
+            vec![[f32::NAN, 10.0], [20.0, f32::INFINITY], [30.0, f32::NEG_INFINITY]],
+        ];
+        for poly in cases {
+            stroke_contours(&mut rgba, 64, &[(poly.clone(), true)], [1.0, 0.5, 0.1], 1.0, 4.0);
+            stroke_contours(&mut rgba, 64, &[(poly.clone(), false)], [1.0, 0.5, 0.1], 1.0, 1e9);
+            fill_contours(&mut rgba, 64, &[(poly, true)], [1.0, 0.5, 0.1], 1.0, false);
+        }
+        stroke_contours(&mut [], 0, &[(vec![[1.0, 1.0], [5.0, 5.0]], false)], [1.0; 3], 1.0, 2.0);
+        fill_contours(&mut [], 0, &[(vec![[1.0, 1.0], [5.0, 5.0], [1.0, 5.0]], true)], [1.0; 3], 1.0, false);
+        stroke_contours(&mut rgba, 64, &[(vec![[5.0, 5.0], [10.0, 10.0]], false)], [1.0; 3], f32::NAN, f32::INFINITY);
+    }
+
+    #[test]
+    #[ignore]
+    fn renders_local_cached_tgs_if_present() {
+        let Some(appdata) = std::env::var_os("APPDATA") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(appdata).join("Rustgramm/accounts/slot_1/cache/tgs");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("tgs")
+                && let Ok(bytes) = std::fs::read(&path)
+                && let Some(anim) = TgsAnim::from_bytes(&bytes)
+            {
+                let _ = anim.render_frame(anim.ip, 256);
+                let _ = anim.render_frame((anim.ip + anim.op) * 0.5, 256);
+                count += 1;
+            }
+        }
+        assert!(count > 0, "no tgs files rendered");
     }
 }

@@ -23,6 +23,43 @@ struct LoggerState {
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static STATE: OnceLock<Mutex<LoggerState>> = OnceLock::new();
+static PANIC_HOOK_ONCE: OnceLock<()> = OnceLock::new();
+
+/// Регистрирует единый хук паник для синхронной записи в `rustgramm.log` и `crash.log` до завершения процесса.
+pub fn install_panic_hook() {
+    PANIC_HOOK_ONCE.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                (*s).to_owned()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_owned()
+            };
+            let loc = info
+                .location()
+                .map_or_else(|| "unknown".to_owned(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+            let thread = std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned();
+            let msg = format!("thread='{thread}' at {loc}: {payload}");
+            error("PANIC", &msg);
+            if let Some(p) = log_path()
+                && let Some(dir) = p.parent()
+            {
+                let crash_path = dir.join("crash.log");
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(crash_path) {
+                    let clean = sanitize_line(&msg);
+                    let _ = writeln!(f, "[{}] [PANIC] {}", timestamp_now(), clean);
+                    let _ = f.flush();
+                }
+            }
+            prev(info);
+        }));
+    });
+}
 
 /// Включить или выключить запись диагностического лога.
 pub fn set_enabled(on: bool) {

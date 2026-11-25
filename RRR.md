@@ -1062,3 +1062,28 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --target aarch64-linux-android` (Full и Lite `--no-default-features`, NDK 27) — **0 ошибок**.
 - `cargo test --workspace` — **2 156 тестов пройдено, 0 провалено, 0 пропущено** (`rg-ayu`: 27+370+320, `rg-core`: 49+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 69+631; включая `cache_tl_peers_persists_channel_hash_and_self_user`, `fast_emoji_precheck_matches_entire_atlas_equivalently`, `optimistic_send_reconciles_confirm_and_fail_cleanly`, `live_read_inbox_draft_and_reactions_update_dialog_state`, тесты `dice_outcome_label`, `validate_username`, `validate_birthday`).
 - `bash scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.21.0`) собран (**20 353 024 байта**, release 5m 07s); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` — **OK** (`ALIVE=True`).
+
+## Этап 34 (2026-11-25, v0.22.0)
+
+### Фикс вылета при входе (`0xc0000409` / `capacity overflow` в `lottie::stroke_contours`), crash-хук, 5 новых функций и правило единого релиза (3 ассета)
+
+1. **Исправлен немедленный вылет при старте/входе (`crates/rg-ui/src/lottie.rs`, `crates/rg-core/src/diag.rs`, `crates/rg-ui/src/lib.rs`)**:
+   - *Причина (доказана по 6 дампам `%LOCALAPPDATA%\CrashDumps\Rustgramm.exe.*.dmp` и дизассемблированию RVA `0xc6a0e5` -> `TgsAnim::render_frame` -> `stroke_contours`):* при растеризации `.tgs`-стикеров/кастомных эмодзи, у которых контур обводки выходил правее или ниже холста (`min_x - pad > ss - 1`), `x0 > x1` (или `y0 > y1`) вызывало целочисленное переполнение `x1 - x0 + 1` -> `vec![0u8; box_w * box_h]` -> панику `capacity overflow` (`alloc/src/raw_vec/mod.rs:29`) и мгновенный `panic = "abort"` (`0xc0000409` / `int 0x29`).
+   - *Решение:* в `stroke_contours` и `fill_contours` добавлена знаковая (`isize`) проверка границ холста до клампа, `checked_mul`, отсечение не-конечных координат (`NaN`/`Infinity`) и лимит распаковки `.tgs` (`8 МБ`); в `diag::install_panic_hook` добавлен синхронный хук записи паник в `rustgramm.log` и `crash.log`. Проверено: рендеринг всех кэшированных `.tgs` в `slot_1\cache\tgs` и живой запуск `dist/Rustgramm.exe` (8+ сек, 0 крашей, 0 новых дампов).
+
+2. **5 новых функций AyuGram / Telegram (`rg-ayu/src/store.rs`, `rg-core/src/{engine,engine_ext}.rs`, `rg-ui/src/{worker,lib,chat,features_ui,settings_ui}.rs`)**:
+   - **Похожие каналы (`channels.getChannelRecommendations`)**: загрузка и отображение рекомендаций в правой панели канала с привязкой `collapse_similar_channels` и `hide_similar_channels`.
+   - **Глобальный журнал удалённых сообщений + экспорт аудита чата (TXT/JSON)**: `MessageStore::search_deleted_global`, `stats`, `export_audit_txt`/`export_audit_json`, модальное окно глобального поиска с переходом в чат и кнопки экспорта в окне «Удалённые и история правок».
+   - **«Прочитать локально» (Local Read)**: `local_read_dialog` / `local_read_all` / `local_read_dates` — обнуляет счётчики непрочитанных локально без отправки `messages.readHistory` в Telegram; исправлена подпись `drawer_l_read_toggle` («Прочитать локально») и добавлены пункты в шторку, контекстное меню и `⋮`.
+   - **Переход к дате (`Jump to Date`)**: `Engine::history_at_date` (`messages.getHistory { offset_date }`), `parse_date_dmy`, интерактивный календарь `date_jump_window`, кликабельные пилюли даты в ленте и плашка возврата к новым сообщениям.
+   - **Общие группы и управление контактами в профиле**: `Engine::common_chats` (`messages.getCommonChats`), `add_contact` / `delete_contact`, вкладка «Общие» и встроенный редактор контакта в правой панели профиля.
+
+3. **Единый релиз GitHub с 3 ассетами и постоянное правило (`.github/workflows/release.yml`, `.agents/skills/allskill/SKILL.md`, `.claude/skills/allskill/SKILL.md`, `RRR.md`, `docs/PARITY.md`)**:
+   - **Правило:** на GitHub Releases всегда публикуется ОДИН единый релиз с ровно 3 ассетами — `Rustgramm-Windows-x64.exe`, `Rustgramm-Android-Full.apk` (с плагинами) и `Rustgramm-Android-Lite.apk` (без плагинов). Все остальные старые релизы и их теги удаляются (`Cleanup Old GitHub Releases`).
+
+### Проверки (v0.22.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `-p rg-ui -p rg-desktop --no-default-features --all-targets -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `cargo check -p rg-android --features plugins` и `--no-default-features` — **OK**.
+- `cargo test --workspace` — **2 160 тестов пройдено, 0 провалено, 1 ignored** (`renders_local_cached_tgs_if_present`, пройдена отдельно `1 passed` по реальному кэшу `.tgs`).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.22.0`) собран (**20 527 616 байт**); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` и живой запуск на реальной сессии (>8 с, без новых дампов) — **OK**.

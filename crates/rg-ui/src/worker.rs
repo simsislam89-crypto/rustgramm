@@ -522,6 +522,28 @@ pub enum Cmd {
     UpdateBirthday(Option<(i32, i32, Option<i32>)>),
     /// Обновить публичный `@username` с проверкой (`account.updateUsername`).
     UpdateUsernameChecked(String),
+    /// Загрузить похожие каналы (`channels.getChannelRecommendations`).
+    SimilarChannels(usize),
+    /// Поиск по глобальному журналу удалённых сообщений во всех чатах.
+    GlobalDeletedLog(String),
+    /// Экспорт журнала удалённых и правок открытого чата в файл (TXT / JSON).
+    ExportChatAudit {
+        chat_title: String,
+        as_json: bool,
+    },
+    /// Загрузить историю чата на указанную дату (unix timestamp).
+    JumpToDate(usize, i32),
+    /// Загрузить общие группы с пользователем (`messages.getCommonChats`).
+    CommonChats(usize),
+    /// Добавить или обновить пользователя в контактах (`contacts.addContact`).
+    AddContact {
+        idx: usize,
+        first_name: String,
+        last_name: String,
+        phone: String,
+    },
+    /// Удалить пользователя из контактов (`contacts.deleteContacts`).
+    DeleteContact(usize),
     Settings(Box<Settings>),
 }
 
@@ -720,6 +742,20 @@ pub enum Ev {
     UsernameUpdated(String),
     /// Обновлена дата рождения аккаунта.
     BirthdayUpdated(Option<(i32, i32, Option<i32>)>),
+    /// Похожие каналы (`channel_id`, список).
+    SimilarChannels(i64, Vec<rg_core::engine::SimilarChannelRow>),
+    /// Результаты глобального поиска по удалённым сообщениям.
+    GlobalDeletedLog {
+        query: String,
+        items: Vec<rg_ayu::store::Saved>,
+        stats: (usize, usize, usize),
+    },
+    /// История чата на выбранную дату (`dialog_id`, сообщения, `target_unix`).
+    DateJumpHistory(i64, Vec<MessageRow>, i32),
+    /// Общие группы с пользователем (`user_id`, список).
+    CommonChats(i64, Vec<ContactRow>),
+    /// Обновление статуса контакта (`user_id`, в контактах, отображаемое имя).
+    ContactUpdated(i64, bool, String),
     Status(String),
     Error(String),
 }
@@ -4425,6 +4461,112 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         Err(e) => out.err(format!("Имя пользователя: {e}")),
                     }
                 });
+            }
+            Cmd::SimilarChannels(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok(list) = eng.similar_channels(peer).await {
+                        out.send(Ev::SimilarChannels(did, list));
+                    }
+                });
+            }
+            Cmd::GlobalDeletedLog(query) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    let (items, stats) = tokio::join!(eng.global_deleted(&query, 200), eng.store_stats());
+                    out.send(Ev::GlobalDeletedLog { query, items, stats });
+                });
+            }
+            Cmd::ExportChatAudit { chat_title, as_json } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let list = engine.audit_peer(&d.peer).await;
+                let did = d.id;
+                let ext = if as_json { "json" } else { "txt" };
+                let content = if as_json {
+                    rg_ayu::store::export_audit_json(&chat_title, &list)
+                } else {
+                    rg_ayu::store::export_audit_txt(&chat_title, &list)
+                };
+                let default_name = format!("audit_{did}.{ext}");
+                let dl_dir = home.join("downloads");
+                let out_c = out.clone();
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(not(target_os = "android"))]
+                    let picked = rfd::FileDialog::new()
+                        .set_file_name(&default_name)
+                        .add_filter(if as_json { "JSON" } else { "TXT" }, &[ext])
+                        .save_file();
+                    #[cfg(target_os = "android")]
+                    let picked = {
+                        let _ = std::fs::create_dir_all(&dl_dir);
+                        Some(dl_dir.join(&default_name))
+                    };
+                    let _ = &dl_dir;
+                    if let Some(path) = picked {
+                        match std::fs::write(&path, content.as_bytes()) {
+                            Ok(()) => out_c.send(Ev::Status(format!(
+                                "Экспортировано записей ({}) → {}",
+                                list.len(),
+                                path.display()
+                            ))),
+                            Err(e) => out_c.err(format!("Экспорт: {e}")),
+                        }
+                    }
+                });
+            }
+            Cmd::JumpToDate(i, target_unix) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng.history_at_date(peer, target_unix).await {
+                        Ok(rows) => out.send(Ev::DateJumpHistory(did, rows, target_unix)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::CommonChats(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok(list) = eng.common_chats(peer, 50).await {
+                        out.send(Ev::CommonChats(did, list));
+                    }
+                });
+            }
+            Cmd::AddContact { idx, first_name, last_name, phone } => {
+                let Some(d) = dialogs.get(idx) else { continue };
+                let full_name = format!("{} {}", first_name.trim(), last_name.trim()).trim().to_owned();
+                match engine.add_contact(d.peer, &first_name, &last_name, &phone).await {
+                    Ok(()) => {
+                        let did = d.id;
+                        if let Some(dm) = dialogs.get_mut(idx) {
+                            dm.contact = true;
+                            if !full_name.is_empty() {
+                                dm.name = full_name.clone();
+                            }
+                        }
+                        out.send(Ev::ContactUpdated(did, true, full_name));
+                        out.send(Ev::Status("Контакт добавлен".into()));
+                    }
+                    Err(e) => out.err(e),
+                }
+            }
+            Cmd::DeleteContact(idx) => {
+                let Some(d) = dialogs.get(idx) else { continue };
+                let did = d.id;
+                let keep_name = d.name.clone();
+                match engine.delete_contact(d.peer).await {
+                    Ok(()) => {
+                        if let Some(dm) = dialogs.get_mut(idx) {
+                            dm.contact = false;
+                        }
+                        out.send(Ev::ContactUpdated(did, false, keep_name));
+                        out.send(Ev::Status("Удалён из контактов".into()));
+                    }
+                    Err(e) => out.err(e),
+                }
             }
             Cmd::Settings(s) => {
                 let s = *s;

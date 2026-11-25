@@ -112,6 +112,16 @@
 | Интерфейс каналов и полноценная ветка комментариев Telegram | ✅ плоская 42px нижняя полоса канала `channel_bottom_bar`, интегрированная строка комментариев поста (`history_comments` + счётчик с плюрализацией + `›`), встроенная на всю высоту панели ветка обсуждения (`discussion_panel`: `←`, карточка поста, пузыри с ответами и реакциями, оптимистичная отправка комментария) | `chat.rs`, `engine.rs`, `worker.rs`, `lib.rs` |
 | 5 новых функций Telegram (облачные черновики, отметка непрочитанным + `@`/`❤`, мини-игры Dice, просмотр и установка стикерпаков, редактор ДР/`@username`) | ✅ `saveDraft`/`getAllDrafts` + автосохранение + превью `Черновик:`; `markDialogUnread`, фильтр «Непрочитанные», FAB `@` и `❤`; `InputMediaDice` (`🎲 🎯 🏀 ⚽ 🎰 🎳`, анимация и расшифровка); `getStickerSet`/`installStickerSet`/`uninstallStickerSet` + модальное окно; `updateBirthday`/`updateUsername` с валидацией | `engine.rs`, `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs`, `media_ui.rs`, `panels.rs`, `tg_settings.rs` |
 
+## Новые функции этапа 34 (v0.22.0)
+
+| Функция | Статус | Где |
+|---|---|---|
+| Похожие каналы (`channels.getChannelRecommendations`) + сворачивание/скрытие | ✅ `Engine::similar_channels`, секция в правой панели канала, привязка `collapse_similar_channels` и `hide_similar_channels` | `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs` |
+| Глобальный журнал удалённых + экспорт истории/правок чата (TXT / JSON) | ✅ `MessageStore::search_deleted_global` / `stats`, `global_deleted_window`, `export_audit_txt` / `export_audit_json` | `store.rs`, `engine.rs`, `worker.rs`, `features_ui.rs`, `chat.rs`, `settings_ui.rs` |
+| Прочитать локально (без отправки в Telegram) + настройка меню | ✅ `local_read_dialog` / `local_read_all`, `local_read_dates`, `drawer_l_read_toggle` («Прочитать локально») и пункты в контекстном меню/`⋮` | `lib.rs`, `chat.rs`, `settings_ui.rs` |
+| Переход к дате (календарь + `messages.getHistory { offset_date }`) | ✅ `Engine::history_at_date`, `parse_date_dmy`, `date_jump_window` (быстрые кнопки + сетка календаря + ввод ДД.ММ.ГГГГ), кликабельные пилюли даты | `engine_ext.rs`, `worker.rs`, `features_ui.rs`, `chat.rs` |
+| Общие группы + добавление/правка/удаление контакта в профиле | ✅ `Engine::common_chats` (`messages.getCommonChats`), `add_contact` / `delete_contact`, вкладка «Общие» и блок контакта в `info_ui` | `engine_ext.rs`, `worker.rs`, `lib.rs`, `chat.rs` |
+
 ## Порядок дальнейших этапов
 1. **Этап 9 — лента как у Telegram:** форматирование текста и ссылки, GIF/видео/голосовые, анимированные стикеры, альбомы.
 2. **Этап 10 — навигация:** папки, архив, контакты, избранное, профили, глобальный поиск.

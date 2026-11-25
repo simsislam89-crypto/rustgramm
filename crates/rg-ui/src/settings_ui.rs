@@ -246,6 +246,9 @@ impl App {
                 if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
                     act = Some("saved");
                 }
+                if a.drawer_l_read_toggle && item(ui, icons::Ico::Read, "Прочитать локально") {
+                    act = Some("local_read");
+                }
                 if a.drawer_s_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
                     act = Some("read");
                 }
@@ -308,6 +311,10 @@ impl App {
             Some("read") => {
                 self.drawer_open = false;
                 self.force_read_all();
+            }
+            Some("local_read") => {
+                self.drawer_open = false;
+                self.local_read_all();
             }
             Some("contacts") => {
                 self.drawer_open = false;
@@ -508,7 +515,14 @@ impl App {
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                                 match tab {
-                                    page::AYU => ayu_page(ui, &mut s, &mut expanded),
+                                    page::AYU => {
+                                        ayu_page(ui, &mut s, &mut expanded);
+                                        divider(ui);
+                                        if nav_row(ui, "menu/edited_status", "Глобальный журнал удалённых", "Поиск по чатам") {
+                                            close = true;
+                                            toast_msg = Some("__open_global_deleted__".to_owned());
+                                        }
+                                    }
                                     page::FILTERS => {
                                         if let Some(p) = filters_page(ui, &mut s) {
                                             tab = p;
@@ -537,7 +551,12 @@ impl App {
         self.font_picker_open = font_open;
         self.font_search = font_search;
         if let Some(m) = toast_msg {
-            self.status = m;
+            if m == "__open_global_deleted__" {
+                self.global_deleted_open = true;
+                self.send(Cmd::GlobalDeletedLog(self.global_deleted_query.clone()));
+            } else {
+                self.status = m;
+            }
         }
         if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.settings_open = false;
@@ -1290,8 +1309,8 @@ fn appearance_page(
     toggle(ui, "Контакты", &mut a.drawer_contacts);
     toggle(ui, "Звонки", &mut a.drawer_calls);
     toggle(ui, "Избранное", &mut a.drawer_saved_messages);
-    toggle(ui, "Прочитать на сервере", &mut a.drawer_l_read_toggle);
-    toggle(ui, "Секретное чтение", &mut a.drawer_s_read_toggle);
+    toggle(ui, "Прочитать локально", &mut a.drawer_l_read_toggle);
+    toggle(ui, "Прочитать на сервере", &mut a.drawer_s_read_toggle);
     toggle(ui, "Ночной режим", &mut a.drawer_night_mode_toggle);
     toggle(ui, "Режим призрака", &mut a.drawer_ghost_toggle);
     toggle(ui, "Режим стримера", &mut a.drawer_streamer_toggle);
