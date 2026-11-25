@@ -17,7 +17,7 @@
 | 2 | Записать одной строкой: «Задача: <тип>. Скиллы: <список>» и вызвать нужные скиллы |
 | 3 | Агенты — только когда выигрывает отдельный контекст (`research`, `search_web`, широкая разведка по крейтам) |
 | 4 | Сверка с живым `AyuGram.exe`, проверка в `dist\Rustgramm.exe` (тестовые сообщения — только в `sudoyp` с удалением за собой) |
-| 5 | Перед «готово»: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `bash scripts/make-dist.sh`, запись в `RRR.md`, `verify-and-stop` |
+| 5 | Перед «готово»: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `bash scripts/make-dist.sh`, запись в `RRR.md`, `verify-and-stop`. **Правило релизов GitHub:** всегда ровно 1 релиз с 3 ассетами (`Rustgramm-Windows-x64.exe`, `Rustgramm-Android-Full.apk`, `Rustgramm-Android-Lite.apk`); остальные удалять |
 
 ## Задача → скиллы
 | Задача | Скиллы |
