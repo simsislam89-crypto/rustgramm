@@ -228,6 +228,27 @@ pub fn tick(p: &Painter, c: Pos2, color: Color32, double: bool) {
     tg(p, if double { "history_received" } else { "history_sent" }, c, color);
 }
 
+/// Чёткая пятиконечная векторная звезда Telegram Stars (без растрового мыла).
+pub fn paint_star(p: &Painter, center: Pos2, radius: f32, fill: Color32) {
+    let outer = radius.max(2.0);
+    let inner = outer * 0.44;
+    let mut mesh = egui::epaint::Mesh::default();
+    let uv = egui::epaint::WHITE_UV;
+    mesh.vertices.push(egui::epaint::Vertex { pos: center, uv, color: fill });
+    for i in 0..10 {
+        let r = if i % 2 == 0 { outer } else { inner };
+        let ang = -std::f32::consts::FRAC_PI_2 + (i as f32) * std::f32::consts::PI / 5.0;
+        let pt = center + Vec2::new(ang.cos() * r, ang.sin() * r);
+        mesh.vertices.push(egui::epaint::Vertex { pos: pt, uv, color: fill });
+    }
+    for i in 0..10u32 {
+        let a = 1 + i;
+        let b = 1 + ((i + 1) % 10);
+        mesh.indices.extend_from_slice(&[0, a, b]);
+    }
+    p.add(Shape::mesh(mesh));
+}
+
 /// Круглый логотип: самолётик на круге.
 pub fn logo(p: &Painter, c: Pos2, r: f32, bg: Color32) {
     p.circle_filled(c, r, bg);

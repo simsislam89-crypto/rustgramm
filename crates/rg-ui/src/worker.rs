@@ -598,6 +598,14 @@ pub enum Cmd {
     CheckFolderInvite(String),
     /// 5в. Присоединиться к папке чатов по ссылке.
     JoinFolderInvite(String, Vec<grammers_session::types::PeerRef>),
+    /// Переход к сообщению вне загруженного окна истории (`history_around`).
+    JumpToMessage(i64, i32),
+    /// Открыть привязанную группу обсуждения канала (`linked_chat_id`).
+    OpenLinkedDiscussion(i64, i64),
+    /// Поиск по чату с типом фильтра (`Фото`/`Видео`/`Файлы`/`Ссылки`/`Голосовые`).
+    SearchFiltered(String, rg_core::engine::ChatSearchFilter),
+    /// Отправить сообщение без звука (`silent = true`) с оптимистичным temp_id.
+    SendSilent(String, Option<i32>, i32),
     Settings(Box<Settings>),
 }
 
@@ -828,6 +836,14 @@ pub enum Ev {
     FolderInviteUrl(String),
     /// 5б. Предпросмотр папки по приглашению `t.me/addlist/...`.
     FolderInvitePreview(rg_core::engine::FolderInvitePreview),
+    /// Окно сообщений вокруг целевого ID (`dialog_id, rows, target_msg_id`).
+    HistoryAround(i64, Vec<MessageRow>, i32),
+    /// Подтверждённое сервером снятие закрепления сообщения `(dialog_id, msg_id)`.
+    Unpinned(i64, i32),
+    /// Выбрать существующий диалог по ID (для «Обсудить» и переходов).
+    SelectDialogById(i64),
+    /// Добавить разрешённую группу обсуждения в список и открыть её.
+    OpenResolvedDialog(Box<DialogRow>),
     Status(String),
     Error(String),
 }
@@ -956,6 +972,8 @@ struct CachedDialog {
     verified: bool,
     #[serde(default)]
     premium: bool,
+    #[serde(default)]
+    read_inbox_max_id: i32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1072,6 +1090,7 @@ fn save_disk_cache(home: &std::path::Path, me: &str, dialogs: &[DialogRow], fold
                 emoji_status: d.emoji_status,
                 verified: d.verified,
                 premium: d.premium,
+                read_inbox_max_id: d.read_inbox_max_id,
             })
             .collect(),
         folders: folders
@@ -1134,6 +1153,7 @@ fn load_disk_cache(home: &std::path::Path) -> Option<(String, Vec<DialogRow>, Ve
             premium: d.premium,
             unread_mentions: 0,
             unread_reactions: 0,
+            read_inbox_max_id: d.read_inbox_max_id,
         })
         .collect();
     let folders = cache
@@ -2355,11 +2375,19 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 }
                 spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 out.send(Ev::Dialogs(dialogs.clone()));
-                let (eng, out) = (engine.clone(), out.clone());
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
                 tokio::spawn(async move {
                     match eng.force_read(peer).await {
                         Ok(()) => out.send(Ev::Status("Чат отмечен прочитанным на сервере".into())),
-                        Err(e) => out.err(format!("Не отмечено: {e}")),
+                        Err(e) => {
+                            out.err(format!("Не отмечено: {e}"));
+                            fetch_and_push_dialogs(&eng, &tx, &flag).await;
+                        }
                     }
                 });
             }
@@ -2396,6 +2424,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             premium: false,
                             unread_mentions: 0,
                             unread_reactions: 0,
+                            read_inbox_max_id: 0,
                         },
                     );
                     current = current.map(|i| i + 1);
@@ -2774,12 +2803,13 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::Forward(id, to, no_author) => {
                 let Some(i) = current else { continue };
                 let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to)) else { continue };
-                let (eng, out, from_peer, dest_peer, dest_name) = (
+                let (eng, out, from_peer, dest_peer, dest_name, to_saved) = (
                     engine.clone(),
                     out.clone(),
                     from.peer,
                     dest.peer,
                     dest.name.clone(),
+                    dest.saved,
                 );
                 tokio::spawn(async move {
                     let res = if no_author {
@@ -2788,11 +2818,15 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         eng.forward(from_peer, dest_peer, &[id]).await
                     };
                     match res {
-                        Ok(()) => out.send(Ev::Status(format!(
-                            "Переслано{}: {}",
-                            if no_author { " без автора" } else { "" },
-                            dest_name
-                        ))),
+                        Ok(()) => out.send(Ev::Status(if to_saved {
+                            "Сохранено в «Избранное»".to_owned()
+                        } else {
+                            format!(
+                                "Переслано{}: {}",
+                                if no_author { " без автора" } else { "" },
+                                dest_name
+                            )
+                        })),
                         Err(e) => out.err(format!("Не переслано: {e}")),
                     }
                 });
@@ -2811,10 +2845,18 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::Pin(id, pinned) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
-                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
                 tokio::spawn(async move {
                     match eng.pin(peer, id, pinned).await {
-                        Ok(()) => reload(&eng, &out, peer, i).await,
+                        Ok(()) => {
+                            if !pinned {
+                                out.send(Ev::Unpinned(did, id));
+                                out.send(Ev::Status("Сообщение откреплено".to_owned()));
+                            } else {
+                                out.send(Ev::Status("Сообщение закреплено".to_owned()));
+                            }
+                            reload(&eng, &out, peer, i).await;
+                        }
                         Err(e) => out.err(format!("Закрепление: {e}")),
                     }
                 });
@@ -3427,6 +3469,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                             premium: false,
                                             unread_mentions: 0,
                                             unread_reactions: 0,
+                                            read_inbox_max_id: 0,
                                         },
                                     );
                                     out.send(Ev::Dialogs(dialogs.clone()));
@@ -3490,6 +3533,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                             premium: false,
                                             unread_mentions: 0,
                                             unread_reactions: 0,
+                                            read_inbox_max_id: 0,
                                         },
                                     );
                                     out.send(Ev::Dialogs(dialogs.clone()));
@@ -4773,10 +4817,16 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 d.unread = if unread { d.unread.max(1) } else { 0 };
                 spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 out.send(Ev::Dialogs(dialogs.clone()));
-                let (eng, out) = (engine.clone(), out.clone());
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
                 tokio::spawn(async move {
                     if let Err(e) = eng.mark_dialog_unread(peer, unread).await {
                         out.err(format!("Отметка непрочитанного: {e}"));
+                        fetch_and_push_dialogs(&eng, &tx, &flag).await;
                     }
                 });
             }
@@ -5217,6 +5267,75 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                 });
             }
+            Cmd::JumpToMessage(did, msg_id) => {
+                let Some(peer) = dialogs.iter().find(|d| d.id == did).map(|d| d.peer) else { continue };
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.history_around(peer, msg_id, 40).await {
+                        Ok(rows) => out.send(Ev::HistoryAround(did, rows, msg_id)),
+                        Err(e) => out.err(format!("Переход к сообщению: {e}")),
+                    }
+                });
+            }
+            Cmd::OpenLinkedDiscussion(_chan_did, linked_chat_id) => {
+                let target_id = if linked_chat_id < 0 {
+                    linked_chat_id
+                } else {
+                    -1_000_000_000_000 - linked_chat_id
+                };
+                if let Some(existing) = dialogs
+                    .iter()
+                    .find(|d| d.id == linked_chat_id || d.id == target_id)
+                {
+                    out.send(Ev::SelectDialogById(existing.id));
+                    continue;
+                }
+                let Some(i) = current else { continue };
+                let Some(chan_peer) = dialogs.get(i).map(|d| d.peer) else { continue };
+                let (eng, out, tx) = (engine.clone(), out.clone(), dialog_refresh_tx.clone());
+                tokio::spawn(async move {
+                    match eng.resolve_linked_chat(chan_peer, linked_chat_id).await {
+                        Ok(dlg) => {
+                            let _ = tx.send(vec![dlg.clone()]).await;
+                            out.send(Ev::OpenResolvedDialog(Box::new(dlg)));
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SearchFiltered(q, filter) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    if q.trim().is_empty() && filter == rg_core::engine::ChatSearchFilter::All {
+                        reload(&eng, &out, peer, i).await;
+                        return;
+                    }
+                    match eng.search_filtered(peer, q.trim(), filter, 80).await {
+                        Ok(rows) => out.send(Ev::Found(i, rows)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SendSilent(text, reply_to, temp_id) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng
+                        .send_message_advanced(peer, &text, &[], reply_to, None, None, None, true)
+                        .await
+                    {
+                        Ok(row) => out.send(Ev::SentConfirm(did, temp_id, Box::new(row))),
+                        Err(e) => {
+                            let msg = format!("Не отправлено: {e}");
+                            out.send(Ev::SendFailed(did, temp_id, msg.clone()));
+                            out.err(msg);
+                        }
+                    }
+                });
+            }
             Cmd::Settings(s) => {
                 let s = *s;
                 rg_core::diag::set_enabled(s.diag_logging);
@@ -5605,6 +5724,7 @@ mod tests {
                 premium: i == 1,
                 unread_mentions: 0,
                 unread_reactions: 0,
+                read_inbox_max_id: 0,
             })
             .collect();
         let folders = vec![FolderRow {

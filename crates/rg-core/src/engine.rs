@@ -65,6 +65,185 @@ pub struct DialogRow {
     pub unread_mentions: i32,
     /// Число непрочитанных реакций `❤` на сообщения пользователя (`unread_reactions_count`).
     pub unread_reactions: i32,
+    /// Наибольший прочитанный входящий ID (`Dialog.read_inbox_max_id`) для плашки «Непрочитанные сообщения».
+    pub read_inbox_max_id: i32,
+}
+
+/// Фильтр типа сообщений для встроенного поиска в чате (`messages.search`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatSearchFilter {
+    #[default]
+    All,
+    Photos,
+    Videos,
+    Files,
+    Links,
+    Voice,
+}
+
+impl ChatSearchFilter {
+    pub const ALL: [Self; 6] = [
+        Self::All,
+        Self::Photos,
+        Self::Videos,
+        Self::Files,
+        Self::Links,
+        Self::Voice,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "Все",
+            Self::Photos => "Фото",
+            Self::Videos => "Видео",
+            Self::Files => "Файлы",
+            Self::Links => "Ссылки",
+            Self::Voice => "Голосовые",
+        }
+    }
+
+    pub fn to_tl(self) -> grammers_client::tl::enums::MessagesFilter {
+        use grammers_client::tl::enums::MessagesFilter as F;
+        match self {
+            Self::All => F::InputMessagesFilterEmpty,
+            Self::Photos => F::InputMessagesFilterPhotos,
+            Self::Videos => F::InputMessagesFilterVideo,
+            Self::Files => F::InputMessagesFilterDocument,
+            Self::Links => F::InputMessagesFilterUrl,
+            Self::Voice => F::InputMessagesFilterVoice,
+        }
+    }
+}
+
+/// Форматирует счётчики (просмотры, реакции, участники, комментарии):
+/// либо точно с пробелами между разрядами (`exact == true`), либо компактно (`K`/`M`).
+pub fn format_compact_count(n: i32, exact: bool) -> String {
+    let n = n.max(0);
+    if exact || n < 1_000 {
+        let s = n.to_string();
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len() + 2);
+        for (i, &b) in bytes.iter().enumerate() {
+            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+                out.push(' ');
+            }
+            out.push(b as char);
+        }
+        return out;
+    }
+    if n >= 1_000_000 {
+        let tenths = (n / 100_000) % 10;
+        let whole = n / 1_000_000;
+        if tenths == 0 {
+            format!("{whole}M")
+        } else {
+            format!("{whole}.{tenths}M")
+        }
+    } else {
+        let tenths = (n / 100) % 10;
+        let whole = n / 1_000;
+        if tenths == 0 {
+            format!("{whole}K")
+        } else {
+            format!("{whole}.{tenths}K")
+        }
+    }
+}
+
+/// Экспорт загруженных сообщений чата в читаемый текстовый формат UTF-8.
+pub fn format_chat_export_txt(chat_name: &str, chat_id: i64, rows: &[MessageRow]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Чат: {chat_name} (ID: {chat_id})");
+    let _ = writeln!(out, "Сообщений в выборке: {}", rows.len());
+    let _ = writeln!(out, "{}", "─".repeat(48));
+    for m in rows {
+        let dt = chrono_utc_hm(m.date);
+        let who = if m.outgoing {
+            "Вы"
+        } else if m.sender.trim().is_empty() {
+            "Собеседник"
+        } else {
+            m.sender.trim()
+        };
+        let _ = write!(out, "[{dt}] {who}");
+        if m.sender_id != 0 {
+            let _ = write!(out, " (#{})", m.sender_id);
+        }
+        if m.deleted {
+            let _ = write!(out, " [удалено]");
+        }
+        if let Some((rid, _)) = m.reply_to {
+            let _ = write!(out, " [ответ на #{rid}]");
+        }
+        let body = if !m.text.trim().is_empty() {
+            m.text.trim().to_owned()
+        } else if let Some(mi) = &m.media {
+            use crate::media::MediaKind;
+            let label = match &mi.kind {
+                MediaKind::Photo => "Фото",
+                MediaKind::Video => "Видео",
+                MediaKind::Voice => "Голосовое",
+                MediaKind::Round => "Видеосообщение",
+                MediaKind::Audio => "Аудио",
+                MediaKind::Gif => "GIF",
+                MediaKind::Sticker | MediaKind::AnimatedSticker => "Стикер",
+                MediaKind::File => {
+                    if mi.name.is_empty() {
+                        "Файл"
+                    } else {
+                        &mi.name
+                    }
+                }
+                MediaKind::WebPage { title, url, .. } => {
+                    if title.is_empty() {
+                        url
+                    } else {
+                        title
+                    }
+                }
+                MediaKind::Poll { question, .. } => question,
+                MediaKind::Dice { emoticon, .. } => emoticon,
+                MediaKind::Contact { first_name, .. } => first_name,
+                MediaKind::Geo { title, .. } => {
+                    if title.is_empty() {
+                        "Геопозиция"
+                    } else {
+                        title
+                    }
+                }
+                MediaKind::Other(s) => s,
+            };
+            format!("[{label}]")
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, ": {body}");
+    }
+    out
+}
+
+fn chrono_utc_hm(unix: i64) -> String {
+    if unix <= 0 {
+        return "0000-00-00 00:00:00".to_owned();
+    }
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let h = secs / 3_600;
+    let m = (secs % 3_600) / 60;
+    let s = secs % 60;
+    // Гражданский календарь (алгоритм Howard Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
 }
 
 /// Музыкальный трек (из профиля `saved_music` или аудиосообщения).
@@ -905,6 +1084,9 @@ pub struct MessageRow {
     /// Включены ли комментарии у поста канала (`Message.replies.comments`).
     #[serde(default)]
     pub has_comments: bool,
+    /// Идентификаторы до 3 последних комментаторов поста (`MessageReplies.recent_repliers`).
+    #[serde(default)]
+    pub recent_repliers: Vec<i64>,
 }
 
 impl MessageRow {
@@ -938,6 +1120,7 @@ impl MessageRow {
             silent: false,
             replies_count: 0,
             has_comments: false,
+            recent_repliers: Vec::new(),
         }
     }
 }
@@ -1320,9 +1503,11 @@ impl Engine {
                     }
                     _ => None,
                 });
-                let (replies_count, has_comments) = match &x.replies {
-                    Some(grammers_client::tl::enums::MessageReplies::Replies(r)) => (r.replies, r.comments),
-                    None => (0, false),
+                let (replies_count, has_comments, recent_repliers) = match &x.replies {
+                    Some(grammers_client::tl::enums::MessageReplies::Replies(r)) => {
+                        (r.replies, r.comments, extract_recent_repliers(r.recent_repliers.as_deref()))
+                    }
+                    None => (0, false, Vec::new()),
                 };
                 let (rblocks, rsum) = x
                     .rich_message
@@ -1395,6 +1580,7 @@ impl Engine {
                     silent: x.silent,
                     replies_count,
                     has_comments,
+                    recent_repliers,
                     ..MessageRow::plain(x.id, text, x.out, i64::from(x.date))
                 });
             }
@@ -1782,6 +1968,7 @@ impl Engine {
                 premium,
                 unread_mentions: d.unread_mentions_count,
                 unread_reactions: d.unread_reactions_count,
+                read_inbox_max_id: d.read_inbox_max_id,
             });
         }
         (out, more_hint, last_off, users, chats, channel_pts)
@@ -2375,7 +2562,8 @@ impl Engine {
             && let Ok(cf) = self.compiled_filters.read()
             && !cf.is_empty()
         {
-            rows.retain(|r| !cf.hides(key, &r.text));
+            let allow_global = cfg.ayu.filters_enabled_in_chats;
+            rows.retain(|r| !cf.hides_with(key, &r.text, allow_global));
         }
         if !cfg.ayu.shadow_ban_ids.is_empty() {
             rows.retain(|r| !cfg.ayu.shadow_ban_ids.contains(&r.sender_id));
@@ -2407,7 +2595,7 @@ impl Engine {
                 .or(h.post_author)
                 .unwrap_or_else(|| "скрытый отправитель".to_owned())
         });
-        let (inline_buttons, reply_keyboard, paid_reactions, service_text, rich_blocks, rich_summary, rich_media, effect, todo, silent, replies_count, has_comments) = match &m.raw {
+        let (inline_buttons, reply_keyboard, paid_reactions, service_text, rich_blocks, rich_summary, rich_media, effect, todo, silent, replies_count, has_comments, recent_repliers) = match &m.raw {
             grammers_client::tl::enums::Message::Message(x) => {
                 let (ib, rk) = extract_reply_markup(x.reply_markup.as_ref());
                 let (rblocks, rsum) = x
@@ -2417,9 +2605,11 @@ impl Engine {
                     .unwrap_or_default();
                 let rmedia = x.rich_message.as_ref().and_then(extract_rich_primary_media);
                 let todo = extract_todo_media(x.media.as_ref());
-                let (rep_cnt, has_c) = match &x.replies {
-                    Some(grammers_client::tl::enums::MessageReplies::Replies(r)) => (r.replies, r.comments),
-                    None => (0, false),
+                let (rep_cnt, has_c, repliers) = match &x.replies {
+                    Some(grammers_client::tl::enums::MessageReplies::Replies(r)) => {
+                        (r.replies, r.comments, extract_recent_repliers(r.recent_repliers.as_deref()))
+                    }
+                    None => (0, false, Vec::new()),
                 };
                 (
                     ib,
@@ -2434,6 +2624,7 @@ impl Engine {
                     x.silent,
                     rep_cnt,
                     has_c,
+                    repliers,
                 )
             }
             grammers_client::tl::enums::Message::Service(s) => (
@@ -2449,6 +2640,7 @@ impl Engine {
                 s.silent,
                 0,
                 false,
+                Vec::new(),
             ),
             _ => (
                 Vec::new(),
@@ -2463,6 +2655,7 @@ impl Engine {
                 false,
                 0,
                 false,
+                Vec::new(),
             ),
         };
         let text = if !m.text().is_empty() {
@@ -2513,7 +2706,140 @@ impl Engine {
             silent,
             replies_count,
             has_comments,
+            recent_repliers,
         }
+    }
+
+    /// Загрузить окно истории вокруг указанного сообщения (для переходов к закрепам, ответам и поиску).
+    pub async fn history_around(
+        &self,
+        peer: PeerRef,
+        target_msg_id: i32,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let key = peer_key(&peer);
+        let lim = limit.clamp(10, 80) as i32;
+        let res = self
+            .invoke_retry(
+                "messages.getHistory(around)",
+                &tl::functions::messages::GetHistory {
+                    peer: peer.into(),
+                    offset_id: target_msg_id.saturating_add(1),
+                    offset_date: 0,
+                    add_offset: -(lim / 2),
+                    limit: lim,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                },
+            )
+            .await?;
+        let mut rows = tl_messages_to_rows(&res);
+        rows.sort_by_key(|r| (r.date, r.id));
+        Ok(self.finish(key, rows))
+    }
+
+    /// Поиск по тексту и типу вложений внутри чата (`messages.search`).
+    pub async fn search_filtered(
+        &self,
+        peer: PeerRef,
+        query: &str,
+        filter: ChatSearchFilter,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>, String> {
+        if filter == ChatSearchFilter::All && !query.trim().is_empty() {
+            return self
+                .search(peer, query, limit)
+                .await
+                .map_err(|e| format!("Поиск: {e}"));
+        }
+        use grammers_client::tl;
+        let res = self
+            .invoke_retry(
+                "messages.search(filtered)",
+                &tl::functions::messages::Search {
+                    peer: peer.into(),
+                    q: query.to_owned(),
+                    from_id: None,
+                    saved_peer_id: None,
+                    saved_reaction: None,
+                    top_msg_id: None,
+                    filter: filter.to_tl(),
+                    min_date: 0,
+                    max_date: 0,
+                    offset_id: 0,
+                    add_offset: 0,
+                    limit: limit.clamp(1, 100) as i32,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                },
+            )
+            .await
+            .map_err(|e| format!("Поиск: {e}"))?;
+        let mut rows = tl_messages_to_rows(&res);
+        rows.sort_by_key(|r| (r.date, r.id));
+        Ok(rows)
+    }
+
+    /// Получить или разрешить привязанную группу обсуждения канала (`channels.getFullChannel` -> `linked_chat_id`).
+    pub async fn resolve_linked_chat(
+        &self,
+        channel_peer: PeerRef,
+        linked_chat_id: i64,
+    ) -> Result<DialogRow, String> {
+        use grammers_client::tl;
+        let tl::enums::InputPeer::Channel(ch) = tl::enums::InputPeer::from(channel_peer) else {
+            return Err("Обсуждение доступно только для каналов".to_owned());
+        };
+        let tl::enums::messages::ChatFull::Full(full) = self
+            .invoke_retry(
+                "channels.getFullChannel(linked)",
+                &tl::functions::channels::GetFullChannel {
+                    channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: ch.channel_id,
+                        access_hash: ch.access_hash,
+                    }),
+                },
+            )
+            .await
+            .map_err(|e| format!("Открытие группы обсуждения: {e}"))?;
+        if let Some(sess) = &self.session {
+            crate::cache_tl_peers(&**sess, &full.users, &full.chats).await;
+        }
+        let target_raw_id = (-linked_chat_id).saturating_sub(1_000_000_000_000);
+        for c in &full.chats {
+            if let tl::enums::Chat::Channel(chan) = c
+                && (chan.id == linked_chat_id || chan.id == target_raw_id)
+            {
+                let peer = grammers_session::types::PeerRef::from(c);
+                let did = peer.id.bot_api_dialog_id_unchecked();
+                return Ok(DialogRow {
+                    peer,
+                    id: did,
+                    name: chan.title.clone(),
+                    last: String::new(),
+                    date: 0,
+                    unread: 0,
+                    pinned: false,
+                    muted: false,
+                    notify_explicit: None,
+                    saved: false,
+                    archived: false,
+                    kind: if chan.broadcast { DialogKind::Channel } else { DialogKind::Group },
+                    contact: false,
+                    read_out: 0,
+                    emoji_status: emoji_status_id(chan.emoji_status.as_ref()),
+                    verified: chan.verified,
+                    premium: false,
+                    unread_mentions: 0,
+                    unread_reactions: 0,
+                    read_inbox_max_id: 0,
+                });
+            }
+        }
+        Err("У этого канала нет доступной группы обсуждения".to_owned())
     }
 
     /// Поиск по тексту внутри чата (на сервере); результат — по возрастанию времени.
@@ -6054,6 +6380,14 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
                         .sum()
                 })
                 .unwrap_or(0);
+            let (replies_count, has_comments, recent_repliers) = match &x.replies {
+                Some(tl::enums::MessageReplies::Replies(r)) => (
+                    r.replies,
+                    r.comments,
+                    extract_recent_repliers(r.recent_repliers.as_deref()),
+                ),
+                None => (0, false, Vec::new()),
+            };
             let text = if !x.message.is_empty() {
                 x.message.clone()
             } else {
@@ -6073,6 +6407,9 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
                 inline_buttons,
                 reply_keyboard,
                 silent: x.silent,
+                replies_count,
+                has_comments,
+                recent_repliers,
                 ..MessageRow::plain(x.id, text, x.out, i64::from(x.date))
             })
         })
@@ -6321,6 +6658,10 @@ fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
             grammers_client::tl::enums::Dialog::Dialog(x) => x.unread_reactions_count,
             _ => 0,
         },
+        read_inbox_max_id: match &d.raw {
+            grammers_client::tl::enums::Dialog::Dialog(x) => x.read_inbox_max_id,
+            _ => 0,
+        },
     }
 }
 
@@ -6381,6 +6722,21 @@ pub fn extract_reaction_pills(reactions: Option<&grammers_client::tl::enums::Mes
                 }),
                 R::Empty => None,
             }
+        })
+        .collect()
+}
+
+fn extract_recent_repliers(repliers: Option<&[grammers_client::tl::enums::Peer]>) -> Vec<i64> {
+    use grammers_client::tl::enums::Peer as P;
+    let Some(list) = repliers else {
+        return Vec::new();
+    };
+    list.iter()
+        .take(3)
+        .map(|p| match p {
+            P::User(u) => u.user_id,
+            P::Chat(c) => -c.chat_id,
+            P::Channel(c) => -1_000_000_000_000 - c.channel_id,
         })
         .collect()
 }
@@ -6502,6 +6858,7 @@ mod tests {
             premium: false,
             unread_mentions: 0,
             unread_reactions: 0,
+            read_inbox_max_id: 0,
         }
     }
 
@@ -7042,5 +7399,86 @@ mod tests {
         )));
         assert!(p_all.allows("👍"));
         assert_eq!(p_all.default_allowed(""), Some("👍"));
+    }
+
+    #[test]
+    fn recent_repliers_capped_at_three_and_mapped_for_all_peer_types() {
+        use grammers_client::tl::{enums, types};
+        let peers = [
+            enums::Peer::User(types::PeerUser { user_id: 101 }),
+            enums::Peer::Chat(types::PeerChat { chat_id: 202 }),
+            enums::Peer::Channel(types::PeerChannel { channel_id: 303 }),
+            enums::Peer::User(types::PeerUser { user_id: 404 }),
+        ];
+        let ids = extract_recent_repliers(Some(&peers));
+        assert_eq!(ids, vec![101, -202, -1_000_000_000_303]);
+        assert!(extract_recent_repliers(None).is_empty());
+    }
+
+    #[test]
+    fn chat_search_filter_labels_and_tl_variants_match() {
+        use grammers_client::tl::enums::MessagesFilter as MF;
+        assert_eq!(ChatSearchFilter::ALL.len(), 6);
+        assert_eq!(ChatSearchFilter::All.label(), "Все");
+        assert_eq!(ChatSearchFilter::Photos.label(), "Фото");
+        assert_eq!(ChatSearchFilter::Videos.label(), "Видео");
+        assert_eq!(ChatSearchFilter::Files.label(), "Файлы");
+        assert_eq!(ChatSearchFilter::Links.label(), "Ссылки");
+        assert_eq!(ChatSearchFilter::Voice.label(), "Голосовые");
+        assert!(matches!(ChatSearchFilter::All.to_tl(), MF::InputMessagesFilterEmpty));
+        assert!(matches!(ChatSearchFilter::Photos.to_tl(), MF::InputMessagesFilterPhotos));
+        assert!(matches!(ChatSearchFilter::Videos.to_tl(), MF::InputMessagesFilterVideo));
+        assert!(matches!(ChatSearchFilter::Files.to_tl(), MF::InputMessagesFilterDocument));
+        assert!(matches!(ChatSearchFilter::Links.to_tl(), MF::InputMessagesFilterUrl));
+        assert!(matches!(ChatSearchFilter::Voice.to_tl(), MF::InputMessagesFilterVoice));
+    }
+
+    #[test]
+    fn format_compact_count_and_chat_export_behave_honestly() {
+        assert_eq!(format_compact_count(42, false), "42");
+        assert_eq!(format_compact_count(12_430, false), "12.4K");
+        assert_eq!(format_compact_count(12_430, true), "12 430");
+        assert_eq!(format_compact_count(2_500_000, false), "2.5M");
+        assert_eq!(format_compact_count(2_500_000, true), "2 500 000");
+
+        let mut rows = vec![
+            MessageRow::plain(1, "Привет".to_owned(), false, 1_700_000_000),
+            MessageRow::plain(2, String::new(), true, 1_700_000_060),
+        ];
+        rows[0].sender = "Анна".to_owned();
+        rows[0].sender_id = 777;
+        rows[1].deleted = true;
+        rows[1].reply_to = Some((1, String::new()));
+        let txt = format_chat_export_txt("Тест-чат", -100, &rows);
+        assert!(txt.contains("Чат: Тест-чат (ID: -100)"));
+        assert!(txt.contains("Анна (#777): Привет"));
+        assert!(txt.contains("[удалено]"));
+        assert!(txt.contains("[ответ на #1]"));
+    }
+
+    #[test]
+    fn filter_set_respects_filters_enabled_in_chats_flag() {
+        let filters = vec![
+            rg_settings::Filter {
+                text: "спам".to_owned(),
+                dialog_id: None,
+                enabled: true,
+                ..rg_settings::Filter::default()
+            },
+            rg_settings::Filter {
+                text: "секретно".to_owned(),
+                dialog_id: Some(555),
+                enabled: true,
+                ..rg_settings::Filter::default()
+            },
+        ];
+        let (set, bad) = rg_ayu::filters::FilterSet::build(&filters);
+        assert!(bad.is_empty());
+        // Когда глобальные фильтры в чатах включены (`allow_global = true`) — скрываются оба.
+        assert!(set.hides_with(555, "обычный спам", true));
+        assert!(set.hides_with(555, "секретно", true));
+        // Когда `filters_enabled_in_chats = false` — глобальные молчат, а правила конкретного чата работают!
+        assert!(!set.hides_with(555, "обычный спам", false));
+        assert!(set.hides_with(555, "секретно", false));
     }
 }

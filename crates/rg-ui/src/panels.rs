@@ -466,12 +466,14 @@ impl App {
                             acts.push(StickerAct::AddOpen(false));
                         }
                     }
-                    let (r, resp) = ui.allocate_exact_size(Vec2::new(cell, 38.0), Sense::click());
-                    let k = tween(ui.ctx(), "emadd", f32::from(u8::from(resp.hovered() || self.emoji_add_open)), 0.1);
-                    icons::tg(ui.painter(), "menu/add", r.center(), lerp_color(SUBTEXT, WHITE, k));
-                    if resp.on_hover_text("Добавить эмодзи").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        acts.push(StickerAct::AddOpen(!self.emoji_add_open));
-                        acts.push(StickerAct::Featured);
+                    if !self.settings.ayu.show_only_added_emojis_and_stickers {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(cell, 38.0), Sense::click());
+                        let k = tween(ui.ctx(), "emadd", f32::from(u8::from(resp.hovered() || self.emoji_add_open)), 0.1);
+                        icons::tg(ui.painter(), "menu/add", r.center(), lerp_color(SUBTEXT, WHITE, k));
+                        if resp.on_hover_text("Добавить эмодзи").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            acts.push(StickerAct::AddOpen(!self.emoji_add_open));
+                            acts.push(StickerAct::Featured);
+                        }
                     }
                 });
             });
@@ -601,6 +603,13 @@ impl App {
 
     /// Окно «Добавить эмодзи»: рекомендуемые наборы с кнопкой «Добавить».
     pub(crate) fn featured_view(&self, ui: &mut egui::Ui, acts: &mut Vec<StickerAct>) {
+        if self.settings.ayu.show_only_added_emojis_and_stickers {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Показываются только установленные наборы").color(SUBTEXT));
+            });
+            return;
+        }
         if self.featured_sets.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -693,11 +702,17 @@ impl App {
             });
             return;
         }
+        let recent_cap = if self.settings.ayu.unlimited_recent_stickers || self.settings.extera.unlimited_recent_stickers {
+            200
+        } else {
+            30
+        };
+        let recent_slice: Vec<rg_core::engine::StickerRow> = self.recent_stickers.iter().take(recent_cap).cloned().collect();
         let cur = self.sticker_cur.min(total_tabs - 1);
-        let (title, list): (&str, Option<&Vec<rg_core::engine::StickerRow>>) = if has_fav && cur == 0 {
-            ("★ Избранные стикеры", Some(&self.faved_stickers))
+        let (title, list): (&str, Option<&[rg_core::engine::StickerRow]>) = if has_fav && cur == 0 {
+            ("★ Избранные стикеры", Some(self.faved_stickers.as_slice()))
         } else if has_rec && cur == usize::from(has_fav) {
-            ("Недавние стикеры", Some(&self.recent_stickers))
+            ("Недавние стикеры", Some(recent_slice.as_slice()))
         } else {
             let set_idx = cur - extra;
             let set = &self.sticker_sets[set_idx];
@@ -705,7 +720,7 @@ impl App {
             if l.is_none() {
                 acts.push(StickerAct::LoadSet(set_idx));
             }
-            (&set.title, l)
+            (&set.title, l.map(Vec::as_slice))
         };
         let cols = 4usize;
         let width = ui.available_width();

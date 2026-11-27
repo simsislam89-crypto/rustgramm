@@ -1200,21 +1200,43 @@ impl App {
         let Some(msg_id) = self.paid_react_msg else {
             return;
         };
+        let req_id = egui::Id::new("paid-react-stars-req");
+        let already_req = ctx.data(|d| d.get_temp::<i32>(req_id)) == Some(msg_id);
+        if self.stars_summary.is_none() && !already_req {
+            ctx.data_mut(|d| d.insert_temp(req_id, msg_id));
+            self.send(Cmd::LoadStarsStatus);
+        }
         let mut open = true;
         let mut send_now = false;
-        egui::Window::new("Звёздная реакция ⭐")
+        egui::Window::new("Звёздная реакция")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(300.0)
+            .default_width(310.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                if let Some(st) = &self.stars_summary {
+                    ui.horizontal(|ui| {
+                        let (sr, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        super::icons::paint_star(ui.painter(), sr.center(), 7.0, Color32::from_rgb(245, 195, 55));
+                        ui.label(
+                            RichText::new(format!("Баланс: {} Telegram Stars", st.balance))
+                                .size(12.5)
+                                .color(Color32::from_rgb(245, 195, 55))
+                                .strong(),
+                        );
+                    });
+                    ui.add_space(4.0);
+                } else {
+                    ui.label(RichText::new("Загрузка баланса Telegram Stars…").size(12.0).color(SUBTEXT));
+                    ui.add_space(4.0);
+                }
                 ui.label(RichText::new("Выберите количество Telegram Stars:").color(WHITE));
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     for amt in [1, 5, 10, 25, 50, 100] {
                         if ui
-                            .selectable_label(self.paid_react_count == amt, format!("⭐ {amt}"))
+                            .selectable_label(self.paid_react_count == amt, format!("★ {amt}"))
                             .clicked()
                         {
                             self.paid_react_count = amt;
@@ -1222,12 +1244,22 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Своё количество:").size(12.5).color(SUBTEXT));
+                    ui.add(egui::DragValue::new(&mut self.paid_react_count).range(1..=2500));
+                });
+                ui.add_space(6.0);
                 ui.checkbox(&mut self.paid_react_anon, "Отправить анонимно (скрыть имя)");
+                ui.label(
+                    RichText::new("Списывается с вашего реального баланса Telegram Stars.")
+                        .size(11.5)
+                        .color(SUBTEXT),
+                );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if orange_button(
                         ui,
-                        &format!("Отправить ⭐ {}", self.paid_react_count),
+                        &format!("Отправить ★ {}", self.paid_react_count),
                         Vec2::new(165.0, 34.0),
                     )
                     .clicked()
@@ -2509,11 +2541,10 @@ impl App {
                 self.scroll_to = Some(mid);
                 self.highlight_msg = Some((mid, ctx.input(|i| i.time)));
             } else {
-                self.status = "Загрузите более старую историю чата для перехода".to_owned();
+                self.send(Cmd::JumpToMessage(did, mid));
             }
         }
         if let Some(mid) = unpin_one {
-            self.pinned_list.retain(|m| m.id != mid);
             self.send(Cmd::Pin(mid, false));
         }
         if unpin_all {

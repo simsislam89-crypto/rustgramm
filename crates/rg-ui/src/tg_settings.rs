@@ -510,23 +510,25 @@ impl App {
                             let mr = Rect::from_center_size(Pos2::new(head.right() - 56.0, head.center().y), Vec2::splat(32.0));
                             let mresp = ui.interact(mr, ui.make_persistent_id("tgs-dots"), Sense::click());
                             icons::dots(ui.painter(), mr.center(), if mresp.hovered() { WHITE } else { SUBTEXT });
-                            egui::Popup::menu(&mresp.on_hover_cursor(egui::CursorIcon::PointingHand)).show(|ui| {
-                                ui.set_min_width(190.0);
-                                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                                if kit::menu_item(ui, "menu/edit", "Изменить профиль", false) {
-                                    st.page_back.push(page);
-                                    page = pg::ACCOUNT;
-                                    ui.close();
-                                }
-                                if kit::menu_item(ui, "menu/qr_code", "QR-код профиля", false) {
-                                    st.qr_open = true;
-                                    ui.close();
-                                }
-                                if kit::menu_item(ui, "menu/leave", "Выйти из аккаунта", true) {
-                                    act.logout = true;
-                                    ui.close();
-                                }
-                            });
+                            egui::Popup::menu(&mresp.on_hover_cursor(egui::CursorIcon::PointingHand))
+                                .frame(kit::compact_popup_frame())
+                                .show(|ui| {
+                                    ui.set_min_width(176.0);
+                                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                                    if kit::menu_item(ui, "menu/edit", "Изменить профиль", false) {
+                                        st.page_back.push(page);
+                                        page = pg::ACCOUNT;
+                                        ui.close();
+                                    }
+                                    if kit::menu_item(ui, "menu/qr_code", "QR-код профиля", false) {
+                                        st.qr_open = true;
+                                        ui.close();
+                                    }
+                                    if kit::menu_item(ui, "menu/leave", "Выйти из аккаунта", true) {
+                                        act.logout = true;
+                                        ui.close();
+                                    }
+                                });
                         }
                         let x = Rect::from_center_size(Pos2::new(head.right() - 24.0, head.center().y), Vec2::splat(34.0));
                         let xr = ui.interact(x, ui.make_persistent_id("tgs-close"), Sense::click());
@@ -2324,16 +2326,13 @@ fn plugins_page(
 
     divider(ui);
     section(ui, "Настройки телефона (exteraGram / Android)");
-    toggle(ui, "Иконки Solar и единый стиль значков", &mut s.extera.use_solar_icons);
     toggle(ui, "Квадратная кнопка FAB в чатах", &mut s.extera.square_fab);
     toggle(ui, "Скрыть разделители строк настроек", &mut s.extera.disable_dividers);
     toggle(ui, "Центрировать заголовок шапки", &mut s.extera.center_title);
     toggle(ui, "Скрыть статус в шапке", &mut s.extera.hide_action_bar_status);
     toggle(ui, "Скрывать номер телефона в профиле", &mut s.extera.hide_phone_number);
     toggle(ui, "Скрывать клавиатуру при прокрутке чата", &mut s.extera.hide_keyboard_on_scroll);
-    toggle(ui, "Ускорение загрузки медиа (Speed Boost)", &mut s.extera.upload_speed_boost);
     toggle(ui, "Показывать секунды во времени", &mut s.extera.format_time_with_seconds);
-    toggle(ui, "Архив по свайпу вниз", &mut s.extera.archive_on_pull);
 }
 
 fn double_tap_label(v: i32, def_react: &str) -> String {
@@ -2364,7 +2363,6 @@ fn extera_page(
     toggle(ui, "Скрыть статус собеседника в шапке", &mut e.hide_action_bar_status);
     toggle(ui, "Квадратная плавающая кнопка (FAB)", &mut e.square_fab);
     toggle(ui, "Убрать полосы-разделители в настройках", &mut e.disable_dividers);
-    toggle(ui, "Иконки Solar", &mut e.use_solar_icons);
     toggle(ui, "Размытие панелей (Force Blur)", &mut e.force_blur);
     divider(ui);
     section(ui, "Чаты и жесты");
@@ -2401,6 +2399,21 @@ fn extera_page(
         }
     });
     ui.add_space(6.0);
+    desc(ui, "⭐ Звёздная реакция (Telegram Stars) доступна в меню реакций и под постами каналов, где автор включил платные реакции.");
+    ui.horizontal(|ui| {
+        ui.add_space(kit::PAD);
+        if ui
+            .add(
+                egui::Button::new(RichText::new("⭐ Открыть баланс Telegram Stars").size(12.5).color(Color32::WHITE))
+                    .fill(t_btn(ORANGE))
+                    .corner_radius(CornerRadius::same(8)),
+            )
+            .clicked()
+        {
+            act.open_stars = true;
+        }
+    });
+    ui.add_space(6.0);
     toggle(ui, "Скрывать всплывающие панели при прокрутке", &mut e.hide_keyboard_on_scroll);
     toggle(ui, "Скрывать кнопку пересылки справа от постов", &mut e.hide_share_button);
     toggle(ui, "Пауза при сворачивании", &mut e.pause_on_minimize);
@@ -2409,16 +2422,6 @@ fn extera_page(
     toggle(ui, "Скрывать номер телефона в профиле и настройках", &mut e.hide_phone_number);
     toggle(ui, "Показывать секунды в штампах времени", &mut e.format_time_with_seconds);
     toggle(ui, "Точные числа без сокращений", &mut e.disable_number_rounding);
-    let dl_lbl = match e.download_speed_boost {
-        1 => "Среднее",
-        2 => "Максимум",
-        _ => "Выкл.",
-    };
-    if value_row(ui, "Ускорение скачивания медиа", dl_lbl, false) {
-        e.download_speed_boost = (e.download_speed_boost + 1) % 3;
-    }
-    toggle(ui, "Ускорение отправки медиа", &mut e.upload_speed_boost);
-    toggle(ui, "Архив по свайпу вниз", &mut e.archive_on_pull);
     desc(ui, "Все параметры exteraGram применяются сразу на ПК и Android без перезапуска.");
 }
 

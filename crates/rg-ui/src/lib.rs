@@ -275,6 +275,20 @@ struct App {
     /// Кэш закреплённых сообщений для баннера в шапке (`chat_id -> MessageRow`).
     pinned_msgs: HashMap<i64, MessageRow>,
     pinned_req: HashSet<(i64, i32)>,
+    /// Все закреплённые сообщения по чату для сегментированного индикатора и циклического перехода.
+    pinned_lists: HashMap<i64, Vec<MessageRow>>,
+    pinned_cur_idx: HashMap<i64, usize>,
+    pinned_list_req: HashSet<i64>,
+    /// Подтверждение открепления сообщения из верхней плашки `(dialog_id, msg_id)`.
+    confirm_unpin: Option<(i64, i32)>,
+    /// Граница `read_inbox_max_id` при открытии чата (плашка «Непрочитанные сообщения»).
+    open_unread_anchor: Option<i32>,
+    /// Выбранный индекс в автодополнении `@упоминаний` и фильтр/индекс поиска по чату.
+    mention_sel_idx: usize,
+    chat_search_filter: rg_core::engine::ChatSearchFilter,
+    chat_search_idx: usize,
+    /// Записанное голосовое сообщение, ожидающее подтверждения перед отправкой `(path, dur_secs, waveform, reply_to)`.
+    pending_voice_confirm: Option<(std::path::PathBuf, u32, Vec<u8>, Option<i32>)>,
     /// Форумы и темы супергрупп (`chat_id -> topics`).
     forum_topics: HashMap<i64, Vec<ForumTopicRow>>,
     forum_req: HashSet<i64>,
@@ -925,6 +939,15 @@ impl App {
             typing: HashMap::new(),
             pinned_msgs: HashMap::new(),
             pinned_req: HashSet::new(),
+            pinned_lists: HashMap::new(),
+            pinned_cur_idx: HashMap::new(),
+            pinned_list_req: HashSet::new(),
+            confirm_unpin: None,
+            open_unread_anchor: None,
+            mention_sel_idx: 0,
+            chat_search_filter: rg_core::engine::ChatSearchFilter::All,
+            chat_search_idx: 0,
+            pending_voice_confirm: None,
             forum_topics: HashMap::new(),
             forum_req: HashSet::new(),
             active_topic: None,
@@ -2376,7 +2399,8 @@ impl App {
         }
         self.reset_chat_state();
         self.selected = Some(i);
-        if let Some(id) = self.dialogs.get(i).map(|d| d.id) {
+        if let Some((id, unread, rim)) = self.dialogs.get(i).map(|d| (d.id, d.unread, d.read_inbox_max_id)) {
+            self.open_unread_anchor = (unread > 0 && rim > 0).then_some(rim);
             if let Some((draft_txt, draft_reply)) = self.drafts.get(&id).cloned() {
                 self.input = draft_txt;
                 self.reply = draft_reply.map(|rid| (rid, format!("#{rid}")));
@@ -2385,6 +2409,11 @@ impl App {
             }
             if self.info_req.insert(id) {
                 self.send(Cmd::PeerInfo(i));
+            }
+            if self.peer_infos.get(&id).and_then(|p| p.pinned_msg_id).is_some()
+                && self.pinned_list_req.insert(id)
+            {
+                self.send(Cmd::LoadPinnedMessages(id));
             }
             if let Some(cached) = self.history_cache.get(&id).cloned()
                 && !cached.is_empty()
@@ -2424,6 +2453,11 @@ impl App {
         self.visible_tgs_msgs.clear();
         self.participants_filter = rg_core::engine::ParticipantFilter::All;
         self.participants_query.clear();
+        self.mention_sel_idx = 0;
+        self.chat_search_filter = rg_core::engine::ChatSearchFilter::All;
+        self.chat_search_idx = 0;
+        self.pending_voice_confirm = None;
+        self.open_unread_anchor = None;
         self.last_typing_sent = None;
         self.contact_modal_open = false;
         self.geo_modal_open = false;
@@ -3076,11 +3110,15 @@ impl App {
                         self.send(Cmd::CustomEmojiDocs(vec![doc_id]));
                     }
                     if let Some(idx) = self.selected.filter(|&i| self.dialogs.get(i).is_some_and(|d| d.id == id)) {
-                        if let Some(pid) = info.pinned_msg_id
-                            && self.pinned_msgs.get(&id).is_none_or(|m| m.id != pid)
-                            && self.pinned_req.insert((id, pid))
-                        {
-                            self.send(Cmd::LoadPinned(idx, pid));
+                        if let Some(pid) = info.pinned_msg_id {
+                            if self.pinned_msgs.get(&id).is_none_or(|m| m.id != pid)
+                                && self.pinned_req.insert((id, pid))
+                            {
+                                self.send(Cmd::LoadPinned(idx, pid));
+                            }
+                            if self.pinned_list_req.insert(id) {
+                                self.send(Cmd::LoadPinnedMessages(id));
+                            }
                         }
                         if info.forum
                             && !self.forum_topics.contains_key(&id)
@@ -3112,7 +3150,13 @@ impl App {
                     self.stories = list;
                 }
                 Ev::PinnedMsg(id, msg) => {
-                    self.pinned_msgs.insert(id, *msg);
+                    let msg_v = *msg;
+                    let list = self.pinned_lists.entry(id).or_default();
+                    if !list.iter().any(|x| x.id == msg_v.id) {
+                        list.insert(0, msg_v.clone());
+                    }
+                    self.pinned_cur_idx.entry(id).or_insert(0);
+                    self.pinned_msgs.insert(id, msg_v);
                 }
                 Ev::MiniAppReady { title, url } => {
                     #[cfg(windows)]
@@ -3315,6 +3359,15 @@ impl App {
                 Ev::Older(..) => {}
                 Ev::Found(idx, rows) if self.selected == Some(idx) => {
                     self.request_previews(idx, &rows);
+                    self.chat_search_idx = rows.len().saturating_sub(1);
+                    if let Some(last) = rows.last() {
+                        if self.messages.iter().any(|m| m.id == last.id) {
+                            self.scroll_to = Some(last.id);
+                            self.highlight_msg = Some((last.id, ctx.input(|i| i.time)));
+                        } else if let Some(did) = self.dialogs.get(idx).map(|d| d.id) {
+                            self.send(Cmd::JumpToMessage(did, last.id));
+                        }
+                    }
                     self.found = Some(rows);
                 }
                 Ev::Found(..) => {}
@@ -3753,16 +3806,84 @@ impl App {
                     self.history_cache.remove(&did);
                 }
                 Ev::PinnedMessagesList(did, rows) => {
+                    if let Some(first) = rows.first() {
+                        self.pinned_msgs.insert(did, first.clone());
+                    } else {
+                        self.pinned_msgs.remove(&did);
+                    }
+                    self.pinned_lists.insert(did, rows.clone());
+                    let cur = self.pinned_cur_idx.entry(did).or_insert(0);
+                    if !rows.is_empty() && *cur >= rows.len() {
+                        *cur = 0;
+                    }
                     self.pinned_list_did = Some(did);
                     self.pinned_list = rows;
                 }
                 Ev::AllUnpinned(did) => {
                     self.pinned_msgs.remove(&did);
+                    self.pinned_lists.remove(&did);
+                    self.pinned_cur_idx.remove(&did);
                     if self.pinned_list_did == Some(did) {
                         self.pinned_list.clear();
                     }
-                    for m in &mut self.messages {
-                        m.pinned = false;
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did) {
+                        for m in &mut self.messages {
+                            m.pinned = false;
+                        }
+                    }
+                }
+                Ev::Unpinned(did, msg_id) => {
+                    if let Some(list) = self.pinned_lists.get_mut(&did) {
+                        list.retain(|m| m.id != msg_id);
+                        if let Some(next) = list.first().cloned() {
+                            self.pinned_msgs.insert(did, next);
+                        } else {
+                            self.pinned_msgs.remove(&did);
+                        }
+                        if let Some(cur) = self.pinned_cur_idx.get_mut(&did) {
+                            *cur = if list.is_empty() { 0 } else { (*cur).min(list.len() - 1) };
+                        }
+                    } else if self.pinned_msgs.get(&did).is_some_and(|m| m.id == msg_id) {
+                        self.pinned_msgs.remove(&did);
+                    }
+                    if self.pinned_list_did == Some(did) {
+                        self.pinned_list.retain(|m| m.id != msg_id);
+                    }
+                    if self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| d.id == did) {
+                        for m in &mut self.messages {
+                            if m.id == msg_id {
+                                m.pinned = false;
+                            }
+                        }
+                    }
+                }
+                Ev::HistoryAround(did, rows, target_id) => {
+                    if let Some(idx) = self.selected.filter(|&i| self.dialogs.get(i).is_some_and(|d| d.id == did)) {
+                        self.request_previews(idx, &rows);
+                        self.known.extend(rows.iter().map(|r| r.id));
+                        self.messages = rows;
+                        self.history_loading = false;
+                        self.msg_heights.clear();
+                        self.scroll_to = Some(target_id);
+                        self.highlight_msg = Some((target_id, ctx.input(|i| i.time)));
+                    }
+                }
+                Ev::SelectDialogById(did) => {
+                    if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
+                        self.in_archive = self.dialogs[pos].archived;
+                        self.open_dialog(pos);
+                    }
+                }
+                Ev::OpenResolvedDialog(dlg) => {
+                    let did = dlg.id;
+                    if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
+                        self.in_archive = self.dialogs[pos].archived;
+                        self.open_dialog(pos);
+                    } else {
+                        self.dialogs.insert(0, *dlg);
+                        self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+                        self.in_archive = false;
+                        self.open_dialog(0);
                     }
                 }
                 Ev::FolderInviteUrl(url) => {
@@ -4999,7 +5120,7 @@ impl App {
                 ui.weak("Без прокси соединение идёт напрямую с серверами Telegram.");
                 if orange_button(ui, "Сохранить", Vec2::new(110.0, 32.0)).clicked() {
                     self.send(Cmd::Proxy(self.proxy.trim().to_owned()));
-                    self.status = "Прокси сохранён: перезапустите приложение".to_owned();
+                    self.status = "Сохранение прокси и переподключение…".to_owned();
                 }
             });
         self.proxy_open = open;
@@ -5546,47 +5667,50 @@ impl App {
                     if resp.clicked() {
                         open = Some(i);
                     }
-                    egui::Popup::context_menu(&resp).show(|ui| {
-                        ui.set_min_width(210.0);
-                        ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, a: DialogAct| {
-                            if kit::menu_item(ui, icon, label, false) {
-                                dact = Some((i, a));
-                                ui.close();
+                    egui::Popup::context_menu(&resp)
+                        .frame(kit::compact_popup_frame())
+                        .show(|ui| {
+                            ui.set_min_width(184.0);
+                            ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                            let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, a: DialogAct| {
+                                if kit::menu_item(ui, icon, label, false) {
+                                    dact = Some((i, a));
+                                    ui.close();
+                                }
+                            };
+                            if !d.saved {
+                                item(
+                                    ui,
+                                    if d.archived { "menu/unarchive" } else { "menu/archive" },
+                                    if d.archived { "Вернуть из архива" } else { "В архив" },
+                                    DialogAct::Archive(!d.archived),
+                                );
                             }
-                        };
-                        if !d.saved {
                             item(
                                 ui,
-                                if d.archived { "menu/unarchive" } else { "menu/archive" },
-                                if d.archived { "Вернуть из архива" } else { "В архив" },
-                                DialogAct::Archive(!d.archived),
+                                if d.pinned { "menu/unpin" } else { "menu/pin" },
+                                if d.pinned { "Открепить" } else { "Закрепить" },
+                                DialogAct::Pin(!d.pinned),
                             );
-                        }
-                        item(
-                            ui,
-                            if d.pinned { "menu/unpin" } else { "menu/pin" },
-                            if d.pinned { "Открепить" } else { "Закрепить" },
-                            DialogAct::Pin(!d.pinned),
-                        );
-                        item(
-                            ui,
-                            if d.muted { "menu/unmute" } else { "menu/mute" },
-                            if d.muted { "Включить звук" } else { "Отключить звук" },
-                            DialogAct::Mute(!d.muted),
-                        );
-                        if d.unread > 0 {
-                            item(ui, "menu/read", "Прочитать локально", DialogAct::LocalRead);
-                            item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
-                        } else {
-                            item(ui, "menu/unread", "Отметить непрочитанным", DialogAct::Unread(true));
-                        }
-                        item(ui, "menu/info", "Подсмотреть (без прочтения)", DialogAct::Peek);
-                        item(ui, "menu/delete", "Очистить историю", DialogAct::ConfirmClear);
-                        if !d.saved && matches!(d.kind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel) {
-                            item(ui, "menu/leave", "Покинуть чат / канал", DialogAct::ConfirmLeave);
-                        }
-                    });
+                            item(
+                                ui,
+                                if d.muted { "menu/unmute" } else { "menu/mute" },
+                                if d.muted { "Включить звук" } else { "Отключить звук" },
+                                DialogAct::Mute(!d.muted),
+                            );
+                            if d.unread > 0 {
+                                item(ui, "menu/read", "Прочитать локально", DialogAct::LocalRead);
+                                item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
+                            } else {
+                                item(ui, "menu/unread", "Отметить непрочитанным", DialogAct::Unread(true));
+                            }
+                            item(ui, "menu/info", "Подсмотреть (без прочтения)", DialogAct::Peek);
+                            kit::menu_separator(ui);
+                            item(ui, "menu/delete", "Очистить историю", DialogAct::ConfirmClear);
+                            if !d.saved && matches!(d.kind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel) {
+                                item(ui, "menu/leave", "Покинуть чат / канал", DialogAct::ConfirmLeave);
+                            }
+                        });
                 }
             },
         );
@@ -5783,13 +5907,29 @@ impl eframe::App for App {
             self.hide_window_to_tray();
         }
         theme::set_opacity(self.settings.window_opacity);
-        theme::set_blur(self.settings.blur_enabled);
+        theme::set_blur(self.settings.blur_enabled || self.settings.extera.force_blur);
+        theme::apply_mono_font(&ctx, &self.settings.ayu.mono_font);
         theme::sync_visuals(&ctx);
         kit::sync_prefs(
             self.settings.ayu.material_switches,
             self.settings.extera.disable_dividers,
         );
-        win::set_window_blur(self.settings.blur_enabled && self.settings.window_opacity < 100);
+        win::set_window_blur((self.settings.blur_enabled || self.settings.extera.force_blur) && self.settings.window_opacity < 100);
+        if self.settings.extera.pause_on_minimize && ctx.input(|i| i.viewport().minimized == Some(true)) {
+            #[cfg(windows)]
+            {
+                if let Some(v) = self.audio_view.as_ref()
+                    && v.is_playing()
+                {
+                    v.set_playing(false);
+                }
+                if let Some(v) = self.player.take() {
+                    v.stop();
+                    self.player_path = None;
+                    self.player_stream = None;
+                }
+            }
+        }
         self.sync_tray_and_window(&ctx);
         theme::set_anim_speed(self.settings.anim_speed);
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
@@ -5972,6 +6112,23 @@ impl eframe::App for App {
             .exact_size(TOP_BAR_HEIGHT)
             .frame(header_frame)
             .show(ui, |ui| self.header_ui(ui, narrow));
+        let has_pinned_bar = self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| {
+            self.pinned_lists.get(&d.id).is_some_and(|l| !l.is_empty())
+                || self.pinned_msgs.contains_key(&d.id)
+        });
+        if has_pinned_bar {
+            let pin_frame = if glass_mobile {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 162))
+                    .inner_margin(egui::Margin::ZERO)
+            } else {
+                egui::Frame::new().fill(tint_panel()).inner_margin(egui::Margin::ZERO)
+            };
+            egui::Panel::top("pinned-bar")
+                .exact_size(46.0)
+                .frame(pin_frame)
+                .show(ui, |ui| self.pinned_bar_ui(ui));
+        }
         if self.audio_path.is_some() || self.audio_stream.is_some() {
             egui::Panel::top("audio-bar")
                 .exact_size(40.0)
@@ -6001,7 +6158,7 @@ impl eframe::App for App {
         }
         if self.search_open && self.selected.is_some() {
             egui::Panel::top("chat-search")
-                .exact_size(40.0)
+                .exact_size(68.0)
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.search_bar(ui));
         }
@@ -6124,6 +6281,7 @@ impl App {
         self.chat_action_confirm_window(ctx);
         self.pinned_list_window(ctx);
         self.folder_invite_window(ctx);
+        self.confirm_unpin_modal(ctx);
         if let Some((path, caption, reply_to, opts)) =
             media_editor::media_editor_window(ctx, &mut self.media_editor, &worker::home().join("cache"))
         {
@@ -6158,6 +6316,35 @@ impl App {
         {
             let _ = frame;
             self.miniapp_fallback_window(ctx);
+        }
+    }
+
+    /// Модальное окно подтверждения открепления сообщения.
+    pub(crate) fn confirm_unpin_modal(&mut self, ctx: &egui::Context) {
+        let Some((_did, mid)) = self.confirm_unpin else {
+            return;
+        };
+        let mut close = false;
+        egui::Window::new("Открепить сообщение?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                ui.label("Сообщение останется в истории чата, но пропадёт из закрепа.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if orange_button(ui, "Открепить", Vec2::new(112.0, 30.0)).clicked() {
+                        self.send(Cmd::Pin(mid, false));
+                        close = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.confirm_unpin = None;
         }
     }
 
@@ -6693,6 +6880,7 @@ fn demo_app(mode: &str) -> App {
             premium: i == 1,
             unread_mentions: 0,
             unread_reactions: 0,
+            read_inbox_max_id: 0,
         });
     }
     for (i, (n, l)) in [("Старый чат", "Давно не писали"), ("Рассылка", "Скидки на всё")].iter().enumerate() {
@@ -6720,6 +6908,7 @@ fn demo_app(mode: &str) -> App {
             premium: false,
             unread_mentions: 0,
             unread_reactions: 0,
+            read_inbox_max_id: 0,
         });
     }
     app.selected = Some(0);
@@ -6836,6 +7025,7 @@ mod tests {
             premium: false,
             unread_mentions: 0,
             unread_reactions: 0,
+            read_inbox_max_id: 0,
         }
     }
 
@@ -7536,5 +7726,197 @@ mod tests {
         assert!(txt_full.contains("≡ Меню"), "left bot menu pill missing: {txt_full}");
         assert!(txt_full.contains("Команды бота") && txt_full.contains("/menu"), "bot cmd popup missing: {txt_full}");
         assert!(txt_full.contains('@') && txt_full.contains('❤'), "stacked FABs missing: {txt_full}");
+    }
+
+    #[test]
+    fn pinned_bar_spans_full_width_and_unpins_only_on_server_event() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        let did = app.dialogs[0].id;
+        app.selected = Some(0);
+        let pin1 = MessageRow::plain(101, "Первый закреп".into(), false, app.now);
+        let pin2 = MessageRow::plain(102, "Второй закреп".into(), false, app.now + 10);
+        app.handle_event(&ctx, Ev::PinnedMessagesList(did, vec![pin1.clone(), pin2.clone()]));
+        assert_eq!(app.pinned_lists.get(&did).map(Vec::len), Some(2));
+
+        let mut bar_rect = egui::Rect::NOTHING;
+        let mut txt = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 600.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::top("pinned-bar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(t(SIDEBAR_BG))
+                            .inner_margin(egui::Margin::symmetric(0, 0)),
+                    )
+                    .show(ui, |ui| {
+                        bar_rect = ui.max_rect();
+                        app.pinned_bar_ui(ui);
+                    });
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            });
+            out.textures_delta.clear();
+            txt.clear();
+            out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut txt));
+        }
+        assert!(bar_rect.width() >= 800.0, "pinned bar must span full chat width, got {}", bar_rect.width());
+        assert!(txt.contains("Закреплённое сообщение"), "pinned title missing: {txt}");
+        assert!(txt.contains("1 из 2") || txt.contains("#1"), "multi-pin counter missing: {txt}");
+
+        // Циклический сдвиг индекса и окно подтверждения открепления до прихода Ev::Unpinned.
+        app.pinned_cur_idx.insert(did, 1);
+        app.confirm_unpin = Some((did, 102));
+        let mut confirm_txt = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 600.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.confirm_unpin_modal(ui.ctx());
+            });
+            out.textures_delta.clear();
+            confirm_txt.clear();
+            out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut confirm_txt));
+        }
+        assert!(confirm_txt.contains("Открепить сообщение?"), "confirm unpin modal missing: {confirm_txt}");
+        assert!(
+            app.pinned_lists.get(&did).is_some_and(|l| l.len() == 2),
+            "pin list must not shrink before server Ev::Unpinned"
+        );
+
+        app.handle_event(&ctx, Ev::Unpinned(did, 102));
+        assert_eq!(app.pinned_lists.get(&did).map(Vec::len), Some(1));
+        app.handle_event(&ctx, Ev::Unpinned(did, 101));
+        assert!(!app.pinned_msgs.contains_key(&did));
+    }
+
+    #[test]
+    fn channel_discuss_bar_recent_repliers_and_paid_star_pill_render_faithfully() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        let ch_idx = app
+            .dialogs
+            .iter()
+            .position(|d| d.kind == rg_core::engine::DialogKind::Channel)
+            .unwrap_or_else(|| {
+                let mut d = app.dialogs[0].clone();
+                d.id = -1_001_555_666;
+                d.kind = rg_core::engine::DialogKind::Channel;
+                d.name = "Новости Rust".into();
+                app.dialogs.push(d);
+                app.dialogs.len() - 1
+            });
+        let ch_id = app.dialogs[ch_idx].id;
+        app.selected = Some(ch_idx);
+        app.peer_infos.insert(
+            ch_id,
+            rg_core::engine::PeerInfo {
+                id: ch_id,
+                name: "Новости Rust".into(),
+                broadcast: true,
+                linked_chat_id: Some(-1_001_777_888),
+                paid_reactions_available: true,
+                ..Default::default()
+            },
+        );
+        let mut post = MessageRow::plain(501, "Релизная запись канала".into(), false, app.now);
+        post.has_comments = true;
+        post.replies_count = 12;
+        post.recent_repliers = vec![1001, 1002, 1003];
+        post.paid_reactions = 9;
+        post.reaction_items = vec![rg_core::engine::ReactionPill {
+            emoji: "⭐".into(),
+            custom_doc_id: None,
+            count: 9,
+            chosen: false,
+            paid: true,
+        }];
+        app.messages = vec![post];
+
+        let mut txt = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 680.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::bottom("cmp").show(ui, |ui| app.composer_ui(ui));
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            });
+            out.textures_delta.clear();
+            txt.clear();
+            out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut txt));
+        }
+        assert!(txt.contains("Обсудить"), "title-case channel Обсудить button missing: {txt}");
+        assert!(!txt.contains("ОБСУДИТЬ"), "ALL-CAPS ОБСУДИТЬ must not be rendered: {txt}");
+        assert!(txt.contains("12 комментариев"), "channel comments footer missing: {txt}");
+    }
+
+    #[test]
+    fn unread_divider_voice_confirmation_and_no_lie_settings_audit() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.selected = Some(0);
+        app.open_unread_anchor = Some(10);
+        app.messages = vec![
+            MessageRow::plain(10, "Прочитанное".into(), false, app.now - 60),
+            MessageRow::plain(11, "Новое входящее".into(), false, app.now),
+        ];
+        app.settings.ayu.voice_confirmation = true;
+        app.pending_voice_confirm = Some((
+            std::path::PathBuf::from("voice_test.ogg"),
+            4,
+            vec![5, 12, 18],
+            None,
+        ));
+
+        let mut txt = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 680.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::bottom("cmp").show(ui, |ui| app.composer_ui(ui));
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            });
+            out.textures_delta.clear();
+            txt.clear();
+            out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut txt));
+        }
+        assert!(txt.contains("Непрочитанные сообщения"), "unread divider missing: {txt}");
+        assert!(
+            txt.contains("Отправить") || txt.contains("Голосовое"),
+            "voice confirmation preview missing: {txt}"
+        );
+
+        let settings_src = concat!(include_str!("settings_ui.rs"), "\n", include_str!("tg_settings.rs"));
+        for dead in [
+            "local_premium",
+            "use_solar_icons",
+            "download_speed_boost",
+            "upload_speed_boost",
+            "archive_on_pull",
+            "field_gift_button",
+            "field_ai_editor_button",
+            "drawer_bots",
+            "disable_notifications_delay",
+            "improve_link_previews",
+            "round_confirmation",
+            "disable_ads",
+        ] {
+            assert!(
+                !settings_src.contains(dead),
+                "No-Lie Audit failed: inert toggle `{dead}` still present in settings UI"
+            );
+        }
     }
 }

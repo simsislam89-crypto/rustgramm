@@ -971,6 +971,8 @@ pub fn apply(ctx: &egui::Context) {
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 4.0);
         s.spacing.button_padding = Vec2::new(14.0, 7.0);
+        s.spacing.menu_margin = egui::Margin::same(4);
+        s.spacing.window_margin = egui::Margin::same(8);
         s.spacing.scroll.floating = true;
         s.spacing.scroll.floating_allocated_width = 9.0;
         s.spacing.scroll.floating_width = 5.0;
@@ -1011,6 +1013,60 @@ fn read_face(path: &str) -> Option<Arc<FontData>> {
 /// Системные шрифты Windows/Android с полным покрытием символов и эмодзи во всех семействах
 /// (убирает квадраты `□` в именах контактов, секретных чатах, кнопках и заголовках).
 fn install_fonts(ctx: &egui::Context) {
+    install_fonts_with_mono(ctx, "");
+}
+
+static LAST_MONO_FONT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Применить выбранный пользователем моноширинный шрифт (`ayu.mono_font`) поверх установленных.
+pub fn apply_mono_font(ctx: &egui::Context, font_name: &str) {
+    let trimmed = font_name.trim().to_owned();
+    if let Ok(mut g) = LAST_MONO_FONT.lock() {
+        if g.as_deref() == Some(trimmed.as_str()) {
+            return;
+        }
+        *g = Some(trimmed.clone());
+    }
+    install_fonts_with_mono(ctx, &trimmed);
+}
+
+fn find_mono_font_bytes(name: &str) -> Option<Arc<FontData>> {
+    if name.trim().is_empty() {
+        return None;
+    }
+    let needle = name.trim().to_ascii_lowercase();
+    let dirs = [
+        "C:\\Windows\\Fonts",
+        "/system/fonts",
+        "/usr/share/fonts/truetype",
+    ];
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let is_font = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"));
+            if !is_font {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if (stem == needle || stem.contains(&needle) || stem.replace(['-', '_'], " ").contains(&needle))
+                && let Some(face) = path.to_str().and_then(read_face)
+            {
+                return Some(face);
+            }
+        }
+    }
+    None
+}
+
+fn install_fonts_with_mono(ctx: &egui::Context, mono_name: &str) {
     let mut fonts = FontDefinitions::default();
     let has_segoe = if let Some(f) = read_face("C:\\Windows\\Fonts\\segoeui.ttf") {
         fonts.font_data.insert("segoe".into(), f);
@@ -1037,13 +1093,21 @@ fn install_fonts(ctx: &egui::Context) {
     } else {
         display.push("Ubuntu-Light".into());
     }
+    if let Some(custom_mono) = find_mono_font_bytes(mono_name) {
+        fonts.font_data.insert("custom-mono".into(), custom_mono);
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "custom-mono".into());
+    }
     if let Some(f) = read_face("C:\\Windows\\Fonts\\consola.ttf") {
         fonts.font_data.insert("consola".into(), f);
         fonts
             .families
             .entry(FontFamily::Monospace)
             .or_default()
-            .insert(0, "consola".into());
+            .push("consola".into());
     } else if has_segoe {
         fonts
             .families
@@ -1064,7 +1128,6 @@ fn install_fonts(ctx: &egui::Context) {
             fonts.families.entry(family).or_default().insert(0, "android-roboto".to_owned());
         }
     }
-    // Фоллбэки Unicode/символов во ВСЕ три семейства — без 10-МБ NotoColorEmoji (эмодзи рисует атлас).
     let fallback_paths = [
         ("segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
         ("noto-symbols2", "/system/fonts/NotoSansSymbols2-Regular.ttf"),

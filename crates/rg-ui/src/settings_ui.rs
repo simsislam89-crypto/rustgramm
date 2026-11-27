@@ -892,8 +892,7 @@ fn ayu_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     toggle(ui, "Сохранять в чатах с ботами", &mut s.ayu.save_for_bots);
     divider(ui);
     section(ui, "Прочее");
-    toggle(ui, "Локальный Telegram Premium", &mut s.ayu.local_premium);
-    toggle(ui, "Отключить рекламу", &mut s.ayu.disable_ads);
+    desc(ui, "Реклама Telegram не запрашивается клиентом.");
     divider(ui);
     section(ui, "Щит приватности трафика и метаданных");
     toggle(
@@ -1112,30 +1111,26 @@ fn general_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
         sub_toggle(ui, "Сворачивать", &mut a.collapse_similar_channels);
         sub_toggle(ui, "Скрывать", &mut a.hide_similar_channels);
     }
-    toggle(ui, "Отключить задержку уведомлений", &mut a.disable_notifications_delay);
     divider(ui);
     toggle_ex(ui, "Чистка «зальго»", None, true, &mut a.filter_zalgo);
-    toggle(ui, "Улучшенные превью ссылок", &mut a.improve_link_previews);
-    let n = [a.sticker_confirmation, a.gif_confirmation, a.voice_confirmation, a.round_confirmation]
+    let n = [a.sticker_confirmation, a.gif_confirmation, a.voice_confirmation]
         .iter()
         .filter(|b| **b)
         .count();
     let mut any = n > 0;
-    if toggle_ex(ui, "Подтверждение отправки", Some((n, 4, *expanded & 4 != 0)), false, &mut any) {
+    if toggle_ex(ui, "Подтверждение отправки", Some((n, 3, *expanded & 4 != 0)), false, &mut any) {
         if ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.x < ui.min_rect().right() - 80.0) {
             *expanded ^= 4;
         } else {
             a.sticker_confirmation = any;
             a.gif_confirmation = any;
             a.voice_confirmation = any;
-            a.round_confirmation = any;
         }
     }
     if *expanded & 4 != 0 {
         sub_toggle(ui, "Стикеры", &mut a.sticker_confirmation);
         sub_toggle(ui, "GIF", &mut a.gif_confirmation);
         sub_toggle(ui, "Голосовые", &mut a.voice_confirmation);
-        sub_toggle(ui, "Видеокружки", &mut a.round_confirmation);
     }
     toggle(ui, "Секунды во времени сообщения", &mut a.show_message_seconds);
     let id = match a.show_peer_id {
@@ -1303,7 +1298,6 @@ fn appearance_page(
     divider(ui);
     section(ui, "Элементы меню");
     toggle(ui, "Мой профиль", &mut a.drawer_my_profile);
-    toggle(ui, "Боты", &mut a.drawer_bots);
     toggle(ui, "Новая группа", &mut a.drawer_new_group);
     toggle(ui, "Новый канал", &mut a.drawer_new_channel);
     toggle(ui, "Контакты", &mut a.drawer_contacts);
@@ -1412,8 +1406,6 @@ fn chats_page(ui: &mut egui::Ui, s: &mut Settings, expanded: &mut u32) {
     toggle(ui, "Эмодзи", &mut a.field_emoji_button);
     toggle(ui, "Микрофон", &mut a.field_microphone_button);
     toggle(ui, "Автоудаление", &mut a.field_auto_delete_button);
-    toggle(ui, "Подарок", &mut a.field_gift_button);
-    toggle(ui, "ИИ-редактор", &mut a.field_ai_editor_button);
     toggle(ui, "Всплывающее меню скрепки", &mut a.show_attach_popup);
     toggle(ui, "Всплывающая панель эмодзи", &mut a.show_emoji_popup);
     ui.add_space(8.0);

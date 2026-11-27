@@ -257,30 +257,28 @@ pub fn card(
             cards.push((rect, if matches!(load, Load::Active(..)) { Act::CancelFetch(m.id) } else { Act::Save(m.id) }));
         }
         MediaKind::WebPage { url, site, title, desc } => {
-            let mut h = 24.0;
+            let mut h = 26.0;
             if !title.is_empty() {
                 h += 20.0;
             }
             if !desc.is_empty() {
-                h += 34.0;
+                h += 36.0;
             }
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
             let p = ui.painter();
-            p.rect_filled(
-                rect,
-                CornerRadius::same(8),
-                Color32::from_rgba_unmultiplied(0, 0, 0, (42.0 * opacity_f32()) as u8),
-            );
-            let bar = Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(2.5, rect.height() - 12.0));
-            p.rect_filled(bar, CornerRadius::same(1), t_btn(ORANGE));
-            let left = rect.left() + 15.0;
-            let mut y = rect.top() + 6.0;
+            let accent = t_btn(ORANGE);
+            let tint = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), if resp.hovered() { 34 } else { 20 });
+            p.rect_filled(rect, CornerRadius::same(8), tint);
+            let bar = Rect::from_min_size(rect.min + Vec2::new(5.0, 5.0), Vec2::new(3.0, (rect.height() - 10.0).max(8.0)));
+            p.rect_filled(bar, CornerRadius::same(1), accent);
+            let left = rect.left() + 14.0;
+            let mut y = rect.top() + 5.0;
             p.text(
                 Pos2::new(left, y),
                 Align2::LEFT_TOP,
                 clip_text(if site.is_empty() { url } else { site }, 34),
                 FontId::proportional(12.5),
-                ORANGE,
+                accent,
             );
             y += 17.0;
             if !title.is_empty() {
@@ -294,7 +292,7 @@ pub fn card(
                 y += 18.0;
             }
             if !desc.is_empty() {
-                let g = p.layout(clip_text(desc, 85), FontId::proportional(12.5), date_c, (w - 22.0).max(60.0));
+                let g = p.layout(clip_text(desc, 90), FontId::proportional(12.0), date_c, (w - 22.0).max(60.0));
                 p.galley(Pos2::new(left, y), g, date_c);
             }
             if !url.is_empty() {

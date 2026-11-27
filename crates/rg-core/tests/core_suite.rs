@@ -47,6 +47,7 @@ fn dummy_dialog(
         premium: false,
         unread_mentions: 0,
         unread_reactions: 0,
+        read_inbox_max_id: 0,
     }
 }
 

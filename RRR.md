@@ -1214,3 +1214,32 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: 20768 bytes, version 037`, `aarch64-linux-android` Full & Lite OK).
 - `cargo test --workspace` — **2 186 тестов пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 62+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 81+631; включая `obfuscated_transport_builds_fresh_non_forbidden_handshake`, `chat_reactions_policy_handles_all_some_and_none`, `matte_backdrop_and_plane_mascot_have_no_circle_or_blue_orange_glow`, `bot_empty_welcome_commands_popup_and_scrolled_fab_render_cleanly`).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.25.0`) собран (**21 271 552 байта**, release 4m 40s); live smoke `RG_DEMO=1`, `login`, `qr`, `390x844 RG_MOBILE_GLASS=1` — **ALIVE=True**.
+
+## Этап 39 (2026-11-27, v0.26.0)
+
+### Полноширинное закрепление, «Обсудить» как в Telegram, компактные меню, звёздная реакция в меню, 100% аудит без лжи и 10 новых функций
+
+1. **Полноширинная плашка закрепа (`crates/rg-ui/src/{lib,chat,worker,features_ui}.rs`)**:
+   - Вынесена в `Panel::top("pinned-bar")` сразу под шапкой на всю ширину области чата (сегментированная вертикальная полоса слева, счётчик `#k из N` при множестве закрепов, превью с поддержкой медиа и миниатюр фото, переход к любому закрепу даже за пределами загруженного окна через `Cmd::JumpToMessage` -> `Engine::history_around`, кнопка списка всех закрепов и `✕` с честным подтверждением `confirm_unpin_modal`, ожидающим серверного `Ev::Unpinned`).
+
+2. **«Обсудить» 1 в 1 с Telegram (`crates/rg-core/src/engine.rs`, `crates/rg-ui/src/{chat,worker}.rs`)**:
+   - В `MessageRow` добавлено поле `recent_repliers: Vec<i64>` (до 3 реальных комментаторов из `MessageReplies`); футер под постом канала рисует сплошную верхнюю линию-разделитель, стопку из до 3 круговых аватарок комментаторов, склоняемый/компактный счётчик (`plural_comments_ex`) и 2-сегментный шеврон `›`.
+   - Нижняя панель канала `channel_bottom_bar` (44 px, без ALL-CAPS — заглавное «Обсудить» + кнопка звука справа) открывает реальную связанную группу обсуждения через `Cmd::OpenLinkedDiscussion` -> `Engine::resolve_linked_chat`.
+
+3. **Компактные всплывающие меню и ⭐ звёздная реакция в меню (`crates/rg-ui/src/{icons,kit,theme,chat,tg_settings,features_ui}.rs`)**:
+   - Унифицированы компактные попапы: `MENU_ITEM_H = 28.0`, `MENU_MIN_W = 176.0`, `kit::compact_popup_frame()`, `kit::menu_separator()`, `menu_margin = 4`, переведены контекстные меню пузыря, списка чатов, вложений, параметров отправки, команд бота и `⋮` профиля/чата.
+   - Векторная золотая звезда `icons::paint_star` встроена первой кнопкой в верхнюю панель быстрых реакций контекстного меню сообщения (при `paid_reactions_available == true`, без дубля в теле меню), а кликабельная пилюля платной реакции открывает обновлённую модалку `paid_reaction_modal` с реальным балансом Telegram Stars и шагом 1..=2500.
+
+4. **100% честный клиент без заглушек (No-Lie Audit, `crates/rg-{ayu,core,ui}/src/*.rs`)**:
+   - Удалены 12 неработающих переключателей-пустышек из `settings_ui.rs` и `tg_settings.rs` (`local_premium`, `disable_ads`, `disable_notifications_delay`, `improve_link_previews`, `round_confirmation`, `drawer_bots`, `field_gift_button`, `field_ai_editor_button`, `use_solar_icons`, `download_speed_boost`, `upload_speed_boost`, `archive_on_pull`; поля в `rg-settings` оставлены с `#[serde(default)]` для совместимости конфигов).
+   - Подключены к живому коду 14 ранее неиспользованных настроек (`filters_enabled_in_chats`, `mono_font`, `unlimited_recent_stickers`, `show_only_added_emojis_and_stickers`, `hide_share_button`, `disable_number_rounding`, `force_blur`, `pause_on_minimize`, `field_microphone_button`, `show_attach_popup`, `voice_confirmation`, `single_corner_radius`, `disable_greeting_sticker`, `quick_admin_shortcuts`).
+   - Исправлен откат `ReadDialog`/`MarkDialogUnread` при ошибке RPC, честные статусы в `Cmd::Forward`, `Cmd::Pin`, `proxy_window`, `Act::SaveToSaved` и двойное сложение счётчика при наличии `reaction_items`.
+
+5. **10 новых реальных функций (`rg-core/src/engine.rs`, `rg-ui/src/{chat,media_ui,worker,lib}.rs`)**:
+   - `JumpToMessage` (подгрузка истории вокруг целевого ID), разделитель «Непрочитанные сообщения» (`read_inbox_max_id`), тонированная полоса цитаты в реплаях, реальные аватарки `recent_repliers` + переход в связанную группу, автокомплит `@упоминаний` в поле ввода, контекстное меню кнопки отправки («Отправить без звука», «Отложить», «Эффекты / Опрос / Чек-лист»), навигация `↑`/`↓` (`k из N`) в поиске по чату, 6 серверных фильтров `messages.search` (`Все`/`Фото`/`Видео`/`Файлы`/`Ссылки`/`Голосовые`), экспорт загруженной истории чата в UTF-8 TXT и обновлённая карточка превью веб-ссылок `WebPage`.
+
+### Проверки (v0.26.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `cargo clippy -p rg-ui --no-default-features -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: 20768 bytes`, `aarch64-linux-android` Full & Lite OK).
+- Добавлены тесты `rg-core` (4 теста: `recent_repliers`, `ChatSearchFilter`, `format_compact_count` / `format_chat_export_txt`, `filters_enabled_in_chats`), `kit.rs` (`compact_menu_constants_and_frame_stay_tight`), `chat.rs` (4 теста, включая headless `menu_places_gold_star_reaction_in_top_strip_only_when_paid_available`) и `lib.rs` (3 headless-теста: полноширинный закреп + `Ev::Unpinned`, канал «Обсудить» + `recent_repliers`, разделитель непрочитанных + `voice_confirmation` + No-Lie аудит настроек).

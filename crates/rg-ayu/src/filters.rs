@@ -39,11 +39,19 @@ impl FilterSet {
 
     /// Нужно ли скрыть сообщение с таким текстом в этом чате.
     pub fn hides(&self, chat: i64, text: &str) -> bool {
+        self.hides_with(chat, text, true)
+    }
+
+    /// Проверяет фильтрацию сообщения с учётом включения глобальных фильтров в чатах (`allow_global`).
+    /// Локальные правила конкретного чата (`f.dialog_id == Some(chat)`) работают всегда, когда включены фильтры.
+    pub fn hides_with(&self, chat: i64, text: &str, allow_global: bool) -> bool {
         let mut text_lower: Option<String> = None;
         self.rules.iter().any(|(f, re, lower)| {
-            if let Some(target_dialog) = f.dialog_id
-                && target_dialog != chat
-            {
+            if let Some(target_dialog) = f.dialog_id {
+                if target_dialog != chat {
+                    return false;
+                }
+            } else if !allow_global {
                 return false;
             }
             if f.excluded_chats.contains(&chat) {

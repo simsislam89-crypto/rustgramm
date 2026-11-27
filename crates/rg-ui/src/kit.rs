@@ -312,25 +312,50 @@ pub fn sub_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
     false
 }
 
-/// Строка контекстного меню Telegram: значок слева, подпись, высота 34 px, красная для опасных.
+pub const MENU_ITEM_H: f32 = 28.0;
+pub const MENU_MIN_W: f32 = 176.0;
+
+/// Рамка компактного всплывающего меню Telegram.
+pub fn compact_popup_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(t2(WINDOW_BG))
+        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(24)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(3, 4))
+}
+
+/// Компактный разделитель внутри контекстного меню.
+pub fn menu_separator(ui: &mut egui::Ui) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 5.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left() + 8.0, rect.center().y),
+            Pos2::new((rect.right() - 8.0).max(rect.left() + 8.0), rect.center().y),
+        ],
+        egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+    );
+}
+
+/// Строка контекстного меню Telegram: значок слева, подпись, компактная высота 28 px, красная для опасных.
 pub fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, danger: bool) -> bool {
-    let w = ui.available_width().max(210.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    let w = ui.available_width().max(MENU_MIN_W);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, MENU_ITEM_H), Sense::click());
     let p = ui.painter();
     if resp.hovered() {
-        p.rect_filled(rect, 0.0, t2(WINDOW_OVER));
+        p.rect_filled(rect.shrink2(Vec2::new(4.0, 1.0)), CornerRadius::same(6), t2(WINDOW_OVER));
     }
     let (icon_c, text_c) = if danger { (DANGER, DANGER) } else { (DIALOG_DATE, WHITE) };
-    super::icons::tg(p, icon, Pos2::new(rect.left() + 26.0, rect.center().y), icon_c);
+    super::icons::tg_sized(p, icon, Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(15.0), icon_c);
     let clip = Rect::from_min_max(
-        Pos2::new(rect.left() + 52.0, rect.top()),
-        Pos2::new((rect.right() - 12.0).max(rect.left() + 60.0), rect.bottom()),
+        Pos2::new(rect.left() + 36.0, rect.top()),
+        Pos2::new((rect.right() - 10.0).max(rect.left() + 44.0), rect.bottom()),
     );
     p.with_clip_rect(clip).text(
-        Pos2::new(rect.left() + 53.0, rect.center().y),
+        Pos2::new(rect.left() + 36.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        FontId::proportional(14.0),
+        FontId::proportional(13.0),
         text_c,
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
@@ -348,5 +373,17 @@ mod tests {
         sync_prefs(false, false);
         assert!(!MD3_SWITCHES.load(Ordering::Relaxed));
         assert!(!HIDE_DIVIDERS.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn compact_menu_constants_and_frame_stay_tight() {
+        const {
+            assert!(MENU_ITEM_H <= 28.0);
+            assert!(MENU_MIN_W <= 180.0);
+        }
+        let frame = compact_popup_frame();
+        assert_eq!(frame.inner_margin, egui::Margin::symmetric(3, 4));
+        assert_eq!(frame.corner_radius, CornerRadius::same(10));
+        assert_eq!(frame.stroke.width, 1.0);
     }
 }
