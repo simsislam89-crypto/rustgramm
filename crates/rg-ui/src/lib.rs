@@ -871,9 +871,13 @@ impl App {
             #[cfg(windows)]
             player: None,
             plugins: {
-                let mut reg = rg_ayu::plugins::PluginRegistry::with_builtins();
-                let _ = reg.load_dir(&worker::home().join("plugins"));
-                reg
+                if cfg!(feature = "plugins") {
+                    let mut reg = rg_ayu::plugins::PluginRegistry::with_builtins();
+                    let _ = reg.load_dir(&worker::home().join("plugins"));
+                    reg
+                } else {
+                    rg_ayu::plugins::PluginRegistry::default()
+                }
             },
             settings_opened_at: None,
             chat_nav_back: Vec::new(),
@@ -3823,14 +3827,17 @@ impl App {
                     }
                 }
             }
-            if self.android_webview_open
-                && let Some(tgu) = android_jni::poll_pending_link()
-            {
-                if let Some(parsed) = rg_core::engine::parse_tg_link(&tgu) {
-                    self.send(Cmd::OpenTgLink(parsed));
+            if self.android_webview_open {
+                if let Some(tgu) = android_jni::poll_pending_link() {
+                    if let Some(parsed) = rg_core::engine::parse_tg_link(&tgu) {
+                        self.send(Cmd::OpenTgLink(parsed));
+                    }
+                    self.android_webview_open = false;
+                    self.miniapp_modal = None;
+                } else if !android_jni::is_webview_open() {
+                    self.android_webview_open = false;
+                    self.miniapp_modal = None;
                 }
-                self.android_webview_open = false;
-                self.miniapp_modal = None;
             }
             if self.android_input_pending {
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -5652,7 +5659,14 @@ fn notify_toast(title: &str, body: &str) {
             .spawn();
     }
     #[cfg(target_os = "android")]
-    crate::android_jni::show_notification(1001, title, body);
+    {
+        let mut h = 2_166_136_261u32;
+        for &b in title.as_bytes() {
+            h = (h ^ u32::from(b)).wrapping_mul(16_777_619);
+        }
+        let nid = 1000 + (h % 512) as i32;
+        crate::android_jni::show_notification(nid, title, body);
+    }
     #[cfg(all(not(windows), not(target_os = "android")))]
     let _ = (title, body);
 }

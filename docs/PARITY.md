@@ -149,6 +149,7 @@
 | Поиск участников и фильтры `Все`/`Админы`/`Боты` | ✅ `ParticipantFilter` + `channel_participants_filtered` (`Cmd::ParticipantsFiltered`) с поиском в правой панели | `engine.rs`, `worker.rs`, `chat.rs`, `lib.rs` |
 | 3-точечная волна набора текста + Ghost-безопасный `setTyping` | ✅ `paint_typing_wave` в шапке/списке, `Engine::typing_allowed` (Ghost Mode + `PrivacyShieldSettings`), `Cmd::SetTyping` | `engine.rs`, `worker.rs`, `chat.rs`, `lib.rs` |
 | Контакты и геопозиция: отправка и карточки | ✅ `MediaKind::Contact` / `MediaKind::Geo`, `send_contact` / `send_geo`, богатые карточки с копированием и модальные окна отправки | `media.rs`, `engine.rs`, `worker.rs`, `media_ui.rs`, `lib.rs` |
+| Защита плагинов, WebView/JNI-жизненный цикл, `open_url` на Android и честный Lite `--no-default-features` (v0.24.1) | ✅ Валидация `__id__` против path traversal (`plugins.rs`), `default-features = false` на `rg-ayu` + гейт `cfg!(feature = "plugins")`, `openExternalUrl`/`isWebViewOpen`/`wv.destroy()` и UI-thread `JsProxy` в `RgBridge.java` (`20 768` байт), `rich::open_url` на Android, per-chat Android notification ID, лимит повторов `apply_update.cmd`, `stop_flag` при таймауте микрофона | `plugins.rs`, `rg-core/Cargo.toml`, `build_android_bridge.py`, `test_rg_bridge.py`, `android_jni.rs`, `rich.rs`, `audio_io.rs`, `updater.rs`, `worker.rs`, `lib.rs` |
 
 ## Порядок дальнейших этапов
 1. **Этап 9 — лента как у Telegram:** форматирование текста и ссылки, GIF/видео/голосовые, анимированные стикеры, альбомы.

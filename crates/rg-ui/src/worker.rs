@@ -2723,19 +2723,28 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::Forward(id, to, no_author) => {
                 let Some(i) = current else { continue };
                 let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to)) else { continue };
-                let res = if no_author {
-                    engine.forward_no_author(from.peer, dest.peer, id).await
-                } else {
-                    engine.forward(from.peer, dest.peer, &[id]).await
-                };
-                match res {
-                    Ok(()) => out.send(Ev::Status(format!(
-                        "Переслано{}: {}",
-                        if no_author { " без автора" } else { "" },
-                        dest.name
-                    ))),
-                    Err(e) => out.err(format!("Не переслано: {e}")),
-                }
+                let (eng, out, from_peer, dest_peer, dest_name) = (
+                    engine.clone(),
+                    out.clone(),
+                    from.peer,
+                    dest.peer,
+                    dest.name.clone(),
+                );
+                tokio::spawn(async move {
+                    let res = if no_author {
+                        eng.forward_no_author(from_peer, dest_peer, id).await
+                    } else {
+                        eng.forward(from_peer, dest_peer, &[id]).await
+                    };
+                    match res {
+                        Ok(()) => out.send(Ev::Status(format!(
+                            "Переслано{}: {}",
+                            if no_author { " без автора" } else { "" },
+                            dest_name
+                        ))),
+                        Err(e) => out.err(format!("Не переслано: {e}")),
+                    }
+                });
             }
             Cmd::Translate(id, text) => {
                 let (eng, out) = (engine.clone(), out.clone());
@@ -5344,7 +5353,24 @@ async fn enter(
     let mut stream_done = true;
     if let Some((d, done)) = first_batch {
         stream_done = done;
-        if !d.is_empty() || dialogs.is_empty() {
+        if !done && !dialogs.is_empty() && d.len() < dialogs.len() {
+            // Сохраняем кэшированный список чатов поверх начального батча, обновляя свежие строки сверху.
+            let mut fresh_ids: std::collections::HashSet<i64> =
+                std::collections::HashSet::with_capacity(d.len());
+            let mut merged = Vec::with_capacity(dialogs.len() + d.len());
+            for row in d {
+                if fresh_ids.insert(row.id) {
+                    merged.push(row);
+                }
+            }
+            for old in dialogs.iter() {
+                if !fresh_ids.contains(&old.id) {
+                    merged.push(old.clone());
+                }
+            }
+            *dialogs = merged.clone();
+            out.send(Ev::Dialogs(merged));
+        } else if !d.is_empty() || dialogs.is_empty() {
             *dialogs = d.clone();
             out.send(Ev::Dialogs(d));
         }

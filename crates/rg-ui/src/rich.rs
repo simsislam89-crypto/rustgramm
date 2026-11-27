@@ -408,6 +408,10 @@ pub fn open_url(url: &str) {
             .creation_flags(0x0800_0000)
             .spawn();
     }
+    #[cfg(target_os = "android")]
+    {
+        crate::android_jni::open_url(url);
+    }
     #[cfg(all(unix, not(target_os = "android")))]
     {
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };

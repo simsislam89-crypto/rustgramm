@@ -387,13 +387,17 @@ mod platform {
                 "@echo off\r\n\
                  chcp 65001 >nul\r\n\
                  timeout /t 1 /nobreak >nul\r\n\
+                 set tries=0\r\n\
                  :loop\r\n\
+                 set /a tries+=1\r\n\
                  copy /y \"{new_s}\" \"{cur_s}\" >nul 2>&1\r\n\
                  if errorlevel 1 (\r\n\
+                   if %tries% GEQ 20 goto cleanup\r\n\
                    timeout /t 1 /nobreak >nul\r\n\
                    goto loop\r\n\
                  )\r\n\
                  start \"\" \"{cur_s}\"\r\n\
+                 :cleanup\r\n\
                  del /f /q \"{new_s}\" >nul 2>&1\r\n\
                  del /f /q \"%~f0\" >nul 2>&1\r\n"
             );

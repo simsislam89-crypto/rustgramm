@@ -431,9 +431,18 @@ pub fn parse_plugin(src: &str) -> Result<Plugin, String> {
         }
     }
 
-    if id.trim().is_empty() {
+    let trimmed_id = id.trim();
+    if trimmed_id.is_empty() {
         return Err("В плагине не указан __id__".to_owned());
     }
+    if trimmed_id.contains("..")
+        || !trimmed_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("Недопустимый __id__ плагина: разрешены только латиница, цифры, '.', '_' и '-'".to_owned());
+    }
+    let id = trimmed_id.to_owned();
     if name.trim().is_empty() {
         name.clone_from(&id);
     }
@@ -643,5 +652,15 @@ __description__ = "Тестовый плагин"
             reg.apply_outgoing("топ :fire:"),
             HookOutcome::Modified("топ 🔥".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_path_traversal_plugin_ids() {
+        for bad in ["", "../evil", "..\\evil", "dir/sub", "dir\\sub", "bad id", "a..b"] {
+            let src = format!("__id__ = \"{bad}\"\n__name__ = \"Bad\"");
+            assert!(parse_plugin(&src).is_err(), "expected error for id={bad:?}");
+        }
+        let ok = parse_plugin("__id__ = \"ayu_tools-1.0\"\n__name__ = \"Tools\"").unwrap();
+        assert_eq!(ok.id, "ayu_tools-1.0");
     }
 }

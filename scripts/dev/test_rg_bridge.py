@@ -45,15 +45,26 @@ public final class RgBridgeTest {
         check("CAN:login_code".equals(can), "cancel sentinel mismatch");
         check(RgBridge.pollInputEvent() == null, "cancel sentinel must drain");
 
-        // 4. Null-безопасность Activity-методов (headless CI / тесты без Android UI)
+        // 4. Null-безопасность и проверка схем URL для Activity-методов (headless CI)
+        check(!RgBridge.isWebViewOpen(), "isWebViewOpen must default to false");
         RgBridge.showSoftInput(null);
         RgBridge.promptTextInput(null, "login_code", "Title", "Hint", "123", 2);
         RgBridge.pickFile(null, "*/*", "/tmp");
-        RgBridge.openWebView(null, "https://example.org", "Preview", true);
+        RgBridge.openExternalUrl(null, "https://telegram.org");
+        RgBridge.openExternalUrl(null, "file:///etc/passwd");
+        RgBridge.openWebView(null, "https://telegram.org", "Preview", true);
+        RgBridge.openWebView(null, "file:///etc/passwd", "BadScheme", true);
         RgBridge.closeWebView(null);
         RgBridge.setupGlassWindow(null);
         String ins = RgBridge.getSafeInsetsPx(null);
         check("0,0,0,0".equals(ins), "getSafeInsetsPx(null) must be 0,0,0,0, got: " + ins);
+
+        // 4b. Проверка наличия ключевых JNI-сигнатур RgBridge через reflection
+        check(RgBridge.class.getMethod("openExternalUrl", android.app.Activity.class, String.class) != null, "openExternalUrl missing");
+        check(RgBridge.class.getMethod("isWebViewOpen") != null, "isWebViewOpen missing");
+        check(RgBridge.class.getMethod("setupGlassWindow", android.app.Activity.class) != null, "setupGlassWindow missing");
+        check(RgBridge.class.getMethod("getSafeInsetsPx", android.app.Activity.class) != null, "getSafeInsetsPx missing");
+        check(RgBridge.class.getMethod("pollInputEvent") != null, "pollInputEvent missing");
 
         // 5. Конкурентная запись/чтение INPUT_EVENT без разрыва tag и value
         final int threads = 4;

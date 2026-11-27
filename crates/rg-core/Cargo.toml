@@ -18,7 +18,7 @@ sha2 = "0.11"
 getrandom = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 rg-settings = { path = "../rg-settings" }
-rg-ayu = { path = "../rg-ayu" }
+rg-ayu = { path = "../rg-ayu", default-features = false }
 serde = { workspace = true }
 
 [dev-dependencies]

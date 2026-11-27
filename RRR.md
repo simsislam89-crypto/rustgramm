@@ -1161,3 +1161,27 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: crates/rg-ui/assets/rg_bridge.dex (18220 bytes, version 037)`, `cargo check -p rg-android --target aarch64-linux-android` Full & Lite OK).
 - `cargo test --workspace` (`0.24.0`) — **2 181 тест пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 31+370+320, `rg-core`: 60+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 79+631; `renders_local_cached_tgs_if_present` pre-existing ignored).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.24.0`) собран (**21 176 320 байт**, release 4m 20s); live smoke `RG_DEMO=1`, `RG_DEMO=login`, `RG_DEMO=qr` и `RG_SIZE=390x844 RG_MOBILE_GLASS=1 RG_DEMO=login` — **ALIVE=True**.
+
+## Этап 37 (2026-11-27, v0.24.1)
+
+### Закрытие оставшихся блокеров EGM-аудита, паритет Android WebView / `open_url` и строгий `--no-default-features` Lite
+
+1. **Безопасность плагинов и честный Lite-режим (`crates/rg-ayu/src/plugins.rs`, `crates/rg-core/Cargo.toml`, `crates/rg-ui/src/lib.rs`)**:
+   - В `parse_plugin` добавлена строгая проверка `__id__` (разрешены только ASCII-буквы/цифры, `.`, `_`, `-`; запрещены `..`, `/`, `\`, пробелы) с тестом `rejects_path_traversal_plugin_ids`.
+   - В `crates/rg-core/Cargo.toml` зависимость `rg-ayu` переведена на `default-features = false`, а инициализация `PluginRegistry::with_builtins` + `load_dir` в `rg-ui/src/lib.rs` закрыта проверкой `cfg!(feature = "plugins")`.
+
+2. **Стабильность аудио, автообновлений и неблокирующего старта (`crates/rg-ui/src/{audio_io,updater,worker}.rs`)**:
+   - В `VoiceRecorder::start` и `AndroidVoiceRecorder::start` добавлен `stop_flag.store(true, Ordering::Release)` при таймауте/ошибке инициализации.
+   - В `apply_update.cmd` добавлен потолок в 20 попыток перед очисткой, `Cmd::Forward` вынесен в `tokio::spawn`, а в `enter()` начальный батч `dialogs_stream` мягко сливается поверх кэша без обрезания списка чатов при старте.
+
+3. **Android WebView/JNI-жизненный цикл, внешние ссылки и многочатовые уведомления (`scripts/dev/{build_android_bridge,test_rg_bridge}.py`, `crates/rg-ui/src/{android_jni,rich,lib}.rs`)**:
+   - В `RgBridge.java` (`rg_bridge.dex`, 20 768 байт) добавлены `WEBVIEW_OPEN` / `isWebViewOpen()`, `openExternalUrl(Activity, String)` с проверкой `http://`/`https://`, отключение `allowFileAccess`/`allowContentAccess`, UI-thread `dismiss` в `JsProxy` и `OnDismissListener` с `wv.stopLoading()/destroy()`.
+   - В `android_jni.rs` подключены `open_url` (используется из `rich::open_url` на Android), `is_webview_open`, освобождение `MediaPlayer.release()` при ошибке, фиксация `CHANNEL_CREATED` только после успешного создания канала и `clear_jni_exc`; уведомления `notify_toast` на Android используют per-chat хешированный ID вместо жёсткого `1001`.
+   - `test_rg_bridge.py` расширен проверкой `isWebViewOpen()`, `openExternalUrl`, защиты от `file://` и сигнатур `RgBridge` через reflection.
+
+### Проверки (v0.24.1)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `cargo clippy -p rg-ui --no-default-features -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: crates/rg-ui/assets/rg_bridge.dex (20768 bytes, version 037)`, `cargo check -p rg-android --target aarch64-linux-android` Full & Lite OK).
+- `cargo test --workspace` (`0.24.1`) — **2 182 теста пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 60+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 79+631).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.24.1`) собран (**21 188 608 байт**, release 4m 48s); live smoke `RG_DEMO=1`, `RG_DEMO=login`, `RG_DEMO=qr` и `RG_SIZE=390x844 RG_MOBILE_GLASS=1 RG_DEMO=login` — **ALIVE=True**.

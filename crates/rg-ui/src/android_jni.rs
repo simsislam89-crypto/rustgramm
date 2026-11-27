@@ -201,6 +201,15 @@ mod imp {
         });
     }
 
+    fn clear_jni_exc(env: &mut JNIEnv<'_>) -> bool {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn stop_audio() {
         let slot = ACTIVE_PLAYER.get_or_init(|| Mutex::new(None));
         if let Ok(mut guard) = slot.lock()
@@ -209,7 +218,9 @@ mod imp {
             with_env(|env, _| {
                 let p = player_ref.as_obj();
                 let _ = env.call_method(p, "stop", "()V", &[]);
+                let _ = clear_jni_exc(env);
                 let _ = env.call_method(p, "release", "()V", &[]);
+                let _ = clear_jni_exc(env);
                 Some(())
             });
         }
@@ -221,21 +232,30 @@ mod imp {
         let vol = volume.clamp(0.0, 1.0);
         with_env(|env, _| {
             let mp = env.new_object("android/media/MediaPlayer", "()V", &[]).ok()?;
-            let jpath = env.new_string(&path_str).ok()?;
-            env.call_method(&mp, "setDataSource", "(Ljava/lang/String;)V", &[JValue::Object(&jpath)])
-                .ok()?;
-            env.call_method(&mp, "setLooping", "(Z)V", &[JValue::Bool(u8::from(looping))])
-                .ok()?;
-            env.call_method(&mp, "setVolume", "(FF)V", &[JValue::Float(vol), JValue::Float(vol)])
-                .ok()?;
-            env.call_method(&mp, "prepare", "()V", &[]).ok()?;
-            env.call_method(&mp, "start", "()V", &[]).ok()?;
-            if let Ok(g) = env.new_global_ref(&mp)
-                && let Ok(mut guard) = ACTIVE_PLAYER.get_or_init(|| Mutex::new(None)).lock()
-            {
-                *guard = Some(g);
+            let ok = (|| -> Option<()> {
+                let jpath = env.new_string(&path_str).ok()?;
+                env.call_method(&mp, "setDataSource", "(Ljava/lang/String;)V", &[JValue::Object(&jpath)])
+                    .ok()?;
+                env.call_method(&mp, "setLooping", "(Z)V", &[JValue::Bool(u8::from(looping))])
+                    .ok()?;
+                env.call_method(&mp, "setVolume", "(FF)V", &[JValue::Float(vol), JValue::Float(vol)])
+                    .ok()?;
+                env.call_method(&mp, "prepare", "()V", &[]).ok()?;
+                env.call_method(&mp, "start", "()V", &[]).ok()?;
+                if let Ok(g) = env.new_global_ref(&mp)
+                    && let Ok(mut guard) = ACTIVE_PLAYER.get_or_init(|| Mutex::new(None)).lock()
+                {
+                    *guard = Some(g);
+                    return Some(());
+                }
+                None
+            })();
+            if ok.is_none() {
+                clear_jni_exc(env);
+                let _ = env.call_method(&mp, "release", "()V", &[]);
+                clear_jni_exc(env);
             }
-            Some(())
+            ok
         });
     }
 
@@ -265,7 +285,7 @@ mod imp {
                 return None;
             }
             let chan_id = env.new_string("rustgramm_messages").ok()?;
-            if sdk_int(env) >= 26 && !CHANNEL_CREATED.swap(true, Ordering::Relaxed) {
+            if sdk_int(env) >= 26 && !CHANNEL_CREATED.load(Ordering::Relaxed) {
                 let chan_name = env.new_string("Сообщения").ok()?;
                 let ch = env
                     .new_object(
@@ -278,12 +298,20 @@ mod imp {
                         ],
                     )
                     .ok()?;
-                let _ = env.call_method(
-                    &nm,
-                    "createNotificationChannel",
-                    "(Landroid/app/NotificationChannel;)V",
-                    &[JValue::Object(&ch)],
-                );
+                if env
+                    .call_method(
+                        &nm,
+                        "createNotificationChannel",
+                        "(Landroid/app/NotificationChannel;)V",
+                        &[JValue::Object(&ch)],
+                    )
+                    .is_ok()
+                    && !clear_jni_exc(env)
+                {
+                    CHANNEL_CREATED.store(true, Ordering::Relaxed);
+                } else {
+                    clear_jni_exc(env);
+                }
             }
             let builder = if sdk_int(env) >= 26 {
                 env.new_object(
@@ -338,6 +366,7 @@ mod imp {
                 "(ILandroid/app/Notification;)V",
                 &[JValue::Int(id), JValue::Object(&notif)],
             );
+            clear_jni_exc(env);
             Some(())
         });
     }
@@ -425,6 +454,32 @@ mod imp {
             let s: String = env.get_string(&JString::from(res)).ok()?.into();
             (!s.is_empty()).then_some(s)
         })
+    }
+
+    pub fn is_webview_open() -> bool {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            env.call_static_method(cls, "isWebViewOpen", "()Z", &[])
+                .ok()?
+                .z()
+                .ok()
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn open_url(url: &str) {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let jurl = env.new_string(url).ok()?;
+            let _ = env.call_static_method(
+                cls,
+                "openExternalUrl",
+                "(Landroid/app/Activity;Ljava/lang/String;)V",
+                &[JValue::Object(act), JValue::Object(&jurl)],
+            );
+            clear_jni_exc(env);
+            Some(())
+        });
     }
 
     pub fn show_soft_input() {
@@ -680,8 +735,14 @@ mod imp {
                     started: Instant::now(),
                     handle: Some(handle),
                 }),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err("Таймаут инициализации AudioRecord".into()),
+                Ok(Err(e)) => {
+                    stop_flag.store(true, Ordering::Release);
+                    Err(e)
+                }
+                Err(_) => {
+                    stop_flag.store(true, Ordering::Release);
+                    Err("Таймаут инициализации AudioRecord".into())
+                }
             }
         }
 
@@ -753,6 +814,10 @@ mod imp {
     pub fn poll_pending_link() -> Option<String> {
         None
     }
+    pub fn is_webview_open() -> bool {
+        false
+    }
+    pub fn open_url(_url: &str) {}
     pub fn show_soft_input() {}
     pub fn prompt_text_input(_tag: &str, _title: &str, _hint: &str, _initial: &str, _kind: i32) {}
     pub fn poll_text_input() -> Option<(String, String)> {

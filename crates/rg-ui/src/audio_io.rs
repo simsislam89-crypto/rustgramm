@@ -594,8 +594,14 @@ mod win_audio {
                     started: Instant::now(),
                     handle: Some(handle),
                 }),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err("Таймаут инициализации микрофона".to_owned()),
+                Ok(Err(e)) => {
+                    stop_flag.store(true, Ordering::Release);
+                    Err(e)
+                }
+                Err(_) => {
+                    stop_flag.store(true, Ordering::Release);
+                    Err("Таймаут инициализации микрофона".to_owned())
+                }
             }
         }
 

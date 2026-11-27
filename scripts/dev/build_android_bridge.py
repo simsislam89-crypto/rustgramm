@@ -51,6 +51,7 @@ import android.widget.TextView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class RgBridge {
@@ -60,7 +61,9 @@ public final class RgBridge {
     public static final AtomicReference<String> INPUT_RESULT = new AtomicReference<>(null);
     // Атомарный канал "OK:tag\0value" / "CAN:tag", исключающий гонку pollInputTag/pollInputResult.
     public static final AtomicReference<String> INPUT_EVENT = new AtomicReference<>(null);
+    public static final AtomicBoolean WEBVIEW_OPEN = new AtomicBoolean(false);
     private static volatile Dialog activeWebDialog = null;
+    private static volatile WebView activeWebView = null;
     private static volatile AlertDialog activeInputDialog = null;
     private static volatile String pendingDestDir = null;
 
@@ -306,14 +309,34 @@ public final class RgBridge {
         return PENDING_LINK.getAndSet(null);
     }
 
+    public static boolean isWebViewOpen() {
+        return WEBVIEW_OPEN.get();
+    }
+
+    public static void openExternalUrl(final Activity act, final String url) {
+        if (act == null || url == null) return;
+        if (!(url.startsWith("http://") || url.startsWith("https://"))) return;
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    act.startActivity(intent);
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
     public static void openWebView(final Activity act, final String url, final String title, final boolean spoofAndroid) {
         if (act == null || url == null) return;
+        if (!(url.startsWith("http://") || url.startsWith("https://"))) return;
         act.runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 try {
                     closeWebView(act);
-                    Dialog dlg = new Dialog(act, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+                    final Dialog dlg = new Dialog(act, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
                     LinearLayout root = new LinearLayout(act);
                     root.setOrientation(LinearLayout.VERTICAL);
                     root.setBackgroundColor(Color.parseColor("#0E0E10"));
@@ -344,15 +367,17 @@ public final class RgBridge {
                     bar.addView(closeBtn);
                     root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-                    WebView wv = new WebView(act);
+                    final WebView wv = new WebView(act);
                     WebSettings ws = wv.getSettings();
                     ws.setJavaScriptEnabled(true);
                     ws.setDomStorageEnabled(true);
+                    ws.setAllowFileAccess(false);
+                    ws.setAllowContentAccess(false);
                     ws.setMediaPlaybackRequiresUserGesture(false);
                     if (spoofAndroid) {
                         ws.setUserAgentString("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36");
                     }
-                    wv.addJavascriptInterface(new JsProxy(dlg), "TelegramWebviewProxy");
+                    wv.addJavascriptInterface(new JsProxy(act, dlg), "TelegramWebviewProxy");
                     wv.setWebViewClient(new WebViewClient() {
                         @Override
                         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
@@ -362,28 +387,53 @@ public final class RgBridge {
                                 dlg.dismiss();
                                 return true;
                             }
-                            return false;
+                            return !(u.startsWith("http://") || u.startsWith("https://"));
+                        }
+                    });
+                    dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                        @Override
+                        public void onDismiss(DialogInterface d) {
+                            WEBVIEW_OPEN.set(false);
+                            if (activeWebDialog == dlg) activeWebDialog = null;
+                            if (activeWebView == wv) activeWebView = null;
+                            try {
+                                wv.stopLoading();
+                                wv.destroy();
+                            } catch (Throwable ignored) {}
                         }
                     });
                     wv.loadUrl(url);
                     root.addView(wv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
                     dlg.setContentView(root);
                     activeWebDialog = dlg;
+                    activeWebView = wv;
+                    WEBVIEW_OPEN.set(true);
                     dlg.show();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                    WEBVIEW_OPEN.set(false);
+                }
             }
         });
     }
 
     public static void closeWebView(final Activity act) {
         final Dialog d = activeWebDialog;
+        final WebView wv = activeWebView;
         activeWebDialog = null;
-        if (d != null && act != null) {
+        activeWebView = null;
+        WEBVIEW_OPEN.set(false);
+        if ((d != null || wv != null) && act != null) {
             act.runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        if (d.isShowing()) d.dismiss();
+                        if (d != null && d.isShowing()) d.dismiss();
+                    } catch (Throwable ignored) {}
+                    try {
+                        if (wv != null) {
+                            wv.stopLoading();
+                            wv.destroy();
+                        }
                     } catch (Throwable ignored) {}
                 }
             });
@@ -391,15 +441,26 @@ public final class RgBridge {
     }
 
     public static final class JsProxy {
+        private final Activity act;
         private final Dialog dlg;
-        JsProxy(Dialog d) { this.dlg = d; }
+        JsProxy(Activity a, Dialog d) { this.act = a; this.dlg = d; }
         @JavascriptInterface
-        public void postEvent(String eventType, String eventData) {
+        public void postEvent(final String eventType, final String eventData) {
             if ("web_app_close".equals(eventType)) {
-                dlg.dismiss();
+                act.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try { dlg.dismiss(); } catch (Throwable ignored) {}
+                    }
+                });
             } else if ("web_app_open_tg_link".equals(eventType) && eventData != null) {
                 PENDING_LINK.set(eventData);
-                dlg.dismiss();
+                act.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try { dlg.dismiss(); } catch (Throwable ignored) {}
+                    }
+                });
             }
         }
     }
