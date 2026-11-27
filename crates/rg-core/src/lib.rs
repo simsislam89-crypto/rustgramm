@@ -176,6 +176,11 @@ pub fn privacy_params(proxy_url: Option<String>) -> grammers_mtsender::Connectio
         lang_code: "en".to_owned(),
         proxy_url,
         updates_channel_capacity: std::num::NonZeroUsize::new(2048).expect("non-zero capacity"),
+        transport: Box::new(|| {
+            Box::new(grammers_mtproto::transport::Obfuscated::new(
+                grammers_mtproto::transport::Abridged::new(),
+            ))
+        }),
         ..grammers_mtsender::ConnectionParams::default()
     }
 }
@@ -279,11 +284,76 @@ pub fn isolated_connection_params(cfg: &Config) -> grammers_mtsender::Connection
     p
 }
 
+/// Быстрая гонка TCP-подключений к официальным DC Telegram (IPv4 + IPv6) без прокси,
+/// чтобы выбрать первый живой маршрут и не ждать 45с на заблокированном адресе.
+pub async fn probe_reachable_dc(preferred_dc: i32) -> Option<(i32, bool)> {
+    let data = grammers_session::SessionData::default();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, bool)>(16);
+    let mut handles = Vec::new();
+    for (&dc_id, dc) in &data.dc_options {
+        let v4: std::net::SocketAddr = dc.ipv4.into();
+        let tx4 = tx.clone();
+        let delay4 = if dc_id == preferred_dc { 0 } else { 120 };
+        handles.push(tokio::spawn(async move {
+            if delay4 > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay4)).await;
+            }
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(2400),
+                tokio::net::TcpStream::connect(v4),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
+            {
+                let _ = tx4.send((dc_id, false)).await;
+            }
+        }));
+        let v6: std::net::SocketAddr = dc.ipv6.into();
+        let tx6 = tx.clone();
+        handles.push(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(2400),
+                tokio::net::TcpStream::connect(v6),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
+            {
+                let _ = tx6.send((dc_id, true)).await;
+            }
+        }));
+    }
+    drop(tx);
+    let winner = tokio::time::timeout(std::time::Duration::from_millis(2600), rx.recv())
+        .await
+        .ok()
+        .flatten();
+    for h in handles {
+        h.abort();
+    }
+    winner
+}
+
 /// Подключение: пул отправителей с защищённой сессией. Сведений об устройстве не раскрываем.
 pub async fn connect_with_updates(cfg: &Config) -> Result<Connected, Box<dyn std::error::Error>> {
     use grammers_mtsender::SenderPool;
     let session = open_session(cfg).await?;
-    let params = isolated_connection_params(cfg);
+    let mut params = isolated_connection_params(cfg);
+    if cfg.proxy_url.is_none() {
+        let home_dc = session.home_dc_id().unwrap_or(2);
+        if let Some((dc_id, use_ipv6)) = probe_reachable_dc(home_dc).await {
+            params.use_ipv6 = use_ipv6;
+            let has_key = session
+                .dc_option(home_dc)
+                .ok()
+                .flatten()
+                .and_then(|d| d.auth_key)
+                .is_some();
+            if !has_key && dc_id != home_dc {
+                let _ = session.set_home_dc_id(dc_id).await;
+            }
+        }
+    }
     let SenderPool {
         runner,
         handle,
@@ -553,5 +623,24 @@ mod tests {
             other => panic!("unexpected channel peer: {other:?}"),
         }
         assert!(privacy_params(None).updates_channel_capacity.get() >= 2048);
+    }
+
+    #[test]
+    fn obfuscated_transport_builds_fresh_non_forbidden_handshake() {
+        let p = privacy_params(None);
+        let cfg = Config {
+            api_id: 2040,
+            api_hash: "0".into(),
+            session_path: "s".into(),
+            proxy_url: None,
+            device_model: None,
+            system_version: None,
+            app_version: Some("0.25.0".into()),
+            lang_code: None,
+        };
+        let iso = isolated_connection_params(&cfg);
+        assert_eq!(iso.app_version, "5.14.3 x64");
+        let _t1 = (p.transport)();
+        let _t2 = (iso.transport)();
     }
 }

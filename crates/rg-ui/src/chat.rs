@@ -92,6 +92,7 @@ struct Env<'a> {
     double_tap_action: i32,
     double_tap_action_out: i32,
     default_reaction: &'a str,
+    reactions_policy: &'a rg_core::engine::ChatReactionsPolicy,
     arrived: &'a HashMap<i32, f64>,
     img_arrived: &'a HashMap<i32, f64>,
     time: f64,
@@ -1449,36 +1450,130 @@ impl App {
                 }
             });
         }
-        // Всплывающий выбор команд бота и быстрых ответов (`/`).
-        if self.cmd_popup_open && has_cmds {
+        // Telegram-попап команд бота + живой автокомплит при вводе `/` (клавиши ↑/↓/Enter).
+        let slash_filter = if self.input.starts_with('/') && !self.input.contains(' ') && !bot_cmds.is_empty() {
+            Some(self.input.trim_start_matches('/').to_lowercase())
+        } else {
+            None
+        };
+        let popup_cmds: Vec<(String, String)> = if let Some(ref f) = slash_filter {
+            bot_cmds
+                .iter()
+                .filter(|(c, _)| f.is_empty() || c.to_lowercase().starts_with(f))
+                .cloned()
+                .collect()
+        } else if self.cmd_popup_open {
+            bot_cmds.clone()
+        } else {
+            Vec::new()
+        };
+        if (self.cmd_popup_open && has_cmds) || (!popup_cmds.is_empty() && slash_filter.is_some()) {
             let qrs = self.quick_replies.clone();
+            let total_rows = popup_cmds.len() + if slash_filter.is_none() { qrs.len() } else { 0 };
+            if total_rows > 0 {
+                if self.cmd_sel_idx >= total_rows {
+                    self.cmd_sel_idx = 0;
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                    self.cmd_sel_idx = (self.cmd_sel_idx + 1) % total_rows;
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                    self.cmd_sel_idx = if self.cmd_sel_idx == 0 { total_rows - 1 } else { self.cmd_sel_idx - 1 };
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    self.cmd_popup_open = false;
+                }
+            }
             let mut send_qr = None;
+            let mut send_cmd_now: Option<String> = None;
+            let mut fill_cmd: Option<String> = None;
+            if let Some((c, _)) = popup_cmds.get(self.cmd_sel_idx)
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+            {
+                fill_cmd = Some(format!("/{c} "));
+            }
+            let shift_held = ui.input(|i| i.modifiers.shift);
             egui::Frame::new()
-                .fill(t2(WINDOW_BG))
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(10, 6))
+                .fill(Color32::from_rgba_unmultiplied(24, 24, 29, 245))
+                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(32)))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::symmetric(8, 8))
                 .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for (cmd, desc) in &bot_cmds {
-                            let lbl = if desc.is_empty() {
-                                format!("/{cmd}")
-                            } else {
-                                format!("/{cmd} — {desc}")
-                            };
-                            if ui.small_button(lbl).clicked() {
-                                self.input = format!("/{cmd} ");
-                                self.cmd_popup_open = false;
-                            }
-                        }
-                        for qr in &qrs {
-                            let lbl = format!("⚡ /{} ({})", qr.shortcut, qr.count);
-                            if ui.small_button(lbl).on_hover_text("Отправить быстрый ответ").clicked() {
-                                send_qr = Some(qr.shortcut_id);
-                                self.cmd_popup_open = false;
-                            }
-                        }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Команды бота").size(12.0).strong().color(c_orange()));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("↑↓ · Enter / Shift — вставить").size(10.5).color(SUBTEXT));
+                        });
                     });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("bot-cmd-popup-scroll")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for (idx, (cmd, desc)) in popup_cmds.iter().enumerate() {
+                                let selected = idx == self.cmd_sel_idx;
+                                let row_w = ui.available_width();
+                                let (rr, rresp) = ui.allocate_exact_size(Vec2::new(row_w, 30.0), Sense::click());
+                                if selected || rresp.hovered() {
+                                    ui.painter().rect_filled(
+                                        rr,
+                                        egui::CornerRadius::same(8),
+                                        if selected {
+                                            t_btn(c_orange()).gamma_multiply(0.22)
+                                        } else {
+                                            Color32::from_white_alpha(18)
+                                        },
+                                    );
+                                }
+                                let cmd_t = format!("/{cmd}");
+                                let cmd_gal = ui.painter().layout_no_wrap(cmd_t.clone(), FontId::proportional(13.5), c_orange());
+                                ui.painter().text(
+                                    Pos2::new(rr.left() + 10.0, rr.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &cmd_t,
+                                    FontId::proportional(13.5),
+                                    c_orange(),
+                                );
+                                if !desc.is_empty() {
+                                    let desc_x = rr.left() + 18.0 + cmd_gal.size().x;
+                                    let avail_desc = ((rr.right() - 10.0) - desc_x).max(20.0);
+                                    let max_c = ((avail_desc / 6.8) as usize).max(6);
+                                    ui.painter().with_clip_rect(rr).text(
+                                        Pos2::new(desc_x, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        short(desc, max_c),
+                                        FontId::proportional(12.5),
+                                        DIALOG_DATE,
+                                    );
+                                }
+                                if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    if shift_held {
+                                        fill_cmd = Some(format!("/{cmd} "));
+                                    } else {
+                                        send_cmd_now = Some(format!("/{cmd}"));
+                                    }
+                                    self.cmd_popup_open = false;
+                                }
+                            }
+                            if slash_filter.is_none() {
+                                for qr in &qrs {
+                                    let lbl = format!("⚡ /{} ({})", qr.shortcut, qr.count);
+                                    if ui.small_button(lbl).on_hover_text("Отправить быстрый ответ").clicked() {
+                                        send_qr = Some(qr.shortcut_id);
+                                        self.cmd_popup_open = false;
+                                    }
+                                }
+                            }
+                        });
                 });
+            if let Some(txt) = fill_cmd {
+                self.input = txt;
+                self.cmd_popup_open = false;
+            } else if let Some(cmd_msg) = send_cmd_now {
+                self.input.clear();
+                let temp_id = self.push_optimistic_message(cmd_msg.clone(), Vec::new(), None, None);
+                self.send(Cmd::Send(cmd_msg, None, temp_id));
+            }
             if let Some(sid) = send_qr {
                 self.send(Cmd::SendQuickReply {
                     shortcut_id: sid,
@@ -1907,11 +2002,67 @@ impl App {
             .is_some_and(|v| v.len() > 1);
         let line_cnt = self.input.lines().count().clamp(1, 5);
         let row_h = (44.0 + (line_cnt - 1) as f32 * 18.0).min(120.0);
+        let is_bot_chat = self
+            .selected
+            .and_then(|i| self.dialogs.get(i))
+            .is_some_and(|d| d.kind == rg_core::engine::DialogKind::Bot);
+        if is_bot_chat && self.messages.is_empty() && !self.search_open {
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                let bw = (ui.available_width() - 12.0).max(160.0);
+                if orange_button(ui, "Запустить бота (/start)", Vec2::new(bw, 38.0)).clicked() {
+                    let temp_id = self.push_optimistic_message("/start".to_owned(), Vec::new(), None, None);
+                    self.send(Cmd::Send("/start".to_owned(), None, temp_id));
+                }
+            });
+            return;
+        }
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), row_h),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            // Кнопка меню бота слева (≡), как в Telegram Desktop (Mini App или список команд бота).
+            if let Some((w_lbl, w_url)) = &bot_webapp {
+                let lbl = format!("≡ {}", short(w_lbl, 11));
+                let bw = (lbl.chars().count() as f32 * 7.6 + 22.0).clamp(62.0, 128.0);
+                if orange_button(ui, &lbl, Vec2::new(bw, 30.0))
+                    .on_hover_text(format!("Меню бота: {w_lbl}"))
+                    .clicked()
+                    && let Some(idx) = self.selected
+                {
+                    self.send(Cmd::OpenMiniApp {
+                        idx,
+                        msg_id: None,
+                        title: w_lbl.clone(),
+                        url: Some(w_url.clone()),
+                        start_param: None,
+                        simple: false,
+                    });
+                }
+                ui.add_space(2.0);
+            } else if !bot_cmds.is_empty() {
+                let (mrect, mresp) = ui.allocate_exact_size(Vec2::new(66.0, 30.0), Sense::click());
+                let mh = tween(ui.ctx(), "cmp-botmenu-h", f32::from(u8::from(mresp.hovered() || self.cmd_popup_open)), 0.12);
+                let mfill = if self.cmd_popup_open {
+                    t_btn(c_orange())
+                } else {
+                    lerp_color(Color32::from_white_alpha(20), Color32::from_white_alpha(36), mh)
+                };
+                ui.painter().rect_filled(mrect, egui::CornerRadius::same(15), mfill);
+                ui.painter().text(
+                    mrect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "≡ Меню",
+                    FontId::proportional(12.5),
+                    Color32::WHITE,
+                );
+                if mresp.on_hover_text("Команды и меню бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.cmd_popup_open = !self.cmd_popup_open;
+                    self.ttl_popup_open = false;
+                }
+                ui.add_space(2.0);
+            }
             // Все иконки поля ввода стоят на одной линии (высота слота 40 px, визуальный размер 19×19 px!).
             if s.field_attach_button {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::click());
@@ -2001,25 +2152,7 @@ impl App {
                     self.ttl_popup_open = false;
                 }
             }
-            if let Some((w_lbl, w_url)) = &bot_webapp {
-                // Компактная кнопка Mini App (как в Telegram Desktop), не сжимающая поле ввода!
-                let btn_t = short(w_lbl, 10);
-                let btn_w = (btn_t.chars().count() as f32 * 8.0 + 26.0).clamp(54.0, 88.0);
-                if orange_button(ui, &btn_t, Vec2::new(btn_w, 30.0))
-                    .on_hover_text(format!("Открыть Mini App: {w_lbl}"))
-                    .clicked()
-                    && let Some(idx) = self.selected
-                {
-                    self.send(Cmd::OpenMiniApp {
-                        idx,
-                        msg_id: None,
-                        title: w_lbl.clone(),
-                        url: Some(w_url.clone()),
-                        start_param: None,
-                        simple: false,
-                    });
-                }
-            }
+            // Правая часть композера: кнопка меню Mini App теперь вынесена влево (`≡`), как в Telegram.
             // Точный расчёт правой части — все слоты 36×40, визуальные иконки 19×19.
             let has_draft = !self.input.trim().is_empty();
             let right_w = 40.0
@@ -2216,17 +2349,29 @@ impl App {
                 ui.painter().circle_stroke(rect.center(), 9.0 * sc.min(1.08), egui::Stroke::new(1.5, color));
                 icons::tg_sized(ui.painter(), "chat/input_smile_face", rect.center(), Vec2::splat(13.0 * sc.min(1.08)), color);
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let is_scrolling = ui.input(|i| i.smooth_scroll_delta.y.abs() > 0.5);
+                let any_down = ui.input(|i| i.pointer.any_down());
+                let now_em = ui.input(|i| i.time);
                 if resp.clicked() {
                     self.emoji_pinned = !self.emoji_pinned;
                     self.emoji_open = self.emoji_pinned;
                     self.emoji_hover_open = false;
-                } else if resp.hovered() && s.show_emoji_popup {
-                    if ui.ctx().content_rect().width() < super::NARROW_WIDTH {
-                        self.emoji_open = true;
-                    } else if !self.emoji_open {
-                        // На ПК при наведении на смайл сразу появляется плавающее мини-окно эмодзи/стикеров/GIF!
-                        self.emoji_hover_open = true;
+                    self.emoji_hover_since = None;
+                } else if resp.hovered() && s.show_emoji_popup && !is_scrolling && !any_down {
+                    if ui.ctx().content_rect().width() >= super::NARROW_WIDTH
+                        && !self.emoji_open
+                        && !self.emoji_hover_open
+                    {
+                        let t0 = *self.emoji_hover_since.get_or_insert(now_em);
+                        if now_em - t0 >= 0.26 {
+                            self.emoji_hover_open = true;
+                            self.emoji_leave_since = None;
+                        } else {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+                        }
                     }
+                } else if !self.emoji_hover_open {
+                    self.emoji_hover_since = None;
                 }
             }
             let (srect, sresp) = ui.allocate_exact_size(Vec2::new(38.0, 40.0), Sense::click());
@@ -2453,6 +2598,11 @@ impl App {
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                 if resp.clicked() {
                     tab = n;
+                    if n == 0 {
+                        // Возврат к вкладке «Эмодзи» всегда сбрасывает просматриваемый кастомный набор обратно к базовым эмодзи.
+                        self.emoji_pack = None;
+                        self.emoji_add_open = false;
+                    }
                 }
             }
             let (pr, presp) = ui.allocate_exact_size(Vec2::new(pin_w, 34.0), Sense::click());
@@ -2705,19 +2855,34 @@ impl App {
                 });
             let _ = card;
         });
-        // Закрытие: Esc или курсор ушёл с мини-окна и кнопки смайла (с запасом 14 px, чтобы удобно переводить мышь).
-        let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+        // Закрытие: Esc, клик вне панели на узком экране, либо 0.22с задержка после ухода курсора на ПК.
+        let now_w = ctx.input(|i| i.time);
+        let any_down = ctx.input(|i| i.pointer.any_down());
+        let any_click = ctx.input(|i| i.pointer.any_click());
+        let ptr_pos = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+        let over = ptr_pos.is_some_and(|p| {
             inner.response.rect.expand(14.0).contains(p) || self.emoji_btn.expand(10.0).contains(p)
         });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.emoji_open = false;
             self.emoji_hover_open = false;
             self.emoji_pinned = false;
-        } else if !over {
-            if is_narrow && !self.emoji_pinned {
+            self.emoji_hover_since = None;
+            self.emoji_leave_since = None;
+        } else if is_narrow {
+            if any_click && !over && !self.emoji_pinned {
                 self.emoji_open = false;
-            } else if !is_narrow {
+            }
+        } else if over || any_down {
+            self.emoji_leave_since = None;
+        } else if appear > 0.35 && self.emoji_hover_open {
+            let t0 = *self.emoji_leave_since.get_or_insert(now_w);
+            if now_w - t0 >= 0.22 {
                 self.emoji_hover_open = false;
+                self.emoji_hover_since = None;
+                self.emoji_leave_since = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(35));
             }
         }
     }
@@ -3091,6 +3256,11 @@ impl App {
             // Платные звёздные реакции доступны ТОЛЬКО в каналах, где автор включил их на сервере!
             let paid_reactions_available =
                 is_channel && cur_info.is_some_and(|p| p.paid_reactions_available);
+            static DEFAULT_RX_POLICY: rg_core::engine::ChatReactionsPolicy =
+                rg_core::engine::ChatReactionsPolicy::All { allow_custom: true };
+            let reactions_policy = cur_info
+                .map(|p| &p.available_reactions)
+                .unwrap_or(&DEFAULT_RX_POLICY);
             let env = Env {
                 read_out,
                 avatars: &self.avatars,
@@ -3130,6 +3300,7 @@ impl App {
                 } else {
                     self.settings.extera.default_reaction.as_str()
                 },
+                reactions_policy,
                 arrived: &self.arrived,
                 img_arrived: &self.img_arrived,
                 time: ui.input(|i| i.time),
@@ -3274,17 +3445,82 @@ impl App {
             self.cmd_popup_open = false;
             self.ttl_popup_open = false;
         }
-        // Плавающие кнопки быстрых переходов (@ упоминания, ❤ реакции) и «Вниз».
+        // Плавающие кнопки быстрых переходов (@ упоминания, ❤ реакции) и анимированная кнопка «Вниз» с векторной стрелкой.
         if self.selected_msgs.is_empty() {
             let show_cnt = !self.settings.ayu.hide_notification_counters;
             let (mentions_cnt, reactions_cnt) = self
                 .selected
                 .and_then(|i| self.dialogs.get(i))
                 .map_or((0, 0), |d| (d.unread_mentions, d.unread_reactions));
-            let mut fab_y = clip_rect.bottom() - if self.scrolled_up { 78.0 } else { 28.0 };
+            let down_raw = tween(
+                ui.ctx(),
+                "scroll-down-fab-vis",
+                f32::from(u8::from(self.scrolled_up)),
+                0.18,
+            );
+            let down_k = ios_spring_bounce(down_raw);
             let square = self.settings.extera.square_fab;
+            let mut fab_y = clip_rect.bottom() - 32.0 - 54.0 * down_raw;
+
+            if down_raw > 0.02 {
+                let slide_y = (1.0 - down_k) * 16.0;
+                let center = Pos2::new(clip_rect.right() - 32.0, clip_rect.bottom() - 32.0 + slide_y);
+                let fab_sz = (42.0 * (0.68 + 0.32 * down_k)).max(4.0);
+                let fab_rect = Rect::from_center_size(center, Vec2::splat(fab_sz));
+                let resp = ui.interact(fab_rect, ui.make_persistent_id("scroll-down-fab"), Sense::click());
+                let hk = tween(ui.ctx(), "scroll-down-fab-h", f32::from(u8::from(resp.hovered())), 0.12);
+                let base_bg = lerp_color(
+                    Color32::from_rgba_unmultiplied(29, 29, 34, (236.0 * down_raw) as u8),
+                    Color32::from_rgba_unmultiplied(44, 44, 52, (246.0 * down_raw) as u8),
+                    hk,
+                );
+                let edge = Color32::from_rgba_unmultiplied(
+                    lerp_color(Color32::WHITE, c_orange(), hk).r(),
+                    lerp_color(Color32::WHITE, c_orange(), hk).g(),
+                    lerp_color(Color32::WHITE, c_orange(), hk).b(),
+                    ((36.0 + 90.0 * hk) * down_raw) as u8,
+                );
+                let p = ui.painter();
+                // Мягкая тень под кнопкой, как в Telegram Desktop.
+                let shadow_a = (44.0 * down_raw) as u8;
+                if square {
+                    p.rect_filled(fab_rect.translate(Vec2::new(0.0, 2.0)).expand(2.0), egui::CornerRadius::same(14), Color32::from_black_alpha(shadow_a));
+                    p.rect_filled(fab_rect, egui::CornerRadius::same(13), base_bg);
+                    p.rect_stroke(fab_rect, egui::CornerRadius::same(13), egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+                } else {
+                    let rad = fab_sz * 0.5;
+                    p.circle_filled(center + Vec2::new(0.0, 2.0), rad + 2.0, Color32::from_black_alpha(shadow_a));
+                    p.circle_filled(center, rad, base_bg);
+                    p.circle_stroke(center, rad, egui::Stroke::new(1.0, edge));
+                }
+                // Чёткий векторный шеврон вниз вместо системного символа.
+                let chev_s = 6.2 * (0.7 + 0.3 * down_k);
+                let chev_c = lerp_color(WHITE, c_orange(), hk).gamma_multiply(down_raw.clamp(0.0, 1.0));
+                let pts = [
+                    Pos2::new(center.x - chev_s, center.y - chev_s * 0.35),
+                    Pos2::new(center.x, center.y + chev_s * 0.52),
+                    Pos2::new(center.x + chev_s, center.y - chev_s * 0.35),
+                ];
+                p.add(egui::Shape::line(pts.to_vec(), egui::Stroke::new(2.1, chev_c)));
+
+                if unread_cnt > 0 && !self.settings.ayu.hide_notification_counters {
+                    let badge = Rect::from_center_size(center - Vec2::new(0.0, 22.0 * down_k), Vec2::new(28.0, 17.0));
+                    p.rect_filled(badge, egui::CornerRadius::same(8), t_btn(c_orange()).gamma_multiply(down_raw));
+                    p.text(
+                        badge.center(),
+                        egui::Align2::CENTER_CENTER,
+                        unread_cnt.min(999).to_string(),
+                        FontId::proportional(10.5),
+                        Color32::WHITE.gamma_multiply(down_raw),
+                    );
+                }
+                if resp.on_hover_text("Вниз").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.scroll_to = self.messages.last().map(|m| m.id);
+                }
+            }
+
             if mentions_cnt > 0 && let Some(sel) = self.selected {
-                let c = Pos2::new(clip_rect.right() - 28.0, fab_y);
+                let c = Pos2::new(clip_rect.right() - 32.0, fab_y);
                 let r = Rect::from_center_size(c, Vec2::splat(40.0));
                 let resp = ui.interact(r, ui.make_persistent_id("mention-jump-fab"), Sense::click());
                 let bg = if resp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
@@ -3307,10 +3543,10 @@ impl App {
                     self.send(Cmd::ReadAllMentions(sel));
                 }
                 let _ = resp.on_hover_text("Следующее @упоминание (ПКМ — прочитать все)").on_hover_cursor(egui::CursorIcon::PointingHand);
-                fab_y -= 50.0;
+                fab_y -= 54.0;
             }
             if reactions_cnt > 0 && let Some(sel) = self.selected {
-                let c = Pos2::new(clip_rect.right() - 28.0, fab_y);
+                let c = Pos2::new(clip_rect.right() - 32.0, fab_y);
                 let r = Rect::from_center_size(c, Vec2::splat(40.0));
                 let resp = ui.interact(r, ui.make_persistent_id("react-jump-fab"), Sense::click());
                 let rose = Color32::from_rgb(232, 74, 95);
@@ -3334,34 +3570,6 @@ impl App {
                     self.send(Cmd::ReadAllReactions(sel));
                 }
                 let _ = resp.on_hover_text("Следующая реакция ❤ (ПКМ — прочитать все)").on_hover_cursor(egui::CursorIcon::PointingHand);
-            }
-        }
-        // Плавающая кнопка прокрутки вниз (учитывает настройку square_fab).
-        if self.scrolled_up && self.selected_msgs.is_empty() {
-            let center = Pos2::new(clip_rect.right() - 28.0, clip_rect.bottom() - 28.0);
-            let fab_rect = Rect::from_center_size(center, Vec2::splat(40.0));
-            let resp = ui.interact(fab_rect, ui.make_persistent_id("scroll-down-fab"), Sense::click());
-            let bg = if resp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
-            if self.settings.extera.square_fab {
-                ui.painter().rect_filled(fab_rect, egui::CornerRadius::same(13), bg);
-                ui.painter().rect_stroke(
-                    fab_rect,
-                    egui::CornerRadius::same(13),
-                    egui::Stroke::new(1.0, Color32::from_white_alpha(32)),
-                    egui::StrokeKind::Inside,
-                );
-            } else {
-                ui.painter().circle_filled(center, 20.0, bg);
-                ui.painter().circle_stroke(center, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
-            }
-            ui.painter().text(center, egui::Align2::CENTER_CENTER, "↓", FontId::proportional(18.0), WHITE);
-            if unread_cnt > 0 && !self.settings.ayu.hide_notification_counters {
-                let badge = Rect::from_center_size(center - Vec2::new(0.0, 22.0), Vec2::new(26.0, 16.0));
-                ui.painter().rect_filled(badge, egui::CornerRadius::same(8), t_btn(ORANGE));
-                ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, unread_cnt.min(999).to_string(), FontId::proportional(10.5), Color32::WHITE);
-            }
-            if resp.on_hover_text("Вниз").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                self.scroll_to = self.messages.last().map(|m| m.id);
             }
         }
         // Отрисовка автоскролла колёсиком мыши: иконка прикреплена прямо к курсору (`cur`), а не застывает в воздухе.
@@ -5742,7 +5950,9 @@ fn bubble(
                                 } else {
                                     ui.painter().text(pr.center(), egui::Align2::CENTER_CENTER, &lbl, FontId::proportional(12.0), text_col);
                                 }
-                                cards.push((pr, Act::ReactToggle(m.id, pill.emoji.clone(), pill.chosen)));
+                                if pill.chosen || env.reactions_policy.allows(&pill.emoji) {
+                                    cards.push((pr, Act::ReactToggle(m.id, pill.emoji.clone(), pill.chosen)));
+                                }
                             }
                         });
                     }
@@ -5869,7 +6079,11 @@ fn bubble(
         }
         if resp.double_clicked() && !m.deleted {
             let code = if m.outgoing { env.double_tap_action_out } else { env.double_tap_action };
-            if let Some(a) = double_tap_act_for(code, m.outgoing, m.id, &m.text, env.default_reaction) {
+            let eff_react = env
+                .reactions_policy
+                .default_allowed(env.default_reaction)
+                .unwrap_or("");
+            if let Some(a) = double_tap_act_for(code, m.outgoing, m.id, &m.text, eff_react) {
                 acts.push(a);
             }
         } else if resp.clicked() {
@@ -5891,34 +6105,40 @@ fn bubble(
         }
         egui::Popup::context_menu(&resp).show(|ui| menu(ui, m, env, acts));
     });
-    // Инлайн-кнопки бота прямо под пузырём сообщения (`ReplyInlineMarkup`) с цветами Telegram и живыми анимациями.
+    // Инлайн-кнопки бота прямо под пузырём сообщения (`ReplyInlineMarkup`) в стиле Telegram (закруглённый нижний ряд).
     if !m.inline_buttons.is_empty() && !m.deleted {
         let total_w = (bubble_w + 2.0 * MSG_PAD_X).max(220.0).min(env.avail * 0.84);
         let left_pad = if env.group && !m.outgoing { 46.0 } else { 6.0 };
+        let last_r = m.inline_buttons.len().saturating_sub(1);
         for (r_idx, row) in m.inline_buttons.iter().enumerate() {
             if row.is_empty() {
                 continue;
             }
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             ui.with_layout(layout, |ui| {
                 ui.add_space(left_pad);
                 let cols = row.len() as f32;
-                let gap = 5.0;
+                let gap = 3.0;
                 let bw = ((total_w - gap * (cols - 1.0).max(0.0)) / cols).max(46.0);
+                let row_cr = if r_idx == last_r {
+                    egui::CornerRadius { nw: 6, ne: 6, sw: 12, se: 12 }
+                } else {
+                    egui::CornerRadius::same(6)
+                };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for (c_idx, btn) in row.iter().enumerate() {
                         let (brect, bresp) = ui.allocate_exact_size(Vec2::new(bw, 34.0), Sense::click());
                         let hk = tween(ui.ctx(), ("ibtn-h", m.id, r_idx, c_idx), f32::from(u8::from(bresp.hovered())), 0.12);
                         let pk = tween(ui.ctx(), ("ibtn-p", m.id, r_idx, c_idx), f32::from(u8::from(bresp.is_pointer_button_down_on())), 0.08);
-                        let draw_r = brect.shrink(pk * 1.4);
+                        let draw_r = brect.shrink(pk * 1.2);
                         let (base_fill, hover_fill, border_c) = bot_btn_palette(btn.style);
                         let bfill = lerp_color(base_fill, hover_fill, hk);
-                        ui.painter().rect_filled(draw_r, egui::CornerRadius::same(9), bfill);
+                        ui.painter().rect_filled(draw_r, row_cr, bfill);
                         ui.painter().rect_stroke(
                             draw_r,
-                            egui::CornerRadius::same(9),
-                            egui::Stroke::new(1.0, border_c.gamma_multiply(0.45 + hk * 0.55)),
+                            row_cr,
+                            egui::Stroke::new(1.0, border_c.gamma_multiply(0.38 + hk * 0.45)),
                             egui::StrokeKind::Inside,
                         );
                         // Анимация бегущего блика ожидания, пока бот обрабатывает callback.
@@ -6008,11 +6228,11 @@ pub(crate) fn bot_btn_palette(style: u8) -> (Color32, Color32, Color32) {
             Color32::from_rgba_unmultiplied(56, 188, 112, 242),
             Color32::from_rgba_unmultiplied(130, 235, 170, 150),
         ),
-        // Обычная стеклянная кнопка.
+        // Матовая полупрозрачная стеклянная кнопка бота (без синего/оранжевого блика).
         _ => (
-            t(SERVICE_BG),
-            t(WINDOW_OVER),
-            Color32::from_white_alpha(48),
+            Color32::from_rgba_unmultiplied(30, 30, 36, 210),
+            Color32::from_rgba_unmultiplied(44, 44, 54, 232),
+            Color32::from_white_alpha(38),
         ),
     }
 }
@@ -6025,10 +6245,7 @@ fn reactions_visible(s: &AyuSettings) -> bool {
 /// Выбор действия при двойном клике по сообщению (входящие vs свои).
 fn double_tap_act_for(code: i32, outgoing: bool, msg_id: i32, text: &str, default_reaction: &str) -> Option<Act> {
     match code {
-        1 => Some(Act::React(
-            msg_id,
-            if default_reaction.is_empty() { "👍".to_owned() } else { default_reaction.to_owned() },
-        )),
+        1 => (!default_reaction.trim().is_empty()).then(|| Act::React(msg_id, default_reaction.to_owned())),
         2 => Some(Act::Reply(msg_id, text.to_owned())),
         3 if !text.is_empty() => Some(Act::Copy(text.to_owned())),
         4 => Some(Act::Forward(msg_id)),
@@ -6044,22 +6261,25 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     let s = env.s;
     ui.set_min_width(210.0);
     if s.menu_reactions_panel.shown(env.shift) && !m.deleted {
-        ui.horizontal(|ui| {
-            for e in REACTIONS {
-                let img = env.emoji.and_then(|em| em.image(e.chars().next()?, 22.0));
-                let clicked = match img {
-                    Some(img) => ui.add(img.sense(Sense::click())).clicked(),
-                    None => ui
-                        .add(egui::Button::new(RichText::new(e).size(20.0)).frame(false))
-                        .clicked(),
-                };
-                if clicked {
-                    acts.push(Act::React(m.id, (*e).to_owned()));
-                    ui.close();
+        let allowed = env.reactions_policy.quick_list(&REACTIONS);
+        if !allowed.is_empty() {
+            ui.horizontal(|ui| {
+                for e in &allowed {
+                    let img = env.emoji.and_then(|em| e.chars().next().and_then(|ch| em.image(ch, 22.0)));
+                    let clicked = match img {
+                        Some(img) => ui.add(img.sense(Sense::click())).clicked(),
+                        None => ui
+                            .add(egui::Button::new(RichText::new(e).size(20.0)).frame(false))
+                            .clicked(),
+                    };
+                    if clicked {
+                        acts.push(Act::React(m.id, e.clone()));
+                        ui.close();
+                    }
                 }
-            }
-        });
-        ui.separator();
+            });
+            ui.separator();
+        }
     }
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut item = |ui: &mut egui::Ui, icon: &str, label: &str, act: Act| {

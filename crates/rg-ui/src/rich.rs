@@ -312,17 +312,29 @@ pub fn render(
     open: &HashSet<(i32, usize)>,
 ) -> Vec<(egui::Rect, Hit)> {
     let mut hot = Vec::new();
+    // Короткие сообщения из 1..=3 эмодзи без обычного текста показываем крупно (как в Telegram).
+    let non_empty_runs: Vec<&Run> = runs.iter().filter(|r| !r.text.is_empty()).collect();
+    let emoji_only_count = non_empty_runs.len();
+    let only_emojis = emoji_only_count > 0
+        && emoji_only_count <= 3
+        && non_empty_runs.iter().all(|r| {
+            r.custom_emoji.is_some()
+                || (r.text.chars().count() == 1
+                    && emoji.is_some_and(|e| e.image(r.text.chars().next().unwrap_or(' '), size).is_some()))
+        });
+    let eff_size = if only_emojis { (size * 1.85).min(30.0) } else { size };
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.spacing_mut().item_spacing.x = if only_emojis { 2.0 } else { 0.0 };
         for (idx, run) in runs.iter().enumerate() {
             let shown = !run.spoiler || open.contains(&(msg_id, idx));
             if shown
                 && let Some(doc_id) = run.custom_emoji
                 && let Some(tex) = custom_tex.get(&doc_id)
             {
+                let side = if only_emojis { eff_size * 1.25 } else { eff_size * 1.42 };
                 let img = egui::Image::new(tex)
-                    .fit_to_exact_size(Vec2::splat(size * 1.35))
-                    .corner_radius(3);
+                    .fit_to_exact_size(Vec2::splat(side))
+                    .corner_radius(0);
                 ui.add(img);
                 continue;
             }
@@ -333,7 +345,7 @@ pub fn render(
             for seg in segs {
                 match seg {
                     Seg::Emoji(c) => {
-                        if let Some(img) = emoji.and_then(|e| e.image(c, size * 1.25)) {
+                        if let Some(img) = emoji.and_then(|e| e.image(c, eff_size * 1.25)) {
                             ui.add(img);
                         }
                     }

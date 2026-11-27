@@ -1185,3 +1185,32 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: crates/rg-ui/assets/rg_bridge.dex (20768 bytes, version 037)`, `cargo check -p rg-android --target aarch64-linux-android` Full & Lite OK).
 - `cargo test --workspace` (`0.24.1`) — **2 182 теста пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 60+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 79+631).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.24.1`) собран (**21 188 608 байт**, release 4m 48s); live smoke `RG_DEMO=1`, `RG_DEMO=login`, `RG_DEMO=qr` и `RG_SIZE=390x844 RG_MOBILE_GLASS=1 RG_DEMO=login` — **ALIVE=True**.
+
+## Этап 38 (2026-11-27, v0.25.0)
+
+### Исправление 45с таймаута на Android, удаление кругов/пульсации и бликов, полировка интерфейса под Telegram/AyuGram, политика реакций канала, HiDPI эмодзи/стикеры, меню ботов и веб-превью в `dist/`
+
+1. **Устранение 45-секундного таймаута на телефоне (`crates/rg-core/{Cargo.toml,src/lib.rs}`, `crates/rg-ui/src/worker.rs`)**:
+   - *Причина:* транспорт по умолчанию (`transport::Full`) отправляет открытый MTProto-заголовок, который часто режет DPI мобильных операторов, а подключение к недоступному IPv4 DC без гонки по всем DC и с фоновым `help.getNearestDc` удерживало однопоточный `SenderPoolRunner` до 45с таймаута.
+   - *Исправление:* в `privacy_params` подключён официальный обфусцированный транспорт `grammers_mtproto::transport::Obfuscated::new(Abridged::new())`; добавлена быстрая гонка TCP `probe_reachable_dc` по IPv4 и IPv6 всех DC (`SessionData::default().dc_options`, 2.4с/2.6с) с переключением `home_dc_id` у неавторизованных сессий; убран блокирующий `help.getNearestDc`; таймаут `RequestCode`/`ResendCode`/`Code` снижен до **20с** с 1 автоматическим переподключением пула (`auth_retry_count`) при таймауте.
+
+2. **Удаление круговой анимации, пульсации и синих/оранжевых бликов (`crates/rg-ui/src/{login_anim,theme}.rs`)**:
+   - В `paint_plane_mascot` и `paint_keys_mascot` удалены оранжевые круги, внешние ореолы, пульсирующее кольцо и мерцающие звёздочки — остался чистый векторный самолётик и ключ на матовом фоне без холостых перерисовок.
+   - В `paint_android_glass_backdrop` и `paint_blur_backdrop` полностью удалены все синие и оранжевые градиентные блики — используется единый нейтральный матовый тёмный фон с сохранением оранжевого акцента элементов управления.
+
+3. **Интерфейс 1 в 1, панель эмодзи, реакции каналов, быстрые HiDPI кастомные эмодзи и меню ботов (`rg-core/src/engine.rs`, `rg-ui/src/{chat,panels,rich,worker,lib}.rs`)**:
+   - **FAB-стек без наложения**: анимированная кнопка прокрутки вниз (`scroll-down-fab-vis` + `ios_spring_bounce`) с чётким векторным шевроном `∨` и вертикальным шагом `54 px` под `@` / `❤`.
+   - **Панель эмодзи/стикеров/GIF**: добавлен антидребезг наведения (`emoji_hover_since` 0.26с и `emoji_leave_since` 0.22с без срабатывания во время скролла и на узком/сенсорном экране); клик по вкладке «Эмодзи» всегда сбрасывает открытый кастом-набор обратно к стандартным эмодзи.
+   - **Политика реакций канала**: в `PeerInfo` добавлено поле `available_reactions: ChatReactionsPolicy` (`All`/`Some`/`None` из `ChannelFull`/`ChatFull`); контекстное меню, двойной тап (`double_tap_act_for`) и пилюли реакций строго учитывают ограничения канала (скрываются при `None` или показывают только разрешённые).
+   - **Быстрые чёткие стикеры и Premium-эмодзи**: выделен высокоприоритетный пул `emoji_limit` (10 Android / 18 ПК), мгновенная отдача кэша с диска до RPC в `Cmd::CustomEmojiDocs` без повторной загрузки превью для `.tgs`, декодирование статики в 112–160 px, растеризация `tgs_docs` в 96 px (ПК) / 72 px (Android) и автоувеличение одиночных 1..=3 эмодзи в `rich::render`.
+   - **Полноценный UI ботов**: левая кнопка меню бота (`≡ {title}` или `≡ Меню`), плавающий Telegram-попап `/команд` с живой фильтрацией, навигацией `↑`/`↓`/`Tab` и отправкой, стартовая карточка «Что умеет этот бот?» + нижняя кнопка `Запустить бота (/start)`, компактные инлайн-кнопки со скруглением нижнего ряда.
+
+4. **Веб-превью дизайна (`dist/rustgramm-preview.html`)**:
+   - Добавлен автономный однофайловый HTML-прототип в `dist/` для быстрой проверки десктопной (`1280px`), мобильной (`390×844`) вёрстки, политики реакций канала, бота и экрана входа; проверен скриншотами Edge.
+
+### Проверки (v0.25.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `cargo clippy -p rg-ui --no-default-features -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: 20768 bytes, version 037`, `aarch64-linux-android` Full & Lite OK).
+- `cargo test --workspace` — **2 186 тестов пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 62+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 81+631; включая `obfuscated_transport_builds_fresh_non_forbidden_handshake`, `chat_reactions_policy_handles_all_some_and_none`, `matte_backdrop_and_plane_mascot_have_no_circle_or_blue_orange_glow`, `bot_empty_welcome_commands_popup_and_scrolled_fab_render_cleanly`).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.25.0`) собран (**21 271 552 байта**, release 4m 40s); live smoke `RG_DEMO=1`, `login`, `qr`, `390x844 RG_MOBILE_GLASS=1` — **ALIVE=True**.

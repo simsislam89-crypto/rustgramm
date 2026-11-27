@@ -638,7 +638,7 @@ pub fn paint_frosted_scrim(p: &egui::Painter, rect: Rect, raw: f32) {
     p.rect_filled(rect, 0.0, Color32::from_black_alpha(dark_a));
     if blur_on() {
         let frost_a = (12.0 * k * op) as u8;
-        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(24, 30, 40, frost_a));
+        p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(16, 16, 18, frost_a));
     }
 }
 
@@ -662,69 +662,21 @@ pub fn paint_glass_bar(p: &egui::Painter, rect: Rect, radius: f32, fill_alpha: u
     );
 }
 
-/// Кэшированный 256×256 GPU-фон рассеянного «жидкого стекла» для Android (0 аллокаций на кадр).
-pub fn paint_android_glass_backdrop(ctx: &egui::Context, rect: Rect, accent: Color32) {
-    #[derive(Clone)]
-    struct CachedGlassTex {
-        key: (u8, u8, u8),
-        tex: egui::TextureHandle,
-    }
-    let key = (accent.r(), accent.g(), accent.b());
-    let id = egui::Id::NULL.with("rg-android-glass-backdrop");
-    let existing = ctx.data(|d| d.get_temp::<CachedGlassTex>(id));
-    let tex = if let Some(c) = existing.filter(|c| c.key == key) {
-        c.tex
-    } else {
-        let side = 256usize;
-        let mut pixels = vec![Color32::BLACK; side * side];
-        let ar = f32::from(accent.r());
-        let ag = f32::from(accent.g());
-        let ab = f32::from(accent.b());
-        for y in 0..side {
-            let fy = y as f32 / (side as f32 - 1.0);
-            for x in 0..side {
-                let fx = x as f32 / (side as f32 - 1.0);
-                // Основное верхнее свечение акцентом + холодное индиго снизу-слева.
-                let d1 = ((fx - 0.82).powi(2) + (fy - 0.16).powi(2)).sqrt();
-                let d2 = ((fx - 0.18).powi(2) + (fy - 0.84).powi(2)).sqrt();
-                let d3 = ((fx - 0.50).powi(2) + (fy - 0.45).powi(2)).sqrt();
-                let g1 = (1.0 - d1 * 1.15).clamp(0.0, 1.0).powf(2.0);
-                let g2 = (1.0 - d2 * 1.10).clamp(0.0, 1.0).powf(2.0);
-                let g3 = (1.0 - d3 * 1.25).clamp(0.0, 1.0).powf(1.8);
-                // Детерминированный микро-дизеринг без видимого бандинга.
-                let hash = ((x.wrapping_mul(374_761_393) ^ y.wrapping_mul(668_265_263)) & 3) as f32 - 1.5;
-                let r = (12.0 + g1 * (ar * 0.28) + g2 * 22.0 + g3 * 16.0 + hash * 0.6).clamp(0.0, 255.0) as u8;
-                let g = (14.0 + g1 * (ag * 0.24) + g2 * 36.0 + g3 * 22.0 + hash * 0.6).clamp(0.0, 255.0) as u8;
-                let b = (22.0 + g1 * (ab * 0.26) + g2 * 74.0 + g3 * 34.0 + hash * 0.6).clamp(0.0, 255.0) as u8;
-                pixels[y * side + x] = Color32::from_rgb(r, g, b);
-            }
-        }
-        let img = egui::ColorImage {
-            size: [side, side],
-            source_size: Vec2::new(side as f32, side as f32),
-            pixels,
-        };
-        let handle = ctx.load_texture("rg-android-glass-backdrop", img, egui::TextureOptions::LINEAR);
-        ctx.data_mut(|d| {
-            d.insert_temp(
-                id,
-                CachedGlassTex {
-                    key,
-                    tex: handle.clone(),
-                },
-            );
-        });
-        handle
-    };
+/// Чистый матовый тёмный фон для Android и мобильного режима — без синих и оранжевых бликов.
+pub fn paint_android_glass_backdrop(ctx: &egui::Context, rect: Rect, _accent: Color32) {
+    let base = resolve_theme_color(WINDOW_BG);
     let p = ctx.layer_painter(egui::LayerId::background());
-    p.image(
-        tex.id(),
+    p.rect_filled(
         rect,
-        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-        Color32::WHITE,
+        CornerRadius::ZERO,
+        Color32::from_rgb(base.r(), base.g(), base.b()),
     );
-    let veil_a = (46.0 * opacity_f32()).clamp(12.0, 80.0) as u8;
-    p.rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(veil_a));
+    let veil_a = (38.0 * opacity_f32()).clamp(10.0, 72.0) as u8;
+    p.rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        Color32::from_rgba_unmultiplied(12, 12, 14, veil_a),
+    );
 }
 
 /// Мягкая внешняя тень-ореол и стеклянная кромка вокруг модальной карточки

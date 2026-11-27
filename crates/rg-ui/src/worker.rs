@@ -1261,6 +1261,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
 
     let mut pending_auth_cmd: Option<Cmd> = None;
     let mut keep_signed_in = true;
+    let mut auth_retry_count = 0u8;
     'account_loop: loop {
         let mut settings = load_settings(&settings_path);
         if settings.accounts.is_empty() {
@@ -1455,10 +1456,15 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         let engine = Engine::new(connected.client.clone(), settings, store)
             .with_session(connected.session.clone())
             .with_dirs(&home.join("cache"), &home.join("downloads"));
-        // Умеренная конкурентность без голодания UI-потока (особенно критично на Android).
-        let (med_lim, av_lim) = if cfg!(target_os = "android") { (4, 6) } else { (8, 12) };
+        // Умеренная конкурентность без голодания UI-потока + выделенный быстрый пул для эмодзи и стикеров.
+        let (med_lim, av_lim, em_lim) = if cfg!(target_os = "android") {
+            (4, 6, 10)
+        } else {
+            (8, 12, 18)
+        };
         let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(med_lim));
         let avatar_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(av_lim));
+        let emoji_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(em_lim));
         let mut updates = Some(connected.updates);
         let (dialog_stream_tx, mut dialog_stream_rx) =
             tokio::sync::mpsc::channel::<(Vec<DialogRow>, bool)>(64);
@@ -1520,7 +1526,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     out.send(Ev::LoginBusy(true));
                     out.send(Ev::Status("Подключение к серверам Telegram…".to_owned()));
                     let res = tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
+                        std::time::Duration::from_secs(20),
                         rg_core::auth::request_login_code(
                             &connected.client,
                             &*connected.session,
@@ -1547,7 +1553,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
                         }
                         Ok(Err(e)) => out.err(friendly_login_error(&e)),
-                        Err(_) => out.err("Сервер Telegram не ответил за 45 с — проверьте сеть или SOCKS5 прокси"),
+                        Err(_) => out.err("Сервер Telegram не ответил за 20 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси»"),
                     }
                 }
                 Cmd::UseQr | Cmd::RefreshQr => {
@@ -1561,15 +1567,6 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         } else if cfg!(target_os = "android") {
             qr_mode = false;
             out.send(Ev::Stage(Stage::NeedPhone));
-            // Предпрогрев TLS/MTProto рукопожатия с ближайшим DC в фоне, пока пользователь вводит номер.
-            let warmup_client = connected.client.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(12),
-                    warmup_client.invoke(&grammers_client::tl::functions::help::GetNearestDc {}),
-                )
-                .await;
-            });
         } else {
             qr_mode = true;
             out.send(Ev::Stage(Stage::Qr(String::new())));
@@ -1728,7 +1725,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 out.send(Ev::LoginBusy(true));
                 out.send(Ev::Status("Подключение к серверам Telegram…".to_owned()));
                 let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(45),
+                    std::time::Duration::from_secs(20),
                     rg_core::auth::request_login_code(
                         &connected.client,
                         &*connected.session,
@@ -1743,6 +1740,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 out.send(Ev::Status(String::new()));
                 match res {
                     Ok(Ok(RequestCodeOutcome::CodeSent(info))) => {
+                        auth_retry_count = 0;
                         out.send(Ev::CodeDeliveryHint(info.delivery_hint.clone()));
                         out.send(Ev::CodeMeta {
                             length: info.code_length,
@@ -1752,12 +1750,26 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         out.send(Ev::Stage(Stage::NeedCode));
                     }
                     Ok(Ok(RequestCodeOutcome::AlreadyAuthorized)) => {
+                        auth_retry_count = 0;
                         enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
                     }
-                    Ok(Err(e)) => out.err(friendly_login_error(&e)),
-                    Err(_) => out.err(
-                        "Сервер Telegram не ответил за 45 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси»",
-                    ),
+                    Ok(Err(e)) => {
+                        auth_retry_count = 0;
+                        out.err(friendly_login_error(&e));
+                    }
+                    Err(_) if auth_retry_count == 0 => {
+                        auth_retry_count += 1;
+                        rg_core::diag::warn("auth", "request_login_code 20s timeout — reconnecting pool and retrying");
+                        connected.pool_handle.quit();
+                        pending_auth_cmd = Some(Cmd::RequestCode(phone));
+                        break true;
+                    }
+                    Err(_) => {
+                        auth_retry_count = 0;
+                        out.err(
+                            "Сервер Telegram не ответил за 20 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси»",
+                        );
+                    }
                 }
             }
             Cmd::ResendCode => {
@@ -1769,7 +1781,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 out.send(Ev::LoginBusy(true));
                 out.send(Ev::Status("Повторный запрос кода…".to_owned()));
                 let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(45),
+                    std::time::Duration::from_secs(20),
                     rg_core::auth::resend_login_code(
                         &connected.client,
                         &*connected.session,
@@ -1806,7 +1818,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 out.send(Ev::LoginBusy(true));
                 out.send(Ev::Status("Проверка кода…".to_owned()));
                 let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(45),
+                    std::time::Duration::from_secs(20),
                     rg_core::auth::sign_in(
                         &connected.client,
                         &*connected.session,
@@ -2006,7 +2018,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::TgsMessage(i, msg_id) => {
                 let Some(d) = dialogs.get(i) else { continue };
-                let (eng, out, limit, peer) = (engine.clone(), out.clone(), avatar_limit.clone(), d.peer);
+                let (eng, out, limit, peer) = (engine.clone(), out.clone(), emoji_limit.clone(), d.peer);
                 tokio::spawn(async move {
                     let Ok(_permit) = limit.acquire().await else { return };
                     if let Ok(Some(bytes)) = eng.tgs_message_bytes(peer, msg_id).await {
@@ -2106,9 +2118,46 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::CustomEmojiDocs(ids) => {
-                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                let (eng, out, limit, cache_dir) = (
+                    engine.clone(),
+                    out.clone(),
+                    emoji_limit.clone(),
+                    home.join("cache"),
+                );
                 tokio::spawn(async move {
-                    if let Ok(rows) = eng.custom_emoji_docs(&ids).await {
+                    // Мгновенная локальная подгрузка уже кэшированных `.tgs` / `.webp` эмодзи без RPC-запроса.
+                    let missing = tokio::task::spawn_blocking({
+                        let ids = ids.clone();
+                        let out = out.clone();
+                        move || {
+                            let mut miss = Vec::new();
+                            for id in ids {
+                                let tgs_p = cache_dir.join("tgs").join(format!("{id}.tgs"));
+                                if let Ok(bytes) = std::fs::read(&tgs_p)
+                                    && !bytes.is_empty()
+                                {
+                                    out.send(Ev::TgsDoc(id, bytes));
+                                    continue;
+                                }
+                                let webp_p = cache_dir.join("stickers").join(format!("{id}.webp"));
+                                let thumb_p = cache_dir.join("stickers").join(format!("{id}_t.webp"));
+                                if let Some(img) = decode_square(&webp_p, 128)
+                                    .or_else(|| decode_square(&thumb_p, 128))
+                                {
+                                    out.send(Ev::StickerImg(id, Box::new(img)));
+                                    continue;
+                                }
+                                miss.push(id);
+                            }
+                            miss
+                        }
+                    })
+                    .await
+                    .unwrap_or(ids);
+                    if missing.is_empty() {
+                        return;
+                    }
+                    if let Ok(rows) = eng.custom_emoji_docs(&missing).await {
                         for row in rows {
                             let (e2, o2, lim) = (eng.clone(), out.clone(), limit.clone());
                             tokio::spawn(async move {
@@ -2117,9 +2166,10 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                     && let Ok(Some(bytes)) = e2.tgs_sticker_bytes(&row).await
                                 {
                                     o2.send(Ev::TgsDoc(row.id, bytes));
+                                    return;
                                 }
                                 if let Ok(Some(path)) = e2.sticker_file(&row).await
-                                    && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 72)).await
+                                    && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 128)).await
                                 {
                                     o2.send(Ev::StickerImg(row.id, Box::new(img)));
                                 }
@@ -2429,16 +2479,17 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::StickerThumb(doc) => {
                 let row = sticker_docs.lock().ok().and_then(|g| g.get(&doc).cloned());
                 let Some(row) = row else { continue };
-                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                let (eng, out, limit) = (engine.clone(), out.clone(), emoji_limit.clone());
                 tokio::spawn(async move {
                     let Ok(_permit) = limit.acquire().await else { return };
                     if row.mime == "application/x-tgsticker"
                         && let Ok(Some(bytes)) = eng.tgs_sticker_bytes(&row).await
                     {
                         out.send(Ev::TgsDoc(doc, bytes));
+                        return;
                     }
                     if let Ok(Some(path)) = eng.sticker_file(&row).await
-                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 144)).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 160)).await
                     {
                         out.send(Ev::StickerImg(doc, Box::new(img)));
                     }
@@ -2604,11 +2655,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::SetIcon(set) => {
-                let (eng, out, limit) = (engine.clone(), out.clone(), avatar_limit.clone());
+                let (eng, out, limit) = (engine.clone(), out.clone(), emoji_limit.clone());
                 tokio::spawn(async move {
                     let Ok(_permit) = limit.acquire().await else { return };
                     if let Ok(Some(path)) = eng.set_icon(&set).await
-                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 96)).await
+                        && let Ok(Some(img)) = tokio::task::spawn_blocking(move || decode_square(&path, 112)).await
                     {
                         out.send(Ev::StickerImg(set.id, Box::new(img)));
                     }

@@ -297,6 +297,7 @@ struct App {
     user_filter: Option<(i64, String)>,
     /// Попапы поля ввода: команды бота (`/`), автоудаление, панель форматирования.
     cmd_popup_open: bool,
+    cmd_sel_idx: usize,
     ttl_popup_open: bool,
     format_bar_open: bool,
     composer_sel: Option<(usize, usize)>,
@@ -450,8 +451,10 @@ struct App {
     gifs_loaded: bool,
     faved_stickers: Vec<StickerRow>,
     recent_stickers: Vec<StickerRow>,
-    /// Всплывающее мини-окно эмодзи/стикеров/GIF при наведении на смайл (на ПК).
+    /// Всплывающее мини-окно эмодзи/стикеров/GIF при наведении на смайл (на ПК) и таймеры антидребезга.
     emoji_hover_open: bool,
+    emoji_hover_since: Option<f64>,
+    emoji_leave_since: Option<f64>,
     /// Архив загружен лениво (по клику на «Архив», не на старте).
     archive_loaded: bool,
     /// Состояние просмотрщика историй (пауза, звук, ошибки загрузки, лайки).
@@ -936,6 +939,7 @@ impl App {
             pending_confirm_media: None,
             user_filter: None,
             cmd_popup_open: false,
+            cmd_sel_idx: 0,
             ttl_popup_open: false,
             format_bar_open: false,
             composer_sel: None,
@@ -1058,6 +1062,8 @@ impl App {
             faved_stickers: Vec::new(),
             recent_stickers: Vec::new(),
             emoji_hover_open: false,
+            emoji_hover_since: None,
+            emoji_leave_since: None,
             archive_loaded: false,
             story_errors: HashMap::new(),
             story_paused: false,
@@ -2471,6 +2477,10 @@ impl App {
         self.msg_activity = None;
         self.user_filter = None;
         self.cmd_popup_open = false;
+        self.cmd_sel_idx = 0;
+        self.emoji_hover_open = false;
+        self.emoji_hover_since = None;
+        self.emoji_leave_since = None;
         self.ttl_popup_open = false;
         self.format_bar_open = false;
         self.composer_sel = None;
@@ -2768,8 +2778,9 @@ impl App {
         };
         let mut active = false;
         let mut rendered_this_frame = 0usize;
-        let max_tgs_rasters: usize = if cfg!(target_os = "android") { 2 } else { 4 };
+        let max_tgs_rasters: usize = if cfg!(target_os = "android") { 4 } else { 8 };
         let bucket_step: usize = if cfg!(target_os = "android") { 3 } else { 2 };
+        let doc_px: usize = if cfg!(target_os = "android") { 72 } else { 96 };
 
         // Обновляем только видимые анимированные Custom Emoji / стикеры панели и сообщений (`visible_tgs_docs`):
         // невидимые рендерятся ровно 1 раз (0-й кадр) — 0% CPU в простое!
@@ -2790,7 +2801,7 @@ impl App {
                 self.sticker_tex.insert(doc_id, tex.clone());
             } else if rendered_this_frame < max_tgs_rasters || !self.sticker_tex.contains_key(&doc_id) {
                 rendered_this_frame += 1;
-                let img = anim.render_frame_into(bucket as f32, 64, &mut self.tgs_scratch);
+                let img = anim.render_frame_into(bucket as f32, doc_px, &mut self.tgs_scratch);
                 let tex = ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR);
                 self.tgs_frame_cache.insert(key, tex.clone());
                 self.sticker_tex.insert(doc_id, tex);
@@ -2840,7 +2851,7 @@ impl App {
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
-        let mut tex_left: usize = 6;
+        let mut tex_left: usize = if cfg!(target_os = "android") { 8 } else { 14 };
         for _ in 0..self.pending_tex_uploads.len().min(tex_left) {
             if let Some(ev) = self.pending_tex_uploads.pop_front() {
                 tex_left = tex_left.saturating_sub(1);
@@ -7413,5 +7424,117 @@ mod tests {
         let back_g: rg_core::media::MediaInfo =
             serde_json::from_str(&serde_json::to_string(&geo).unwrap()).unwrap();
         assert_eq!(back_g, geo);
+    }
+
+    #[test]
+    fn matte_backdrop_and_plane_mascot_have_no_circle_or_blue_orange_glow() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(390.0, 844.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            theme::paint_android_glass_backdrop(&ctx, ui.max_rect(), c_orange());
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    login_anim::paint_plane_mascot(ui, true, 1.0);
+                    login_anim::paint_keys_mascot(ui);
+                });
+        });
+        out.textures_delta.clear();
+        // На фоне нет текстурных градиентов/бликов и нет фоновых кругов за самолётиком.
+        fn count_circles(shape: &egui::Shape, cnt: &mut usize) {
+            match shape {
+                egui::Shape::Circle(c) if c.radius >= 35.0 => *cnt += 1,
+                egui::Shape::Vec(v) => v.iter().for_each(|s| count_circles(s, cnt)),
+                _ => {}
+            }
+        }
+        let mut big_circles = 0;
+        for cs in &out.shapes {
+            count_circles(&cs.shape, &mut big_circles);
+        }
+        assert_eq!(big_circles, 0, "expected no background circle behind mascot");
+    }
+
+    #[test]
+    fn bot_empty_welcome_commands_popup_and_scrolled_fab_render_cleanly() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        // Выбираем бота без сообщений -> проверяем экран старта и карточку «Что умеет этот бот?».
+        let bot_idx = app
+            .dialogs
+            .iter()
+            .position(|d| d.kind == rg_core::engine::DialogKind::Bot)
+            .unwrap_or_else(|| {
+                let mut d = app.dialogs[0].clone();
+                d.id = 999_001;
+                d.kind = rg_core::engine::DialogKind::Bot;
+                d.name = "Тест Бот".into();
+                app.dialogs.push(d);
+                app.dialogs.len() - 1
+            });
+        let bot_id = app.dialogs[bot_idx].id;
+        app.selected = Some(bot_idx);
+        app.messages.clear();
+        app.peer_infos.insert(
+            bot_id,
+            rg_core::engine::PeerInfo {
+                id: bot_id,
+                name: "Тест Бот".into(),
+                bot_description: "Описание тестового бота".into(),
+                bot_commands: vec![
+                    ("start".into(), "Запуск".into()),
+                    ("menu".into(), "Открыть меню".into()),
+                ],
+                ..Default::default()
+            },
+        );
+        let mut txt_empty = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 680.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::bottom("cmp").show(ui, |ui| app.composer_ui(ui));
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            });
+            out.textures_delta.clear();
+            txt_empty.clear();
+            out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut txt_empty));
+        }
+        assert!(txt_empty.contains("Что умеет этот бот?"), "welcome missing: {txt_empty}");
+        assert!(txt_empty.contains("Запустить бота (/start)"), "start bar missing: {txt_empty}");
+
+        // С сообщениями: кнопка `≡ Меню`, попап команд, `scrolled_up` FAB + @ и ❤ стек.
+        app.messages.push(MessageRow::plain(1, "Привет от бота".into(), false, app.now));
+        app.cmd_popup_open = true;
+        app.scrolled_up = true;
+        if let Some(d) = app.dialogs.get_mut(bot_idx) {
+            d.unread = 4;
+            d.unread_mentions = 2;
+            d.unread_reactions = 1;
+        }
+        let mut txt_full = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 680.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::bottom("cmp").show(ui, |ui| app.composer_ui(ui));
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            });
+            out.textures_delta.clear();
+            txt_full.clear();
+            out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut txt_full));
+        }
+        assert!(txt_full.contains("≡ Меню"), "left bot menu pill missing: {txt_full}");
+        assert!(txt_full.contains("Команды бота") && txt_full.contains("/menu"), "bot cmd popup missing: {txt_full}");
+        assert!(txt_full.contains('@') && txt_full.contains('❤'), "stacked FABs missing: {txt_full}");
     }
 }

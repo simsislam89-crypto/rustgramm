@@ -485,7 +485,7 @@ impl App {
         if list.is_none() {
             acts.push(StickerAct::LoadPack(i));
         }
-        let cell = 40.0;
+        let cell = 44.0;
         let cols = ((ui.available_width() / cell).floor() as usize).max(1);
         let head_h = 30.0;
         let (head, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), head_h), Sense::hover());
@@ -515,7 +515,7 @@ impl App {
                         if h > 0.01 {
                             ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(8), Color32::from_rgba_unmultiplied(255, 255, 255, (26.0 * h) as u8));
                         }
-                        let side = 28.0 + 4.0 * h;
+                        let side = 32.0 + 4.0 * h;
                         let area = Rect::from_center_size(r.center(), Vec2::splat(side));
                         if let Some(tex) = self.sticker_tex.get(&st.id) {
                             acts.push(StickerAct::VisibleDoc(st.id));

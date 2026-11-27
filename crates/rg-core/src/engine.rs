@@ -116,6 +116,88 @@ impl AudioTrack {
     }
 }
 
+/// Какие реакции разрешены администратором в чате или канале (`available_reactions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatReactionsPolicy {
+    /// Разрешены все доступные реакции (`allow_custom` — можно ли кастомные эмодзи).
+    All { allow_custom: bool },
+    /// Разрешён только явный список эмодзи.
+    Some(Vec<String>),
+    /// Все реакции запрещены (`ChatReactions::None`).
+    None,
+}
+
+impl Default for ChatReactionsPolicy {
+    fn default() -> Self {
+        Self::All { allow_custom: true }
+    }
+}
+
+impl ChatReactionsPolicy {
+    pub fn from_tl(cr: Option<&grammers_client::tl::enums::ChatReactions>) -> Self {
+        use grammers_client::tl::enums::{ChatReactions as CR, Reaction as R};
+        match cr {
+            Some(CR::None) => Self::None,
+            Some(CR::All(a)) => Self::All {
+                allow_custom: a.allow_custom,
+            },
+            Some(CR::Some(s)) => {
+                let list: Vec<String> = s
+                    .reactions
+                    .iter()
+                    .filter_map(|r| match r {
+                        R::Emoji(e) => Some(e.emoticon.clone()),
+                        _ => Option::None,
+                    })
+                    .collect();
+                if list.is_empty() {
+                    Self::None
+                } else {
+                    Self::Some(list)
+                }
+            }
+            Option::None => Self::default(),
+        }
+    }
+
+    /// Проверяет, допустима ли данная эмодзи-реакция в чате/канале.
+    pub fn allows(&self, emoji: &str) -> bool {
+        let e = emoji.trim();
+        if e.is_empty() {
+            return false;
+        }
+        match self {
+            Self::All { .. } => true,
+            Self::Some(list) => list.iter().any(|x| x == e),
+            Self::None => false,
+        }
+    }
+
+    /// Список быстрых реакций для контекстного меню сообщения (пустой, если реакции запрещены).
+    pub fn quick_list(&self, defaults: &[&str]) -> Vec<String> {
+        match self {
+            Self::All { .. } => defaults.iter().map(|s| (*s).to_owned()).collect(),
+            Self::Some(list) => list.iter().take(7).cloned().collect(),
+            Self::None => Vec::new(),
+        }
+    }
+
+    /// Предпочитаемая быстрая реакция для двойного тапа (с учётом ограничений канала).
+    pub fn default_allowed<'a>(&'a self, preferred: &'a str) -> Option<&'a str> {
+        match self {
+            Self::All { .. } => Some(if preferred.is_empty() { "👍" } else { preferred }),
+            Self::Some(list) => {
+                if !preferred.is_empty() && list.iter().any(|x| x == preferred) {
+                    Some(preferred)
+                } else {
+                    list.first().map(String::as_str)
+                }
+            }
+            Self::None => Option::None,
+        }
+    }
+}
+
 /// Сведения о собеседнике, группе или канале для правой панели.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -150,6 +232,8 @@ pub struct PeerInfo {
     pub bot_description: String,
     /// Включены ли платные звёздные реакции в этом канале (`ChannelFull.paid_reactions_available`).
     pub paid_reactions_available: bool,
+    /// Политика разрешённых реакций в группе или канале (`ChannelFull`/`ChatFull.available_reactions`).
+    pub available_reactions: ChatReactionsPolicy,
     /// Интервал медленного режима (Slow Mode), секунды (0 — выключен).
     pub slowmode_seconds: i32,
     /// Unix-время, когда можно отправить следующее сообщение при Slow Mode.
@@ -2035,6 +2119,7 @@ impl Engine {
                     info.pinned_msg_id = full.pinned_msg_id;
                     info.ttl_period = full.ttl_period;
                     info.paid_reactions_available = full.paid_reactions_available;
+                    info.available_reactions = ChatReactionsPolicy::from_tl(full.available_reactions.as_ref());
                     info.slowmode_seconds = full.slowmode_seconds.unwrap_or(0);
                     info.slowmode_next_send_date = full.slowmode_next_send_date.unwrap_or(0);
                     info.has_welcome_messages = full.has_welcome_messages;
@@ -2064,6 +2149,7 @@ impl Engine {
                     info.about = full.about;
                     info.pinned_msg_id = full.pinned_msg_id;
                     info.ttl_period = full.ttl_period;
+                    info.available_reactions = ChatReactionsPolicy::from_tl(full.available_reactions.as_ref());
                     if let Some(tl::enums::ChatParticipants::Participants(p)) = Some(full.participants) {
                         info.members = p.participants.len() as i32;
                     }
@@ -6921,5 +7007,40 @@ mod tests {
         ));
         assert!(Engine::archive_text_from_row(&r_g).contains("Геопозиция"));
         assert!(raw_media_label(Some(&grammers_client::tl::enums::MessageMedia::Empty)).is_empty());
+    }
+
+    #[test]
+    fn chat_reactions_policy_handles_all_some_and_none() {
+        use grammers_client::tl::{enums, types};
+
+        let p_none = ChatReactionsPolicy::from_tl(Some(&enums::ChatReactions::None));
+        assert_eq!(p_none, ChatReactionsPolicy::None);
+        assert!(!p_none.allows("👍"));
+        assert!(p_none.quick_list(&["👍", "❤"]).is_empty());
+        assert_eq!(p_none.default_allowed("👍"), None);
+
+        let p_some = ChatReactionsPolicy::from_tl(Some(&enums::ChatReactions::Some(
+            types::ChatReactionsSome {
+                reactions: vec![
+                    enums::Reaction::Emoji(types::ReactionEmoji {
+                        emoticon: "🔥".into(),
+                    }),
+                    enums::Reaction::Emoji(types::ReactionEmoji {
+                        emoticon: "❤".into(),
+                    }),
+                ],
+            },
+        )));
+        assert!(p_some.allows("🔥"));
+        assert!(!p_some.allows("👍"));
+        assert_eq!(p_some.quick_list(&["👍", "❤"]), vec!["🔥", "❤"]);
+        assert_eq!(p_some.default_allowed("👍"), Some("🔥"));
+        assert_eq!(p_some.default_allowed("❤"), Some("❤"));
+
+        let p_all = ChatReactionsPolicy::from_tl(Some(&enums::ChatReactions::All(
+            types::ChatReactionsAll { allow_custom: false },
+        )));
+        assert!(p_all.allows("👍"));
+        assert_eq!(p_all.default_allowed(""), Some("👍"));
     }
 }

@@ -24,53 +24,31 @@ fn rot(v: Vec2, rad: f32) -> Vec2 {
     Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// Логотип Rustgramm для стартового экрана и ввода телефона: оранжевый градиент и парящий бумажный самолётик.
-pub fn paint_plane_mascot(ui: &mut egui::Ui, busy: bool, enter_k: f32) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(126.0), Sense::hover());
+/// Логотип Rustgramm для стартового экрана и ввода телефона: чистый парящий бумажный самолётик без круга и пульсации.
+pub fn paint_plane_mascot(ui: &mut egui::Ui, _busy: bool, enter_k: f32) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(108.0), Sense::hover());
     let c = rect.center();
     let p = ui.painter();
-    let t = ui.input(|i| i.time);
-    let hk = theme::tween(ui.ctx(), "lg-plane-h", f32::from(u8::from(resp.hovered())), 0.16);
+    let hk = theme::tween(ui.ctx(), "lg-plane-h", f32::from(u8::from(resp.hovered())), 0.18);
     let spring_k = ios_spring_bounce(enter_k.clamp(0.0, 1.0));
-    let scale = (0.78 + 0.22 * spring_k) * (1.0 + 0.04 * hk);
-    let r = 52.0 * scale;
+    let scale = (0.86 + 0.14 * spring_k) * (1.0 + 0.05 * hk);
+    let r = 54.0 * scale;
     let orange = c_orange();
-    let orange_hi = lerp_color(orange, Color32::from_rgb(255, 198, 96), 0.35);
+    let fold_mid = lerp_color(orange, Color32::from_rgb(175, 82, 16), 0.35);
+    let fold_deep = lerp_color(orange, Color32::from_rgb(120, 48, 8), 0.55);
 
-    if busy {
-        let pulse = ((t * 3.6).sin() as f32) * 0.5 + 0.5;
-        p.circle_stroke(
-            c,
-            r + 6.0 + 8.0 * pulse,
-            Stroke::new(2.0, Color32::from_rgba_unmultiplied(orange.r(), orange.g(), orange.b(), (140.0 * (1.0 - pulse)) as u8)),
-        );
-    }
-    p.circle_filled(
-        c,
-        r + 5.0,
-        Color32::from_rgba_unmultiplied(orange.r(), orange.g(), orange.b(), (28.0 * enter_k) as u8),
-    );
-    p.circle_filled(c, r, orange);
-    // Мягкий тёплый блик сверху.
-    p.circle_filled(
-        c + Vec2::new(-r * 0.14, -r * 0.24),
-        r * 0.66,
-        Color32::from_rgba_unmultiplied(orange_hi.r(), orange_hi.g(), orange_hi.b(), 72),
-    );
-
-    // Мягкое 60 FPS покачивание самолётика в воздухе.
-    let float_y = (t * 2.4).sin() as f32 * 2.4 + (1.0 - spring_k) * 14.0;
-    let float_x = (t * 1.7).cos() as f32 * 1.2 - (1.0 - spring_k) * 8.0;
+    let float_y = (1.0 - spring_k) * 10.0 - hk * 2.5;
+    let float_x = -(1.0 - spring_k) * 6.0;
     let pc = c + Vec2::new(float_x, float_y);
     let k = r / 54.0;
-    let tilt = ((t * 2.0).sin() as f32) * 0.035 + hk * 0.05;
+    let tilt = hk * 0.04;
     let pt = |vx: f32, vy: f32| pc + rot(Vec2::new(vx, vy) * k, tilt);
 
-    let p_left = pt(-28.0, 2.0);
-    let p_tip = pt(25.0, -19.0);
-    let p_bot = pt(14.0, 22.0);
-    let p_fold_top = pt(-8.0, 7.0);
-    let p_fold_mid = pt(-5.0, 17.0);
+    let p_left = pt(-34.0, 3.0);
+    let p_tip = pt(32.0, -24.0);
+    let p_bot = pt(17.0, 27.0);
+    let p_fold_top = pt(-10.0, 9.0);
+    let p_fold_mid = pt(-6.0, 21.0);
 
     p.add(egui::Shape::convex_polygon(
         vec![p_left, p_tip, p_fold_top],
@@ -79,20 +57,19 @@ pub fn paint_plane_mascot(ui: &mut egui::Ui, busy: bool, enter_k: f32) {
     ));
     p.add(egui::Shape::convex_polygon(
         vec![p_fold_top, p_tip, p_bot],
-        Color32::from_rgb(252, 246, 240),
+        orange,
         Stroke::NONE,
     ));
     p.add(egui::Shape::convex_polygon(
         vec![p_fold_top, p_tip, p_fold_mid],
-        Color32::from_rgb(245, 210, 180),
+        fold_mid,
         Stroke::NONE,
     ));
     p.add(egui::Shape::convex_polygon(
-        vec![p_fold_mid, p_tip, pt(1.0, 12.0)],
-        Color32::from_rgb(230, 178, 138),
+        vec![p_fold_mid, p_tip, pt(2.0, 15.0)],
+        fold_deep,
         Stroke::NONE,
     ));
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }
 
 /// Общая векторная мордочка обезьянки Telegram без фона и без подложек.
@@ -251,37 +228,20 @@ pub fn paint_password_monkey(ui: &mut egui::Ui, show_password: bool, pass_len: u
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }
 
-/// Парящий оранжевый векторный ключ без фона (для экрана ввода API-ключей).
+/// Статичный оранжевый векторный ключ без бликов и фоновой пульсации (для экрана ввода API-ключей).
 pub fn paint_keys_mascot(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(108.0), Sense::hover());
-    let t = ui.input(|i| i.time);
-    let bob = (t * 2.5).sin() as f32 * 3.0;
-    let sway = (t * 1.9).cos() as f32 * 0.14;
-    let c = rect.center() + Vec2::new(0.0, bob);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
+    let hk = theme::tween(ui.ctx(), "lg-keys-h", f32::from(u8::from(resp.hovered())), 0.16);
+    let c = rect.center() + Vec2::new(0.0, -hk * 2.0);
     let orange = c_orange();
-    let gold = lerp_color(orange, Color32::from_rgb(255, 214, 110), 0.45);
+    let edge = lerp_color(orange, Color32::from_rgb(255, 200, 130), 0.25);
     let p = ui.painter();
-    let pt = |x: f32, y: f32| c + rot(Vec2::new(x, y), sway);
+    let pt = |x: f32, y: f32| c + Vec2::new(x, y);
 
-    // Головка ключа.
     let bow = pt(-16.0, 0.0);
     p.circle_stroke(bow, 15.0, Stroke::new(6.0, orange));
-    p.circle_stroke(bow, 15.0, Stroke::new(2.0, gold));
-    // Стержень и зубцы.
-    let shaft_a = pt(-2.0, 0.0);
-    let shaft_b = pt(30.0, 0.0);
-    p.line_segment([shaft_a, shaft_b], Stroke::new(6.0, orange));
+    p.circle_stroke(bow, 15.0, Stroke::new(1.5, edge));
+    p.line_segment([pt(-2.0, 0.0), pt(30.0, 0.0)], Stroke::new(6.0, orange));
     p.line_segment([pt(16.0, 0.0), pt(16.0, 11.0)], Stroke::new(5.5, orange));
     p.line_segment([pt(26.0, 0.0), pt(26.0, 14.0)], Stroke::new(5.5, orange));
-
-    // Звёздочки-блики вокруг.
-    for (idx, off) in [(0, Vec2::new(-28.0, -24.0)), (1, Vec2::new(26.0, -20.0))] {
-        let ph = ((t * 3.0 + idx as f64 * 1.7).sin() as f32 * 0.5 + 0.5).clamp(0.15, 1.0);
-        let sc = c + off;
-        let r = 5.5 * ph;
-        let col = Color32::from_rgba_unmultiplied(gold.r(), gold.g(), gold.b(), (220.0 * ph) as u8);
-        p.line_segment([sc - Vec2::new(r, 0.0), sc + Vec2::new(r, 0.0)], Stroke::new(1.6, col));
-        p.line_segment([sc - Vec2::new(0.0, r), sc + Vec2::new(0.0, r)], Stroke::new(1.6, col));
-    }
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }

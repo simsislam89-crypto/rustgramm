@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 rg-net = { path = "../rg-net" }
+grammers-mtproto = "0.12"
 grammers-mtsender = { version = "0.12", features = ["proxy"] }
 grammers-session = "0.12"
 grammers-client = "0.12"
