@@ -161,6 +161,8 @@ struct App {
     inline_gif: Option<video::InlineGifView>,
     /// Кэш истории уже открытых чатов (мгновенное переключение за 0 мс).
     history_cache: HashMap<i64, Vec<MessageRow>>,
+    history_cache_order: std::collections::VecDeque<i64>,
+    history_fresh_at: HashMap<i64, std::time::Instant>,
     history_loading: bool,
     /// Время загрузки миниатюр (для плавного проявления).
     img_arrived: HashMap<i32, f64>,
@@ -332,6 +334,8 @@ struct App {
     login_busy: bool,
     login_last_phone: String,
     login_code_sent_at: Option<std::time::Instant>,
+    login_code_len: u8,
+    login_resend_secs: u64,
     /// Активные ожидания нативных диалогов Android (чтобы не дёргать JNI каждый кадр впустую).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     android_webview_open: bool,
@@ -394,6 +398,20 @@ struct App {
     last_capture_excluded: Option<bool>,
     wallpaper_failed_path: String,
     visible_tgs_msgs: HashSet<i32>,
+    visible_tgs_docs: HashSet<i64>,
+    tgs_scratch: lottie::TgsScratch,
+    /// Модальный предпросмотр чата без отметки прочтения `(dialog_id, name, messages)`.
+    peek_modal: Option<(i64, String, Vec<MessageRow>)>,
+    participants_filter: rg_core::engine::ParticipantFilter,
+    participants_query: String,
+    last_typing_sent: Option<(usize, std::time::Instant)>,
+    contact_modal_open: bool,
+    send_contact_phone: String,
+    send_contact_first: String,
+    send_contact_last: String,
+    geo_modal_open: bool,
+    geo_lat: String,
+    geo_lon: String,
     pending_tex_uploads: VecDeque<Ev>,
     /// Общее число участников в супергруппах/каналах (для догрузки по страницам).
     participants_total: HashMap<i64, i32>,
@@ -808,6 +826,8 @@ impl App {
             #[cfg(windows)]
             inline_gif: None,
             history_cache: HashMap::new(),
+            history_cache_order: std::collections::VecDeque::new(),
+            history_fresh_at: HashMap::new(),
             history_loading: false,
             img_arrived: HashMap::new(),
             global_results: Vec::new(),
@@ -940,6 +960,8 @@ impl App {
             login_busy: false,
             login_last_phone: String::new(),
             login_code_sent_at: None,
+            login_code_len: 5,
+            login_resend_secs: 60,
             android_webview_open: false,
             android_input_pending: false,
             autoscroll_holding: false,
@@ -989,6 +1011,19 @@ impl App {
             last_capture_excluded: None,
             wallpaper_failed_path: String::new(),
             visible_tgs_msgs: HashSet::new(),
+            visible_tgs_docs: HashSet::new(),
+            tgs_scratch: lottie::TgsScratch::default(),
+            peek_modal: None,
+            participants_filter: rg_core::engine::ParticipantFilter::All,
+            participants_query: String::new(),
+            last_typing_sent: None,
+            contact_modal_open: false,
+            send_contact_phone: String::new(),
+            send_contact_first: String::new(),
+            send_contact_last: String::new(),
+            geo_modal_open: false,
+            geo_lat: "55.7558".to_owned(),
+            geo_lon: "37.6173".to_owned(),
             pending_tex_uploads: VecDeque::new(),
             participants_total: HashMap::new(),
             media_editor: None,
@@ -1268,6 +1303,7 @@ impl App {
                 if self.apply_live_to_list(key, &row_snapshot, open_id == Some(key)) {
                     self.refresh_at.get_or_insert(std::time::Instant::now());
                 }
+                self.history_fresh_at.remove(&key);
                 // Уведомление по настройкам с учётом мута (чат, архив, категория Telegram), `silent` и антиспама >3/сек.
                 if !row_snapshot.1 {
                     let now = std::time::Instant::now();
@@ -1314,7 +1350,11 @@ impl App {
                         }
                     }
                 }
-                self.refresh_at.get_or_insert(std::time::Instant::now());
+                if let Some(cid) = ch {
+                    self.history_fresh_at.remove(&cid);
+                } else {
+                    self.history_fresh_at.retain(|cid, _| *cid <= -1_000_000_000_000);
+                }
             }
             Live::ReadOutbox(key, max) => {
                 if let Some(d) = self.dialogs.iter_mut().find(|d| d.id == key) {
@@ -2339,10 +2379,20 @@ impl App {
             if let Some(cached) = self.history_cache.get(&id).cloned()
                 && !cached.is_empty()
             {
+                self.history_cache_order.retain(|&x| x != id);
+                self.history_cache_order.push_back(id);
                 self.known.extend(cached.iter().map(|r| r.id));
                 self.request_previews(i, &cached);
                 self.messages = cached;
                 self.history_loading = false;
+                let fresh = self
+                    .history_fresh_at
+                    .get(&id)
+                    .is_some_and(|t| t.elapsed().as_millis() < 1500);
+                if !fresh {
+                    self.send(Cmd::Open(i));
+                }
+                return;
             } else {
                 self.history_loading = true;
             }
@@ -2362,6 +2412,11 @@ impl App {
     fn reset_chat_state(&mut self) {
         self.cached_media.clear();
         self.visible_tgs_msgs.clear();
+        self.participants_filter = rg_core::engine::ParticipantFilter::All;
+        self.participants_query.clear();
+        self.last_typing_sent = None;
+        self.contact_modal_open = false;
+        self.geo_modal_open = false;
         self.pending_tex_uploads.retain(|ev| !matches!(ev, Ev::Image(..)));
         self.gif_paths.clear();
         self.gif_auto_req.clear();
@@ -2670,15 +2725,35 @@ impl App {
         // Не нагружаем CPU в фоне, когда окно свёрнуто в трей или не в фокусе.
         let focused = !self.hidden_to_tray && ctx.input(|i| i.focused);
         if self.tgs_frame_cache.len() > 600 {
+            let keep_docs = &self.visible_tgs_docs;
+            let keep_msgs = &self.visible_tgs_msgs;
             let drop_keys: Vec<(i64, usize)> = self
                 .tgs_frame_cache
                 .keys()
                 .enumerate()
-                .filter(|(idx, _)| idx % 2 == 0)
+                .filter(|(idx, (k, _))| {
+                    let is_vis_msg = *k < -900_000
+                        && i32::try_from(-*k - 1_000_000).is_ok_and(|mid| keep_msgs.contains(&mid));
+                    let is_vis_doc = keep_docs.contains(k);
+                    !is_vis_msg && !is_vis_doc && idx % 2 == 0
+                })
                 .map(|(_, k)| *k)
                 .collect();
             for k in drop_keys {
                 self.tgs_frame_cache.remove(&k);
+            }
+            // Жёсткий потолок на случай десятков одновременно видимых анимированных стикеров.
+            if self.tgs_frame_cache.len() > 750 {
+                let hard_drop: Vec<(i64, usize)> = self
+                    .tgs_frame_cache
+                    .keys()
+                    .enumerate()
+                    .filter(|(idx, _)| idx % 2 == 0)
+                    .map(|(_, k)| *k)
+                    .collect();
+                for k in hard_drop {
+                    self.tgs_frame_cache.remove(&k);
+                }
             }
         }
         let speed = f64::from(self.settings.anim_speed) / 100.0;
@@ -2689,28 +2764,29 @@ impl App {
         };
         let mut active = false;
         let mut rendered_this_frame = 0usize;
-        const MAX_TGS_RASTERS_PER_FRAME: usize = 2;
+        let max_tgs_rasters: usize = if cfg!(target_os = "android") { 2 } else { 4 };
+        let bucket_step: usize = if cfg!(target_os = "android") { 3 } else { 2 };
 
-        // Обновляем анимированные Custom Emoji / стикеры панели (`tgs_docs`) на плавных 30 FPS:
-        // если панель эмодзи закрыта, рендерим только 0-й кадр один раз (0% нагрузки CPU в простое!).
-        let panel_visible = self.emoji_open || self.emoji_hover_open;
+        // Обновляем только видимые анимированные Custom Emoji / стикеры панели и сообщений (`visible_tgs_docs`):
+        // невидимые рендерятся ровно 1 раз (0-й кадр) — 0% CPU в простое!
         for (&doc_id, anim) in &self.tgs_docs {
-            let bucket = if panel_visible && focused {
+            let is_visible = self.visible_tgs_docs.contains(&doc_id);
+            let bucket = if is_visible && focused && speed > 0.01 {
                 let f = anim.frame_at_time(t);
                 active = true;
-                (f.round() as usize / 2) * 2
+                (f.round() as usize / bucket_step) * bucket_step
             } else {
                 0
             };
-            if bucket == 0 && self.sticker_tex.contains_key(&doc_id) && !panel_visible {
+            if bucket == 0 && self.sticker_tex.contains_key(&doc_id) && !is_visible {
                 continue;
             }
             let key = (doc_id, bucket);
             if let Some(tex) = self.tgs_frame_cache.get(&key) {
                 self.sticker_tex.insert(doc_id, tex.clone());
-            } else if rendered_this_frame < MAX_TGS_RASTERS_PER_FRAME || !self.sticker_tex.contains_key(&doc_id) {
+            } else if rendered_this_frame < max_tgs_rasters || !self.sticker_tex.contains_key(&doc_id) {
                 rendered_this_frame += 1;
-                let img = anim.render_frame(bucket as f32, 64);
+                let img = anim.render_frame_into(bucket as f32, 64, &mut self.tgs_scratch);
                 let tex = ctx.load_texture(format!("tgsd_{doc_id}_{bucket}"), img, egui::TextureOptions::LINEAR);
                 self.tgs_frame_cache.insert(key, tex.clone());
                 self.sticker_tex.insert(doc_id, tex);
@@ -2718,20 +2794,20 @@ impl App {
         }
 
         // Обновляем анимированные TGS-стикеры в видимой области открытого чата (`tgs_msgs`).
-        if focused {
+        if focused && speed > 0.01 {
             let has_vis = !self.visible_tgs_msgs.is_empty();
             for (&msg_id, anim) in &self.tgs_msgs {
                 if has_vis && !self.visible_tgs_msgs.contains(&msg_id) {
                     continue;
                 }
                 let f = anim.frame_at_time(t);
-                let bucket = (f.round() as usize / 2) * 2;
+                let bucket = (f.round() as usize / bucket_step) * bucket_step;
                 let key = (-i64::from(msg_id) - 1_000_000, bucket);
                 if let Some(tex) = self.tgs_frame_cache.get(&key) {
                     self.textures.insert(msg_id, tex.clone());
-                } else if rendered_this_frame < MAX_TGS_RASTERS_PER_FRAME || !self.textures.contains_key(&msg_id) {
+                } else if rendered_this_frame < max_tgs_rasters || !self.textures.contains_key(&msg_id) {
                     rendered_this_frame += 1;
-                    let img = anim.render_frame(bucket as f32, 256);
+                    let img = anim.render_frame_into(bucket as f32, 256, &mut self.tgs_scratch);
                     let tex = ctx.load_texture(format!("tgsm_{msg_id}_{bucket}"), img, egui::TextureOptions::LINEAR);
                     self.tgs_frame_cache.insert(key, tex.clone());
                     self.textures.insert(msg_id, tex);
@@ -2741,7 +2817,8 @@ impl App {
         }
 
         if active && focused && speed > 0.01 {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            let delay_ms = if cfg!(target_os = "android") { 50 } else { 33 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         }
     }
 
@@ -2789,6 +2866,9 @@ impl App {
                 Ev::Stage(s) => {
                     let changed = std::mem::discriminant(&self.stage) != std::mem::discriminant(&s);
                     let is_ready = s == Stage::Ready;
+                    if changed && !matches!(s, Stage::NeedCode) {
+                        self.code.clear();
+                    }
                     self.stage = s;
                     if changed || is_ready {
                         self.error.clear();
@@ -2906,6 +2986,7 @@ impl App {
                 Ev::GlobalFound(list) => self.global_results = list,
                 Ev::Translated(id, tr) => {
                     self.translated.insert(id, tr);
+                    self.msg_heights.remove(&id);
                     self.status.clear();
                 }
                 Ev::Participants(id, list) => {
@@ -2950,16 +3031,16 @@ impl App {
                     self.audit_history = Some((id, rows));
                 }
                 Ev::TgsDoc(id, bytes) => {
-                    if self.tgs_docs.len() > 80 {
-                        self.tgs_docs.clear();
+                    if self.tgs_docs.len() > 160 {
+                        self.tgs_docs.retain(|k, _| self.visible_tgs_docs.contains(k));
                     }
                     if let Some(anim) = lottie::TgsAnim::from_bytes(&bytes) {
                         self.tgs_docs.insert(id, anim);
                     }
                 }
                 Ev::TgsMsg(msg_id, bytes) => {
-                    if self.tgs_msgs.len() > 30 {
-                        self.tgs_msgs.clear();
+                    if self.tgs_msgs.len() > 60 {
+                        self.tgs_msgs.retain(|k, _| self.visible_tgs_msgs.contains(k));
                     }
                     if let Some(anim) = lottie::TgsAnim::from_bytes(&bytes) {
                         self.tgs_msgs.insert(msg_id, anim);
@@ -2993,7 +3074,7 @@ impl App {
                             self.send(Cmd::ForumTopics(idx));
                         }
                     }
-                    self.peer_infos.insert(id, info);
+                    self.peer_infos.insert(id, *info);
                 }
                 Ev::ForumTopics(id, topics) => {
                     self.forum_topics.insert(id, topics);
@@ -3016,7 +3097,7 @@ impl App {
                     self.stories = list;
                 }
                 Ev::PinnedMsg(id, msg) => {
-                    self.pinned_msgs.insert(id, msg);
+                    self.pinned_msgs.insert(id, *msg);
                 }
                 Ev::MiniAppReady { title, url } => {
                     #[cfg(windows)]
@@ -3078,6 +3159,8 @@ impl App {
                     self.peer_saved_gifts.clear();
                     self.saved_gifts_req.clear();
                     self.history_cache.clear();
+                    self.history_cache_order.clear();
+                    self.history_fresh_at.clear();
                     self.archive_loaded = false;
                     self.in_archive = false;
                     self.stickers_requested = false;
@@ -3115,9 +3198,15 @@ impl App {
                     self.sticker_lists.insert(id, l);
                 }
                 Ev::StickerImg(id, img) => {
-                    // Ограничение кэша текстур стикеров/эмодзи в ОЗУ (до 260 шт.).
-                    if self.sticker_tex.len() > 260 {
-                        let keep: HashSet<i64> = self.dialogs.iter().filter_map(|d| d.emoji_status).collect();
+                    // Ограничение кэша текстур стикеров/эмодзи в ОЗУ (до 360 шт.), не вытесняя видимые.
+                    if self.sticker_tex.len() > 360 {
+                        let keep: HashSet<i64> = self
+                            .dialogs
+                            .iter()
+                            .filter_map(|d| d.emoji_status)
+                            .chain(self.visible_tgs_docs.iter().copied())
+                            .chain(self.tgs_docs.keys().copied())
+                            .collect();
                         self.sticker_tex.retain(|k, _| keep.contains(k));
                         self.sticker_req.retain(|k| self.sticker_tex.contains_key(k));
                         self.custom_emoji_req.retain(|k| self.sticker_tex.contains_key(k));
@@ -3126,14 +3215,19 @@ impl App {
                     self.sticker_tex.insert(id, tex);
                 }
                 Ev::History(dialog_id, m) => {
-                    // Сохраняем в ОЗУ-кэш даже при быстром переключении чатов (до 16 последних).
-                    if self.history_cache.len() >= 16
-                        && !self.history_cache.contains_key(&dialog_id)
-                        && let Some(&drop_key) = self.history_cache.keys().next()
-                    {
-                        self.history_cache.remove(&drop_key);
+                    // Сохраняем в 64-чатовый LRU-кэш ОЗУ даже при быстром переключении чатов.
+                    if !self.history_cache.contains_key(&dialog_id) && self.history_cache.len() >= 64 {
+                        while let Some(drop_key) = self.history_cache_order.pop_front() {
+                            if drop_key != dialog_id && self.history_cache.remove(&drop_key).is_some() {
+                                self.history_fresh_at.remove(&drop_key);
+                                break;
+                            }
+                        }
                     }
+                    self.history_cache_order.retain(|&x| x != dialog_id);
+                    self.history_cache_order.push_back(dialog_id);
                     self.history_cache.insert(dialog_id, m.clone());
+                    self.history_fresh_at.insert(dialog_id, std::time::Instant::now());
                     // Сопоставляем по стабильному `dialog_id` — перестановки списка чатов больше не ломают загрузку!
                     if let Some(idx) = self
                         .selected
@@ -3254,6 +3348,12 @@ impl App {
                 Ev::CodeDeliveryHint(h) => {
                     self.login_code_hint = h;
                 }
+                Ev::CodeMeta { length, resend_secs } => {
+                    self.login_code_len = length.clamp(4, 12);
+                    if let Some(secs) = resend_secs {
+                        self.login_resend_secs = (secs as u64).clamp(15, 300);
+                    }
+                }
                 Ev::StoryImage(sid, img) => {
                     let tex = ctx.load_texture(format!("story-{sid}"), *img, egui::TextureOptions::LINEAR);
                     self.story_textures.insert(sid, tex);
@@ -3286,6 +3386,9 @@ impl App {
                 }
                 Ev::AvailableEffects(eff) => {
                     self.available_effects = eff;
+                }
+                Ev::PeekHistory(did, name, rows) => {
+                    self.peek_modal = Some((did, name, rows));
                 }
                 Ev::AdminLog(rows) => self.admin_log = rows,
                 Ev::AdminInvites(rows) => self.admin_invites = rows,
@@ -3957,10 +4060,14 @@ impl App {
                         |ui| {
                             ui.spacing_mut().item_spacing.x = gap;
                             for &key in row {
+                                let glass = theme::mobile_glass_active();
                                 let btn = egui::Button::new(RichText::new(key).size(16.0).strong().color(WHITE))
-                                    .fill(Color32::from_white_alpha(18))
-                                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
-                                    .corner_radius(egui::CornerRadius::same(10));
+                                    .fill(Color32::from_white_alpha(if glass { 28 } else { 18 }))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        Color32::from_white_alpha(if glass { 46 } else { 26 }),
+                                    ))
+                                    .corner_radius(egui::CornerRadius::same(12));
                                 if ui.add_sized([kw, row_h], btn).clicked() {
                                     match key {
                                         "⌫" => {
@@ -4116,14 +4223,20 @@ impl App {
                 let top_gap = (ui.available_height() * if compact { 0.025 } else { 0.06 }).clamp(6.0, 52.0);
                 ui.add_space(top_gap);
                 let col_w = (ui.available_width() - outer_pad * 2.0 - f32::from(margin_x) * 2.0).clamp(260.0, 336.0);
+                let glass_mobile = theme::mobile_glass_active();
                 egui::Frame::new()
-                    .fill(if cfg!(target_os = "android") || compact {
+                    .fill(if glass_mobile {
+                        Color32::from_rgba_unmultiplied(18, 20, 28, (235.0 * theme::opacity_f32().max(0.68)) as u8)
+                    } else if compact {
                         Color32::from_rgba_unmultiplied(24, 25, 30, 250)
                     } else {
                         Color32::from_rgba_unmultiplied(24, 25, 30, (220.0 * opacity_f32().max(0.65)) as u8)
                     })
-                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(20)))
-                    .corner_radius(egui::CornerRadius::same(20))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        Color32::from_white_alpha(if glass_mobile { 40 } else { 20 }),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(22))
                     .inner_margin(egui::Margin::symmetric(margin_x, 20))
                     .show(ui, |ui| {
                         ui.set_width(col_w);
@@ -4163,6 +4276,15 @@ impl App {
                                     .clicked()
                                 {
                                     self.proxy_open = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("Копировать").size(12.0).color(SUBTEXT))
+                                            .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(self.error.clone());
                                 }
                             });
                         });
@@ -4610,6 +4732,9 @@ impl App {
                 ui.add_space(14.0);
 
                 let mut enter_code = false;
+                let code_target_len = usize::from(self.login_code_len.clamp(4, 12));
+                let code_ph = format!("{code_target_len} цифр кода");
+                let code_prompt_hint = format!("Введите {code_target_len} цифр кода");
                 if cfg!(target_os = "android") {
                     if Self::outlined_login_button(
                         ui,
@@ -4621,7 +4746,7 @@ impl App {
                         accent,
                         bg_cut,
                         &self.code,
-                        "5 цифр кода",
+                        &code_ph,
                         LoginButtonRight::Keyboard,
                     )
                     .clicked()
@@ -4629,7 +4754,7 @@ impl App {
                         self.open_android_input(
                             "login_code",
                             "Код подтверждения",
-                            "Введите 5 цифр кода",
+                            &code_prompt_hint,
                             &self.code.clone(),
                             2,
                         );
@@ -4662,9 +4787,10 @@ impl App {
                 let mut auto_submit = false;
                 if cfg!(target_os = "android") {
                     ui.add_space(8.0);
-                    if Self::paint_android_keypad(ui, form_w, &mut self.code, false, 6) {
+                    let max_code_chars = usize::from(self.login_code_len.clamp(4, 12));
+                    if Self::paint_android_keypad(ui, form_w, &mut self.code, false, max_code_chars) {
                         let digits: String = self.code.chars().filter(char::is_ascii_digit).collect();
-                        if digits.len() == 5 {
+                        if digits.len() == max_code_chars {
                             auto_submit = true;
                         }
                     }
@@ -4687,7 +4813,6 @@ impl App {
                     self.login_busy = true;
                     let clean: String = self.code.chars().filter(char::is_ascii_digit).collect();
                     self.send(Cmd::Code(if clean.is_empty() { self.code.trim().to_owned() } else { clean }));
-                    self.code.clear();
                 }
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
@@ -4699,7 +4824,7 @@ impl App {
                     ui.add_space(16.0);
                     let wait_left = self
                         .login_code_sent_at
-                        .map_or(0, |t| 30u64.saturating_sub(t.elapsed().as_secs()));
+                        .map_or(0, |t| self.login_resend_secs.saturating_sub(t.elapsed().as_secs()));
                     if wait_left > 0 {
                         ui.label(RichText::new(format!("Повторно через {wait_left}с")).size(12.0).color(SUBTEXT));
                         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
@@ -4707,7 +4832,7 @@ impl App {
                         self.error.clear();
                         self.login_code_sent_at = Some(std::time::Instant::now());
                         self.login_busy = true;
-                        self.send(Cmd::RequestCode(self.login_last_phone.clone()));
+                        self.send(Cmd::ResendCode);
                     }
                 });
             }
@@ -5327,6 +5452,7 @@ impl App {
                         && badge_x < clip_right - 8.0
                     {
                         if let Some(tex) = self.sticker_tex.get(&doc_id) {
+                            self.visible_tgs_docs.insert(doc_id);
                             let area = egui::Rect::from_center_size(egui::pos2(badge_x, badge_y), Vec2::splat(16.0));
                             egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
                         } else {
@@ -5349,12 +5475,12 @@ impl App {
                         .filter(|(_, at)| at.elapsed().as_secs() < 6)
                         .map(|(lbl, _)| lbl.as_str());
                     if let Some(lbl) = live_typing {
-                        p.with_clip_rect(text_clip).text(
-                            rect.left_top() + Vec2::new(68.0, 35.0),
-                            egui::Align2::LEFT_TOP,
-                            lbl,
-                            FontId::proportional(14.0),
+                        chat::paint_typing_wave(
+                            &p.with_clip_rect(text_clip),
+                            ui.ctx(),
+                            rect.left_top() + Vec2::new(68.0, 42.0),
                             ORANGE,
+                            lbl,
                         );
                     } else if let Some((draft_txt, _)) = self.drafts.get(&d.id).filter(|(t, _)| !t.trim().is_empty()) {
                         let prefix = "Черновик: ";
@@ -5437,6 +5563,7 @@ impl App {
                         } else {
                             item(ui, "menu/unread", "Отметить непрочитанным", DialogAct::Unread(true));
                         }
+                        item(ui, "menu/info", "Подсмотреть (без прочтения)", DialogAct::Peek);
                         item(ui, "menu/delete", "Очистить историю", DialogAct::ConfirmClear);
                         if !d.saved && matches!(d.kind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel) {
                             item(ui, "menu/leave", "Покинуть чат / канал", DialogAct::ConfirmLeave);
@@ -5477,6 +5604,7 @@ impl App {
                     self.send(Cmd::MarkDialogUnread(i, on));
                 }
                 DialogAct::Archive(on) => self.send(Cmd::Archive(i, on)),
+                DialogAct::Peek => self.send(Cmd::PeekHistory(i)),
                 DialogAct::ConfirmClear => {
                     if let Some(d) = self.dialogs.get(i) {
                         self.confirm_chat_action = Some((d.id, d.name.clone(), false, false));
@@ -5537,6 +5665,7 @@ enum DialogAct {
     Read,
     Unread(bool),
     Archive(bool),
+    Peek,
     ConfirmClear,
     ConfirmLeave,
 }
@@ -5659,11 +5788,16 @@ impl eframe::App for App {
             ctx.set_zoom_factor(zoom);
         }
         // Единая фоновая подложка на фоновом слое (без двоения краёв и швов при прозрачности).
-        ctx.layer_painter(egui::LayerId::background()).rect_filled(
-            ctx.content_rect().expand(2.0),
-            egui::CornerRadius::ZERO,
-            t(BACKDROP),
-        );
+        let bg_rect = ctx.content_rect().expand(2.0);
+        if theme::mobile_glass_active() {
+            theme::paint_android_glass_backdrop(&ctx, bg_rect, theme::c_orange());
+        } else {
+            ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                bg_rect,
+                egui::CornerRadius::ZERO,
+                t(BACKDROP),
+            );
+        }
         if !self.emoji_tried {
             self.emoji_tried = true;
             self.emoji = emoji::Emoji::load(&ctx);
@@ -5672,6 +5806,7 @@ impl eframe::App for App {
         self.poll_android_bridge(&ctx);
         self.flush_pending_notification(&ctx);
         self.tick_tgs(&ctx);
+        self.visible_tgs_docs.clear();
         self.handle_shortcuts(&ctx);
         let ui_t = ctx.input(|i| i.time);
         let focused = ctx.input(|i| i.focused);
@@ -5707,17 +5842,33 @@ impl eframe::App for App {
                 .show(ui, |ui| self.titlebar(ui));
             self.resize_edges(ui);
         }
-        #[cfg(target_os = "android")]
-        {
-            // Безопасные отступы под системный статус-бар (камера, часы, батарея) и нижнюю полосу жестов.
-            egui::Panel::top("android-safe-top")
-                .exact_size(54.0)
-                .frame(egui::Frame::new().fill(tint_title()))
+        if theme::mobile_glass_active() {
+            // Безопасные отступы под статус-бар / вырез камеры / IME в стеклянном стиле.
+            let ins = android_jni::safe_insets_dp(ctx.pixels_per_point());
+            let top_h = if ins[0] > 1.0 {
+                ins[0].clamp(20.0, 72.0)
+            } else if cfg!(target_os = "android") {
+                40.0
+            } else {
+                26.0
+            };
+            let bot_h = if ins[2] > 1.0 {
+                ins[2].clamp(12.0, 420.0)
+            } else if cfg!(target_os = "android") {
+                16.0
+            } else {
+                14.0
+            };
+            let top_resp = egui::Panel::top("android-safe-top")
+                .exact_size(top_h)
+                .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
                 .show(ui, |_ui| {});
-            egui::Panel::bottom("android-safe-bottom")
-                .exact_size(18.0)
-                .frame(egui::Frame::new().fill(tint_panel()))
+            theme::paint_glass_bar(ui.painter(), top_resp.response.rect, 0.0, 152);
+            let bot_resp = egui::Panel::bottom("android-safe-bottom")
+                .exact_size(bot_h)
+                .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
                 .show(ui, |_ui| {});
+            theme::paint_glass_bar(ui.painter(), bot_resp.response.rect, 0.0, 148);
         }
         if self.update_available.is_some() && !self.update_dismissed {
             egui::Panel::top("update-banner")
@@ -5784,9 +5935,17 @@ impl eframe::App for App {
                     }
                 });
         }
+        let glass_mobile = theme::mobile_glass_active();
+        let header_frame = if glass_mobile {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 168))
+                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
+        } else {
+            egui::Frame::new().fill(tint_panel())
+        };
         egui::Panel::top("header")
             .exact_size(TOP_BAR_HEIGHT)
-            .frame(egui::Frame::new().fill(tint_panel()))
+            .frame(header_frame)
             .show(ui, |ui| self.header_ui(ui, narrow));
         if self.audio_path.is_some() || self.audio_stream.is_some() {
             egui::Panel::top("audio-bar")
@@ -5822,12 +5981,18 @@ impl eframe::App for App {
                 .show(ui, |ui| self.search_bar(ui));
         }
         if self.selected.is_some() {
+            let comp_frame = if glass_mobile {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 172))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+            } else {
+                egui::Frame::new()
+                    .fill(tint_panel())
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+            };
             egui::Panel::bottom("composer")
-                .frame(
-                    egui::Frame::new()
-                        .fill(tint_panel())
-                        .inner_margin(egui::Margin::symmetric(8, 4)),
-                )
+                .frame(comp_frame)
                 .show(ui, |ui| self.composer_ui(ui));
         }
         // Стабильные отступы ленты при входе в чат (без покадрового смещения inner_margin.left,
@@ -5928,6 +6093,9 @@ impl App {
         self.quick_switcher_window(ctx);
         self.global_deleted_window(ctx);
         self.date_jump_window(ctx);
+        self.peek_window(ctx);
+        self.contact_send_window(ctx);
+        self.geo_send_window(ctx);
         self.chat_action_confirm_window(ctx);
         self.pinned_list_window(ctx);
         self.folder_invite_window(ctx);
@@ -5965,6 +6133,208 @@ impl App {
         {
             let _ = frame;
             self.miniapp_fallback_window(ctx);
+        }
+    }
+
+    /// Предпросмотр последних 20 сообщений чата без пометки прочитанным.
+    fn peek_window(&mut self, ctx: &egui::Context) {
+        let Some((did, title, rows)) = self.peek_modal.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut open_chat = false;
+        let w = (ctx.content_rect().width() - 32.0).clamp(280.0, 520.0);
+        egui::Window::new(format!("👁 Предпросмотр: {title}"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(w)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 232))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(36)))
+                    .corner_radius(egui::CornerRadius::same(16))
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(w - 24.0);
+                ui.label(
+                    RichText::new("Сообщения загружены локально — статус прочтения не отправляется")
+                        .size(11.5)
+                        .color(SUBTEXT),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if rows.is_empty() {
+                            ui.label(RichText::new("Нет сообщений").color(SUBTEXT));
+                        }
+                        for m in &rows {
+                            let bg = if m.outgoing {
+                                Color32::from_rgba_unmultiplied(c_orange().r(), c_orange().g(), c_orange().b(), 30)
+                            } else {
+                                Color32::from_white_alpha(14)
+                            };
+                            egui::Frame::new()
+                                .fill(bg)
+                                .corner_radius(egui::CornerRadius::same(10))
+                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.set_width((w - 56.0).max(180.0));
+                                    ui.horizontal(|ui| {
+                                        let who = if m.outgoing {
+                                            "Вы"
+                                        } else if m.sender.is_empty() {
+                                            title.as_str()
+                                        } else {
+                                            m.sender.as_str()
+                                        };
+                                        ui.label(RichText::new(who).size(12.0).strong().color(c_orange()));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(RichText::new(theme::hhmm(m.date)).size(11.0).color(SUBTEXT));
+                                        });
+                                    });
+                                    if let Some(mi) = &m.media {
+                                        ui.label(RichText::new(format!("[{}]", mi.name)).size(12.0).color(SUBTEXT));
+                                    }
+                                    if !m.text.is_empty() {
+                                        ui.label(RichText::new(&m.text).size(13.5).color(WHITE));
+                                    }
+                                });
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if orange_button(ui, "Открыть чат", Vec2::new(136.0, 32.0)).clicked() {
+                        open_chat = true;
+                    }
+                    if ui.button("Закрыть").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.peek_modal = None;
+                    }
+                });
+            });
+        if open_chat {
+            self.peek_modal = None;
+            if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
+                self.open_dialog(pos);
+            }
+        } else if !open {
+            self.peek_modal = None;
+        }
+    }
+
+    /// Модальная форма отправки контакта в открытый чат.
+    fn contact_send_window(&mut self, ctx: &egui::Context) {
+        if !self.contact_modal_open {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("Отправить контакт")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 232))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(36)))
+                    .corner_radius(egui::CornerRadius::same(16))
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                ui.label(RichText::new("Телефон (E.164):").size(12.0).color(SUBTEXT));
+                ui.add(egui::TextEdit::singleline(&mut self.send_contact_phone).desired_width(270.0).hint_text("+79991234567"));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Имя:").size(12.0).color(SUBTEXT));
+                ui.add(egui::TextEdit::singleline(&mut self.send_contact_first).desired_width(270.0).hint_text("Иван"));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Фамилия (необязательно):").size(12.0).color(SUBTEXT));
+                ui.add(egui::TextEdit::singleline(&mut self.send_contact_last).desired_width(270.0).hint_text("Иванов"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let valid = !self.send_contact_phone.trim().is_empty() && !self.send_contact_first.trim().is_empty();
+                    if ui.add_enabled(valid, egui::Button::new("Отправить").fill(c_orange())).clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.contact_modal_open = false;
+                    }
+                });
+            });
+        if submit {
+            let reply_to = self.reply.take().map(|(id, _)| id);
+            self.send(Cmd::SendContact {
+                phone: self.send_contact_phone.trim().to_owned(),
+                first_name: self.send_contact_first.trim().to_owned(),
+                last_name: self.send_contact_last.trim().to_owned(),
+                reply_to,
+            });
+            self.send_contact_phone.clear();
+            self.send_contact_first.clear();
+            self.send_contact_last.clear();
+            self.contact_modal_open = false;
+        } else if !open {
+            self.contact_modal_open = false;
+        }
+    }
+
+    /// Модальная форма отправки геопозиции (`lat`, `lon`).
+    fn geo_send_window(&mut self, ctx: &egui::Context) {
+        if !self.geo_modal_open {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("Отправить геопозицию")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 232))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(36)))
+                    .corner_radius(egui::CornerRadius::same(16))
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                ui.label(RichText::new("Широта (-90..90):").size(12.0).color(SUBTEXT));
+                ui.add(egui::TextEdit::singleline(&mut self.geo_lat).desired_width(270.0));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Долгота (-180..180):").size(12.0).color(SUBTEXT));
+                ui.add(egui::TextEdit::singleline(&mut self.geo_lon).desired_width(270.0));
+                let parsed = self.geo_lat.trim().replace(',', ".").parse::<f64>().ok().zip(
+                    self.geo_lon.trim().replace(',', ".").parse::<f64>().ok(),
+                );
+                let ok = parsed.is_some_and(|(lat, lon)| (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(ok, egui::Button::new("Отправить точку").fill(c_orange())).clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.geo_modal_open = false;
+                    }
+                });
+            });
+        if submit
+            && let (Ok(lat), Ok(lon)) = (
+                self.geo_lat.trim().replace(',', ".").parse::<f64>(),
+                self.geo_lon.trim().replace(',', ".").parse::<f64>(),
+            )
+        {
+            let reply_to = self.reply.take().map(|(id, _)| id);
+            self.send(Cmd::SendGeo { lat, lon, reply_to });
+            self.geo_modal_open = false;
+        } else if !open {
+            self.geo_modal_open = false;
         }
     }
 
@@ -6809,5 +7179,225 @@ mod tests {
             texts.contains("Выбор страны") && texts.contains("Россия"),
             "country picker missing expected text: {texts}"
         );
+    }
+
+    fn collect_all_text(shape: &egui::Shape, buf: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                buf.push_str(t.galley.text());
+                buf.push('\n');
+            }
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_all_text(s, buf);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn android_phone_login_flow_preserves_code_and_dynamic_length() {
+        let mut app = demo_app("login");
+        app.stage = Stage::NeedPhone;
+        app.login_dial = "+7".into();
+        app.login_phone_full = "+7 9991234567".into();
+        let norm = countries::normalize_phone(&app.login_dial, "89991234567").unwrap();
+        assert_eq!(norm, "+79991234567");
+
+        // Эмулируем Ev::CodeMeta длиной 6 цифр + переход в NeedCode.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        app.handle_event(&ctx, Ev::CodeDeliveryHint("Код отправлен на email".into()));
+        app.handle_event(&ctx, Ev::CodeMeta { length: 6, resend_secs: Some(45) });
+        app.handle_event(&ctx, Ev::Stage(Stage::NeedCode));
+        assert_eq!(app.login_code_len, 6);
+        assert_eq!(app.login_resend_secs, 45);
+        assert_eq!(app.stage, Stage::NeedCode);
+
+        // Ввод 5 цифр не сбрасывает и сохраняет код при ошибке.
+        app.code = "123456".into();
+        app.handle_event(&ctx, Ev::Error("Неверный код подтверждения".into()));
+        assert_eq!(app.code, "123456");
+
+        // Переход на 2FA очищает code и рендерит экран пароля без паник.
+        app.handle_event(&ctx, Ev::Stage(Stage::NeedPassword("год".into())));
+        assert!(app.code.is_empty());
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(390.0, 844.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            theme::paint_android_glass_backdrop(&ctx, ui.max_rect(), c_orange());
+            egui::CentralPanel::default().show(ui, |ui| app.login_ui(ui));
+        });
+        out.textures_delta.clear();
+        let mut txt = String::new();
+        for cs in &out.shapes {
+            collect_all_text(&cs.shape, &mut txt);
+        }
+        assert!(txt.contains("Подсказка: год") && txt.contains("облачный пароль"));
+    }
+
+    #[test]
+    fn glass_backdrop_and_bar_render_cleanly() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        theme::set_opacity(72);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(390.0, 844.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            theme::paint_android_glass_backdrop(&ctx, ui.max_rect(), c_orange());
+            theme::paint_glass_bar(ui.painter(), egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(390.0, 40.0)), 0.0, 152);
+            theme::paint_glass_bar(ui.painter(), egui::Rect::from_min_size(egui::Pos2::new(0.0, 820.0), Vec2::new(390.0, 24.0)), 0.0, 148);
+        });
+        out.textures_delta.clear();
+        assert!(!out.shapes.is_empty());
+    }
+
+    #[test]
+    fn history_cache_uses_64_slot_lru_eviction() {
+        let ctx = egui::Context::default();
+        let mut app = demo_app("1");
+        app.history_cache.clear();
+        app.history_cache_order.clear();
+        for did in 1..=64i64 {
+            app.handle_event(&ctx, Ev::History(did, vec![MessageRow::plain(1, format!("m{did}"), true, 100 + did)]));
+        }
+        assert_eq!(app.history_cache.len(), 64);
+        // Обращение к первому диалогу поднимает его в хвост LRU, поэтому вытеснится dialog=2.
+        app.history_cache_order.retain(|&x| x != 1);
+        app.history_cache_order.push_back(1);
+        app.handle_event(&ctx, Ev::History(65, vec![MessageRow::plain(1, "m65".into(), true, 200)]));
+        assert_eq!(app.history_cache.len(), 64);
+        assert!(app.history_cache.contains_key(&1));
+        assert!(!app.history_cache.contains_key(&2));
+        assert!(app.history_cache.contains_key(&65));
+    }
+
+    #[test]
+    fn tgs_eviction_protects_visible_docs_and_lottie_scratch_reuses_buffer() {
+        let ctx = egui::Context::default();
+        let mut app = demo_app("1");
+        let tgs_json = br#"{"v":"5.7.4","fr":30,"ip":0,"op":30,"w":64,"h":64,"layers":[{"ty":4,"nm":"s","ip":0,"op":30,"st":0,"ks":{},"shapes":[]}]}"#;
+        app.visible_tgs_docs.insert(999);
+        app.handle_event(&ctx, Ev::TgsDoc(999, tgs_json.to_vec()));
+        for id in 1..=165i64 {
+            app.handle_event(&ctx, Ev::TgsDoc(id, tgs_json.to_vec()));
+        }
+        assert!(app.tgs_docs.contains_key(&999), "visible doc must survive eviction");
+
+        let anim = lottie::TgsAnim::from_bytes(tgs_json).unwrap();
+        let mut scratch = lottie::TgsScratch::default();
+        let img1 = anim.render_frame_into(0.0, 32, &mut scratch);
+        let img2 = anim.render_frame_into(10.0, 32, &mut scratch);
+        assert_eq!(img1.size, [32, 32]);
+        assert_eq!(img2.size, [32, 32]);
+    }
+
+    #[test]
+    fn peek_history_contact_geo_reaction_pills_and_typing_wave_render() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        let mut msg = MessageRow::plain(5001, "Проверь пилюли и карточки".into(), false, app.now);
+        msg.reaction_items = vec![rg_core::engine::ReactionPill {
+            emoji: "🔥".into(),
+            custom_doc_id: None,
+            count: 7,
+            chosen: true,
+            paid: false,
+        }];
+        msg.media = Some(rg_core::media::MediaInfo::basic(
+            rg_core::media::MediaKind::Contact {
+                phone: "+79995551122".into(),
+                first_name: "Алиса".into(),
+                last_name: "Тест".into(),
+                user_id: 99,
+            },
+            "Алиса Тест",
+            0,
+        ));
+        let mut geo_msg = MessageRow::plain(5002, String::new(), true, app.now + 1);
+        geo_msg.media = Some(rg_core::media::MediaInfo::basic(
+            rg_core::media::MediaKind::Geo {
+                lat_micro: 55_755_800,
+                lon_micro: 37_617_300,
+                title: "Кремль".into(),
+            },
+            "Кремль",
+            0,
+        ));
+        app.messages.push(msg.clone());
+        app.messages.push(geo_msg.clone());
+        app.handle_event(&ctx, Ev::PeekHistory(123, "Секретный чат".into(), vec![msg]));
+        app.contact_modal_open = true;
+        app.geo_modal_open = true;
+        let selected_before = app.selected;
+
+        let mut txt = String::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    chat::paint_typing_wave(ui.painter(), ui.ctx(), egui::pos2(20.0, 20.0), ORANGE, "печатает…");
+                    app.messages_ui(ui);
+                });
+                app.peek_window(ui.ctx());
+                app.contact_send_window(ui.ctx());
+                app.geo_send_window(ui.ctx());
+            });
+            out.textures_delta.clear();
+            txt.clear();
+            for cs in &out.shapes {
+                collect_all_text(&cs.shape, &mut txt);
+            }
+        }
+        assert_eq!(app.selected, selected_before);
+        assert!(txt.contains("Предпросмотр: Секретный чат"), "peek missing: {txt}");
+        assert!(txt.contains("🔥 7"), "reaction pill missing: {txt}");
+        assert!(txt.contains("+79995551122"), "contact card missing: {txt}");
+        assert!(txt.contains("Кремль") && txt.contains("55.75580"), "geo card missing: {txt}");
+        assert!(txt.contains("Отправить контакт") && txt.contains("Отправить геопозицию"));
+    }
+
+    #[test]
+    fn message_row_and_contact_geo_serde_compat() {
+        let legacy_json = r#"{"id":42,"text":"hi","outgoing":true,"date":1700000,"deleted":false,"edits":0,"media":null,"sender":"A","reply_to":null,"forwarded_from":null,"pinned":false,"edit_date":null,"views":null,"reactions":0,"sender_id":1,"entities":[],"grouped":null}"#;
+        let row: MessageRow = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(row.id, 42);
+        assert!(row.reaction_items.is_empty());
+
+        let contact = rg_core::media::MediaInfo::basic(
+            rg_core::media::MediaKind::Contact {
+                phone: "+79991112233".into(),
+                first_name: "Анна".into(),
+                last_name: "К".into(),
+                user_id: 55,
+            },
+            "Анна К",
+            0,
+        );
+        let back_c: rg_core::media::MediaInfo =
+            serde_json::from_str(&serde_json::to_string(&contact).unwrap()).unwrap();
+        assert_eq!(back_c, contact);
+
+        let geo = rg_core::media::MediaInfo::basic(
+            rg_core::media::MediaKind::Geo {
+                lat_micro: 59_934_280,
+                lon_micro: 30_335_099,
+                title: "СПб".into(),
+            },
+            "СПб",
+            0,
+        );
+        let back_g: rg_core::media::MediaInfo =
+            serde_json::from_str(&serde_json::to_string(&geo).unwrap()).unwrap();
+        assert_eq!(back_g, geo);
     }
 }

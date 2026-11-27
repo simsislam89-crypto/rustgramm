@@ -42,6 +42,19 @@ pub enum MediaKind {
         emoticon: String,
         value: i32,
     },
+    /// Контакт (телефон, имя, фамилия, user_id).
+    Contact {
+        phone: String,
+        first_name: String,
+        last_name: String,
+        user_id: i64,
+    },
+    /// Геопозиция / место на карте (координаты в микроградусах 1e-6).
+    Geo {
+        lat_micro: i64,
+        lon_micro: i64,
+        title: String,
+    },
     Other(String),
 }
 
@@ -114,7 +127,12 @@ impl MediaInfo {
     pub fn is_downloadable(&self) -> bool {
         !matches!(
             self.kind,
-            MediaKind::Other(_) | MediaKind::WebPage { .. } | MediaKind::Poll { .. } | MediaKind::Dice { .. }
+            MediaKind::Other(_)
+                | MediaKind::WebPage { .. }
+                | MediaKind::Poll { .. }
+                | MediaKind::Dice { .. }
+                | MediaKind::Contact { .. }
+                | MediaKind::Geo { .. }
         )
     }
 }
@@ -270,10 +288,24 @@ pub fn describe(media: &Media) -> MediaInfo {
             info.dc_id = doc_dc;
             info
         }
-        Media::Contact(c) => other(&format!(
-            "Контакт: {} {} (+{})",
-            c.raw.first_name, c.raw.last_name, c.raw.phone_number
-        )),
+        Media::Contact(c) => {
+            let full = format!("{} {}", c.raw.first_name, c.raw.last_name).trim().to_owned();
+            let label = if full.is_empty() {
+                c.raw.phone_number.clone()
+            } else {
+                full
+            };
+            MediaInfo::basic(
+                MediaKind::Contact {
+                    phone: c.raw.phone_number.clone(),
+                    first_name: c.raw.first_name.clone(),
+                    last_name: c.raw.last_name.clone(),
+                    user_id: c.raw.user_id,
+                },
+                label,
+                0,
+            )
+        }
         Media::Poll(p) => {
             let tl::enums::TextWithEntities::Entities(q) = &p.raw.question;
             let total = p.raw_results.total_voters.unwrap_or(0).max(0);
@@ -311,7 +343,43 @@ pub fn describe(media: &Media) -> MediaInfo {
                 0,
             )
         }
-        Media::Geo(_) | Media::Venue(_) | Media::GeoLive(_) => other("Место"),
+        Media::Geo(g) => MediaInfo::basic(
+            MediaKind::Geo {
+                lat_micro: (g.raw.lat * 1_000_000.0).round() as i64,
+                lon_micro: (g.raw.long * 1_000_000.0).round() as i64,
+                title: String::new(),
+            },
+            "Геопозиция",
+            0,
+        ),
+        Media::Venue(v) => match &v.geo {
+            Some(g) => MediaInfo::basic(
+                MediaKind::Geo {
+                    lat_micro: (g.raw.lat * 1_000_000.0).round() as i64,
+                    lon_micro: (g.raw.long * 1_000_000.0).round() as i64,
+                    title: v.raw_venue.title.clone(),
+                },
+                if v.raw_venue.title.is_empty() {
+                    "Место"
+                } else {
+                    v.raw_venue.title.as_str()
+                },
+                0,
+            ),
+            None => other("Место"),
+        },
+        Media::GeoLive(gl) => match &gl.geo {
+            Some(g) => MediaInfo::basic(
+                MediaKind::Geo {
+                    lat_micro: (g.raw.lat * 1_000_000.0).round() as i64,
+                    lon_micro: (g.raw.long * 1_000_000.0).round() as i64,
+                    title: "Трансляция геопозиции".to_owned(),
+                },
+                "Трансляция геопозиции",
+                0,
+            ),
+            None => other("Трансляция геопозиции"),
+        },
         Media::Dice(d) => MediaInfo::basic(
             MediaKind::Dice {
                 emoticon: d.raw.emoticon.clone(),
@@ -570,5 +638,33 @@ mod tests {
         assert_eq!(dc_location(4), "Amsterdam");
         assert_eq!(dc_location(5), "Singapore");
         assert_eq!(dc_location(99), "Telegram DC");
+    }
+
+    #[test]
+    fn contact_and_geo_cards_are_not_downloadable() {
+        let contact = MediaInfo::basic(
+            MediaKind::Contact {
+                phone: "+79991112233".into(),
+                first_name: "Анна".into(),
+                last_name: "К".into(),
+                user_id: 55,
+            },
+            "Анна К",
+            0,
+        );
+        assert!(!contact.is_downloadable());
+        assert!(!contact.has_preview());
+
+        let geo = MediaInfo::basic(
+            MediaKind::Geo {
+                lat_micro: 59_934_280,
+                lon_micro: 30_335_099,
+                title: "Санкт-Петербург".into(),
+            },
+            "Санкт-Петербург",
+            0,
+        );
+        assert!(!geo.is_downloadable());
+        assert!(!geo.has_preview());
     }
 }

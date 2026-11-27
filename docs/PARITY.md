@@ -135,6 +135,21 @@
 | Расширенная пересылка AyuGram (`ForwardOptions`) | ✅ `Engine::forward_advanced` (`drop_author`, `drop_media_captions`, `silent`) и 3 чекбокса в окнах одиночной и пакетной пересылки | `engine_ext.rs`, `worker.rs`, `chat.rs` |
 | Ссылки на папки Telegram (`chatlists.*` + `t.me/addlist/...`) | ✅ `TgLink::ChatlistInvite`, `export_folder_invite`/`check_folder_invite`/`join_folder_invite`, «Поделиться ссылкой» и «Добавить папку по ссылке» в настройках папок, предпросмотр и подключение `folder_invite_window` | `engine.rs`, `engine_ext.rs`, `worker.rs`, `tg_settings.rs`, `features_ui.rs`, `lib.rs` |
 
+## Новые функции этапа 36 (v0.24.0)
+
+| Функция | Статус | Где |
+|---|---|---|
+| Исправление входа Android, оффлайн-устойчивость и перенаправление DC | ✅ `isolated_connection_params`, `invoke_with_dc_migrate`, `resend_login_code`, `SentCodeInfo::code_length`, `check_password_safe` с таймаутами на `SRP_ID_INVALID`, `normalize_phone`/`format_phone_input`, атомарный `INPUT_EVENT` + `CAN:` fallback, `updates.getState`, сохранение `Stage::Ready` с кэшем при оффлайне | `rg-core/{lib,auth}.rs`, `countries.rs`, `worker.rs`, `lib.rs`, `android_jni.rs`, `build_android_bridge.py` |
+| Стеклянный дизайн Android (`window_opacity` 50..=100 + safe insets) | ✅ GPU-фон `paint_android_glass_backdrop`, `paint_glass_bar`, `setupGlassWindow` + `getSafeInsetsPx` (250 мс кэш) в `RgBridge.java`, стеклянные карточки/клавиатура/шапка/композер | `theme.rs`, `lib.rs`, `android_jni.rs`, `build_android_bridge.py` |
+| Автотестер APK и Java/JNI-моста без эмулятора | ✅ `test_rg_bridge.py` (`RgBridgeTest`), проверка `rg_bridge.dex`, Full+Lite `aarch64-linux-android` cross-check, аудит APK и `cargo test --workspace` в `scripts/test-apk.sh` | `scripts/dev/test_rg_bridge.py`, `scripts/test-apk.sh` |
+| Мгновенная загрузка и переключение чатов на ПК | ✅ `write_lock`, частичный индекс, `scan_range_for_merge`, `prune_old_live(1500)`, последовательный `run_updates`, `history_before` `.limit`, неблокирующие `tokio::spawn` + `spawn_blocking`, 64-чатовый LRU `history_cache` | `rg-ayu/src/store.rs`, `rg-core/src/engine.rs`, `rg-ui/src/{worker,chat,lib}.rs` |
+| Анимации стикеров и Custom Emoji без лишней нагрузки на CPU/RAM | ✅ `TgsScratch` (`render_frame_into`), трекинг видимых `visible_tgs_docs`/`visible_tgs_msgs`, защита от вытеснения видимых, 0% CPU в простое, сброс `msg_heights` на `Ev::Translated` | `lottie.rs`, `panels.rs`, `chat.rs`, `lib.rs` |
+| Кликабельные пилюли реакций (`ReactionPill`) | ✅ Обычные, кастомные эмодзи и Paid ★ пилюли под сообщениями (`extract_reaction_pills`, `toggle_reaction`, `Cmd::ReactToggle`) | `engine.rs`, `worker.rs`, `chat.rs`, `lib.rs` |
+| Предпросмотр чата без прочтения (`Chat Peek`) | ✅ `Cmd::PeekHistory` / `Ev::PeekHistory` / `DialogAct::Peek` и окно `peek_window` без отправки `messages.readHistory` | `worker.rs`, `chat.rs`, `lib.rs` |
+| Поиск участников и фильтры `Все`/`Админы`/`Боты` | ✅ `ParticipantFilter` + `channel_participants_filtered` (`Cmd::ParticipantsFiltered`) с поиском в правой панели | `engine.rs`, `worker.rs`, `chat.rs`, `lib.rs` |
+| 3-точечная волна набора текста + Ghost-безопасный `setTyping` | ✅ `paint_typing_wave` в шапке/списке, `Engine::typing_allowed` (Ghost Mode + `PrivacyShieldSettings`), `Cmd::SetTyping` | `engine.rs`, `worker.rs`, `chat.rs`, `lib.rs` |
+| Контакты и геопозиция: отправка и карточки | ✅ `MediaKind::Contact` / `MediaKind::Geo`, `send_contact` / `send_geo`, богатые карточки с копированием и модальные окна отправки | `media.rs`, `engine.rs`, `worker.rs`, `media_ui.rs`, `lib.rs` |
+
 ## Порядок дальнейших этапов
 1. **Этап 9 — лента как у Telegram:** форматирование текста и ссылки, GIF/видео/голосовые, анимированные стикеры, альбомы.
 2. **Этап 10 — навигация:** папки, архив, контакты, избранное, профили, глобальный поиск.

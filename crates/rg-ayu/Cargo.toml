@@ -17,6 +17,7 @@ regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 libsql = { version = "0.10", default-features = false, features = ["core"] }
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

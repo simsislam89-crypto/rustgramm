@@ -133,7 +133,12 @@ pub fn normalize_phone(dial_code: &str, local_number: &str) -> Result<String, &'
         local_trim.chars().filter(char::is_ascii_digit).collect()
     } else {
         let mut d: String = dial_code.chars().filter(char::is_ascii_digit).collect();
-        d.extend(local_trim.chars().filter(char::is_ascii_digit));
+        let local_digits: String = local_trim.chars().filter(char::is_ascii_digit).collect();
+        if d == "7" && local_digits.len() == 11 && (local_digits.starts_with('8') || local_digits.starts_with('7')) {
+            d.push_str(&local_digits[1..]);
+        } else {
+            d.push_str(&local_digits);
+        }
         d
     };
     if digits.len() < 7 {
@@ -170,9 +175,13 @@ pub fn detect_country_from_full(raw: &str) -> Option<usize> {
 
 /// Мягкое форматирование поля единого ввода номера (`+7 999 123 45 67` / `+7`), сохраняя удобное стирание.
 pub fn format_phone_input(raw: &str) -> String {
-    let digits: String = raw.chars().filter(char::is_ascii_digit).take(15).collect();
+    let has_plus = raw.trim_start().starts_with('+');
+    let mut digits: String = raw.chars().filter(char::is_ascii_digit).take(15).collect();
     if digits.is_empty() {
         return if raw.contains('+') { "+".to_owned() } else { String::new() };
+    }
+    if !has_plus && digits.len() == 11 && digits.starts_with('8') {
+        digits.replace_range(..1, "7");
     }
     let prefixed = format!("+{digits}");
     let dial_len = COUNTRIES
@@ -249,8 +258,18 @@ mod tests {
     fn normalize_phone_validates_e164() {
         assert_eq!(normalize_phone("+1", "(970) 287-6230").unwrap(), "+19702876230");
         assert_eq!(normalize_phone("+7", "+19702876230").unwrap(), "+19702876230");
+        assert_eq!(normalize_phone("+7", "89991234567").unwrap(), "+79991234567");
+        assert_eq!(normalize_phone("+7", "79991234567").unwrap(), "+79991234567");
+        assert_eq!(normalize_phone("+7", "7011234567").unwrap(), "+77011234567");
         assert!(normalize_phone("+7", "123").is_err());
         assert!(normalize_phone("+7", "12345678901234567").is_err());
+    }
+
+    #[test]
+    fn format_phone_handles_ru_and_asian_prefixes() {
+        assert_eq!(format_phone_input("89991234567"), "+7 9991234567");
+        assert_eq!(format_phone_input("+819012345678"), "+81 9012345678");
+        assert_eq!(format_phone_input("+8613800138000"), "+86 13800138000");
     }
 
     #[test]

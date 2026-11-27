@@ -742,6 +742,27 @@ pub struct TodoListInfo {
     pub items: Vec<TodoItemRow>,
 }
 
+/// Реакция под сообщением для интерактивных пилюль UI.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReactionPill {
+    pub emoji: String,
+    #[serde(default)]
+    pub custom_doc_id: Option<i64>,
+    pub count: i32,
+    #[serde(default)]
+    pub chosen: bool,
+    #[serde(default)]
+    pub paid: bool,
+}
+
+/// Фильтр списка участников группы или канала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipantFilter {
+    All,
+    Admins,
+    Bots,
+}
+
 /// Сообщение для интерфейса.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MessageRow {
@@ -767,6 +788,9 @@ pub struct MessageRow {
     /// Число платных звёздных реакций (`ReactionPaid`).
     #[serde(default)]
     pub paid_reactions: i32,
+    /// Детализированные реакции под сообщением (`ReactionPill`: эмодзи/кастом/звёзды + счётчик + выбор).
+    #[serde(default)]
+    pub reaction_items: Vec<ReactionPill>,
     /// Отправитель (формат Bot API), 0 если неизвестен.
     pub sender_id: i64,
     /// Форматирование текста.
@@ -818,6 +842,7 @@ impl MessageRow {
             views: None,
             reactions: 0,
             paid_reactions: 0,
+            reaction_items: Vec::new(),
             sender_id: 0,
             entities: Vec::new(),
             grouped: None,
@@ -951,6 +976,17 @@ fn dialog_last_preview(m: &grammers_client::message::Message) -> String {
             MediaKind::WebPage { .. } => format!("🔗 {}", info.name),
             MediaKind::File => format!("📎 {}", info.name),
             MediaKind::Dice { emoticon, value } => format!("{emoticon} ({value})"),
+            MediaKind::Contact { phone, first_name, last_name, .. } => {
+                let full = format!("{first_name} {last_name}").trim().to_owned();
+                format!("👤 {}", if full.is_empty() { phone } else { full })
+            }
+            MediaKind::Geo { title, .. } => {
+                if title.is_empty() {
+                    "📍 Геопозиция".to_owned()
+                } else {
+                    format!("📍 {title}")
+                }
+            }
             MediaKind::Other(label) => label,
         },
         None => String::new(),
@@ -1035,6 +1071,8 @@ impl Engine {
                 media::MediaKind::Dice { emoticon, .. } => {
                     return format!("[Бросок {emoticon}]");
                 }
+                media::MediaKind::Contact { .. } => "Контакт",
+                media::MediaKind::Geo { .. } => "Геопозиция",
                 media::MediaKind::Other(s) => s.as_str(),
             };
             if m.name.trim().is_empty() {
@@ -1269,6 +1307,7 @@ impl Engine {
                     pinned: x.pinned,
                     grouped: x.grouped_id,
                     paid_reactions: extract_paid_reactions(x.reactions.as_ref()),
+                    reaction_items: extract_reaction_pills(x.reactions.as_ref()),
                     silent: x.silent,
                     replies_count,
                     has_comments,
@@ -1343,6 +1382,11 @@ impl Engine {
         self.apply_traffic_jitter().await;
         self.client.mark_as_read(peer).await?;
         Ok(true)
+    }
+
+    /// Фоновая подрезка старых живых сообщений в локальной БД (удалённые сохраняются полностью).
+    pub async fn prune_old_live(&self, max_live_per_peer: usize) {
+        let _ = self.store.prune_old_live(max_live_per_peer).await;
     }
 
     /// Случайная микрозадержка перед сетевым запросом (`traffic_jitter_ms`) для защиты от тайминг-корреляции трафика.
@@ -2096,13 +2140,63 @@ impl Engine {
         limit: usize,
     ) -> Result<Vec<MessageRow>, grammers_client::InvocationError> {
         let key = peer_key(&peer);
-        let mut it = self.client.iter_messages(peer).offset_id(before_id);
-        let mut msgs = Vec::new();
-        while msgs.len() < limit {
-            let Some(m) = it.next().await? else { break };
-            msgs.push(m);
+        let mut msgs = Vec::with_capacity(limit);
+        let mut cur_offset = before_id;
+        let mut attempt = 0usize;
+        let delays = [250u64, 600, 1200];
+        loop {
+            let rem = limit.saturating_sub(msgs.len());
+            if rem == 0 {
+                break;
+            }
+            let mut it = self.client.iter_messages(peer).offset_id(cur_offset).limit(rem);
+            let mut step_err = None;
+            while msgs.len() < limit {
+                match it.next().await {
+                    Ok(Some(m)) => {
+                        cur_offset = m.id();
+                        msgs.push(m);
+                    }
+                    Ok(None) => {
+                        step_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        step_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            match step_err {
+                None => break,
+                Some(e) if attempt < delays.len() => {
+                    use grammers_client::InvocationError;
+                    let wait_ms = match &e {
+                        InvocationError::Rpc(r) if r.name == "FLOOD_WAIT" && r.value.unwrap_or(999) <= 10 => {
+                            u64::from(r.value.unwrap_or(1)) * 1000 + 100
+                        }
+                        InvocationError::Rpc(r)
+                            if r.code == 500
+                                || r.code == 502
+                                || r.code == 503
+                                || r.code == -503
+                                || r.name.contains("MCGET")
+                                || r.name.contains("CALL_FAIL")
+                                || r.name.contains("TIMEOUT")
+                                || r.name.contains("INTERNAL") =>
+                        {
+                            delays[attempt]
+                        }
+                        InvocationError::Io(_) => delays[attempt],
+                        _ => return Err(e),
+                    };
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                }
+                Some(e) => return Err(e),
+            }
         }
-        // Загрузка сообщений и синхронная фиксация в локальную БД + выявление оффлайн-удалений.
+        // Загрузка сообщений и быстрое индексированное слияние; запись в БД уходит в фон.
         let counts = self.store.edit_counts(key).await.unwrap_or_default();
         let cfg = self.settings();
         let is_bot_chat = msgs.iter().any(|m| {
@@ -2132,14 +2226,36 @@ impl Engine {
             (wmin, before_id.saturating_sub(1))
         };
         if save_ok {
-            let present_ids: Vec<i32> = rows.iter().filter(|r| r.id > 0).map(|r| r.id).collect();
-            let _ = self
-                .store
-                .mark_missing_deleted(key, win_min, win_max, &present_ids)
-                .await;
+            let mut present_set: std::collections::HashSet<i32> =
+                rows.iter().filter(|r| r.id > 0).map(|r| r.id).collect();
+            let mut missing_ids = Vec::new();
+            if win_min <= win_max
+                && let Ok((saved_del, live_in_range)) =
+                    self.store.scan_range_for_merge(key, win_min, win_max).await
+            {
+                for live in live_in_range {
+                    if live.msg_id > 0 && present_set.insert(live.msg_id) {
+                        missing_ids.push(live.msg_id);
+                        let mut r = MessageRow::plain(live.msg_id, live.text, live.outgoing, live.date);
+                        r.sender = live.sender;
+                        r.deleted = true;
+                        r.edits = counts.get(&live.msg_id).copied().unwrap_or(0);
+                        rows.push(r);
+                    }
+                }
+                for s in saved_del {
+                    if present_set.insert(s.msg_id) {
+                        let mut r = MessageRow::plain(s.msg_id, s.text, s.outgoing, s.date);
+                        r.sender = s.sender;
+                        r.deleted = true;
+                        r.edits = counts.get(&s.msg_id).copied().unwrap_or(0);
+                        rows.push(r);
+                    }
+                }
+            }
             let batch: Vec<(i32, String, i64, bool, String)> = rows
                 .iter()
-                .filter(|r| r.id > 0)
+                .filter(|r| r.id > 0 && !r.deleted)
                 .map(|r| {
                     (
                         r.id,
@@ -2150,28 +2266,16 @@ impl Engine {
                     )
                 })
                 .collect();
-            let _ = self.store.remember_many_full(key, &batch).await;
-        }
-        if save_ok {
-            let saved_del = if before_id == 0 {
-                self.deleted(key).await
-            } else if win_min <= win_max {
-                self.store
-                    .deleted_in_range(key, win_min, win_max)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            // Удалённые (кем угодно и когда угодно, включая оффлайн и самоудаление) возвращаем на место по времени.
-            for s in saved_del {
-                if !rows.iter().any(|r| r.id == s.msg_id) {
-                    let mut r = MessageRow::plain(s.msg_id, s.text, s.outgoing, s.date);
-                    r.sender = s.sender;
-                    r.deleted = true;
-                    r.edits = counts.get(&s.msg_id).copied().unwrap_or(0);
-                    rows.push(r);
-                }
+            if !missing_ids.is_empty() || !batch.is_empty() {
+                let store_bg = std::sync::Arc::clone(&self.store);
+                tokio::spawn(async move {
+                    if !missing_ids.is_empty() {
+                        let _ = store_bg.mark_deleted(key, &missing_ids).await;
+                    }
+                    if !batch.is_empty() {
+                        let _ = store_bg.remember_many_full(key, &batch).await;
+                    }
+                });
             }
         }
         rows.sort_by_key(|r| (r.date, r.id));
@@ -2303,6 +2407,10 @@ impl Engine {
             views: m.view_count(),
             reactions: m.reaction_count().unwrap_or(0),
             paid_reactions,
+            reaction_items: match &m.raw {
+                grammers_client::tl::enums::Message::Message(x) => extract_reaction_pills(x.reactions.as_ref()),
+                _ => Vec::new(),
+            },
             sender_id: m
                 .sender_id()
                 .map_or(0, |p| p.bot_api_dialog_id_unchecked()),
@@ -2643,6 +2751,48 @@ impl Engine {
         let ghost_mode = self.settings().ghost;
         self.send_offline_if_needed(&ghost_mode).await;
         Ok(())
+    }
+
+    /// Переключить реакцию: если `remove = true`, снимает выбранную реакцию пользователя.
+    pub async fn toggle_reaction(
+        &self,
+        peer: PeerRef,
+        id: i32,
+        emoji: &str,
+        remove: bool,
+    ) -> Result<(), grammers_client::InvocationError> {
+        self.react(peer, id, if remove { "" } else { emoji }).await
+    }
+
+    /// Проверяет, разрешена ли отправка статуса набора текста с учётом режима призрака и Privacy Shield.
+    pub fn typing_allowed(cfg: &Settings) -> bool {
+        !cfg.ghost.active && cfg.ghost.send_upload_progress && !cfg.privacy_shield.block_activity_telemetry
+    }
+
+    /// Отправляет или отменяет статус «печатает…» (`messages.setTyping`) только если режим призрака не блокирует его.
+    pub async fn set_typing(
+        &self,
+        peer: PeerRef,
+        typing: bool,
+    ) -> Result<bool, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        if !Self::typing_allowed(&self.settings()) {
+            return Ok(false);
+        }
+        let action = if typing {
+            tl::enums::SendMessageAction::SendMessageTypingAction
+        } else {
+            tl::enums::SendMessageAction::SendMessageCancelAction
+        };
+        let _ = self
+            .client
+            .invoke(&tl::functions::messages::SetTyping {
+                peer: peer.into(),
+                top_msg_id: None,
+                action,
+            })
+            .await?;
+        Ok(true)
     }
 
     /// Фото профиля или чата в кэше (`cache/avatars/<id>.jpg`); `None`, если фото нет.
@@ -3009,10 +3159,6 @@ impl Engine {
         }
     }
 
-    async fn deleted(&self, peer: i64) -> Vec<rg_ayu::store::Saved> {
-        self.store.deleted(peer).await.unwrap_or_default()
-    }
-
     /// Полный журнал сохранённых удалённых и изменённых сообщений чата (`ayu/ui/message_history`).
     pub async fn audit_peer(&self, peer: &PeerRef) -> Vec<rg_ayu::store::SavedAudit> {
         self.store
@@ -3067,17 +3213,21 @@ impl Engine {
             .stream_updates(updates, UpdatesConfiguration { catch_up: true })
             .await?;
         crate::diag::info("UPD", "Поток live-обновлений запущен (0-ms dispatch)");
+        // Последовательный потребитель сохраняет строгий порядок NewMessage -> Edit/Delete в SQLite.
+        let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<Update>();
+        let eng_seq = self.clone();
+        tokio::spawn(async move {
+            while let Some(upd) = apply_rx.recv().await {
+                eng_seq.apply(&upd).await;
+            }
+        });
         let mut consecutive_err = 0u32;
         loop {
             match stream.next().await {
                 Ok(upd) => {
                     consecutive_err = 0;
                     on_event(&upd);
-                    let eng = self.clone();
-                    let upd_bg = upd;
-                    tokio::spawn(async move {
-                        eng.apply(&upd_bg).await;
-                    });
+                    let _ = apply_tx.send(upd);
                 }
                 Err(e) => {
                     consecutive_err += 1;
@@ -3939,8 +4089,34 @@ impl Engine {
         offset: i32,
         limit: i32,
     ) -> Result<(Vec<ContactRow>, i32), grammers_client::InvocationError> {
+        self.channel_participants_filtered(peer, ParticipantFilter::All, "", offset, limit)
+            .await
+    }
+
+    /// Поиск и фильтрация участников канала/группы по вкладке (`Все` / `Админы` / `Боты`) и запросу.
+    pub async fn channel_participants_filtered(
+        &self,
+        peer: PeerRef,
+        filter: ParticipantFilter,
+        query: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<(Vec<ContactRow>, i32), grammers_client::InvocationError> {
         use grammers_client::tl;
-        let (users, total) = match tl::enums::InputPeer::from(peer) {
+        let q = query.trim();
+        let tl_filter = if !q.is_empty() {
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsSearch(
+                tl::types::ChannelParticipantsSearch { q: q.to_owned() },
+            )
+        } else {
+            match filter {
+                ParticipantFilter::All => tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
+                ParticipantFilter::Admins => tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins,
+                ParticipantFilter::Bots => tl::enums::ChannelParticipantsFilter::ChannelParticipantsBots,
+            }
+        };
+        let q_low = q.to_lowercase();
+        let (users, total, is_legacy_chat) = match tl::enums::InputPeer::from(peer) {
             tl::enums::InputPeer::Channel(c) => {
                 let res = self
                     .client
@@ -3949,15 +4125,15 @@ impl Engine {
                             channel_id: c.channel_id,
                             access_hash: c.access_hash,
                         }),
-                        filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
+                        filter: tl_filter,
                         offset: offset.max(0),
                         limit: limit.clamp(1, 200),
                         hash: 0,
                     })
                     .await?;
                 match res {
-                    tl::enums::channels::ChannelParticipants::Participants(p) => (p.users, p.count),
-                    tl::enums::channels::ChannelParticipants::NotModified => (Vec::new(), 0),
+                    tl::enums::channels::ChannelParticipants::Participants(p) => (p.users, p.count, false),
+                    tl::enums::channels::ChannelParticipants::NotModified => (Vec::new(), 0, false),
                 }
             }
             tl::enums::InputPeer::Chat(c) => {
@@ -3966,14 +4142,17 @@ impl Engine {
                     .invoke(&tl::functions::messages::GetFullChat { chat_id: c.chat_id })
                     .await?;
                 let n = f.users.len() as i32;
-                (f.users, n)
+                (f.users, n, true)
             }
-            _ => (Vec::new(), 0),
+            _ => (Vec::new(), 0, false),
         };
-        let rows = users
+        let rows: Vec<ContactRow> = users
             .iter()
             .filter_map(|u| match u {
                 tl::enums::User::User(y) if !y.deleted => {
+                    if filter == ParticipantFilter::Bots && !y.bot {
+                        return None;
+                    }
                     let name = format!(
                         "{} {}",
                         y.first_name.clone().unwrap_or_default(),
@@ -3986,6 +4165,13 @@ impl Engine {
                         .as_ref()
                         .map(|un| format!("@{un}"))
                         .unwrap_or_else(|| y.status.as_ref().map(status_text).unwrap_or_default());
+                    if is_legacy_chat && !q_low.is_empty() {
+                        let nm = name.to_lowercase();
+                        let st = status.to_lowercase();
+                        if !nm.contains(&q_low) && !st.contains(&q_low) {
+                            return None;
+                        }
+                    }
                     Some(ContactRow {
                         peer: PeerRef::from(u),
                         id: y.id,
@@ -3996,7 +4182,8 @@ impl Engine {
                 _ => None,
             })
             .collect();
-        Ok((rows, total))
+        let eff_total = if is_legacy_chat { rows.len() as i32 } else { total };
+        Ok((rows, eff_total))
     }
 
     /// Получить или создать ссылку-приглашение в группу/канал (`messages.exportChatInvite`).
@@ -4363,6 +4550,118 @@ impl Engine {
         self.remember_row_sync(peer, &row).await;
         self.spawn_after_send(peer, ghost, &row, true);
         Ok(row)
+    }
+
+    async fn send_raw_media(
+        &self,
+        peer: PeerRef,
+        media: grammers_client::tl::enums::InputMedia,
+        fallback_text: &str,
+        reply_to: Option<i32>,
+    ) -> Result<MessageRow, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static SEQ: AtomicI64 = AtomicI64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as i64);
+        let random_id = nanos ^ (SEQ.fetch_add(1, Ordering::Relaxed) << 20);
+        let ghost = self.settings().ghost;
+        let silent = ghost.should_send_without_sound();
+        self.apply_traffic_jitter().await;
+        let updates = self
+            .client
+            .invoke(&tl::functions::messages::SendMedia {
+                silent,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.into(),
+                reply_to: reply_to.map(|id| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id: id,
+                        top_msg_id: None,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                        quote_rich: None,
+                    })
+                }),
+                media,
+                message: String::new(),
+                random_id,
+                reply_markup: None,
+                entities: None,
+                schedule_date: ghost::schedule_date(&ghost),
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })
+            .await?;
+        let row = self.row_from_tl_updates(peer, &updates, fallback_text, silent);
+        self.remember_row_sync(peer, &row).await;
+        self.spawn_after_send(peer, ghost, &row, true);
+        Ok(row)
+    }
+
+    /// Отправить карточку контакта (`InputMedia::Contact`).
+    pub async fn send_contact(
+        &self,
+        peer: PeerRef,
+        phone: &str,
+        first_name: &str,
+        last_name: &str,
+        reply_to: Option<i32>,
+    ) -> Result<MessageRow, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        let full = format!("{} {}", first_name.trim(), last_name.trim()).trim().to_owned();
+        let label = if full.is_empty() { phone.trim().to_owned() } else { full };
+        self.send_raw_media(
+            peer,
+            tl::enums::InputMedia::Contact(tl::types::InputMediaContact {
+                phone_number: phone.trim().to_owned(),
+                first_name: first_name.trim().to_owned(),
+                last_name: last_name.trim().to_owned(),
+                vcard: String::new(),
+            }),
+            &label,
+            reply_to,
+        )
+        .await
+    }
+
+    /// Отправить геопозицию (`InputMedia::GeoPoint`).
+    pub async fn send_geo(
+        &self,
+        peer: PeerRef,
+        lat: f64,
+        lon: f64,
+        reply_to: Option<i32>,
+    ) -> Result<MessageRow, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.send_raw_media(
+            peer,
+            tl::enums::InputMedia::GeoPoint(tl::types::InputMediaGeoPoint {
+                geo_point: tl::enums::InputGeoPoint::Point(tl::types::InputGeoPoint {
+                    lat,
+                    long: lon,
+                    accuracy_radius: None,
+                }),
+            }),
+            "Геопозиция",
+            reply_to,
+        )
+        .await
     }
 }
 
@@ -5681,6 +5980,7 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
                 reply_to,
                 reactions,
                 paid_reactions: extract_paid_reactions(x.reactions.as_ref()),
+                reaction_items: extract_reaction_pills(x.reactions.as_ref()),
                 edit_date: x.edit_date.map(i64::from),
                 views: x.views,
                 pinned: x.pinned,
@@ -5955,6 +6255,48 @@ fn format_business_hours(bh: &grammers_client::tl::enums::BusinessWorkHours) -> 
     } else {
         format!("{status} ({})", h.timezone_id)
     }
+}
+
+/// Извлекает детализированный список реакций (`ReactionPill`) из `MessageReactions`.
+pub fn extract_reaction_pills(reactions: Option<&grammers_client::tl::enums::MessageReactions>) -> Vec<ReactionPill> {
+    use grammers_client::tl::enums::{MessageReactions as MR, Reaction as R, ReactionCount as RC};
+    let Some(MR::Reactions(r)) = reactions else {
+        return Vec::new();
+    };
+    r.results
+        .iter()
+        .filter_map(|rc| {
+            let RC::Count(c) = rc;
+            if c.count <= 0 {
+                return None;
+            }
+            let chosen = c.chosen_order.is_some();
+            match &c.reaction {
+                R::Emoji(e) => Some(ReactionPill {
+                    emoji: e.emoticon.clone(),
+                    custom_doc_id: None,
+                    count: c.count,
+                    chosen,
+                    paid: false,
+                }),
+                R::CustomEmoji(ce) => Some(ReactionPill {
+                    emoji: "✨".to_owned(),
+                    custom_doc_id: Some(ce.document_id),
+                    count: c.count,
+                    chosen,
+                    paid: false,
+                }),
+                R::Paid => Some(ReactionPill {
+                    emoji: "⭐".to_owned(),
+                    custom_doc_id: None,
+                    count: c.count,
+                    chosen,
+                    paid: true,
+                }),
+                R::Empty => None,
+            }
+        })
+        .collect()
 }
 
 fn extract_paid_reactions(reactions: Option<&grammers_client::tl::enums::MessageReactions>) -> i32 {
@@ -6473,5 +6815,111 @@ mod tests {
             },
         );
         assert_eq!(button_style_info(Some(&st)), (3, Some(54321)));
+    }
+
+    #[test]
+    fn extract_reaction_pills_handles_emoji_custom_paid_and_zero() {
+        use grammers_client::tl::{enums, types};
+        let reactions = enums::MessageReactions::Reactions(types::MessageReactions {
+            min: false,
+            can_see_list: true,
+            reactions_as_tags: false,
+            results: vec![
+                enums::ReactionCount::Count(types::ReactionCount {
+                    chosen_order: Some(0),
+                    reaction: enums::Reaction::Emoji(types::ReactionEmoji {
+                        emoticon: "🔥".into(),
+                    }),
+                    count: 5,
+                }),
+                enums::ReactionCount::Count(types::ReactionCount {
+                    chosen_order: None,
+                    reaction: enums::Reaction::CustomEmoji(types::ReactionCustomEmoji {
+                        document_id: 987_654,
+                    }),
+                    count: 2,
+                }),
+                enums::ReactionCount::Count(types::ReactionCount {
+                    chosen_order: Some(1),
+                    reaction: enums::Reaction::Paid,
+                    count: 10,
+                }),
+                enums::ReactionCount::Count(types::ReactionCount {
+                    chosen_order: None,
+                    reaction: enums::Reaction::Empty,
+                    count: 1,
+                }),
+            ],
+            recent_reactions: None,
+            top_reactors: None,
+        });
+        let pills = extract_reaction_pills(Some(&reactions));
+        assert_eq!(pills.len(), 3);
+        assert_eq!(pills[0].emoji, "🔥");
+        assert!(pills[0].chosen);
+        assert_eq!(pills[0].count, 5);
+        assert_eq!(pills[1].custom_doc_id, Some(987_654));
+        assert!(!pills[1].chosen);
+        assert!(pills[2].paid && pills[2].chosen);
+        assert_eq!(extract_paid_reactions(Some(&reactions)), 10);
+    }
+
+    #[test]
+    fn typing_allowed_respects_ghost_and_privacy_shield() {
+        let mut s = Settings::default();
+        // По умолчанию PrivacyShieldSettings::block_activity_telemetry = true.
+        assert!(!Engine::typing_allowed(&s));
+
+        s.privacy_shield.block_activity_telemetry = false;
+        assert!(Engine::typing_allowed(&s));
+
+        s.ghost.active = true;
+        assert!(!Engine::typing_allowed(&s));
+
+        s.ghost.active = false;
+        s.ghost.send_upload_progress = false;
+        assert!(!Engine::typing_allowed(&s));
+
+        s.ghost.send_upload_progress = true;
+        s.privacy_shield.block_activity_telemetry = true;
+        assert!(!Engine::typing_allowed(&s));
+    }
+
+    #[test]
+    fn message_row_plain_has_empty_reaction_items_and_defaults() {
+        let row = MessageRow::plain(42, "hi".into(), true, 1_700_000);
+        assert_eq!(row.id, 42);
+        assert!(row.reaction_items.is_empty());
+        assert_eq!(ParticipantFilter::All, ParticipantFilter::All);
+        assert_ne!(ParticipantFilter::Admins, ParticipantFilter::Bots);
+    }
+
+    #[test]
+    fn archive_text_and_raw_labels_cover_contact_and_geo() {
+        let mut r_c = MessageRow::plain(1, String::new(), true, 100);
+        r_c.media = Some(MediaInfo::basic(
+            MediaKind::Contact {
+                phone: "+79990001122".into(),
+                first_name: "Иван".into(),
+                last_name: "".into(),
+                user_id: 7,
+            },
+            "Иван",
+            0,
+        ));
+        assert!(Engine::archive_text_from_row(&r_c).contains("Контакт"));
+
+        let mut r_g = MessageRow::plain(2, String::new(), false, 101);
+        r_g.media = Some(MediaInfo::basic(
+            MediaKind::Geo {
+                lat_micro: 55_755_800,
+                lon_micro: 37_617_300,
+                title: "Москва".into(),
+            },
+            "Москва",
+            0,
+        ));
+        assert!(Engine::archive_text_from_row(&r_g).contains("Геопозиция"));
+        assert!(raw_media_label(Some(&grammers_client::tl::enums::MessageMedia::Empty)).is_empty());
     }
 }

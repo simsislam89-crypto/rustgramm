@@ -467,26 +467,81 @@ mod imp {
     pub fn poll_text_input() -> Option<(String, String)> {
         with_env(|env, act| {
             let cls = bridge_class(env, act)?;
-            let tag_obj = env
-                .call_static_method(&cls, "pollInputTag", "()Ljava/lang/String;", &[])
+            let ev_obj = env
+                .call_static_method(&cls, "pollInputEvent", "()Ljava/lang/String;", &[])
                 .ok()?
                 .l()
                 .ok()?;
-            if tag_obj.is_null() {
+            if ev_obj.is_null() {
                 return None;
             }
-            let tag: String = env.get_string(&JString::from(tag_obj)).ok()?.into();
-            let val_obj = env
-                .call_static_method(&cls, "pollInputResult", "()Ljava/lang/String;", &[])
+            let raw: String = env.get_string(&JString::from(ev_obj)).ok()?.into();
+            if let Some(rest) = raw.strip_prefix("OK:") {
+                let (tag, val) = rest.split_once('\0')?;
+                if tag.is_empty() {
+                    return Some((String::new(), String::new()));
+                }
+                return Some((tag.to_owned(), val.to_owned()));
+            }
+            Some((String::new(), String::new()))
+        })
+    }
+
+    /// Включает edge-to-edge полупрозрачные системные панели и blur диалогов под glass UI.
+    pub fn setup_glass_window() {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let _ = env.call_static_method(
+                cls,
+                "setupGlassWindow",
+                "(Landroid/app/Activity;)V",
+                &[JValue::Object(act)],
+            );
+            Some(())
+        });
+    }
+
+    /// Возвращает безопасные отступы (top, right, bottom, left) в egui dp с учётом вырезов и IME
+    /// с 250 мс кэшем, чтобы не пересекать JNI на каждом кадре.
+    pub fn safe_insets_dp(ppp: f32) -> [f32; 4] {
+        static CACHE: OnceLock<Mutex<Option<(Instant, f32, [f32; 4])>>> = OnceLock::new();
+        let scale = ppp.max(0.5);
+        let cache = CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cache.lock()
+            && let Some((ts, cached_scale, vals)) = *guard
+            && ts.elapsed().as_millis() < 250
+            && (cached_scale - scale).abs() < 0.01
+        {
+            return vals;
+        }
+        let vals = with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let obj = env
+                .call_static_method(
+                    cls,
+                    "getSafeInsetsPx",
+                    "(Landroid/app/Activity;)Ljava/lang/String;",
+                    &[JValue::Object(act)],
+                )
                 .ok()?
                 .l()
                 .ok()?;
-            if tag.is_empty() || val_obj.is_null() {
-                return Some((String::new(), String::new()));
+            if obj.is_null() {
+                return None;
             }
-            let val: String = env.get_string(&JString::from(val_obj)).ok()?.into();
-            Some((tag, val))
+            let s: String = env.get_string(&JString::from(obj)).ok()?.into();
+            let mut it = s.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
+            let top = it.next()? / scale;
+            let right = it.next()? / scale;
+            let bottom = it.next()? / scale;
+            let left = it.next()? / scale;
+            Some([top, right, bottom, left])
         })
+        .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((Instant::now(), scale, vals));
+        }
+        vals
     }
 
     pub fn shutdown_all() {
@@ -702,6 +757,10 @@ mod imp {
     pub fn prompt_text_input(_tag: &str, _title: &str, _hint: &str, _initial: &str, _kind: i32) {}
     pub fn poll_text_input() -> Option<(String, String)> {
         None
+    }
+    pub fn setup_glass_window() {}
+    pub fn safe_insets_dp(_ppp: f32) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
     pub fn shutdown_all() {}
 }

@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use grammers_client::SignInError;
 use grammers_client::client::PasswordToken;
 use rg_core::auth::{RequestCodeOutcome, SentCodeInfo, SignInOutcome};
 use rg_ayu::store::MessageStore;
@@ -45,6 +44,7 @@ pub enum Cmd {
     /// Скачать вложение и открыть программой по умолчанию (безопасные типы) или показать в папке.
     OpenFile(i32),
     RequestCode(String),
+    ResendCode,
     Code(String),
     Password(String),
     Open(usize),
@@ -499,6 +499,27 @@ pub enum Cmd {
         document_id: Option<i64>,
         until: Option<i32>,
     },
+    /// Переключить (поставить или снять) реакцию на сообщении.
+    ReactToggle(i32, String, bool),
+    /// Подсмотреть последние 20 сообщений чата без пометки прочитанным.
+    PeekHistory(usize),
+    /// Поиск/фильтрация участников канала или группы (`Все` / `Админы` / `Боты`).
+    ParticipantsFiltered(usize, rg_core::engine::ParticipantFilter, String),
+    /// Отправить или отменить статус «печатает…» (с проверкой режима призрака).
+    SetTyping(usize, bool),
+    /// Отправить карточку контакта в открытый чат.
+    SendContact {
+        phone: String,
+        first_name: String,
+        last_name: String,
+        reply_to: Option<i32>,
+    },
+    /// Отправить геопозицию в открытый чат.
+    SendGeo {
+        lat: f64,
+        lon: f64,
+        reply_to: Option<i32>,
+    },
     /// Загрузить списки прочитавших и реакций для окна «Сведения о сообщении».
     LoadMessageActivity(i32),
     /// Скопировать фото сообщения в системный буфер обмена (на ПК).
@@ -615,7 +636,7 @@ pub enum Ev {
     GifsLoaded,
     Account(Box<rg_core::engine::AccountOverview>),
     /// Сведения о чате (идентификатор чата Bot API).
-    PeerInfo(i64, rg_core::engine::PeerInfo),
+    PeerInfo(i64, Box<rg_core::engine::PeerInfo>),
     /// Ролик скачан: открыть во встроенном плеере.
     PlayVideo(PathBuf),
     /// Потоковое воспроизведение ролика по локальному адресу до окончания загрузки (адрес, подпись).
@@ -659,7 +680,7 @@ pub enum Ev {
     /// Активные истории.
     Stories(Vec<StoryRow>),
     /// Закреплённое сообщение чата.
-    PinnedMsg(i64, MessageRow),
+    PinnedMsg(i64, Box<MessageRow>),
     /// Готовый URL для открытия встроенного окна Mini App / WebApp бота.
     MiniAppReady {
         title: String,
@@ -682,6 +703,8 @@ pub enum Ev {
     LoginBusy(bool),
     /// Подсказка о том, куда отправлен код подтверждения («SMS», «приложение Telegram» и т.п.).
     CodeDeliveryHint(String),
+    /// Ожидаемая длина кода и таймаут повторной отправки (в секундах).
+    CodeMeta { length: u8, resend_secs: Option<i32> },
     /// Картинка истории для просмотрщика (`story_id`).
     StoryImage(i32, Box<eframe::egui::ColorImage>),
     /// Ошибка загрузки медиа истории (`story_id`, причина).
@@ -723,6 +746,8 @@ pub enum Ev {
     ParticipantsPage(i64, Vec<ContactRow>, i32, i32),
     /// Баланс и транзакции Telegram Stars.
     StarsStatus(rg_core::engine::StarsSummary),
+    /// Предпросмотр чата без отметки о прочтении (`dialog_id`, заголовок, последние сообщения).
+    PeekHistory(i64, String, Vec<MessageRow>),
     /// Витрина подарков Telegram Stars.
     StarGiftsCatalog(Vec<rg_core::engine::StarGiftItem>),
     /// Подарки в профиле `(peer_id, gifts)`.
@@ -965,6 +990,64 @@ fn u8_to_kind(v: u8) -> DialogKind {
         3 => DialogKind::Channel,
         _ => DialogKind::User,
     }
+}
+
+async fn fetch_and_push_dialogs(
+    eng: &Engine,
+    tx: &tokio::sync::mpsc::Sender<Vec<DialogRow>>,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if let Ok(list) = eng.dialogs(200).await {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        let _ = tx.send(list).await;
+    }
+}
+
+fn spawn_save_disk_cache(
+    home: &std::path::Path,
+    me: &str,
+    dialogs: &[DialogRow],
+    folders: &[FolderRow],
+) {
+    let h = home.to_path_buf();
+    let me_c = me.to_owned();
+    let d_c = dialogs.to_vec();
+    let f_c = folders.to_vec();
+    tokio::task::spawn_blocking(move || save_disk_cache(&h, &me_c, &d_c, &f_c));
+}
+
+fn spawn_refresh_dialogs(
+    engine: &Engine,
+    tx: &tokio::sync::mpsc::Sender<Vec<DialogRow>>,
+    in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_at: &mut std::time::Instant,
+    force: bool,
+) {
+    if !force && last_at.elapsed() < std::time::Duration::from_secs(4) {
+        return;
+    }
+    if in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    *last_at = std::time::Instant::now();
+    let eng = engine.clone();
+    let tx_c = tx.clone();
+    let flag = std::sync::Arc::clone(in_flight);
+    tokio::spawn(async move {
+        let res = eng.dialogs(200).await;
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(list) = res {
+            let _ = tx_c.send(list).await;
+        }
+    });
 }
 
 fn save_disk_cache(home: &std::path::Path, me: &str, dialogs: &[DialogRow], folders: &[FolderRow]) {
@@ -1280,12 +1363,24 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         .await
         {
             Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                rg_core::diag::error("connect", &format!("connect_with_updates failed: {e}"));
+            other => {
+                // Сохраняем Stage::Ready, если оффлайн-кэш чатов уже показан пользователю.
+                let err_msg = match other {
+                    Ok(Err(e)) => {
+                        rg_core::diag::error("connect", &format!("connect_with_updates failed: {e}"));
+                        friendly_login_error(&e.to_string())
+                    }
+                    Err(_) => {
+                        rg_core::diag::error("connect", "connect_with_updates timed out (14s)");
+                        "Таймаут подключения к Telegram (14 с) — проверьте интернет/VPN или прокси в «Прокси / Сеть»".to_owned()
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                };
                 out.send(Ev::LoginBusy(false));
-                out.send(Ev::Stage(Stage::NeedPhone));
-                out.err(friendly_login_error(&e.to_string()));
-                // Не убиваем рабочий поток при сбое сети/прокси (критично для Android!) — ждём прокси или повтор.
+                if dialogs.is_empty() {
+                    out.send(Ev::Stage(Stage::NeedPhone));
+                }
+                out.err(err_msg);
                 loop {
                     match cmds.recv().await {
                         Some(Cmd::Proxy(url)) => {
@@ -1320,56 +1415,24 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             out.send(Ev::ResetSession);
                             continue 'account_loop;
                         }
+                        Some(Cmd::RemoveAccountSlot(slot)) => {
+                            if slot > 0 {
+                                let mut s = settings.clone();
+                                s.accounts.retain(|a| a.slot != slot);
+                                if s.active_account == slot {
+                                    s.active_account = 0;
+                                }
+                                let _ = std::fs::write(&settings_path, s.to_json());
+                                out.send(Ev::ResetSession);
+                                continue 'account_loop;
+                            }
+                        }
                         Some(Cmd::SetKeepSignedIn(keep)) => {
                             keep_signed_in = keep;
                         }
                         Some(Cmd::Settings(s)) => {
                             rg_core::diag::set_enabled(s.diag_logging);
                             let _ = std::fs::write(&settings_path, s.to_json());
-                        }
-                        Some(Cmd::Shutdown) | None => return,
-                        Some(_) => {}
-                    }
-                }
-            }
-            Err(_) => {
-                rg_core::diag::error("connect", "connect_with_updates timed out (14s)");
-                out.send(Ev::LoginBusy(false));
-                out.send(Ev::Stage(Stage::NeedPhone));
-                out.err("Таймаут подключения к Telegram (14 с) — проверьте интернет/VPN или прокси в «Прокси / Сеть»");
-                loop {
-                    match cmds.recv().await {
-                        Some(Cmd::Proxy(url)) => {
-                            let trimmed = url.trim().to_owned();
-                            if trimmed.is_empty() || trimmed.starts_with("socks5://") {
-                                let _ = std::fs::write(home.join("proxy.txt"), &trimmed);
-                                continue 'account_loop;
-                            } else {
-                                out.err("Допустим только адрес вида socks5://host:port");
-                            }
-                        }
-                        Some(Cmd::RequestCode(phone)) => {
-                            pending_auth_cmd = Some(Cmd::RequestCode(phone));
-                            out.send(Ev::LoginBusy(true));
-                            out.send(Ev::Status("Подключение к Telegram и отправка кода…".to_owned()));
-                            continue 'account_loop;
-                        }
-                        Some(Cmd::UseQr) => {
-                            pending_auth_cmd = Some(Cmd::UseQr);
-                            continue 'account_loop;
-                        }
-                        Some(Cmd::RetryConnect | Cmd::UsePhone) => {
-                            continue 'account_loop;
-                        }
-                        Some(Cmd::SwitchAccount(slot)) => {
-                            let mut s = settings.clone();
-                            s.active_account = slot;
-                            let _ = std::fs::write(&settings_path, s.to_json());
-                            out.send(Ev::ResetSession);
-                            continue 'account_loop;
-                        }
-                        Some(Cmd::SetKeepSignedIn(keep)) => {
-                            keep_signed_in = keep;
                         }
                         Some(Cmd::Shutdown) | None => return,
                         Some(_) => {}
@@ -1399,6 +1462,12 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         let mut updates = Some(connected.updates);
         let (dialog_stream_tx, mut dialog_stream_rx) =
             tokio::sync::mpsc::channel::<(Vec<DialogRow>, bool)>(64);
+        let (dialog_refresh_tx, mut dialog_refresh_rx) =
+            tokio::sync::mpsc::channel::<Vec<DialogRow>>(8);
+        let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut last_dialog_refresh = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(10))
+            .unwrap_or_else(std::time::Instant::now);
         type ActiveCallMedia = std::sync::Arc<
             std::sync::Mutex<
                 Option<(rg_core::call_media::CallMediaSession, crate::audio_io::CallAudioPump)>,
@@ -1449,11 +1518,13 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 Cmd::RequestCode(phone) => {
                     out.send(Ev::Stage(Stage::NeedPhone));
                     out.send(Ev::LoginBusy(true));
+                    out.send(Ev::Status("Подключение к серверам Telegram…".to_owned()));
                     let res = tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
+                        std::time::Duration::from_secs(45),
                         rg_core::auth::request_login_code(
                             &connected.client,
                             &*connected.session,
+                            Some(&*connected.pool_handle),
                             cfg.api_id,
                             &cfg.api_hash,
                             &phone,
@@ -1461,9 +1532,14 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     )
                     .await;
                     out.send(Ev::LoginBusy(false));
+                    out.send(Ev::Status(String::new()));
                     match res {
                         Ok(Ok(RequestCodeOutcome::CodeSent(info))) => {
                             out.send(Ev::CodeDeliveryHint(info.delivery_hint.clone()));
+                            out.send(Ev::CodeMeta {
+                                length: info.code_length,
+                                resend_secs: info.timeout_secs,
+                            });
                             login = Some(info);
                             out.send(Ev::Stage(Stage::NeedCode));
                         }
@@ -1471,7 +1547,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
                         }
                         Ok(Err(e)) => out.err(friendly_login_error(&e)),
-                        Err(_) => out.err("Сервер Telegram не ответил за 20 с — проверьте сеть или SOCKS5 прокси"),
+                        Err(_) => out.err("Сервер Telegram не ответил за 45 с — проверьте сеть или SOCKS5 прокси"),
                     }
                 }
                 Cmd::UseQr | Cmd::RefreshQr => {
@@ -1485,6 +1561,15 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         } else if cfg!(target_os = "android") {
             qr_mode = false;
             out.send(Ev::Stage(Stage::NeedPhone));
+            // Предпрогрев TLS/MTProto рукопожатия с ближайшим DC в фоне, пока пользователь вводит номер.
+            let warmup_client = connected.client.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    warmup_client.invoke(&grammers_client::tl::functions::help::GetNearestDc {}),
+                )
+                .await;
+            });
         } else {
             qr_mode = true;
             out.send(Ev::Stage(Stage::Qr(String::new())));
@@ -1502,10 +1587,15 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     None => std::future::pending().await,
                 }
             }, if qr_mode && updates.is_some() => {
-                if let Some(upd) = maybe_upd
-                    && rg_core::qr::has_login_token_update(&upd)
-                {
-                    qr_next_poll_at = tokio::time::Instant::now();
+                match maybe_upd {
+                    Some(upd) => {
+                        if rg_core::qr::has_login_token_update(&upd) {
+                            qr_next_poll_at = tokio::time::Instant::now();
+                        }
+                    }
+                    None => {
+                        updates = None;
+                    }
                 }
                 continue;
             }
@@ -1526,11 +1616,23 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     out.send(Ev::DialogsBatch(Vec::new(), true));
                 }
                 if done && !engine.settings().privacy_shield.ephemeral_local_cache {
-                    let h_c = home.clone();
-                    let me_c = cached_me.clone();
-                    let d_c = dialogs.clone();
-                    let f_c = cached_folders.clone();
-                    tokio::task::spawn_blocking(move || save_disk_cache(&h_c, &me_c, &d_c, &f_c));
+                    spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                }
+                continue;
+            }
+            Some(mut fresh) = dialog_refresh_rx.recv() => {
+                let keep = current.and_then(|i| dialogs.get(i)).map(|d| d.id);
+                let fresh_ids: std::collections::HashSet<i64> = fresh.iter().map(|d| d.id).collect();
+                for old in dialogs.drain(..) {
+                    if !fresh_ids.contains(&old.id) {
+                        fresh.push(old);
+                    }
+                }
+                dialogs = fresh;
+                current = keep.and_then(|id| dialogs.iter().position(|d| d.id == id));
+                out.send(Ev::Dialogs(dialogs.clone()));
+                if !engine.settings().privacy_shield.ephemeral_local_cache {
+                    spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 }
                 continue;
             }
@@ -1624,11 +1726,13 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::RequestCode(phone) => {
                 out.send(Ev::LoginBusy(true));
+                out.send(Ev::Status("Подключение к серверам Telegram…".to_owned()));
                 let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
+                    std::time::Duration::from_secs(45),
                     rg_core::auth::request_login_code(
                         &connected.client,
                         &*connected.session,
+                        Some(&*connected.pool_handle),
                         cfg.api_id,
                         &cfg.api_hash,
                         &phone,
@@ -1636,9 +1740,14 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 )
                 .await;
                 out.send(Ev::LoginBusy(false));
+                out.send(Ev::Status(String::new()));
                 match res {
                     Ok(Ok(RequestCodeOutcome::CodeSent(info))) => {
                         out.send(Ev::CodeDeliveryHint(info.delivery_hint.clone()));
+                        out.send(Ev::CodeMeta {
+                            length: info.code_length,
+                            resend_secs: info.timeout_secs,
+                        });
                         login = Some(info);
                         out.send(Ev::Stage(Stage::NeedCode));
                     }
@@ -1647,8 +1756,45 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                     Ok(Err(e)) => out.err(friendly_login_error(&e)),
                     Err(_) => out.err(
-                        "Сервер Telegram не ответил за 20 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси / Сеть»",
+                        "Сервер Telegram не ответил за 45 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси»",
                     ),
+                }
+            }
+            Cmd::ResendCode => {
+                let Some(t) = login.as_ref() else {
+                    out.err("Сессия кода устарела — введите номер телефона заново");
+                    out.send(Ev::Stage(Stage::NeedPhone));
+                    continue;
+                };
+                out.send(Ev::LoginBusy(true));
+                out.send(Ev::Status("Повторный запрос кода…".to_owned()));
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    rg_core::auth::resend_login_code(
+                        &connected.client,
+                        &*connected.session,
+                        Some(&*connected.pool_handle),
+                        &t.phone,
+                        &t.phone_code_hash,
+                    ),
+                )
+                .await;
+                out.send(Ev::LoginBusy(false));
+                out.send(Ev::Status(String::new()));
+                match res {
+                    Ok(Ok(RequestCodeOutcome::CodeSent(info))) => {
+                        out.send(Ev::CodeDeliveryHint(info.delivery_hint.clone()));
+                        out.send(Ev::CodeMeta {
+                            length: info.code_length,
+                            resend_secs: info.timeout_secs,
+                        });
+                        login = Some(info);
+                    }
+                    Ok(Ok(RequestCodeOutcome::AlreadyAuthorized)) => {
+                        enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
+                    }
+                    Ok(Err(e)) => out.err(friendly_login_error(&e)),
+                    Err(_) => out.err("Таймаут повторной отправки кода — проверьте сеть"),
                 }
             }
             Cmd::Code(code) => {
@@ -1658,11 +1804,13 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     continue;
                 };
                 out.send(Ev::LoginBusy(true));
+                out.send(Ev::Status("Проверка кода…".to_owned()));
                 let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
+                    std::time::Duration::from_secs(45),
                     rg_core::auth::sign_in(
                         &connected.client,
                         &*connected.session,
+                        Some(&*connected.pool_handle),
                         &t.phone,
                         &t.phone_code_hash,
                         code.trim(),
@@ -1670,6 +1818,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 )
                 .await;
                 out.send(Ev::LoginBusy(false));
+                out.send(Ev::Status(String::new()));
                 match res {
                     Ok(Ok(SignInOutcome::SignedIn)) => enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await,
                     Ok(Ok(SignInOutcome::NeedPassword(p))) => {
@@ -1685,24 +1834,56 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 }
             }
             Cmd::Password(pw) => {
-                let Some(p) = password.take() else { continue };
                 out.send(Ev::LoginBusy(true));
-                let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(25),
-                    connected.client.check_password(p, pw.trim()),
-                )
-                .await;
-                out.send(Ev::LoginBusy(false));
-                match res {
-                    Ok(Ok(_)) => enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await,
-                    Ok(Err(SignInError::InvalidPassword(p))) => {
-                        let hint = p.hint().unwrap_or("нет").to_owned();
-                        password = Some(p);
-                        out.send(Ev::Stage(Stage::NeedPassword(hint)));
-                        out.err("Неверный облачный пароль");
+                out.send(Ev::Status("Проверка облачного пароля…".to_owned()));
+                let token = match password.take() {
+                    Some(p) => Ok(p),
+                    None => {
+                        rg_core::auth::refresh_password_token(
+                            &connected.client,
+                            &*connected.session,
+                            Some(&*connected.pool_handle),
+                        )
+                        .await
                     }
-                    Ok(Err(e)) => out.err(friendly_login_error(&e.to_string())),
-                    Err(_) => out.err("Таймаут проверки облачного пароля"),
+                };
+                match token {
+                    Ok(p) => {
+                        match rg_core::auth::check_password_safe(
+                            &connected.client,
+                            &*connected.session,
+                            Some(&*connected.pool_handle),
+                            p,
+                            pw.trim(),
+                        )
+                        .await
+                        {
+                            rg_core::auth::CheckPasswordOutcome::SignedIn => {
+                                out.send(Ev::LoginBusy(false));
+                                out.send(Ev::Status(String::new()));
+                                enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
+                            }
+                            rg_core::auth::CheckPasswordOutcome::InvalidPassword(p) => {
+                                let hint = p.hint().unwrap_or("нет").to_owned();
+                                password = Some(p);
+                                out.send(Ev::LoginBusy(false));
+                                out.send(Ev::Status(String::new()));
+                                out.send(Ev::Stage(Stage::NeedPassword(hint)));
+                                out.err("Неверный облачный пароль");
+                            }
+                            rg_core::auth::CheckPasswordOutcome::Error { token: recovered, message } => {
+                                password = recovered;
+                                out.send(Ev::LoginBusy(false));
+                                out.send(Ev::Status(String::new()));
+                                out.err(friendly_login_error(&message));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        out.send(Ev::LoginBusy(false));
+                        out.send(Ev::Status(String::new()));
+                        out.err(friendly_login_error(&e));
+                    }
                 }
             }
             Cmd::Open(i) => {
@@ -1713,11 +1894,17 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let (eng, out, peer, did, home_c, open_gen_c) =
                     (engine.clone(), out.clone(), d.peer, d.id, home.clone(), open_gen.clone());
                 rg_core::diag::info("chat", &format!("open dialog id={did} name={}", d.name));
-                // Мгновенно отдаём кэш истории с диска (< 2 мс), пока сеть забирает свежие сообщения.
-                if !ephemeral && let Some(cached) = load_history_cache(&home_c, did) {
-                    out.send(Ev::History(did, cached));
-                }
                 tokio::spawn(async move {
+                    // Мгновенно отдаём кэш истории с диска в blocking-потоке (< 2 мс), пока сеть забирает свежие.
+                    if !ephemeral {
+                        let h_read = home_c.clone();
+                        if let Ok(Some(cached)) =
+                            tokio::task::spawn_blocking(move || load_history_cache(&h_read, did)).await
+                            && open_gen_c.load(std::sync::atomic::Ordering::SeqCst) == seq
+                        {
+                            out.send(Ev::History(did, cached));
+                        }
+                    }
                     // 45 свежих сообщений приходят одним быстрым RPC с автоповтором 500-ошибок.
                     match eng.history(peer, 45).await {
                         Ok(rows) => {
@@ -1793,15 +1980,23 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::ForwardBatch(ids, to, no_author) => {
                 let Some(i) = current else { continue };
                 let (Some(from), Some(dest)) = (dialogs.get(i), dialogs.get(to)) else { continue };
-                let n = ids.len();
-                match engine.forward_batch(from.peer, dest.peer, &ids, no_author).await {
-                    Ok(()) => out.send(Ev::Status(format!(
-                        "Переслано сообщений ({n}){}: {}",
-                        if no_author { " без автора" } else { "" },
-                        dest.name
-                    ))),
-                    Err(e) => out.err(format!("Пакетная пересылка: {e}")),
-                }
+                let (eng, out, from_peer, dest_peer, dest_name) = (
+                    engine.clone(),
+                    out.clone(),
+                    from.peer,
+                    dest.peer,
+                    dest.name.clone(),
+                );
+                tokio::spawn(async move {
+                    let n = ids.len();
+                    match eng.forward_batch(from_peer, dest_peer, &ids, no_author).await {
+                        Ok(()) => out.send(Ev::Status(format!(
+                            "Переслано сообщений ({n}){}: {dest_name}",
+                            if no_author { " без автора" } else { "" },
+                        ))),
+                        Err(e) => out.err(format!("Пакетная пересылка: {e}")),
+                    }
+                });
             }
             Cmd::SavedHistory => {
                 let Some(i) = current else { continue };
@@ -1884,26 +2079,29 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::SetChatTtl(period) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
-                match engine.set_chat_ttl(d.peer, period).await {
-                    Ok(()) => {
-                        out.send(Ev::Status(if period == 0 {
-                            "Автоудаление отключено".into()
-                        } else {
-                            format!("Автоудаление: {} дн.", period / 86_400)
-                        }));
-                        if let Ok(info) = engine.peer_info(d.peer).await {
-                            out.send(Ev::PeerInfo(d.id, info));
+                let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    match eng.set_chat_ttl(peer, period).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if period == 0 {
+                                "Автоудаление отключено".into()
+                            } else {
+                                format!("Автоудаление: {} дн.", period / 86_400)
+                            }));
+                            if let Ok(info) = eng.peer_info(peer).await {
+                                out.send(Ev::PeerInfo(did, Box::new(info)));
+                            }
                         }
+                        Err(e) => out.err(format!("Автоудаление: {e}")),
                     }
-                    Err(e) => out.err(format!("Автоудаление: {e}")),
-                }
+                });
             }
             Cmd::LoadPinned(i, msg_id) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
                 tokio::spawn(async move {
                     if let Ok(Some(m)) = eng.message_row_by_id(peer, msg_id).await {
-                        out.send(Ev::PinnedMsg(id, m));
+                        out.send(Ev::PinnedMsg(id, Box::new(m)));
                     }
                 });
             }
@@ -1931,16 +2129,27 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::CreateChannelFull(title, about, broadcast, username, members) => {
-                match engine
-                    .create_channel_full(&title, &about, broadcast, username.as_deref(), &members)
-                    .await
-                {
-                    Ok(()) => {
-                        out.send(Ev::Status(format!("Создано: «{title}»")));
-                        refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng
+                        .create_channel_full(&title, &about, broadcast, username.as_deref(), &members)
+                        .await
+                    {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("Создано: «{title}»")));
+                            if let Ok(list) = eng.dialogs(200).await {
+                                flag.store(false, std::sync::atomic::Ordering::Release);
+                                let _ = tx.send(list).await;
+                            }
+                        }
+                        Err(e) => out.err(format!("Не создано: {e}")),
                     }
-                    Err(e) => out.err(format!("Не создано: {e}")),
-                }
+                });
             }
             Cmd::InviteMembers(i, members) => {
                 let Some(d) = dialogs.get(i) else { continue };
@@ -1953,7 +2162,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                 out.send(Ev::Participants(id, p));
                             }
                             if let Ok(info) = eng.peer_info(peer).await {
-                                out.send(Ev::PeerInfo(id, info));
+                                out.send(Ev::PeerInfo(id, Box::new(info)));
                             }
                         }
                         Err(e) => out.err(format!("Приглашение: {e}")),
@@ -1988,7 +2197,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         Ok(()) => {
                             out.send(Ev::Status(if block { "Пользователь заблокирован".into() } else { "Пользователь разблокирован".into() }));
                             if let Ok(info) = eng.peer_info(peer).await {
-                                out.send(Ev::PeerInfo(id, info));
+                                out.send(Ev::PeerInfo(id, Box::new(info)));
                             }
                         }
                         Err(e) => out.err(format!("Блокировка: {e}")),
@@ -1998,10 +2207,13 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::VotePoll(msg_id, option) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
-                match engine.vote_poll(d.peer, msg_id, option).await {
-                    Ok(()) => reload(&engine, &out, d.peer, i).await,
-                    Err(e) => out.err(format!("Голосование: {e}")),
-                }
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.vote_poll(peer, msg_id, option).await {
+                        Ok(()) => reload(&eng, &out, peer, i).await,
+                        Err(e) => out.err(format!("Голосование: {e}")),
+                    }
+                });
             }
             Cmd::MemberSearch(q) => {
                 let (eng, out) = (engine.clone(), out.clone());
@@ -2030,41 +2242,68 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::EditHistory(id) => {
                 let Some(i) = current else { continue };
                 let Some(d) = dialogs.get(i) else { continue };
-                out.send(Ev::EditHistory(id, engine.edit_history(&d.peer, id).await));
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    out.send(Ev::EditHistory(id, eng.edit_history(&peer, id).await));
+                });
             }
             Cmd::Archive(i, on) => {
                 let Some(d) = dialogs.get(i) else { continue };
-                match engine.set_archived(d.peer, on).await {
-                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
-                    Err(e) => out.err(format!("Архив: {e}")),
-                }
+                let (eng, out, peer, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    d.peer,
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.set_archived(peer, on).await {
+                        Ok(()) => fetch_and_push_dialogs(&eng, &tx, &flag).await,
+                        Err(e) => out.err(format!("Архив: {e}")),
+                    }
+                });
             }
             Cmd::PinDialog(i, on) => {
                 let Some(d) = dialogs.get(i) else { continue };
-                match engine.set_pinned_dialog(d.peer, on).await {
-                    Ok(()) => refresh_keep(&engine, &out, &mut dialogs, &mut current).await,
-                    Err(e) => out.err(format!("Закрепление: {e}")),
-                }
+                let (eng, out, peer, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    d.peer,
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.set_pinned_dialog(peer, on).await {
+                        Ok(()) => fetch_and_push_dialogs(&eng, &tx, &flag).await,
+                        Err(e) => out.err(format!("Закрепление: {e}")),
+                    }
+                });
             }
             Cmd::MuteDialog(i, on) => {
-                let Some(peer) = dialogs.get(i).map(|d| d.peer) else { continue };
-                match engine.set_muted(peer, on).await {
-                    Ok(()) => {
-                        if let Some(d) = dialogs.get_mut(i) {
-                            d.muted = on;
-                            d.notify_explicit = Some(on);
-                        }
-                        refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                let Some(d) = dialogs.get_mut(i) else { continue };
+                let peer = d.peer;
+                d.muted = on;
+                d.notify_explicit = Some(on);
+                out.send(Ev::Dialogs(dialogs.clone()));
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.set_muted(peer, on).await {
+                        Ok(()) => fetch_and_push_dialogs(&eng, &tx, &flag).await,
+                        Err(e) => out.err(format!("Звук: {e}")),
                     }
-                    Err(e) => out.err(format!("Звук: {e}")),
-                }
+                });
             }
             Cmd::ReadDialog(i) => {
                 let Some(peer) = dialogs.get(i).map(|d| d.peer) else { continue };
                 if let Some(d) = dialogs.get_mut(i) {
                     d.unread = 0;
                 }
-                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 out.send(Ev::Dialogs(dialogs.clone()));
                 let (eng, out) = (engine.clone(), out.clone());
                 tokio::spawn(async move {
@@ -2074,10 +2313,15 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                 });
             }
-            Cmd::Contacts => match engine.contacts().await {
-                Ok(c) => out.send(Ev::Contacts(c)),
-                Err(e) => out.err(format!("Контакты: {e}")),
-            },
+            Cmd::Contacts => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.contacts().await {
+                        Ok(c) => out.send(Ev::Contacts(c)),
+                        Err(e) => out.err(format!("Контакты: {e}")),
+                    }
+                });
+            }
             Cmd::OpenContact(peer, id, name) => {
                 if !dialogs.iter().any(|d| d.id == id) {
                     dialogs.insert(
@@ -2201,7 +2445,13 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::RefreshDialogs => {
-                refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
+                spawn_refresh_dialogs(
+                    &engine,
+                    &dialog_refresh_tx,
+                    &refresh_in_flight,
+                    &mut last_dialog_refresh,
+                    false,
+                );
             }
             Cmd::SenderAvatar(msg_id, sender_id) => {
                 let Some(d) = current.and_then(|i| dialogs.get(i)) else { continue };
@@ -2233,20 +2483,40 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     out.send(Ev::GifsLoaded);
                 });
             }
-            Cmd::CreateChannel(title, about, broadcast) => match engine.create_channel(&title, &about, broadcast).await {
-                Ok(()) => {
-                    out.send(Ev::Status(format!("Создано: «{title}»")));
-                    refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
-                }
-                Err(e) => out.err(format!("Не создано: {e}")),
-            },
-            Cmd::CreateGroup(title, members) => match engine.create_group(&title, &members).await {
-                Ok(()) => {
-                    out.send(Ev::Status(format!("Группа «{title}» создана")));
-                    refresh_keep(&engine, &out, &mut dialogs, &mut current).await;
-                }
-                Err(e) => out.err(format!("Группа не создана: {e}")),
-            },
+            Cmd::CreateChannel(title, about, broadcast) => {
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.create_channel(&title, &about, broadcast).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("Создано: «{title}»")));
+                            fetch_and_push_dialogs(&eng, &tx, &flag).await;
+                        }
+                        Err(e) => out.err(format!("Не создано: {e}")),
+                    }
+                });
+            }
+            Cmd::CreateGroup(title, members) => {
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.create_group(&title, &members).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("Группа «{title}» создана")));
+                            fetch_and_push_dialogs(&eng, &tx, &flag).await;
+                        }
+                        Err(e) => out.err(format!("Группа не создана: {e}")),
+                    }
+                });
+            }
             Cmd::PeerInfo(i) => {
                 let Some(d) = dialogs.get(i) else { continue };
                 let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
@@ -2260,7 +2530,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                     let _ = eng_bg.download_track(&first_track).await;
                                 });
                             }
-                            out.send(Ev::PeerInfo(id, info));
+                            out.send(Ev::PeerInfo(id, Box::new(info)));
                         }
                         Err(e) => out.err(format!("Сведения о чате: {e}")),
                     }
@@ -2268,7 +2538,10 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::MarkRead => {
                 let Some(d) = current.and_then(|i| dialogs.get(i)) else { continue };
-                let _ = engine.mark_read(d.peer).await;
+                let (eng, peer) = (engine.clone(), d.peer);
+                tokio::spawn(async move {
+                    let _ = eng.mark_read(peer).await;
+                });
             }
             Cmd::EmojiSets => {
                 let (eng, out) = (engine.clone(), out.clone());
@@ -2383,7 +2656,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 if let Some(d) = dialogs.get_mut(i) {
                     d.unread = 0;
                 }
-                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 out.send(Ev::Dialogs(dialogs.clone()));
                 let (eng, out) = (engine.clone(), out.clone());
                 tokio::spawn(async move {
@@ -2407,7 +2680,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 for d in &mut dialogs {
                     d.unread = 0;
                 }
-                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 out.send(Ev::Dialogs(dialogs.clone()));
                 if peers.is_empty() {
                     out.send(Ev::Status("Все чаты уже прочитаны на сервере".into()));
@@ -2670,30 +2943,50 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::SaveFolder(folder) => {
-                match engine.save_folder(&folder).await {
-                    Ok(()) => {
-                        out.send(Ev::Status(format!("Папка «{}» сохранена", folder.title)));
-                        if let Ok(f) = engine.folders().await {
-                            cached_folders = f.clone();
-                            save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
-                            out.send(Ev::Folders(f));
+                let (eng, out, h, me_c, d_c) = (
+                    engine.clone(),
+                    out.clone(),
+                    home.clone(),
+                    cached_me.clone(),
+                    dialogs.clone(),
+                );
+                tokio::spawn(async move {
+                    match eng.save_folder(&folder).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(format!("Папка «{}» сохранена", folder.title)));
+                            if let Ok(f) = eng.folders().await {
+                                if !eng.settings().privacy_shield.ephemeral_local_cache {
+                                    spawn_save_disk_cache(&h, &me_c, &d_c, &f);
+                                }
+                                out.send(Ev::Folders(f));
+                            }
                         }
+                        Err(e) => out.err(format!("Папка не сохранена: {e}")),
                     }
-                    Err(e) => out.err(format!("Папка не сохранена: {e}")),
-                }
+                });
             }
             Cmd::DeleteFolder(id) => {
-                match engine.delete_folder(id).await {
-                    Ok(()) => {
-                        out.send(Ev::Status("Папка удалена".into()));
-                        if let Ok(f) = engine.folders().await {
-                            cached_folders = f.clone();
-                            save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
-                            out.send(Ev::Folders(f));
+                let (eng, out, h, me_c, d_c) = (
+                    engine.clone(),
+                    out.clone(),
+                    home.clone(),
+                    cached_me.clone(),
+                    dialogs.clone(),
+                );
+                tokio::spawn(async move {
+                    match eng.delete_folder(id).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Папка удалена".into()));
+                            if let Ok(f) = eng.folders().await {
+                                if !eng.settings().privacy_shield.ephemeral_local_cache {
+                                    spawn_save_disk_cache(&h, &me_c, &d_c, &f);
+                                }
+                                out.send(Ev::Folders(f));
+                            }
                         }
+                        Err(e) => out.err(format!("Папка не удалена: {e}")),
                     }
-                    Err(e) => out.err(format!("Папка не удалена: {e}")),
-                }
+                });
             }
             Cmd::GlobalSearch(q) => {
                 let (eng, out) = (engine.clone(), out.clone());
@@ -4110,6 +4403,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::LoadSendAs(i) => {
                 let Some(d) = dialogs.get(i) else { continue };
+                if d.peer.id.kind() != grammers_session::types::PeerKind::Channel {
+                    continue;
+                }
                 let (eng, out, peer, did) = (engine.clone(), out.clone(), d.peer, d.id);
                 tokio::spawn(async move {
                     if let Ok(list) = eng.send_as_peers(peer).await {
@@ -4140,6 +4436,70 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 tokio::spawn(async move {
                     if let Ok(eff) = eng.available_effects().await {
                         out.send(Ev::AvailableEffects(eff));
+                    }
+                });
+            }
+            Cmd::ReactToggle(msg_id, emoji, remove) => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.toggle_reaction(peer, msg_id, &emoji, remove).await {
+                        Ok(()) => reload(&eng, &out, peer, i).await,
+                        Err(e) => out.err(format!("Реакция: {e}")),
+                    }
+                });
+            }
+            Cmd::PeekHistory(i) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, did, name) = (engine.clone(), out.clone(), d.peer, d.id, d.name.clone());
+                tokio::spawn(async move {
+                    match eng.history(peer, 20).await {
+                        Ok(rows) => out.send(Ev::PeekHistory(did, name, rows)),
+                        Err(e) => out.err(format!("Предпросмотр чата: {e}")),
+                    }
+                });
+            }
+            Cmd::ParticipantsFiltered(i, filter, q) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer, id) = (engine.clone(), out.clone(), d.peer, d.id);
+                tokio::spawn(async move {
+                    if let Ok((rows, total)) = eng.channel_participants_filtered(peer, filter, &q, 0, 200).await {
+                        out.send(Ev::ParticipantsPage(id, rows, 0, total));
+                    }
+                });
+            }
+            Cmd::SetTyping(i, typing) => {
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, peer) = (engine.clone(), d.peer);
+                tokio::spawn(async move {
+                    let _ = eng.set_typing(peer, typing).await;
+                });
+            }
+            Cmd::SendContact {
+                phone,
+                first_name,
+                last_name,
+                reply_to,
+            } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.send_contact(peer, &phone, &first_name, &last_name, reply_to).await {
+                        Ok(_) => reload(&eng, &out, peer, i).await,
+                        Err(e) => out.err(format!("Отправка контакта: {e}")),
+                    }
+                });
+            }
+            Cmd::SendGeo { lat, lon, reply_to } => {
+                let Some(i) = current else { continue };
+                let Some(d) = dialogs.get(i) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.send_geo(peer, lat, lon, reply_to).await {
+                        Ok(_) => reload(&eng, &out, peer, i).await,
+                        Err(e) => out.err(format!("Отправка геопозиции: {e}")),
                     }
                 });
             }
@@ -4351,7 +4711,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 let Some(d) = dialogs.get_mut(i) else { continue };
                 let peer = d.peer;
                 d.unread = if unread { d.unread.max(1) } else { 0 };
-                save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                spawn_save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
                 out.send(Ev::Dialogs(dialogs.clone()));
                 let (eng, out) = (engine.clone(), out.clone());
                 tokio::spawn(async move {
@@ -4671,20 +5031,22 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             Cmd::LeaveChat(did) => {
                 let Some(pos) = dialogs.iter().position(|d| d.id == did) else { continue };
                 let peer = dialogs[pos].peer;
-                match engine.leave_chat(peer).await {
-                    Ok(()) => {
-                        let open_id = current.and_then(|c| dialogs.get(c)).map(|d| d.id);
-                        dialogs.remove(pos);
-                        current = open_id.filter(|&oid| oid != did).and_then(|oid| dialogs.iter().position(|d| d.id == oid));
-                        if !engine.settings().privacy_shield.ephemeral_local_cache {
-                            save_disk_cache(&home, &cached_me, &dialogs, &cached_folders);
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.leave_chat(peer).await {
+                        Ok(()) => {
+                            out.send(Ev::LeftChat(did));
+                            out.send(Ev::Status("Вы покинули чат".into()));
+                            fetch_and_push_dialogs(&eng, &tx, &flag).await;
                         }
-                        out.send(Ev::LeftChat(did));
-                        out.send(Ev::Dialogs(dialogs.clone()));
-                        out.send(Ev::Status("Вы покинули чат".into()));
+                        Err(e) => out.err(e),
                     }
-                    Err(e) => out.err(e),
-                }
+                });
             }
             Cmd::LoadPinnedMessages(did) => {
                 let Some(peer) = dialogs.iter().find(|d| d.id == did).map(|d| d.peer) else { continue };
@@ -4773,16 +5135,27 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 });
             }
             Cmd::JoinFolderInvite(slug, peers) => {
-                match engine.join_folder_invite(&slug, &peers).await {
-                    Ok(()) => {
-                        if let Ok(f) = engine.folders().await {
-                            cached_folders = f.clone();
-                            out.send(Ev::Folders(f));
+                let (eng, out, h, me_c, d_c) = (
+                    engine.clone(),
+                    out.clone(),
+                    home.clone(),
+                    cached_me.clone(),
+                    dialogs.clone(),
+                );
+                tokio::spawn(async move {
+                    match eng.join_folder_invite(&slug, &peers).await {
+                        Ok(()) => {
+                            if let Ok(f) = eng.folders().await {
+                                if !eng.settings().privacy_shield.ephemeral_local_cache {
+                                    spawn_save_disk_cache(&h, &me_c, &d_c, &f);
+                                }
+                                out.send(Ev::Folders(f));
+                            }
+                            out.send(Ev::Status("Папка добавлена".into()));
                         }
-                        out.send(Ev::Status("Папка добавлена".into()));
+                        Err(e) => out.err(e),
                     }
-                    Err(e) => out.err(e),
-                }
+                });
             }
             Cmd::Settings(s) => {
                 let s = *s;
@@ -4822,29 +5195,6 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
 }
 
 /// Обновить основной список чатов (без принудительной загрузки архива — архив подгружается лениво).
-async fn refresh_dialogs(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>) {
-    match engine.dialogs(200).await {
-        Ok(mut d) => {
-            // Сохраняем уже загруженные архивные диалоги, если пользователь открывал архив.
-            for old in dialogs.iter().filter(|x| x.archived) {
-                if !d.iter().any(|y| y.id == old.id) {
-                    d.push(old.clone());
-                }
-            }
-            *dialogs = d.clone();
-            out.send(Ev::Dialogs(d));
-        }
-        Err(e) => out.err(format!("Чаты: {e}")),
-    }
-}
-
-/// Обновить список чатов, сохранив открытый чат (по идентификатору, не по номеру строки).
-async fn refresh_keep(engine: &Engine, out: &Out, dialogs: &mut Vec<DialogRow>, current: &mut Option<usize>) {
-    let keep = current.and_then(|i| dialogs.get(i)).map(|d| d.id);
-    refresh_dialogs(engine, out, dialogs).await;
-    *current = keep.and_then(|id| dialogs.iter().position(|d| d.id == id));
-}
-
 /// Перечитать последние сообщения открытого чата и обновить локальный дисковый кэш (сохраняя deleted=true).
 async fn reload(engine: &Engine, out: &Out, peer: grammers_session::types::PeerRef, _idx: usize) {
     let did = peer.id.bot_api_dialog_id_unchecked();
@@ -4932,7 +5282,31 @@ async fn enter(
         }
     }
 
-    // 2. Запускаем live-обновления после кэширования `self_user`: входящие за время `get_me()` не теряются (буфер 2048).
+    // 2. Инициализируем состояние pts/qts при свежем входе (`updates.getState`), затем запускаем live-обновления.
+    {
+        use grammers_session::Session as _;
+        if let Ok(cur) = session.updates_state().await
+            && cur.pts == 0
+            && cur.seq == 0
+            && let Ok(Ok(grammers_client::tl::enums::updates::State::State(st))) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.client.invoke(&grammers_client::tl::functions::updates::GetState {}),
+            )
+            .await
+        {
+            let _ = session
+                .set_update_state(grammers_session::types::UpdateState::All(
+                    grammers_session::types::UpdatesState {
+                        pts: st.pts,
+                        qts: st.qts,
+                        date: st.date,
+                        seq: st.seq,
+                        channels: Vec::new(),
+                    },
+                ))
+                .await;
+        }
+    }
     if let Some(rx_u) = updates.take() {
         let eng = engine.clone();
         let out_u = out.clone();
@@ -4991,7 +5365,14 @@ async fn enter(
         out.send(Ev::Folders(f));
     }
     if stream_done && !engine.settings().privacy_shield.ephemeral_local_cache {
-        save_disk_cache(home, cached_me, dialogs, cached_folders);
+        spawn_save_disk_cache(home, cached_me, dialogs, cached_folders);
+    }
+    // Разовая фоновая очистка разросшихся старых живых записей messages.db (> 1500 на чат), удалённые не трогаются.
+    {
+        let eng_prune = engine.clone();
+        tokio::spawn(async move {
+            eng_prune.prune_old_live(1500).await;
+        });
     }
     // 3. Обзор аккаунта, истории (с мгновенной предзагрузкой картинок!), секретные чаты и черновики — в фоне.
     {
@@ -5055,17 +5436,35 @@ fn friendly_login_error(raw: &str) -> String {
         "Неверный номер телефона — проверьте выбранную страну и цифры".to_owned()
     } else if up.contains("PHONE_NUMBER_BANNED") {
         "Этот номер заблокирован в Telegram".to_owned()
-    } else if up.contains("PHONE_PASSWORD_FLOOD") || up.contains("FLOOD_WAIT") {
+    } else if up.contains("PHONE_PASSWORD_FLOOD") || up.contains("PHONE_NUMBER_FLOOD") || up.contains("FLOOD_WAIT") {
         format!("Слишком много попыток входа — подождите немного ({raw})")
-    } else if up.contains("PHONE_CODE_EXPIRED") {
+    } else if up.contains("PHONE_CODE_EXPIRED") || up.contains("PHONE_CODE_HASH_EXPIRED") {
         "Срок действия кода истёк — запросите новый код".to_owned()
     } else if up.contains("PHONE_CODE_INVALID") {
         "Неверный код подтверждения".to_owned()
+    } else if up.contains("PASSWORD_HASH_INVALID") {
+        "Неверный облачный пароль".to_owned()
+    } else if up.contains("SRP_ID_INVALID") {
+        "Параметры 2FA устарели — повторите ввод пароля ещё раз".to_owned()
+    } else if up.contains("SESSION_EXPIRED") {
+        "Сессия авторизации истекла — запросите код заново".to_owned()
+    } else if up.contains("API_ID_INVALID") || up.contains("APP_VERSION") {
+        format!("Ошибка параметров клиента Telegram ({raw}) — проверьте API ключи в «Настройках»")
     } else if up.contains("UPDATE_APP_TO_LOGIN") {
         "Сервер Telegram требует обновить версию клиента".to_owned()
     } else if up.contains("AUTH_RESTART") {
         "Telegram попросил перезапустить вход — нажмите «ДАЛЕЕ» ещё раз".to_owned()
-    } else if up.contains("IO") || up.contains("TIMED OUT") || up.contains("CONNECTION") || up.contains("RESET") {
+    } else if up.contains("MIGRATE") || up.contains("303") {
+        format!("Сбой переключения DC ({raw}) — нажмите «ДАЛЕЕ» ещё раз")
+    } else if up.contains("IO")
+        || up.contains("TIMED OUT")
+        || up.contains("TIMEOUT")
+        || up.contains("CONNECTION")
+        || up.contains("RESET")
+        || up.contains("NETWORK")
+        || up.contains("BROKEN PIPE")
+        || up.contains("EOF")
+    {
         format!("Нет связи с серверами Telegram ({raw}). Проверьте VPN или SOCKS5 прокси в «НАСТРОЙКИ»")
     } else {
         format!("Ошибка входа: {raw}")

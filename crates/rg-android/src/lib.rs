@@ -12,6 +12,7 @@ pub const WITH_PLUGINS: bool = cfg!(feature = "plugins");
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
     rg_ui::android_jni::init(app.vm_as_ptr(), app.activity_as_ptr());
+    rg_ui::android_jni::setup_glass_window();
     if let Some(dir) = app.internal_data_path() {
         let _ = rg_ui::worker::DATA_DIR.set(dir);
     }

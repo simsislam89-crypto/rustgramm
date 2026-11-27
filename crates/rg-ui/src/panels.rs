@@ -31,6 +31,8 @@ pub(crate) enum StickerAct {
     InsertCustom(String, i64),
     /// Загрузить сохранённые GIF.
     Gifs,
+    /// Сообщить о видимом на экране анимированном TGS-документе (стикер / эмодзи).
+    VisibleDoc(i64),
     /// Принудительно перезагрузить стикеры.
     ReloadSets,
     /// Принудительно перезагрузить GIF.
@@ -516,6 +518,7 @@ impl App {
                         let side = 28.0 + 4.0 * h;
                         let area = Rect::from_center_size(r.center(), Vec2::splat(side));
                         if let Some(tex) = self.sticker_tex.get(&st.id) {
+                            acts.push(StickerAct::VisibleDoc(st.id));
                             egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
                         } else if st.has_preview() {
                             acts.push(StickerAct::Thumb(st.id));
@@ -738,6 +741,7 @@ impl App {
                         let side = (cell - 12.0) * (1.0 + 0.08 * ios_spring_bounce(h));
                         let area = Rect::from_center_size(r.center(), Vec2::splat(side));
                         if let Some(tex) = self.sticker_tex.get(&st.id) {
+                            acts.push(StickerAct::VisibleDoc(st.id));
                             egui::Image::new(tex).fit_to_exact_size(area.size()).paint_at(ui, area);
                         } else if st.has_preview() || st.mime == "application/x-tgsticker" {
                             acts.push(StickerAct::Thumb(st.id));

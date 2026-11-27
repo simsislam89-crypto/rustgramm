@@ -344,6 +344,12 @@ pub struct TgsAnim {
     assets: HashMap<String, Vec<Layer>>,
 }
 
+/// Повторно используемые буферы растеризации TGS, исключающие покадровые аллокации ~1 МБ в куче.
+#[derive(Default)]
+pub struct TgsScratch {
+    fb: Vec<f32>,
+}
+
 impl TgsAnim {
     /// Декодирует `.tgs` (gzipped Lottie JSON) или обычный JSON.
     pub fn from_bytes(bytes: &[u8]) -> Option<Arc<Self>> {
@@ -402,16 +408,19 @@ impl TgsAnim {
         self.ip + frac * (self.op - self.ip)
     }
 
-    /// Растеризует кадр `frame` в квадратный `ColorImage` размера `px_size×px_size` (с 2×2 сглаживанием).
-    pub fn render_frame(&self, frame: f32, px_size: usize) -> ColorImage {
+    /// Растеризует кадр `frame` в квадратный `ColorImage` размера `px_size×px_size` (с 2×2 сглаживанием),
+    /// используя переданный `TgsScratch` для 0 лишних аллокаций в основном буфере.
+    pub fn render_frame_into(&self, frame: f32, px_size: usize, scratch: &mut TgsScratch) -> ColorImage {
         let sz = px_size.clamp(16, 256);
         let ss = sz * 2;
         let scale = ss as f32 / self.width.max(self.height);
         let ox = (ss as f32 - self.width * scale) * 0.5;
         let oy = (ss as f32 - self.height * scale) * 0.5;
         let root_mat = Mat2D { m: [scale, 0.0, 0.0, scale, ox, oy] };
-        let mut fb = vec![0.0f32; ss * ss * 4]; // RGBA premultiplied linear-alpha buffer (0..1)
-        self.render_layers(&self.layers, frame, root_mat, 1.0, &mut fb, ss, 0);
+        let need = ss * ss * 4;
+        scratch.fb.clear();
+        scratch.fb.resize(need, 0.0f32);
+        self.render_layers(&self.layers, frame, root_mat, 1.0, &mut scratch.fb, ss, 0);
 
         let mut pixels = Vec::with_capacity(sz * sz);
         for y in 0..sz {
@@ -420,10 +429,10 @@ impl TgsAnim {
                 for sy in 0..2 {
                     for sx in 0..2 {
                         let off = ((y * 2 + sy) * ss + (x * 2 + sx)) * 4;
-                        acc[0] += fb[off];
-                        acc[1] += fb[off + 1];
-                        acc[2] += fb[off + 2];
-                        acc[3] += fb[off + 3];
+                        acc[0] += scratch.fb[off];
+                        acc[1] += scratch.fb[off + 1];
+                        acc[2] += scratch.fb[off + 2];
+                        acc[3] += scratch.fb[off + 3];
                     }
                 }
                 let r = (acc[0] * 0.25 * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -438,6 +447,13 @@ impl TgsAnim {
             source_size: eframe::egui::Vec2::new(sz as f32, sz as f32),
             pixels,
         }
+    }
+
+    /// Растеризует кадр `frame` в квадратный `ColorImage` размера `px_size×px_size` (с 2×2 сглаживанием).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn render_frame(&self, frame: f32, px_size: usize) -> ColorImage {
+        let mut scratch = TgsScratch::default();
+        self.render_frame_into(frame, px_size, &mut scratch)
     }
 
     #[allow(clippy::too_many_arguments)]

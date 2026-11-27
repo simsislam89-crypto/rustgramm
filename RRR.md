@@ -1117,3 +1117,47 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo check -p rg-android --features plugins` и `--no-default-features` — **OK**.
 - `cargo test --workspace` — **2 165 тестов пройдено, 0 провалено, 1 ignored** (`renders_local_cached_tgs_if_present`, пройдена отдельно `1 passed` по реальному кэшу `.tgs`; включая `no_foreign_hosts`, `self_delete_and_offline_deletions_persist_across_reopen`, `detects_login_token_updates_only`, `login_keypad_and_country_picker_math_and_alignment`, `extract_chatlist_slug_handles_urls_and_raw_slugs`, `peer_lookup_maps_users_groups_and_channels`, `parse_tg_link_routes_all_telegram_formats`).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.23.0`) собран (**20 752 384 байта**); smoke `RG_DEMO=1`, `RG_DEMO=qr`, `RG_DEMO=login` и живой запуск (6 с, 0 новых дампов) — **OK**.
+
+## Этап 36 (2026-11-27, v0.24.0)
+
+### Настройка EGM/MCP, исправление входа и стеклянный UI на Android, автотестер APK/RgBridge, ускорение загрузки сообщений на ПК, исправление анимаций TGS и 5 новых функций Telegram/AyuGram
+
+1. **Настройка EGM (Elephant Goldfish) и безопасных MCP (`mcp_config.json`, без секретов и ключей)**:
+   - Подключён плагин `egm` (`C:\Users\simsi\.gemini\config\plugins\egm`), проведены критика/аудит до и после диффа (`egm-design`, `egm-codebase-details`, `egm-inventive-catalyst`, `egm-zoom-out`).
+   - В `mcp_config.json` добавлены `h1cloud`, `rust-anything` (`rust-anything.exe mcp`), `context7` и `filesystem-scoped` (`d:\working WIN\rustgramm`, `D:\download WIN`).
+
+2. **Полное исправление ошибок входа и ввода на Android (`rg-core/src/{lib,auth}.rs`, `rg-ui/src/{countries,android_jni,worker,lib}.rs`, `scripts/dev/build_android_bridge.py`, `crates/rg-android/src/lib.rs`)**:
+   - `isolated_connection_params` нормализует устаревший `app_version` с major < 4 при `api_id == 2040` к `"5.14.3 x64"`; на Android добавлен прогрев `help.getNearestDc`, инициализация `updates.getState` при старте, увеличение таймаутов авторизации до 45 с и кнопка «Копировать» у баннера ошибки входа.
+   - В `auth.rs` реализован `invoke_with_dc_migrate` (до 4 переходов `MIGRATE_X` + отключение прежнего DC + повтор при временных сетевых сбоях), `resend_login_code` (`Cmd::ResendCode`), `SentCodeInfo::code_length` + `Ev::CodeMeta` (динамический авто-сабмит), отказ от преждевременной очистки `self.code` до `Stage::Password`, а также `check_password_safe` с ограниченным по времени `refresh_password_token_bounded` при `SRP_ID_INVALID` и сетевых ошибках.
+   - В `countries.rs` исправлены `normalize_phone` и `format_phone_input` (не ломаются азиатские `+81`/`+86` и казахстанские `+7 7xx` номера).
+   - В `RgBridge.java` (`rg_bridge.dex`, 18 220 байт) добавлен атомарный канал `INPUT_EVENT` (`"OK:" + tag + "\0" + val` / `"CAN:" + tag`) и аварийный сброс `CAN:` в `catch`, чтобы `android_input_pending` никогда не зависал; сохраняется `Stage::Ready` при оффлайн-старте из дискового кэша; закрыт потенциальный 100% CPU-спин QR-цикла при закрытии `updates`.
+
+3. **Стеклянный дизайн на Android (`crates/rg-ui/src/{theme,lib,android_jni}.rs`, `scripts/dev/build_android_bridge.py`)**:
+   - Снята жёсткая блокировка `window_opacity = 255` на Android (диапазон `50..=100`, по умолчанию полупрозрачное стекло); добавлены `mobile_glass_active()`, кэшированный 256×256 GPU-фон `paint_android_glass_backdrop()` и `paint_glass_bar()`.
+   - В `RgBridge.java` добавлены `setupGlassWindow(Activity)` (edge-to-edge прозрачные системные бары + blur 36 на API 31+) и `getSafeInsetsPx(Activity)` с 250 мс JNI-кэшем в `android_jni::safe_insets_dp` для безопасных стеклянных отступов статус-бара, выреза и клавиатуры.
+
+4. **Автоматический тестировщик APK и Android Java/JNI-моста (`scripts/dev/test_rg_bridge.py`, `scripts/test-apk.sh`)**:
+   - `test_rg_bridge.py` компилирует и запускает `RgBridgeTest` на реальном `javac`/`java` без эмулятора (проверяет атомарный протокол `INPUT_EVENT` с нулевым байтом, кириллицу/эмодзи/спецсимволы, `CAN:`, `getSafeInsetsPx`, `setupGlassWindow`, запрет лишних внешних URL в WebView и `AndroidManifest.xml`).
+   - `scripts/test-apk.sh` объединяет 5 ворот: `[1/5] RgBridgeTest`, `[2/5] DEX` magic `037` и размер, `[3/5] cargo check -p rg-android --target aarch64-linux-android` (Full и Lite `--no-default-features`), `[4/5]` статический аудит `.apk` (если собран), `[5/5] cargo test --workspace`.
+
+5. **Мгновенная загрузка и переключение сообщений на ПК (`crates/rg-ayu/src/store.rs`, `crates/rg-core/src/engine.rs`, `crates/rg-ui/src/{worker,chat,lib}.rs`)**:
+   - В `MessageStore` добавлен `write_lock: tokio::sync::Mutex<()>`, `drop(rows)` перед `mark_deleted_locked`, транзакционная `record_edit`, частичный индекс `idx_messages_del_only ON messages(peer, msg_id) WHERE deleted = 1`, `scan_range_for_merge` (O(1) слияние) и фоновый `prune_old_live(1500)` при старте.
+   - `history_before` использует `.limit(rem)` с фоновой записью в SQLite (`remember_many_full`/`mark_deleted`), `run_updates` сериализует `eng.apply` через последовательный `mpsc`-канал без гонок SQLite.
+   - `worker.rs` переведён на неблокирующие `tokio::spawn` команды (`Cmd::Open` дисковый кэш через `spawn_blocking`, фоновый `spawn_save_disk_cache`, `dialog_refresh_tx` с 4 с дедупликацией), 64-чатовый LRU `history_cache` + 1.5 с `history_fresh_at` в `lib.rs`, снят шторм `refresh_at` при `Live::Deleted`, поставлен канал-гард на `LoadSendAs`.
+
+6. **Исправление анимаций стикеров и кастомных эмодзи (`crates/rg-ui/src/{lottie,panels,chat,lib}.rs`)**:
+   - Добавлен переиспользуемый буфер `TgsScratch` (`render_frame_into`), трекинг реально видимых `visible_tgs_docs` / `visible_tgs_msgs` на экране (сброс в конце `tick_tgs`), защита видимых документов от вытеснения из кэшей и жёсткий потолок `tgs_frame_cache` (`600` / `750`), 0% CPU при свёрнутом/неактивном окне и сброс `msg_heights` на `Ev::Translated`.
+
+7. **5 новых функций Telegram / AyuGram (`rg-core/src/{media,engine}.rs`, `rg-ui/src/{worker,media_ui,chat,lib}.rs`)**:
+   - **Кликабельные пилюли реакций (`ReactionPill`)**: `extract_reaction_pills` (обычные, кастомные эмодзи, Paid ★), `toggle_reaction` (`Cmd::ReactToggle`), переключение в 1 клик под каждым сообщением.
+   - **Предпросмотр чата без пометки прочитанным (Chat Peek)**: `Cmd::PeekHistory` / `Ev::PeekHistory` / `DialogAct::Peek`, окно `peek_window` с последними сообщениями без отправки `messages.readHistory`.
+   - **Поиск участников и вкладки `Все` / `Админы` / `Боты`**: `ParticipantFilter` + `channel_participants_filtered` (`Cmd::ParticipantsFiltered`) в правой панели профиля.
+   - **Живой анимированный 3-точечный индикатор набора (`paint_typing_wave`) + Ghost-безопасный `messages.setTyping`**: плавная волна в шапке и списке диалогов, `Engine::typing_allowed` (учитывает Ghost Mode и `PrivacyShieldSettings`), троттлинг `Cmd::SetTyping`.
+   - **Отправка и богатые карточки контактов и геопозиции**: `MediaKind::Contact` / `MediaKind::Geo`, `Engine::send_contact` / `Engine::send_geo`, карточки с копированием телефона/координат (`rg-net::no_foreign_hosts` 100% соблюдён) и окна `contact_send_window` / `geo_send_window` в меню вложений.
+
+### Проверки (v0.24.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `cargo clippy -p rg-ui --no-default-features -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: crates/rg-ui/assets/rg_bridge.dex (18220 bytes, version 037)`, `cargo check -p rg-android --target aarch64-linux-android` Full & Lite OK).
+- `cargo test --workspace` (`0.24.0`) — **2 181 тест пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 31+370+320, `rg-core`: 60+274, `rg-net`: 6+1 `no_foreign_hosts`, `rg-settings`: 16+393, `rg-ui`: 79+631; `renders_local_cached_tgs_if_present` pre-existing ignored).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.24.0`) собран (**21 176 320 байт**, release 4m 20s); live smoke `RG_DEMO=1`, `RG_DEMO=login`, `RG_DEMO=qr` и `RG_SIZE=390x844 RG_MOBILE_GLASS=1 RG_DEMO=login` — **ALIVE=True**.

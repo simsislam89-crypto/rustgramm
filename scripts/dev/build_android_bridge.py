@@ -58,6 +58,8 @@ public final class RgBridge {
     public static final AtomicReference<String> PENDING_LINK = new AtomicReference<>(null);
     public static final AtomicReference<String> INPUT_TAG = new AtomicReference<>(null);
     public static final AtomicReference<String> INPUT_RESULT = new AtomicReference<>(null);
+    // Атомарный канал "OK:tag\0value" / "CAN:tag", исключающий гонку pollInputTag/pollInputResult.
+    public static final AtomicReference<String> INPUT_EVENT = new AtomicReference<>(null);
     private static volatile Dialog activeWebDialog = null;
     private static volatile AlertDialog activeInputDialog = null;
     private static volatile String pendingDestDir = null;
@@ -92,8 +94,6 @@ public final class RgBridge {
         final int inputTypeKind
     ) {
         if (act == null) return;
-        INPUT_TAG.set(null);
-        INPUT_RESULT.set(null);
         act.runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -101,6 +101,9 @@ public final class RgBridge {
                     if (activeInputDialog != null && activeInputDialog.isShowing()) {
                         activeInputDialog.dismiss();
                     }
+                    INPUT_TAG.set(null);
+                    INPUT_RESULT.set(null);
+                    INPUT_EVENT.set(null);
                     final EditText et = new EditText(act);
                     et.setHint(hint != null ? hint : "");
                     et.setText(initial != null ? initial : "");
@@ -135,22 +138,29 @@ public final class RgBridge {
                         .setPositiveButton("Готово", new DialogInterface.OnClickListener() {
                             @Override
                             public void onClick(DialogInterface d, int which) {
-                                INPUT_TAG.set(tag != null ? tag : "");
-                                INPUT_RESULT.set(et.getText() != null ? et.getText().toString() : "");
+                                String t = tag != null ? tag : "";
+                                String val = et.getText() != null ? et.getText().toString() : "";
+                                INPUT_EVENT.set("OK:" + t + "\0" + val);
+                                INPUT_RESULT.set(val);
+                                INPUT_TAG.set(t);
                             }
                         })
                         .setNegativeButton("Отмена", new DialogInterface.OnClickListener() {
                             @Override
                             public void onClick(DialogInterface d, int which) {
-                                INPUT_TAG.set("");
+                                String t = tag != null ? tag : "";
+                                INPUT_EVENT.set("CAN:" + t);
                                 INPUT_RESULT.set(null);
+                                INPUT_TAG.set("");
                             }
                         })
                         .setOnCancelListener(new DialogInterface.OnCancelListener() {
                             @Override
                             public void onCancel(DialogInterface d) {
-                                INPUT_TAG.set("");
+                                String t = tag != null ? tag : "";
+                                INPUT_EVENT.set("CAN:" + t);
                                 INPUT_RESULT.set(null);
+                                INPUT_TAG.set("");
                             }
                         })
                         .create();
@@ -159,8 +169,11 @@ public final class RgBridge {
                         @Override
                         public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
                             if (actionId == EditorInfo.IME_ACTION_DONE || actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_SEND) {
-                                INPUT_TAG.set(tag != null ? tag : "");
-                                INPUT_RESULT.set(et.getText() != null ? et.getText().toString() : "");
+                                String t = tag != null ? tag : "";
+                                String val = et.getText() != null ? et.getText().toString() : "";
+                                INPUT_EVENT.set("OK:" + t + "\0" + val);
+                                INPUT_RESULT.set(val);
+                                INPUT_TAG.set(t);
                                 dlg.dismiss();
                                 return true;
                             }
@@ -170,6 +183,12 @@ public final class RgBridge {
                     Window w = dlg.getWindow();
                     if (w != null) {
                         w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+                        if (Build.VERSION.SDK_INT >= 31) {
+                            w.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
+                            WindowManager.LayoutParams lp = w.getAttributes();
+                            lp.setBlurBehindRadius(36);
+                            w.setAttributes(lp);
+                        }
                     }
                     activeInputDialog = dlg;
                     dlg.show();
@@ -185,9 +204,17 @@ public final class RgBridge {
                             } catch (Throwable ignored) {}
                         }
                     }, 80);
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                    INPUT_EVENT.set("CAN:" + (tag != null ? tag : ""));
+                    INPUT_RESULT.set(null);
+                    INPUT_TAG.set("");
+                }
             }
         });
+    }
+
+    public static String pollInputEvent() {
+        return INPUT_EVENT.getAndSet(null);
     }
 
     public static String pollInputTag() {
@@ -196,6 +223,56 @@ public final class RgBridge {
 
     public static String pollInputResult() {
         return INPUT_RESULT.getAndSet(null);
+    }
+
+    public static void setupGlassWindow(final Activity act) {
+        if (act == null) return;
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Window w = act.getWindow();
+                    if (w == null) return;
+                    w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+                    w.clearFlags(
+                        WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS
+                            | WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION
+                    );
+                    w.setStatusBarColor(Color.TRANSPARENT);
+                    w.setNavigationBarColor(Color.parseColor("#660C0E14"));
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        w.setDecorFitsSystemWindows(false);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    public static String getSafeInsetsPx(final Activity act) {
+        if (act == null || act.getWindow() == null) return "0,0,0,0";
+        try {
+            View decor = act.getWindow().getDecorView();
+            if (decor == null || Build.VERSION.SDK_INT < 23) return "0,0,0,0";
+            WindowInsets wi = decor.getRootWindowInsets();
+            if (wi == null) return "0,0,0,0";
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets ins = wi.getInsets(
+                    WindowInsets.Type.systemBars()
+                        | WindowInsets.Type.displayCutout()
+                        | WindowInsets.Type.ime()
+                );
+                return ins.top + "," + ins.right + "," + ins.bottom + "," + ins.left;
+            }
+            return wi.getSystemWindowInsetTop()
+                + ","
+                + wi.getSystemWindowInsetRight()
+                + ","
+                + wi.getSystemWindowInsetBottom()
+                + ","
+                + wi.getSystemWindowInsetLeft();
+        } catch (Throwable ignored) {
+            return "0,0,0,0";
+        }
     }
 
     public static void pickFile(final Activity act, final String mime, final String destDir) {

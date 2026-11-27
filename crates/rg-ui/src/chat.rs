@@ -28,6 +28,7 @@ pub(crate) enum Act {
     Forward(i32),
     Pin(i32, bool),
     React(i32, String),
+    ReactToggle(i32, String, bool),
     Delete(i32),
     Repeat(String),
     Details(i32),
@@ -136,9 +137,35 @@ fn time_label(ts: i64, seconds: bool) -> String {
     if seconds { hhmmss(ts) } else { hhmm(ts) }
 }
 
-fn short(text: &str, n: usize) -> String {
+pub(crate) fn short(text: &str, n: usize) -> String {
     let one: String = text.chars().filter(|c| *c != '\n').take(n).collect();
     if text.chars().count() > n { format!("{one}…") } else { one }
+}
+
+/// Рисует анимированную 3-точечную волну («•••») и подпись статуса набора текста.
+pub(crate) fn paint_typing_wave(
+    p: &egui::Painter,
+    ctx: &egui::Context,
+    left_center: Pos2,
+    color: Color32,
+    label: &str,
+) {
+    let t = ctx.input(|i| i.time);
+    for k in 0..3 {
+        let phase = (t * 6.5 - f64::from(k) * 0.95).sin().max(0.0) as f32;
+        let cx = left_center.x + 3.0 + k as f32 * 5.0;
+        let cy = left_center.y - phase * 2.5;
+        let r = 1.6 + 0.5 * phase;
+        p.circle_filled(Pos2::new(cx, cy), r, color.gamma_multiply(0.55 + 0.45 * phase));
+    }
+    p.text(
+        Pos2::new(left_center.x + 19.0, left_center.y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        color,
+    );
+    ctx.request_repaint_after(std::time::Duration::from_millis(45));
 }
 
 fn plural_comments(n: i32) -> String {
@@ -280,8 +307,10 @@ impl App {
                 // Значок Premium-эмодзи статуса / галочки / Premium прямо рядом с именем (как в AyuGram!).
                 let badge_c = Pos2::new(title_start_x + title_w + 11.0, title_y);
                 if let Some(doc_id) = emoji_id {
-                    if let Some(tex) = self.sticker_tex.get(&doc_id) {
-                        egui::Image::new(tex)
+                    let tex_opt = self.sticker_tex.get(&doc_id).cloned();
+                    if let Some(tex) = tex_opt {
+                        self.visible_tgs_docs.insert(doc_id);
+                        egui::Image::new(&tex)
                             .fit_to_exact_size(Vec2::splat(16.0))
                             .paint_at(ui, Rect::from_center_size(badge_c, Vec2::splat(16.0)));
                     } else {
@@ -294,7 +323,16 @@ impl App {
                 }
                 if !subtitle.is_empty() {
                     let clip_s = Rect::from_min_max(Pos2::new(text_x, hrect.top()), Pos2::new(hrect.right(), hrect.bottom()));
-                    if centered {
+                    if live_typing.is_some() {
+                        let start_x = if centered { (hrect.center().x - 50.0).max(text_x) } else { text_x };
+                        paint_typing_wave(
+                            &ui.painter().with_clip_rect(clip_s),
+                            ui.ctx(),
+                            Pos2::new(start_x, hrect.center().y + 10.0),
+                            sub_color,
+                            &subtitle,
+                        );
+                    } else if centered {
                         ui.painter().with_clip_rect(clip_s).text(
                             Pos2::new(hrect.center().x.max(text_x + 40.0), hrect.center().y + 10.0),
                             egui::Align2::CENTER_CENTER,
@@ -622,8 +660,10 @@ impl App {
             if has_badge {
                 let bc = Pos2::new(name_x + name_galley.size().x * 0.5 + 12.0, top.top() + 114.0);
                 if let Some(doc_id) = emoji_id {
-                    if let Some(tex) = self.sticker_tex.get(&doc_id) {
-                        egui::Image::new(tex)
+                    let tex_opt = self.sticker_tex.get(&doc_id).cloned();
+                    if let Some(tex) = tex_opt {
+                        self.visible_tgs_docs.insert(doc_id);
+                        egui::Image::new(&tex)
                             .fit_to_exact_size(Vec2::splat(17.0))
                             .paint_at(ui, Rect::from_center_size(bc, Vec2::splat(17.0)));
                     } else {
@@ -1080,33 +1120,82 @@ impl App {
                                 }
                             }
                         }
-                    } else if members_list.is_empty() {
-                        ui.add_space(16.0);
-                        ui.vertical_centered(|ui| ui.label(RichText::new("Список участников недоступен или пуст").size(12.5).color(SUBTEXT)));
                     } else {
-                        let total_m = self.participants_total.get(&d.id).copied().unwrap_or(members_list.len() as i32);
-                        egui::ScrollArea::vertical()
-                            .max_height(320.0)
-                            .id_salt(("info-members", d.id))
-                            .show_rows(ui, 48.0, members_list.len(), |ui, range| {
-                                for row_i in range {
-                                    let c = &members_list[row_i];
-                                    let (mr, mresp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
-                                    if mresp.hovered() {
-                                        ui.painter().rect_filled(mr, 0.0, t(WINDOW_OVER));
-                                    }
-                                    draw_avatar(ui, mr.left_center() + Vec2::new(30.0, 0.0), &c.name, c.id, 34.0, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
-                                    ui.painter().text(mr.left_top() + Vec2::new(56.0, 9.0), egui::Align2::LEFT_TOP, &c.name, FontId::proportional(13.5), WHITE);
-                                    ui.painter().text(mr.left_top() + Vec2::new(56.0, 27.0), egui::Align2::LEFT_TOP, &c.status, FontId::proportional(11.5), SUBTEXT);
-                                    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                        open_contact = Some((c.peer, c.id, c.name.clone()));
-                                    }
+                        use rg_core::engine::ParticipantFilter as PF;
+                        let mut refetch = false;
+                        ui.horizontal(|ui| {
+                            for (flt, lbl) in [
+                                (PF::All, "Все"),
+                                (PF::Admins, "Админы"),
+                                (PF::Bots, "Боты"),
+                            ] {
+                                let sel = self.participants_filter == flt;
+                                let btn = egui::Button::new(RichText::new(lbl).size(12.0).color(if sel { Color32::WHITE } else { SUBTEXT }))
+                                    .fill(if sel { c_orange() } else { Color32::from_white_alpha(14) })
+                                    .corner_radius(egui::CornerRadius::same(8));
+                                if ui.add(btn).clicked() && !sel {
+                                    self.participants_filter = flt;
+                                    refetch = true;
                                 }
-                            });
-                        if (members_list.len() as i32) < total_m && members_list.len() < 1000 {
-                            ui.add_space(6.0);
-                            if ui.button(format!("Загрузить ещё ({}/{})", members_list.len(), total_m)).clicked() {
-                                cmd_after = Some(Cmd::ParticipantsPaged(i, members_list.len() as i32));
+                            }
+                        });
+                        ui.add_space(4.0);
+                        let q_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.participants_query)
+                                .desired_width(w)
+                                .hint_text("Поиск участника…"),
+                        );
+                        if (q_resp.changed() && (self.participants_query.chars().count() >= 2 || self.participants_query.is_empty()))
+                            || refetch
+                        {
+                            cmd_after = Some(Cmd::ParticipantsFiltered(
+                                i,
+                                self.participants_filter,
+                                self.participants_query.clone(),
+                            ));
+                        }
+                        ui.add_space(4.0);
+                        let q_low = self.participants_query.trim().to_lowercase();
+                        let filtered_members: Vec<_> = members_list
+                            .iter()
+                            .filter(|c| {
+                                q_low.is_empty()
+                                    || c.name.to_lowercase().contains(&q_low)
+                                    || c.status.to_lowercase().contains(&q_low)
+                            })
+                            .collect();
+                        if filtered_members.is_empty() {
+                            ui.add_space(12.0);
+                            ui.vertical_centered(|ui| ui.label(RichText::new("Список участников недоступен или пуст").size(12.5).color(SUBTEXT)));
+                        } else {
+                            let total_m = self.participants_total.get(&d.id).copied().unwrap_or(members_list.len() as i32);
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .id_salt(("info-members", d.id))
+                                .show_rows(ui, 48.0, filtered_members.len(), |ui, range| {
+                                    for row_i in range {
+                                        let c = filtered_members[row_i];
+                                        let (mr, mresp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
+                                        if mresp.hovered() {
+                                            ui.painter().rect_filled(mr, 0.0, t(WINDOW_OVER));
+                                        }
+                                        draw_avatar(ui, mr.left_center() + Vec2::new(30.0, 0.0), &c.name, c.id, 34.0, self.avatars.get(&c.id), self.settings.ayu.avatar_corners);
+                                        ui.painter().text(mr.left_top() + Vec2::new(56.0, 9.0), egui::Align2::LEFT_TOP, &c.name, FontId::proportional(13.5), WHITE);
+                                        ui.painter().text(mr.left_top() + Vec2::new(56.0, 27.0), egui::Align2::LEFT_TOP, &c.status, FontId::proportional(11.5), SUBTEXT);
+                                        if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                            open_contact = Some((c.peer, c.id, c.name.clone()));
+                                        }
+                                    }
+                                });
+                            if self.participants_filter == PF::All
+                                && q_low.is_empty()
+                                && (members_list.len() as i32) < total_m
+                                && members_list.len() < 1000
+                            {
+                                ui.add_space(6.0);
+                                if ui.button(format!("Загрузить ещё ({}/{})", members_list.len(), total_m)).clicked() {
+                                    cmd_after = Some(Cmd::ParticipantsPaged(i, members_list.len() as i32));
+                                }
                             }
                         }
                     }
@@ -1492,6 +1581,7 @@ impl App {
         });
         if let Some((idx, cid, kind)) = cur_dlg_info {
             if matches!(kind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel)
+                && cid < -1_000_000_000_000
                 && self.send_as_req.insert(cid)
             {
                 self.send(Cmd::LoadSendAs(idx));
@@ -1853,6 +1943,14 @@ impl App {
                         self.send(Cmd::LoadScheduled);
                         ui.close();
                     }
+                    if kit::menu_item(ui, "contacts", "Контакт", false) {
+                        self.contact_modal_open = true;
+                        ui.close();
+                    }
+                    if kit::menu_item(ui, "menu/search", "Геопозиция (координаты)", false) {
+                        self.geo_modal_open = true;
+                        ui.close();
+                    }
                 });
             }
             if has_send_as && let Some((_, cid, _)) = cur_dlg_info {
@@ -2008,6 +2106,19 @@ impl App {
                 self.input_redo.clear();
                 if let Some(idx) = self.selected {
                     self.draft_dirty_at = Some((idx, ui.input(|i| i.time)));
+                    if self.input.trim().is_empty() {
+                        if let Some((prev_idx, _)) = self.last_typing_sent.take() {
+                            self.send(Cmd::SetTyping(prev_idx, false));
+                        }
+                    } else {
+                        let should_ping = self.last_typing_sent.is_none_or(|(pi, t0)| {
+                            pi != idx || t0.elapsed().as_secs_f32() >= 4.5
+                        });
+                        if should_ping {
+                            self.last_typing_sent = Some((idx, std::time::Instant::now()));
+                            self.send(Cmd::SetTyping(idx, true));
+                        }
+                    }
                 }
             }
             if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
@@ -2540,6 +2651,9 @@ impl App {
                     let temp_id = self.push_optimistic_message(String::new(), Vec::new(), reply, Some(media));
                     self.send(Cmd::SendDice(em, reply, temp_id));
                 }
+                A::VisibleDoc(doc_id) => {
+                    self.visible_tgs_docs.insert(doc_id);
+                }
             }
         }
         if let Some(c) = picked {
@@ -2946,7 +3060,7 @@ impl App {
                 }
             }
         }
-        let (out, out_rendered) = {
+        let (out, out_rendered, out_docs) = {
             let topic_slice = self.active_topic.and_then(|tid| {
                 self.topic_msgs
                     .as_ref()
@@ -3028,6 +3142,7 @@ impl App {
             let user_filter = self.user_filter.as_ref().map(|(id, _)| *id);
             let heights = &self.msg_heights;
             let mut rendered_ids: Vec<i32> = Vec::with_capacity(32);
+            let mut rendered_docs: Vec<i64> = Vec::with_capacity(16);
             let scroll_out = egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .stick_to_bottom(!searching && self.autoscroll_anchor.is_none() && self.active_topic.is_none())
@@ -3111,6 +3226,16 @@ impl App {
                         }
                         for item in album {
                             rendered_ids.push(item.id);
+                            for e in &item.entities {
+                                if let rg_core::engine::EntityKind::CustomEmoji(doc_id) = e.kind {
+                                    rendered_docs.push(doc_id);
+                                }
+                            }
+                            for pill in &item.reaction_items {
+                                if let Some(doc_id) = pill.custom_doc_id {
+                                    rendered_docs.push(doc_id);
+                                }
+                            }
                         }
                         let y_before = ui.cursor().min.y;
                         if album.len() > 1 {
@@ -3126,10 +3251,11 @@ impl App {
                     }
                     ui.add_space(8.0);
                 });
-            (scroll_out, rendered_ids)
+            (scroll_out, rendered_ids, rendered_docs)
         };
         self.visible_tgs_msgs.clear();
         self.visible_tgs_msgs.extend(out_rendered);
+        self.visible_tgs_docs.extend(out_docs);
         if self.msg_heights.len() > 4000 {
             let live: std::collections::HashSet<i32> = self.messages.iter().map(|m| m.id).collect();
             self.msg_heights.retain(|id, _| live.contains(id));
@@ -3663,6 +3789,7 @@ impl App {
             Act::Forward(id) => self.forward = Some(id),
             Act::Pin(id, on) => self.send(Cmd::Pin(id, on)),
             Act::React(id, e) => self.send(Cmd::React(id, e)),
+            Act::ReactToggle(id, e, chosen) => self.send(Cmd::ReactToggle(id, e, chosen)),
             Act::PaidReact(id) => self.paid_react_msg = Some(id),
             Act::Delete(id) => self.confirm_delete = Some(id),
             Act::Repeat(text) => {
@@ -5570,6 +5697,55 @@ fn bubble(
                             cards.push((pill_resp.rect, Act::ReplayEffect(m.id)));
                         }
                     });
+                    if !m.deleted && !m.reaction_items.is_empty() && reactions_visible(s) {
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(5.0, 4.0);
+                            for pill in &m.reaction_items {
+                                let lbl = format!("{} {}", pill.emoji, pill.count);
+                                let text_col = if pill.chosen { Color32::WHITE } else { WHITE };
+                                let gal = ui.painter().layout_no_wrap(lbl.clone(), FontId::proportional(12.0), text_col);
+                                let has_custom = pill.custom_doc_id.is_some_and(|did| env.custom_tex.contains_key(&did));
+                                let pw = (gal.size().x + if has_custom { 18.0 } else { 0.0 } + 14.0).max(34.0);
+                                let (pr, presp) = ui.allocate_exact_size(Vec2::new(pw, 22.0), Sense::hover());
+                                let hk = tween(ui.ctx(), ("rxp", m.id, &pill.emoji), f32::from(u8::from(presp.hovered())), 0.1);
+                                let (bg, border) = if pill.chosen {
+                                    (
+                                        t_btn(ORANGE).gamma_multiply(0.34 + 0.16 * hk),
+                                        t_btn(ORANGE).gamma_multiply(0.9),
+                                    )
+                                } else if pill.paid {
+                                    (
+                                        Color32::from_rgba_unmultiplied(245, 190, 50, (36.0 + 22.0 * hk) as u8),
+                                        Color32::from_rgba_unmultiplied(245, 190, 50, 140),
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_white_alpha((22.0 + 18.0 * hk) as u8),
+                                        Color32::from_white_alpha((38.0 + 32.0 * hk) as u8),
+                                    )
+                                };
+                                ui.painter().rect_filled(pr, egui::CornerRadius::same(11), bg);
+                                ui.painter().rect_stroke(pr, egui::CornerRadius::same(11), egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                if let Some(did) = pill.custom_doc_id
+                                    && let Some(tex) = env.custom_tex.get(&did)
+                                {
+                                    let ir = Rect::from_center_size(Pos2::new(pr.left() + 13.0, pr.center().y), Vec2::splat(15.0));
+                                    egui::Image::new(tex).fit_to_exact_size(ir.size()).paint_at(ui, ir);
+                                    ui.painter().text(
+                                        Pos2::new(pr.left() + 24.0, pr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        pill.count.to_string(),
+                                        FontId::proportional(12.0),
+                                        text_col,
+                                    );
+                                } else {
+                                    ui.painter().text(pr.center(), egui::Align2::CENTER_CENTER, &lbl, FontId::proportional(12.0), text_col);
+                                }
+                                cards.push((pr, Act::ReactToggle(m.id, pill.emoji.clone(), pill.chosen)));
+                            }
+                        });
+                    }
                     if ((env.is_channel && env.has_discussion) || m.has_comments) && !m.deleted && m.id > 0 {
                         ui.add_space(3.0);
                         let lbl = plural_comments(m.replies_count);

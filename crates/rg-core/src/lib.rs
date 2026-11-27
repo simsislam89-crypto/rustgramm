@@ -259,6 +259,19 @@ pub fn isolated_connection_params(cfg: &Config) -> grammers_mtsender::Connection
     if let Some(v) = cfg.app_version.as_ref().filter(|s| !s.trim().is_empty()) {
         p.app_version.clone_from(v);
     }
+    // Для Desktop API (2040) Telegram отклоняет слишком старые/semver-префиксы (`0.x`) на auth.sendCode.
+    if cfg.api_id == 2040 {
+        let major = p
+            .app_version
+            .trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        if major < 4 {
+            p.app_version = "5.14.3 x64".to_string();
+        }
+    }
     if let Some(l) = cfg.lang_code.as_ref().filter(|s| !s.trim().is_empty()) {
         p.lang_code.clone_from(l);
         p.system_lang_code.clone_from(l);
@@ -305,6 +318,38 @@ pub mod secret;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_connection_params_normalizes_old_desktop_version() {
+        let cfg = Config {
+            api_id: 2040,
+            api_hash: "0".into(),
+            session_path: "s".into(),
+            proxy_url: None,
+            device_model: None,
+            system_version: None,
+            app_version: Some("0.23.0".into()),
+            lang_code: None,
+        };
+        let p = isolated_connection_params(&cfg);
+        assert_eq!(p.app_version, "5.14.3 x64");
+    }
+
+    #[test]
+    fn isolated_connection_params_keeps_modern_desktop_version() {
+        let cfg = Config {
+            api_id: 2040,
+            api_hash: "0".into(),
+            session_path: "s".into(),
+            proxy_url: None,
+            device_model: None,
+            system_version: None,
+            app_version: Some("5.15.0 x64".into()),
+            lang_code: None,
+        };
+        let p = isolated_connection_params(&cfg);
+        assert_eq!(p.app_version, "5.15.0 x64");
+    }
     use grammers_session::SessionData;
     use grammers_session::storages::MemorySession;
 

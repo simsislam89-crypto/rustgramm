@@ -378,6 +378,59 @@ pub fn card(
             ui.painter().rect_stroke(badge, CornerRadius::same(11), Stroke::new(1.0, pill_col), egui::StrokeKind::Inside);
             ui.painter().text(badge.center(), Align2::CENTER_CENTER, outcome, FontId::proportional(11.5), WHITE);
         }
+        MediaKind::Contact {
+            phone,
+            first_name,
+            last_name,
+            user_id,
+        } => {
+            let full = format!("{first_name} {last_name}").trim().to_owned();
+            let title = if full.is_empty() { phone.as_str() } else { full.as_str() };
+            let phone_fmt = if phone.starts_with('+') || phone.is_empty() {
+                phone.clone()
+            } else {
+                format!("+{phone}")
+            };
+            let cw = w.clamp(190.0, 270.0);
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(cw, 58.0), Sense::hover());
+            let bg = if resp.hovered() { t(WINDOW_OVER) } else { Color32::from_white_alpha(14) };
+            ui.painter().rect_filled(rect, CornerRadius::same(10), bg);
+            ui.painter().rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, Color32::from_white_alpha(26)), egui::StrokeKind::Inside);
+            let av_c = Pos2::new(rect.left() + 26.0, rect.center().y);
+            let col = avatar_color(*user_id);
+            ui.painter().circle_filled(av_c, 18.0, col);
+            let ini: String = title.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "?".into());
+            ui.painter().text(av_c, Align2::CENTER_CENTER, ini, FontId::proportional(14.5), Color32::WHITE);
+            let tx = rect.left() + 52.0;
+            ui.painter().text(Pos2::new(tx, rect.top() + 10.0), Align2::LEFT_TOP, super::chat::short(title, 26), FontId::proportional(13.5), WHITE);
+            ui.painter().text(Pos2::new(tx, rect.top() + 28.0), Align2::LEFT_TOP, &phone_fmt, FontId::proportional(12.0), ORANGE);
+            ui.painter().text(Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0), Align2::RIGHT_BOTTOM, "Копировать", FontId::proportional(10.5), date_c);
+            if !phone_fmt.is_empty() {
+                cards.push((rect, Act::Copy(phone_fmt)));
+            }
+        }
+        MediaKind::Geo {
+            lat_micro,
+            lon_micro,
+            title,
+        } => {
+            let lat = *lat_micro as f64 / 1_000_000.0;
+            let lon = *lon_micro as f64 / 1_000_000.0;
+            let cw = w.clamp(190.0, 270.0);
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(cw, 62.0), Sense::hover());
+            let bg = if resp.hovered() { Color32::from_rgba_unmultiplied(46, 130, 210, 44) } else { Color32::from_rgba_unmultiplied(32, 86, 148, 36) };
+            ui.painter().rect_filled(rect, CornerRadius::same(10), bg);
+            ui.painter().rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, Color32::from_rgba_unmultiplied(110, 185, 255, 72)), egui::StrokeKind::Inside);
+            let pin_c = Pos2::new(rect.left() + 26.0, rect.center().y);
+            ui.painter().circle_filled(pin_c, 17.0, t_btn(ORANGE).gamma_multiply(0.26));
+            ui.painter().text(pin_c, Align2::CENTER_CENTER, "📍", FontId::proportional(16.0), ORANGE);
+            let tx = rect.left() + 52.0;
+            let hdr = if title.is_empty() { "Геопозиция" } else { title.as_str() };
+            ui.painter().text(Pos2::new(tx, rect.top() + 10.0), Align2::LEFT_TOP, super::chat::short(hdr, 24), FontId::proportional(13.5), WHITE);
+            ui.painter().text(Pos2::new(tx, rect.top() + 29.0), Align2::LEFT_TOP, format!("{lat:.5}, {lon:.5}"), FontId::proportional(11.5), date_c);
+            ui.painter().text(Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0), Align2::RIGHT_BOTTOM, "Копировать", FontId::proportional(10.5), ORANGE);
+            cards.push((rect, Act::Copy(format!("{lat:.6}, {lon:.6}"))));
+        }
         MediaKind::Other(_) => {
             ui.label(RichText::new(format!("[{}]", info.name)).color(date_c));
         }

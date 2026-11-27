@@ -61,6 +61,7 @@ const CHANNEL_BOUND: i64 = -1_000_000_000_000;
 pub struct MessageStore {
     _db: libsql::Database,
     conn: Connection,
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl MessageStore {
@@ -92,6 +93,7 @@ impl MessageStore {
                  PRIMARY KEY(peer, msg_id));
              CREATE INDEX IF NOT EXISTS idx_messages_msg_peer ON messages(msg_id, peer);
              CREATE INDEX IF NOT EXISTS idx_messages_peer_del_date ON messages(peer, deleted, date);
+             CREATE INDEX IF NOT EXISTS idx_messages_del_only ON messages(peer, msg_id) WHERE deleted = 1;
              CREATE TABLE IF NOT EXISTS edits(
                  peer INTEGER NOT NULL, msg_id INTEGER NOT NULL,
                  rev INTEGER NOT NULL, old_text TEXT NOT NULL, edited_at INTEGER NOT NULL,
@@ -127,7 +129,11 @@ impl MessageStore {
         let _ = conn
             .execute("ALTER TABLE messages ADD COLUMN sender TEXT NOT NULL DEFAULT ''", ())
             .await;
-        Ok(Self { _db: db, conn })
+        Ok(Self {
+            _db: db,
+            conn,
+            write_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// Запомнить сообщение (новое или обновлённое).
@@ -146,6 +152,7 @@ impl MessageStore {
         outgoing: bool,
         sender: &str,
     ) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO messages(peer,msg_id,text,date,outgoing,sender) VALUES(?1,?2,?3,?4,?5,?6)
@@ -177,6 +184,7 @@ impl MessageStore {
         if items.is_empty() {
             return Ok(());
         }
+        let _g = self.write_lock.lock().await;
         self.conn.execute("BEGIN", ()).await?;
         for (id, text, date, outgoing, sender) in items {
             let r = self
@@ -202,7 +210,10 @@ impl MessageStore {
                 return Err(e);
             }
         }
-        self.conn.execute("COMMIT", ()).await?;
+        if let Err(e) = self.conn.execute("COMMIT", ()).await {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -216,6 +227,7 @@ impl MessageStore {
         outgoing: bool,
         sender: &str,
     ) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO messages(peer,msg_id,text,date,deleted,outgoing,sender) VALUES(?1,?2,?3,?4,1,?5,?6)
@@ -249,7 +261,7 @@ impl MessageStore {
     }
 
     /// Пометить удалёнными одной транзакцией; возвращает, сколько из них у нас сохранено.
-    pub async fn mark_deleted(&self, peer: i64, ids: &[i32]) -> Result<u64> {
+    async fn mark_deleted_locked(&self, peer: i64, ids: &[i32]) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -271,8 +283,19 @@ impl MessageStore {
                 }
             }
         }
-        self.conn.execute("COMMIT", ()).await?;
+        if let Err(e) = self.conn.execute("COMMIT", ()).await {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+            return Err(e);
+        }
         Ok(n)
+    }
+
+    pub async fn mark_deleted(&self, peer: i64, ids: &[i32]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let _g = self.write_lock.lock().await;
+        self.mark_deleted_locked(peer, ids).await
     }
 
     /// Выявить сообщения, удалённые в оффлайне: среди всех сохранённых записей чата в диапазоне
@@ -287,6 +310,7 @@ impl MessageStore {
         if min_id > max_id {
             return Ok(0);
         }
+        let _g = self.write_lock.lock().await;
         let present: std::collections::HashSet<i32> = present_ids.iter().copied().collect();
         let mut rows = self
             .conn
@@ -303,11 +327,13 @@ impl MessageStore {
                 missing.push(mid);
             }
         }
-        self.mark_deleted(peer, &missing).await
+        drop(rows);
+        self.mark_deleted_locked(peer, &missing).await
     }
 
     /// Пометить все сохранённые сообщения данного чата как удалённые (при очистке истории чата).
     pub async fn mark_all_peer_deleted(&self, peer: i64) -> Result<u64> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "UPDATE messages SET deleted=1 WHERE peer=?1 AND deleted=0",
@@ -321,6 +347,7 @@ impl MessageStore {
         if ids.is_empty() {
             return Ok(0);
         }
+        let _g = self.write_lock.lock().await;
         self.conn.execute("BEGIN", ()).await?;
         let mut n = 0;
         for id in ids {
@@ -339,40 +366,59 @@ impl MessageStore {
                 }
             }
         }
-        self.conn.execute("COMMIT", ()).await?;
+        if let Err(e) = self.conn.execute("COMMIT", ()).await {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+            return Err(e);
+        }
         Ok(n)
     }
 
-    /// Правка: старый текст уходит в историю, новый запоминается.
+    /// Правка: старый текст уходит в историю, новый запоминается атомарно в транзакции.
     pub async fn record_edit(&self, peer: i64, msg_id: i32, new_text: &str, at: i64) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         let id = i64::from(msg_id);
-        if let Some(old) = self.get(peer, msg_id).await?
-            && old.text != new_text
-        {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT COALESCE(MAX(rev),0)+1 FROM edits WHERE peer=?1 AND msg_id=?2",
-                    params![peer, id],
-                )
-                .await?;
-            let rev: i64 = match rows.next().await? {
-                Some(r) => r.get(0)?,
-                None => 1,
-            };
+        let old = self.get(peer, msg_id).await?;
+        self.conn.execute("BEGIN", ()).await?;
+        let res: Result<()> = async {
+            if let Some(old) = old
+                && old.text != new_text
+            {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT COALESCE(MAX(rev),0)+1 FROM edits WHERE peer=?1 AND msg_id=?2",
+                        params![peer, id],
+                    )
+                    .await?;
+                let rev: i64 = match rows.next().await? {
+                    Some(r) => r.get(0)?,
+                    None => 1,
+                };
+                drop(rows);
+                self.conn
+                    .execute(
+                        "INSERT INTO edits(peer,msg_id,rev,old_text,edited_at) VALUES(?1,?2,?3,?4,?5)",
+                        params![peer, id, rev, old.text, at],
+                    )
+                    .await?;
+            }
             self.conn
                 .execute(
-                    "INSERT INTO edits(peer,msg_id,rev,old_text,edited_at) VALUES(?1,?2,?3,?4,?5)",
-                    params![peer, id, rev, old.text, at],
+                    "UPDATE messages SET text=?3 WHERE peer=?1 AND msg_id=?2",
+                    params![peer, id, new_text],
                 )
                 .await?;
+            Ok(())
         }
-        self.conn
-            .execute(
-                "UPDATE messages SET text=?3 WHERE peer=?1 AND msg_id=?2",
-                params![peer, id, new_text],
-            )
-            .await?;
+        .await;
+        if let Err(e) = res {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+            return Err(e);
+        }
+        if let Err(e) = self.conn.execute("COMMIT", ()).await {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -444,7 +490,49 @@ impl MessageStore {
     }
 
     /// Удалить сохранённое старше `before` (unix-время), кроме помеченных удалёнными.
+    /// Быстрое индексированное сканирование диапазона `[min_id..=max_id]` без блокировки записи:
+    /// возвращает `(deleted_rows, live_rows)` для мгновенного слияния в `history_before`.
+    pub async fn scan_range_for_merge(
+        &self,
+        peer: i64,
+        min_id: i32,
+        max_id: i32,
+    ) -> Result<(Vec<Saved>, Vec<Saved>)> {
+        if min_id > max_id {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT msg_id,text,date,deleted,outgoing,sender FROM messages
+                 WHERE peer=?1 AND msg_id>=?2 AND msg_id<=?3
+                 ORDER BY date ASC, msg_id ASC",
+                params![peer, i64::from(min_id), i64::from(max_id)],
+            )
+            .await?;
+        let mut deleted = Vec::new();
+        let mut live = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let item = Saved {
+                peer,
+                msg_id: i32::try_from(r.get::<i64>(0)?).unwrap_or_default(),
+                text: r.get(1)?,
+                date: r.get(2)?,
+                deleted: r.get::<i64>(3)? != 0,
+                outgoing: r.get::<i64>(4)? != 0,
+                sender: r.get(5)?,
+            };
+            if item.deleted {
+                deleted.push(item);
+            } else {
+                live.push(item);
+            }
+        }
+        Ok((deleted, live))
+    }
+
     pub async fn prune(&self, before: i64) -> Result<u64> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "DELETE FROM messages WHERE deleted=0 AND date<?1",
@@ -453,8 +541,40 @@ impl MessageStore {
             .await
     }
 
+    /// Подрезает старые живые записи (`deleted=0`) сверх `max_live_per_peer` на чат, сохраняя все удалённые (`deleted=1`).
+    pub async fn prune_old_live(&self, max_live_per_peer: usize) -> Result<u64> {
+        let _g = self.write_lock.lock().await;
+        let keep = max_live_per_peer.max(100) as i64;
+        let mut peers = self
+            .conn
+            .query(
+                "SELECT peer FROM messages WHERE deleted=0 GROUP BY peer HAVING COUNT(*) > ?1",
+                params![keep],
+            )
+            .await?;
+        let mut bloated = Vec::new();
+        while let Some(r) = peers.next().await? {
+            bloated.push(r.get::<i64>(0)?);
+        }
+        let mut removed = 0u64;
+        for peer in bloated {
+            removed += self
+                .conn
+                .execute(
+                    "DELETE FROM messages WHERE peer=?1 AND deleted=0 AND msg_id NOT IN (
+                        SELECT msg_id FROM messages WHERE peer=?1 AND deleted=0
+                        ORDER BY date DESC, msg_id DESC LIMIT ?2
+                     )",
+                    params![peer, keep],
+                )
+                .await?;
+        }
+        Ok(removed)
+    }
+
     /// Окончательно удалить уже удалённое сообщение только у себя из локальной базы, чтобы оно больше не показывалось.
     pub async fn purge_deleted(&self, peer: i64, msg_id: i32) -> Result<u64> {
+        let _g = self.write_lock.lock().await;
         let id = i64::from(msg_id);
         let _ = self
             .conn
@@ -473,6 +593,7 @@ impl MessageStore {
 
     /// Окончательно убрать все удалённые сообщения данного чата из локальной базы.
     pub async fn purge_all_deleted(&self, peer: i64) -> Result<u64> {
+        let _g = self.write_lock.lock().await;
         let _ = self
             .conn
             .execute(
@@ -588,6 +709,7 @@ impl MessageStore {
 
     /// Сохранить или обновить секретный чат E2E.
     pub async fn save_secret_chat(&self, c: &SecretChatRecord) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO secret_chats(chat_id,access_hash,peer_user_id,peer_name,auth_key,key_fingerprint,ttl_secs,state,created_at,is_admin)
@@ -648,6 +770,7 @@ impl MessageStore {
 
     /// Обновить таймер самоуничтожения секретного чата.
     pub async fn set_secret_ttl(&self, chat_id: i32, ttl_secs: i32) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "UPDATE secret_chats SET ttl_secs=?1 WHERE chat_id=?2",
@@ -659,6 +782,7 @@ impl MessageStore {
 
     /// Полностью удалить секретный чат и его сообщения с устройства.
     pub async fn delete_secret_chat(&self, chat_id: i32) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute("DELETE FROM secret_messages WHERE chat_id=?1", params![i64::from(chat_id)])
             .await?;
@@ -670,6 +794,7 @@ impl MessageStore {
 
     /// Сохранить сообщение секретного чата.
     pub async fn save_secret_message(&self, m: &SecretMessageRecord) -> Result<()> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO secret_messages(chat_id,random_id,outgoing,text,date,ttl_secs,expires_at)
@@ -690,6 +815,7 @@ impl MessageStore {
 
     /// Удалить просроченные самоуничтожающиеся сообщения (`expires_at > 0 && expires_at <= now`).
     pub async fn purge_expired_secret_messages(&self, now: i64) -> Result<u64> {
+        let _g = self.write_lock.lock().await;
         self.conn
             .execute(
                 "DELETE FROM secret_messages WHERE expires_at > 0 AND expires_at <= ?1",
@@ -956,6 +1082,7 @@ mod tests {
         for req in [
             "idx_messages_msg_peer",
             "idx_messages_peer_del_date",
+            "idx_messages_del_only",
             "idx_secret_msgs_chat_date",
             "idx_secret_msgs_expires",
         ] {
@@ -1044,5 +1171,51 @@ mod tests {
             assert!(del[1].deleted);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_never_collide_on_transactions() {
+        let s = std::sync::Arc::new(MessageStore::in_memory().await.unwrap());
+        let mut tasks = Vec::new();
+        for worker_idx in 0..8i64 {
+            let st = std::sync::Arc::clone(&s);
+            tasks.push(tokio::spawn(async move {
+                let items: Vec<(i32, String, i64, bool, String)> = (1..=30)
+                    .map(|k| (worker_idx as i32 * 100 + k, format!("msg {k}"), 1000 + i64::from(k), k % 2 == 0, "u".into()))
+                    .collect();
+                st.remember_many_full(worker_idx + 1, &items).await.unwrap();
+                st.mark_deleted(worker_idx + 1, &[worker_idx as i32 * 100 + 1, worker_idx as i32 * 100 + 2])
+                    .await
+                    .unwrap();
+                st.record_edit(worker_idx + 1, worker_idx as i32 * 100 + 3, "edited", 2000)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let (total, deleted, edits) = s.stats().await.unwrap();
+        assert_eq!((total, deleted, edits), (240, 16, 8));
+    }
+
+    #[tokio::test]
+    async fn scan_range_for_merge_and_prune_old_live_preserve_deleted() {
+        let s = MessageStore::in_memory().await.unwrap();
+        let items: Vec<(i32, String, i64, bool, String)> = (1..=2000)
+            .map(|id| (id, format!("row {id}"), 10_000 + i64::from(id), false, "A".into()))
+            .collect();
+        s.remember_many_full(555, &items).await.unwrap();
+        s.mark_deleted(555, &[10, 50, 1990]).await.unwrap();
+
+        let (del, live) = s.scan_range_for_merge(555, 1980, 2000).await.unwrap();
+        assert_eq!(del.len(), 1);
+        assert_eq!(del[0].msg_id, 1990);
+        assert_eq!(live.len(), 20);
+
+        let pruned = s.prune_old_live(1500).await.unwrap();
+        assert!(pruned > 0);
+        let all_del = s.deleted(555).await.unwrap();
+        assert_eq!(all_del.len(), 3);
     }
 }
