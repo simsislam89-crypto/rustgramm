@@ -1273,3 +1273,29 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo clippy --workspace --all-targets -- -D warnings` и `cargo clippy -p rg-ui --no-default-features -- -D warnings` — **0 ошибок, 0 предупреждений**.
 - `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: 21976 bytes`, `aarch64-linux-android` Full & Lite OK).
 - Добавлены тесты `rg-core::transport::tests` (3 теста на воспроизведение бага `-467886238`, реальные коды `-404`/`-429` и частичные буферы) и `rg-ui` (`lang_choices_contain_zero_cjk_tofu`, `copy_text_to_clipboard_and_act_copy_update_status`, `login_anim_mascots_render_sculpted_geometry_without_circles_on_compact_phone`, `reaction_pills_render_color_emoji_atlas_quads_and_paid_star_mesh`).
+
+## Этап 41 (2026-11-28, v0.28.0)
+
+### Apple iOS 26 / 21st.dev Liquid Glass на телефоне, плавные пружинные анимации по всему клиенту и фикс канальных реакций
+
+1. **Библиотека компонентов Apple iOS 26 / 21st.dev Liquid Glass (`crates/rg-ui/src/{glass,kit,settings_ui,chat,lib}.rs`)**:
+   - Новый модуль `glass.rs` с вариантами материала `GlassVariant::{Regular, Clear, Tinted}`: многослойная тень, полупрозрачное матовое заполнение без сине-оранжевых бликов фона, внутренний верхний блик, двуслойная спекулярная кромка (`paint_surface`), кнопка-капсула `pill_button`, плавающая нижняя панель вкладок `floating_tab_bar` (скользящая оранжевая линза по вкладкам `Чаты` / `Архив` / `Контакты` / `Настройки` с бейджами непрочитанных в узком мобильном окне) и плавающий тост `paint_toast`.
+   - Поверхности Liquid Glass применены на карточке входа `login_ui`, боковой шторке `settings_ui::drawer`, шапке чата, плашке закрепа, композере и FAB-кнопках прокрутки вниз / `@` / `❤` при `mobile_glass_active()`.
+   - Переключатель `kit::switch` получил упругое горизонтальное растяжение капсулы по мотивам 21st.dev при переключении тумблера.
+
+2. **Плавные пружинные анимации по всему приложению (`crates/rg-ui/src/lib.rs`)**:
+   - Плавное появление/скрытие плашки закрепа `pinned-bar` (`46 px * ios_spring`) и панели поиска по чату `chat-search` (`68 px * ios_spring`) с обрезкой `clip_rect` и непрозрачностью без скачков раскладки.
+   - Автоматически скрывающийся через 4 секунды плавающий статус-тост `glass::paint_toast` вместо скачущей нижней панели, анимация 3 px активной полоски выбранного чата в `dialogs_ui` и мягкий cross-fade `chat_opened_at` при открытии чата.
+
+3. **Исправление реакций в каналах на 100% (`crates/rg-ui/src/{emoji,chat,lib}.rs`)**:
+   - Добавлен `Emoji::lookup_str` и `Emoji::image_str` в `emoji.rs`: поддержка составных ZWJ/VS16 реакций Telegram (`❤️‍🔥`, `👨‍💻`, `🤷‍♂️`, `🕊️`, `☃️`) через встроенный цветной атлас `Emoji` вместо монохромного текста/пропавших иконок.
+   - В `request_reaction_docs` (`lib.rs`, вызывается также в `Ev::PinnedMessagesList`) добавлен запрос `Cmd::CustomEmojiDocs` для `ReactionPill.custom_doc_id` в пилюлях реакций.
+   - При загрузке кастомной текстуры пилюля рисует плавный мерцающий круг без текстовой заглушки; по клику (`Act::React` / `Act::ReactToggle`) `rx_pop` запускает пружинный bounce и мгновенное оптимистичное переключение пилюли.
+
+### Проверки (v0.28.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` и `cargo clippy -p rg-ui --no-default-features -- -D warnings` — **0 ошибок, 0 предупреждений**.
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED**.
+- `cargo test --workspace` — **2 210 тестов пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 69+274, `rg-net`: 6+1, `rg-settings`: 16+393, `rg-ui`: 98+631; добавлены тесты `glass::tests::glass_surface_pill_button_tab_bar_and_toast_render_cleanly`, `emoji::tests::lookup_str_resolves_zwj_vs16_and_all_telegram_channel_reactions` и 3 теста в `lib.rs` на `request_reaction_docs`, оптимистичный `ReactToggle` + `rx_pop` и мобильную Liquid Glass панель вкладок).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.28.0`) собран (**21 506 560 байт**, release 4m 26s); 3 живых smoke-запуска (`RG_DEMO=1`, `RG_DEMO=login`, `390x844 RG_MOBILE_GLASS=1 RG_DEMO=1`) — **ALIVE=True**.
+- Обновлена интерактивная веб-версия [dist/rustgramm-preview.html](file:///d:/working%20WIN/rustgramm/dist/rustgramm-preview.html) (`v0.28.0`).

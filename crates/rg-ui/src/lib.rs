@@ -8,6 +8,7 @@ mod countries;
 pub mod emoji;
 mod features_ui;
 mod frame;
+mod glass;
 pub mod icons;
 mod kit;
 mod login_anim;
@@ -634,6 +635,13 @@ struct App {
     /// 5. Ссылки-приглашения на папки чатов (`t.me/addlist/...`).
     folder_invite_preview: Option<rg_core::engine::FolderInvitePreview>,
     folder_invite_url: Option<String>,
+    /// Время клика по реакции `(msg_id, emoji)` для анимации отклика.
+    rx_pop: HashMap<(i32, String), f64>,
+    /// Время открытия текущего чата (для плавного проявления ленты).
+    chat_opened_at: f64,
+    /// Отслеживание последнего toast-статуса для автоскрытия и плавного появления.
+    status_last: String,
+    status_at: i64,
 }
 
 pub(crate) struct ShotModal {
@@ -1213,6 +1221,10 @@ impl App {
             forward_silent: false,
             folder_invite_preview: None,
             folder_invite_url: None,
+            rx_pop: HashMap::new(),
+            chat_opened_at: 0.0,
+            status_last: String::new(),
+            status_at: 0,
         }
     }
 
@@ -2279,11 +2291,23 @@ impl App {
                 }
             }
         }
-        // Загружаем текстуры всех пользовательских Premium-эмодзи из сообщений и RichMessage-блоков.
+        self.request_reaction_docs(rows);
+    }
+
+    /// Запрашивает кастомные Premium-эмодзи из текста, RichMessage-блоков и пилюль реакций канала.
+    pub(crate) fn request_reaction_docs(&mut self, rows: &[MessageRow]) {
         let mut custom_ids: Vec<i64> = Vec::new();
         for r in rows {
             for e in &r.entities {
                 if let rg_core::engine::EntityKind::CustomEmoji(doc_id) = e.kind
+                    && !self.sticker_tex.contains_key(&doc_id)
+                    && self.custom_emoji_req.insert(doc_id)
+                {
+                    custom_ids.push(doc_id);
+                }
+            }
+            for pill in &r.reaction_items {
+                if let Some(doc_id) = pill.custom_doc_id
                     && !self.sticker_tex.contains_key(&doc_id)
                     && self.custom_emoji_req.insert(doc_id)
                 {
@@ -2417,6 +2441,7 @@ impl App {
         }
         self.reset_chat_state();
         self.selected = Some(i);
+        self.chat_opened_at = -1.0;
         if let Some((id, unread, rim)) = self.dialogs.get(i).map(|d| (d.id, d.unread, d.read_inbox_max_id)) {
             self.open_unread_anchor = (unread > 0 && rim > 0).then_some(rim);
             if let Some((draft_txt, draft_reply)) = self.drafts.get(&id).cloned() {
@@ -2503,6 +2528,7 @@ impl App {
         self.found = None;
         self.reply = None;
         self.editing = None;
+        self.rx_pop.clear();
         self.search_open = false;
         self.chat_search.clear();
         self.hidden.clear();
@@ -3824,6 +3850,7 @@ impl App {
                     self.history_cache.remove(&did);
                 }
                 Ev::PinnedMessagesList(did, rows) => {
+                    self.request_reaction_docs(&rows);
                     if let Some(first) = rows.first() {
                         self.pinned_msgs.insert(did, first.clone());
                     } else {
@@ -4384,7 +4411,7 @@ impl App {
                 let glass_mobile = theme::mobile_glass_active();
                 egui::Frame::new()
                     .fill(if glass_mobile {
-                        Color32::from_rgba_unmultiplied(18, 20, 28, (235.0 * theme::opacity_f32().max(0.68)) as u8)
+                        Color32::from_rgba_unmultiplied(18, 20, 28, (226.0 * theme::opacity_f32().max(0.66)) as u8)
                     } else if compact {
                         Color32::from_rgba_unmultiplied(24, 25, 30, 250)
                     } else {
@@ -4392,12 +4419,29 @@ impl App {
                     })
                     .stroke(egui::Stroke::new(
                         1.0,
-                        Color32::from_white_alpha(if glass_mobile { 40 } else { 20 }),
+                        Color32::from_white_alpha(if glass_mobile { 46 } else { 22 }),
                     ))
-                    .corner_radius(egui::CornerRadius::same(22))
+                    .corner_radius(egui::CornerRadius::same(if glass_mobile { 24 } else { 22 }))
                     .inner_margin(egui::Margin::symmetric(margin_x, margin_y))
                     .show(ui, |ui| {
                         ui.set_width(col_w);
+                        if glass_mobile {
+                            // Внутренний спекулярный верхний блик iOS 26 Liquid Glass без фоновых пятен.
+                            let outer = ui.max_rect().expand2(Vec2::new(f32::from(margin_x), f32::from(margin_y)));
+                            let sheen = egui::Rect::from_min_max(
+                                egui::Pos2::new(outer.left() + 1.0, outer.top() + 1.0),
+                                egui::Pos2::new(outer.right() - 1.0, (outer.top() + 20.0).min(outer.bottom())),
+                            );
+                            ui.painter().rect_filled(
+                                sheen,
+                                egui::CornerRadius { nw: 23, ne: 23, sw: 2, se: 2 },
+                                Color32::from_white_alpha(12),
+                            );
+                            ui.painter().line_segment(
+                                [egui::Pos2::new(outer.left() + 24.0, outer.top() + 0.8), egui::Pos2::new(outer.right() - 24.0, outer.top() + 0.8)],
+                                egui::Stroke::new(1.0, Color32::from_white_alpha(84)),
+                            );
+                        }
                         ui.vertical_centered(|ui| match self.stage.clone() {
                             Stage::Qr(url) => self.qr_screen(ui, &url, accent),
                             _ => self.form_screen(ui, accent, bg_cut),
@@ -5500,12 +5544,14 @@ impl App {
                     };
                     let p = ui.painter();
                     p.rect_filled(rect, 0.0, fill);
-                    if selected {
+                    let act_k = theme::tween(ui.ctx(), ("dlg-act", d.id), f32::from(u8::from(selected)), 0.16);
+                    if act_k > 0.02 {
+                        let pad = (rect.height() - 16.0) * (1.0 - ios_spring(act_k)) * 0.5;
                         let accent_bar = egui::Rect::from_min_max(
-                            egui::pos2(rect.left(), rect.top() + 8.0),
-                            egui::pos2(rect.left() + 3.0, rect.bottom() - 8.0),
+                            egui::pos2(rect.left(), rect.top() + 8.0 + pad),
+                            egui::pos2(rect.left() + 3.0, rect.bottom() - 8.0 - pad),
                         );
-                        p.rect_filled(accent_bar, egui::CornerRadius::same(2), c_orange());
+                        p.rect_filled(accent_bar, egui::CornerRadius::same(2), c_orange().gamma_multiply(act_k));
                     }
                     if self.avatar_req.insert(d.id) {
                         let _ = self.cmd.send(Cmd::Avatar(i));
@@ -6032,6 +6078,29 @@ impl eframe::App for App {
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
             }
         }
+        if self.status != self.status_last {
+            self.status_last = self.status.clone();
+            self.status_at = self.now;
+        }
+        if !self.status.is_empty() && self.stage == Stage::Ready {
+            if self.now - self.status_at > 4 {
+                self.status.clear();
+                self.status_last.clear();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
+        if self.selected.is_some() && self.chat_opened_at < 0.0 {
+            self.chat_opened_at = ui_t;
+        }
+        let toast_is_err = !self.error.is_empty();
+        let toast_txt = if toast_is_err { self.error.clone() } else { self.status.clone() };
+        let toast_k = theme::tween(
+            &ctx,
+            "rg-status-toast",
+            f32::from(u8::from(self.stage == Stage::Ready && !toast_txt.is_empty())),
+            0.16,
+        );
         #[cfg(not(target_os = "android"))]
         {
             egui::Panel::top("titlebar")
@@ -6086,12 +6155,68 @@ impl eframe::App for App {
                 .show(ui, |ui| self.login_ui(ui));
             return;
         }
-        // Узкое окно (телефон): одна колонка — либо список чатов, либо открытый чат.
+        // Узкое окно (телефон): одна колонка — либо список чатов с плавающей Liquid Glass панелью вкладок, либо открытый чат.
         let narrow = ui.available_width() < NARROW_WIDTH;
         if narrow && self.selected.is_none() {
+            let main_unread: i32 = self.dialogs.iter().filter(|d| !d.archived).map(|d| d.unread).sum();
+            let arch_unread: i32 = self.dialogs.iter().filter(|d| d.archived).map(|d| d.unread).sum();
+            let active_tab = if self.tgs.open {
+                3
+            } else if self.contacts_open {
+                2
+            } else if self.in_archive {
+                1
+            } else {
+                0
+            };
+            if let Some(tab) = egui::Panel::bottom("mobile-glass-tabs")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
+                .show(ui, |ui| {
+                    glass::floating_tab_bar(
+                        ui,
+                        "mob-nav",
+                        &[
+                            ("menu/chats", "Чаты", main_unread),
+                            ("menu/archive", "Архив", arch_unread),
+                            ("folders/folders_type_contacts", "Контакты", 0),
+                            ("menu/settings", "Настройки", 0),
+                        ],
+                        active_tab,
+                    )
+                })
+                .inner
+            {
+                match tab {
+                    0 => {
+                        self.in_archive = false;
+                        self.contacts_open = false;
+                        self.tgs.open = false;
+                    }
+                    1 => {
+                        self.in_archive = true;
+                        self.contacts_open = false;
+                        self.tgs.open = false;
+                        if !self.archive_loaded {
+                            self.archive_loaded = true;
+                            self.send(Cmd::LoadArchive);
+                        }
+                    }
+                    2 => {
+                        self.contacts_open = true;
+                        self.tgs.open = false;
+                        self.contact_search.clear();
+                        self.send(Cmd::Contacts);
+                    }
+                    _ => {
+                        self.tgs.open = true;
+                        self.contacts_open = false;
+                    }
+                }
+            }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.dialogs_ui(ui));
+            glass::paint_toast(&ctx, &toast_txt, toast_is_err, toast_k);
             self.render_modals(&ctx, frame);
             return;
         }
@@ -6135,32 +6260,44 @@ impl eframe::App for App {
         }
         let glass_mobile = theme::mobile_glass_active();
         let header_frame = if glass_mobile {
-            egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 168))
-                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
+            egui::Frame::NONE
         } else {
             egui::Frame::new().fill(tint_panel())
         };
         egui::Panel::top("header")
             .exact_size(TOP_BAR_HEIGHT)
             .frame(header_frame)
-            .show(ui, |ui| self.header_ui(ui, narrow));
+            .show(ui, |ui| {
+                if glass_mobile {
+                    glass::paint_surface(ui.painter(), ui.max_rect(), 0.0, glass::GlassVariant::Regular, 0.0);
+                }
+                self.header_ui(ui, narrow);
+            });
         let has_pinned_bar = self.selected.and_then(|i| self.dialogs.get(i)).is_some_and(|d| {
             self.pinned_lists.get(&d.id).is_some_and(|l| !l.is_empty())
                 || self.pinned_msgs.contains_key(&d.id)
         });
-        if has_pinned_bar {
+        let pin_k = theme::tween(&ctx, "pinned-bar-anim", f32::from(u8::from(has_pinned_bar)), 0.18);
+        if pin_k > 0.02 {
+            let pin_h = (46.0 * ios_spring(pin_k)).max(2.0);
             let pin_frame = if glass_mobile {
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 162))
-                    .inner_margin(egui::Margin::ZERO)
+                egui::Frame::NONE.inner_margin(egui::Margin::ZERO)
             } else {
                 egui::Frame::new().fill(tint_panel()).inner_margin(egui::Margin::ZERO)
             };
             egui::Panel::top("pinned-bar")
-                .exact_size(46.0)
+                .exact_size(pin_h)
                 .frame(pin_frame)
-                .show(ui, |ui| self.pinned_bar_ui(ui));
+                .show(ui, |ui| {
+                    ui.set_clip_rect(ui.max_rect());
+                    ui.set_opacity(pin_k);
+                    if glass_mobile {
+                        glass::paint_surface(ui.painter(), ui.max_rect(), 0.0, glass::GlassVariant::Regular, 0.0);
+                    }
+                    if pin_h >= 24.0 {
+                        self.pinned_bar_ui(ui);
+                    }
+                });
         }
         if self.audio_path.is_some() || self.audio_stream.is_some() {
             egui::Panel::top("audio-bar")
@@ -6174,33 +6311,26 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(tint_panel()))
                 .show(ui, |ui| self.translate_chat_bar(ui));
         }
-        if !self.status.is_empty() || !self.error.is_empty() {
-            egui::Panel::bottom("status")
-                .frame(
-                    egui::Frame::new()
-                        .fill(t(WINDOW_BG))
-                        .inner_margin(egui::Margin::symmetric(12, 4)),
-                )
+        let search_k = theme::tween(&ctx, "chat-search-anim", f32::from(u8::from(self.search_open && self.selected.is_some())), 0.18);
+        if search_k > 0.02 && self.selected.is_some() {
+            let sh = (68.0 * ios_spring(search_k)).max(2.0);
+            egui::Panel::top("chat-search")
+                .exact_size(sh)
+                .frame(if glass_mobile { egui::Frame::NONE } else { egui::Frame::new().fill(tint_panel()) })
                 .show(ui, |ui| {
-                    if !self.error.is_empty() {
-                        ui.colored_label(DANGER, &self.error);
-                    } else {
-                        ui.label(RichText::new(&self.status).color(SUBTEXT));
+                    ui.set_clip_rect(ui.max_rect());
+                    ui.set_opacity(search_k);
+                    if glass_mobile {
+                        glass::paint_surface(ui.painter(), ui.max_rect(), 0.0, glass::GlassVariant::Regular, 0.0);
+                    }
+                    if sh >= 32.0 {
+                        self.search_bar(ui);
                     }
                 });
         }
-        if self.search_open && self.selected.is_some() {
-            egui::Panel::top("chat-search")
-                .exact_size(68.0)
-                .frame(egui::Frame::new().fill(tint_panel()))
-                .show(ui, |ui| self.search_bar(ui));
-        }
         if self.selected.is_some() {
             let comp_frame = if glass_mobile {
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 172))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(26)))
-                    .inner_margin(egui::Margin::symmetric(8, 4))
+                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 4))
             } else {
                 egui::Frame::new()
                     .fill(tint_panel())
@@ -6208,7 +6338,13 @@ impl eframe::App for App {
             };
             egui::Panel::bottom("composer")
                 .frame(comp_frame)
-                .show(ui, |ui| self.composer_ui(ui));
+                .show(ui, |ui| {
+                    if glass_mobile {
+                        let outer = ui.max_rect().expand2(Vec2::new(8.0, 4.0));
+                        glass::paint_surface(ui.painter(), outer, 16.0, glass::GlassVariant::Regular, 0.0);
+                    }
+                    self.composer_ui(ui);
+                });
         }
         // Стабильные отступы ленты при входе в чат (без покадрового смещения inner_margin.left,
         // которое переносило строки и вызывало дёргание сообщений при открытии чата!).
@@ -6260,12 +6396,22 @@ impl eframe::App for App {
                     wp_tex,
                     self.settings.theme.wallpaper_dim,
                 );
+                let chat_fade = if self.chat_opened_at > 0.0 {
+                    ((ui_t - self.chat_opened_at) / 0.14).clamp(0.0, 1.0) as f32
+                } else {
+                    1.0
+                };
+                if chat_fade < 0.99 {
+                    ctx.request_repaint();
+                    ui.set_opacity(chat_fade);
+                }
                 self.messages_ui(ui);
             });
         // Плавающее мини-окно эмодзи/стикеров/GIF работает и на узком экране, и при наведении на ПК!
         if narrow || (self.emoji_hover_open && !self.emoji_open) {
             self.emoji_window(&ctx);
         }
+        glass::paint_toast(&ctx, &toast_txt, toast_is_err, toast_k);
         self.render_modals(&ctx, frame);
     }
 
@@ -8089,5 +8235,110 @@ mod tests {
         assert!(star_meshes >= 1, "paid star reaction pill must render gold star mesh");
         assert!(txt.contains('5') && txt.contains('9'), "reaction counters missing: {txt}");
         assert!(!txt.contains("👍 5"), "monochrome raw emoji fallback must not be used when Emoji atlas loaded");
+    }
+
+    #[test]
+    fn request_previews_queues_custom_emoji_docs_from_reaction_items() {
+        let (cmd, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = demo_app("1");
+        app.cmd = cmd;
+        let mut msg = MessageRow::plain(88, "Канальный пост".into(), false, app.now);
+        msg.reaction_items = vec![rg_core::engine::ReactionPill {
+            emoji: String::new(),
+            custom_doc_id: Some(9_001_002),
+            count: 3,
+            chosen: false,
+            paid: false,
+        }];
+        let rows = vec![msg];
+        app.request_reaction_docs(&rows);
+        let mut found = false;
+        while let Ok(c) = cmd_rx.try_recv() {
+            if let Cmd::CustomEmojiDocs(ids) = c
+                && ids.contains(&9_001_002)
+            {
+                found = true;
+            }
+        }
+        assert!(found, "request_reaction_docs must queue Cmd::CustomEmojiDocs for pill custom_doc_id");
+    }
+
+    #[test]
+    fn optimistic_reaction_toggle_updates_pills_and_records_pop_time() {
+        let ctx = egui::Context::default();
+        let mut app = demo_app("1");
+        let mut msg = MessageRow::plain(91, "Тест клика по реакции".into(), false, app.now);
+        msg.reaction_items = vec![rg_core::engine::ReactionPill {
+            emoji: "🔥".into(),
+            custom_doc_id: None,
+            count: 4,
+            chosen: false,
+            paid: false,
+        }];
+        app.messages = vec![msg];
+        app.apply(&ctx, chat::Act::ReactToggle(91, "🔥".into(), false));
+        let pill = &app.messages[0].reaction_items[0];
+        assert!(pill.chosen && pill.count == 5, "optimistic ReactToggle should mark chosen and increment count");
+        assert!(app.rx_pop.contains_key(&(91, "🔥".to_owned())), "rx_pop must record click timestamp");
+
+        app.apply(&ctx, chat::Act::ReactToggle(91, "🔥".into(), true));
+        let pill = &app.messages[0].reaction_items[0];
+        assert!(!pill.chosen && pill.count == 4, "second ReactToggle should unchoose and decrement count");
+    }
+
+    #[test]
+    fn mobile_liquid_glass_tab_bar_and_animated_panels_render_on_phone_viewport() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.selected = None;
+        app.status = "Скопировано в буфер обмена".into();
+        let mut out_shapes = Vec::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(390.0, 844.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::bottom("mobile-glass-tabs")
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
+                    .show(ui, |ui| {
+                        glass::floating_tab_bar(
+                            ui,
+                            "mob-nav",
+                            &[
+                                ("menu/chats", "Чаты", 3),
+                                ("menu/archive", "Архив", 1),
+                                ("folders/folders_type_contacts", "Контакты", 0),
+                                ("menu/settings", "Настройки", 0),
+                            ],
+                            0,
+                        )
+                    });
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(tint_panel()))
+                    .show(ui, |ui| app.dialogs_ui(ui));
+                glass::paint_toast(&ctx, &app.status, false, 1.0);
+            });
+            out.textures_delta.clear();
+            out_shapes = out.shapes;
+        }
+        let mut txt = String::new();
+        fn collect(s: &egui::Shape, buf: &mut String) {
+            match s {
+                egui::Shape::Text(t) => {
+                    buf.push_str(t.galley.text());
+                    buf.push('\n');
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|x| collect(x, buf)),
+                _ => {}
+            }
+        }
+        out_shapes.iter().for_each(|cs| collect(&cs.shape, &mut txt));
+        assert!(
+            txt.contains("Чаты") && txt.contains("Архив") && txt.contains("Контакты") && txt.contains("Настройки"),
+            "mobile Liquid Glass tabs missing: {txt}"
+        );
+        assert!(txt.contains("Скопировано в буфер обмена"), "floating glass toast text missing: {txt}");
     }
 }

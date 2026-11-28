@@ -136,6 +136,8 @@ struct Env<'a> {
     exact_numbers: bool,
     /// Скрыть боковую кнопку пересылки справа от постов (`extera.hide_share_button`).
     hide_share_button: bool,
+    /// Время клика по реакции `(msg_id, emoji)` для упругой вспышки-отклика.
+    rx_pop: &'a HashMap<(i32, String), f64>,
 }
 
 fn time_label(ts: i64, seconds: bool) -> String {
@@ -3791,6 +3793,7 @@ impl App {
                 rich_cache: &self.rich_runs_cache,
                 exact_numbers: self.settings.extera.disable_number_rounding,
                 hide_share_button: self.settings.extera.hide_share_button,
+                rx_pop: &self.rx_pop,
                 avail: cur_avail,
                 s: &self.settings.ayu,
                 tex: &self.textures,
@@ -4028,9 +4031,16 @@ impl App {
                     ((36.0 + 90.0 * hk) * down_raw) as u8,
                 );
                 let p = ui.painter();
-                // Мягкая тень под кнопкой, как в Telegram Desktop.
                 let shadow_a = (44.0 * down_raw) as u8;
-                if square {
+                if super::theme::mobile_glass_active() {
+                    let g_rect = if square {
+                        fab_rect
+                    } else {
+                        Rect::from_center_size(center, Vec2::splat(fab_sz))
+                    };
+                    let g_rad = if square { 13.0 } else { fab_sz * 0.5 };
+                    super::glass::paint_surface(p, g_rect, g_rad, super::glass::GlassVariant::Clear, hk);
+                } else if square {
                     p.rect_filled(fab_rect.translate(Vec2::new(0.0, 2.0)).expand(2.0), egui::CornerRadius::same(14), Color32::from_black_alpha(shadow_a));
                     p.rect_filled(fab_rect, egui::CornerRadius::same(13), base_bg);
                     p.rect_stroke(fab_rect, egui::CornerRadius::same(13), egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
@@ -4070,13 +4080,22 @@ impl App {
                 let c = Pos2::new(clip_rect.right() - 32.0, fab_y);
                 let r = Rect::from_center_size(c, Vec2::splat(40.0));
                 let resp = ui.interact(r, ui.make_persistent_id("mention-jump-fab"), Sense::click());
-                let bg = if resp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
-                if square {
-                    ui.painter().rect_filled(r, egui::CornerRadius::same(13), bg);
-                    ui.painter().rect_stroke(r, egui::CornerRadius::same(13), egui::Stroke::new(1.0, Color32::from_white_alpha(32)), egui::StrokeKind::Inside);
+                if super::theme::mobile_glass_active() {
+                    let v = if resp.hovered() {
+                        super::glass::GlassVariant::Tinted(ORANGE)
+                    } else {
+                        super::glass::GlassVariant::Regular
+                    };
+                    super::glass::paint_surface(ui.painter(), r, if square { 13.0 } else { 20.0 }, v, 0.25);
                 } else {
-                    ui.painter().circle_filled(c, 20.0, bg);
-                    ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+                    let bg = if resp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
+                    if square {
+                        ui.painter().rect_filled(r, egui::CornerRadius::same(13), bg);
+                        ui.painter().rect_stroke(r, egui::CornerRadius::same(13), egui::Stroke::new(1.0, Color32::from_white_alpha(32)), egui::StrokeKind::Inside);
+                    } else {
+                        ui.painter().circle_filled(c, 20.0, bg);
+                        ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+                    }
                 }
                 ui.painter().text(c, egui::Align2::CENTER_CENTER, "@", FontId::proportional(17.0), WHITE);
                 if show_cnt {
@@ -4097,13 +4116,22 @@ impl App {
                 let r = Rect::from_center_size(c, Vec2::splat(40.0));
                 let resp = ui.interact(r, ui.make_persistent_id("react-jump-fab"), Sense::click());
                 let rose = Color32::from_rgb(232, 74, 95);
-                let bg = if resp.hovered() { rose } else { t2(WINDOW_BG) };
-                if square {
-                    ui.painter().rect_filled(r, egui::CornerRadius::same(13), bg);
-                    ui.painter().rect_stroke(r, egui::CornerRadius::same(13), egui::Stroke::new(1.0, Color32::from_white_alpha(32)), egui::StrokeKind::Inside);
+                if super::theme::mobile_glass_active() {
+                    let v = if resp.hovered() {
+                        super::glass::GlassVariant::Tinted(rose)
+                    } else {
+                        super::glass::GlassVariant::Regular
+                    };
+                    super::glass::paint_surface(ui.painter(), r, if square { 13.0 } else { 20.0 }, v, 0.25);
                 } else {
-                    ui.painter().circle_filled(c, 20.0, bg);
-                    ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+                    let bg = if resp.hovered() { rose } else { t2(WINDOW_BG) };
+                    if square {
+                        ui.painter().rect_filled(r, egui::CornerRadius::same(13), bg);
+                        ui.painter().rect_stroke(r, egui::CornerRadius::same(13), egui::Stroke::new(1.0, Color32::from_white_alpha(32)), egui::StrokeKind::Inside);
+                    } else {
+                        ui.painter().circle_filled(c, 20.0, bg);
+                        ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
+                    }
                 }
                 ui.painter().text(c, egui::Align2::CENTER_CENTER, "❤", FontId::proportional(15.0), WHITE);
                 if show_cnt {
@@ -4593,8 +4621,46 @@ impl App {
             }
             Act::Forward(id) => self.forward = Some(id),
             Act::Pin(id, on) => self.send(Cmd::Pin(id, on)),
-            Act::React(id, e) => self.send(Cmd::React(id, e)),
-            Act::ReactToggle(id, e, chosen) => self.send(Cmd::ReactToggle(id, e, chosen)),
+            Act::React(id, e) => {
+                self.rx_pop.insert((id, e.clone()), ctx.input(|i| i.time));
+                if let Some(m) = self.messages.iter_mut().find(|m| m.id == id) {
+                    if let Some(p) = m.reaction_items.iter_mut().find(|p| !p.paid && p.emoji == e) {
+                        if p.chosen {
+                            p.chosen = false;
+                            p.count = (p.count - 1).max(0);
+                        } else {
+                            p.chosen = true;
+                            p.count += 1;
+                        }
+                        m.reaction_items.retain(|x| x.count > 0);
+                    } else {
+                        m.reaction_items.push(rg_core::engine::ReactionPill {
+                            emoji: e.clone(),
+                            custom_doc_id: None,
+                            count: 1,
+                            chosen: true,
+                            paid: false,
+                        });
+                    }
+                }
+                self.send(Cmd::React(id, e));
+            }
+            Act::ReactToggle(id, e, chosen) => {
+                self.rx_pop.insert((id, e.clone()), ctx.input(|i| i.time));
+                if let Some(m) = self.messages.iter_mut().find(|m| m.id == id)
+                    && let Some(p) = m.reaction_items.iter_mut().find(|p| !p.paid && p.emoji == e)
+                {
+                    if chosen {
+                        p.chosen = false;
+                        p.count = (p.count - 1).max(0);
+                    } else {
+                        p.chosen = true;
+                        p.count += 1;
+                    }
+                    m.reaction_items.retain(|x| x.count > 0);
+                }
+                self.send(Cmd::ReactToggle(id, e, chosen));
+            }
             Act::PaidReact(id) => self.paid_react_msg = Some(id),
             Act::Delete(id) => self.confirm_delete = Some(id),
             Act::Repeat(text) => {
@@ -6563,16 +6629,16 @@ fn bubble(
                     });
                     if !m.deleted && !m.reaction_items.is_empty() && reactions_visible(s) {
                         ui.add_space(5.0);
+                        let glass_m = super::theme::mobile_glass_active();
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
                             for pill in &m.reaction_items {
                                 let cnt_str = rg_core::engine::format_compact_count(pill.count, env.exact_numbers);
                                 let font_id = FontId::proportional(12.0);
-                                let emoji_ch = pill.emoji.chars().next();
                                 let has_color_emoji = !pill.paid
                                     && pill.custom_doc_id.is_none()
-                                    && emoji_ch.and_then(|ch| env.emoji.and_then(|em| em.image(ch, 17.5))).is_some();
-                                let has_custom = pill.custom_doc_id.is_some_and(|did| env.custom_tex.contains_key(&did));
+                                    && env.emoji.and_then(|em| em.image_str(&pill.emoji, 18.0)).is_some();
+                                let has_custom = pill.custom_doc_id.is_some();
                                 let text_col = if pill.paid {
                                     Color32::from_rgb(255, 228, 136)
                                 } else if pill.chosen {
@@ -6582,19 +6648,32 @@ fn bubble(
                                 };
                                 let count_gal = ui.painter().layout_no_wrap(cnt_str.clone(), font_id.clone(), text_col);
                                 let pw = if pill.paid || has_custom || has_color_emoji {
-                                    (8.0 + 17.5 + 5.0 + count_gal.size().x + 9.0).max(46.0)
+                                    (8.0 + 18.0 + 5.0 + count_gal.size().x + 9.0).max(48.0)
                                 } else {
                                     let lbl = format!("{} {cnt_str}", pill.emoji);
                                     let g = ui.painter().layout_no_wrap(lbl, font_id.clone(), text_col);
-                                    (g.size().x + 18.0).max(42.0)
+                                    (g.size().x + 18.0).max(44.0)
                                 };
                                 let (pr, presp) = ui.allocate_exact_size(Vec2::new(pw, 26.0), Sense::hover());
                                 let hk = tween(ui.ctx(), ("rxp", m.id, &pill.emoji), f32::from(u8::from(presp.hovered())), 0.12);
-                                let pop = 1.0 + 0.09 * ios_spring_bounce(hk);
+                                let click_pop = env
+                                    .rx_pop
+                                    .get(&(m.id, pill.emoji.clone()))
+                                    .map(|&t0| {
+                                        let dt = ((env.time - t0) / 0.24).clamp(0.0, 1.0) as f32;
+                                        if dt < 1.0 {
+                                            ui.ctx().request_repaint();
+                                            (dt * std::f32::consts::PI).sin() * 0.26
+                                        } else {
+                                            0.0
+                                        }
+                                    })
+                                    .unwrap_or(0.0);
+                                let pop = 1.0 + 0.09 * ios_spring_bounce(hk) + click_pop;
                                 let (bg, border) = if pill.chosen && !pill.paid {
                                     (
-                                        t_btn(c_orange()).gamma_multiply(0.30 + 0.14 * hk),
-                                        t_btn(c_orange()).gamma_multiply(0.88),
+                                        t_btn(c_orange()).gamma_multiply(0.32 + 0.14 * hk),
+                                        t_btn(c_orange()).gamma_multiply(0.90),
                                     )
                                 } else if pill.paid {
                                     (
@@ -6603,8 +6682,8 @@ fn bubble(
                                     )
                                 } else {
                                     (
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, (18.0 + 16.0 * hk) as u8),
-                                        Color32::from_white_alpha((28.0 + 26.0 * hk) as u8),
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, (20.0 + 16.0 * hk) as u8),
+                                        Color32::from_white_alpha((30.0 + 26.0 * hk) as u8),
                                     )
                                 };
                                 ui.painter().rect_filled(pr, egui::CornerRadius::same(13), bg);
@@ -6614,8 +6693,14 @@ fn bubble(
                                     egui::Stroke::new(1.0, border),
                                     egui::StrokeKind::Inside,
                                 );
+                                if glass_m {
+                                    ui.painter().line_segment(
+                                        [Pos2::new(pr.left() + 10.0, pr.top() + 0.8), Pos2::new(pr.right() - 10.0, pr.top() + 0.8)],
+                                        egui::Stroke::new(1.0, Color32::from_white_alpha(64)),
+                                    );
+                                }
                                 let icon_c = Pos2::new(pr.left() + 16.5, pr.center().y);
-                                let text_pos = Pos2::new(pr.left() + 29.5, pr.center().y);
+                                let text_pos = Pos2::new(pr.left() + 30.0, pr.center().y);
                                 if pill.paid {
                                     icons::paint_star(
                                         ui.painter(),
@@ -6630,11 +6715,19 @@ fn bubble(
                                         font_id,
                                         text_col,
                                     );
-                                } else if let Some(did) = pill.custom_doc_id
-                                    && let Some(tex) = env.custom_tex.get(&did)
-                                {
-                                    let ir = Rect::from_center_size(icon_c, Vec2::splat(17.5 * pop));
-                                    egui::Image::new(tex).fit_to_exact_size(ir.size()).paint_at(ui, ir);
+                                } else if let Some(did) = pill.custom_doc_id {
+                                    if let Some(tex) = env.custom_tex.get(&did) {
+                                        let ir = Rect::from_center_size(icon_c, Vec2::splat(18.0 * pop));
+                                        egui::Image::new(tex).fit_to_exact_size(ir.size()).paint_at(ui, ir);
+                                    } else {
+                                        let pulse = 0.5 + 0.5 * ((env.time * 4.2).sin() as f32);
+                                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(45));
+                                        ui.painter().circle_filled(
+                                            icon_c,
+                                            7.5,
+                                            Color32::from_white_alpha((26.0 + 28.0 * pulse) as u8),
+                                        );
+                                    }
                                     ui.painter().text(
                                         text_pos,
                                         egui::Align2::LEFT_CENTER,
@@ -6642,10 +6735,8 @@ fn bubble(
                                         font_id,
                                         text_col,
                                     );
-                                } else if let Some(ch) = emoji_ch
-                                    && let Some(img) = env.emoji.and_then(|em| em.image(ch, 17.5 * pop))
-                                {
-                                    let ir = Rect::from_center_size(icon_c, Vec2::splat(17.5 * pop));
+                                } else if let Some(img) = env.emoji.and_then(|em| em.image_str(&pill.emoji, 18.0 * pop)) {
+                                    let ir = Rect::from_center_size(icon_c, Vec2::splat(18.0 * pop));
                                     img.paint_at(ui, ir);
                                     ui.painter().text(
                                         text_pos,
@@ -7085,9 +7176,7 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                                 );
                             }
                             let scale_sz = 19.5 * (1.0 + 0.16 * ios_spring_bounce(hk));
-                            if let Some(ch) = e.chars().next()
-                                && let Some(img) = env.emoji.and_then(|em| em.image(ch, scale_sz))
-                            {
+                            if let Some(img) = env.emoji.and_then(|em| em.image_str(e, scale_sz)) {
                                 img.paint_at(ui, Rect::from_center_size(r_rect.center(), Vec2::splat(scale_sz)));
                             } else {
                                 ui.painter().text(
@@ -7586,6 +7675,7 @@ mod tests {
                 rich_cache: &rich_cache,
                 exact_numbers: false,
                 hide_share_button: false,
+                rx_pop: &HashMap::new(),
             };
             let mut acts = Vec::new();
             let raw = egui::RawInput {

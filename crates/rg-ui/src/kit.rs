@@ -66,10 +66,11 @@ fn row_bg(ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
     }
 }
 
-/// Переключатель Telegram: классическая «таблетка» или Material Design 3 (`material_switches`).
+/// Переключатель Telegram / iOS Liquid Glass (`material_switches`, эластичная капля при сдвиге).
 fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
-    let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.15);
+    let lin = tween(ui.ctx(), ("sw", key, center.y as i32), f32::from(u8::from(on)), 0.16);
     let k = if on { ios_spring(lin) } else { 1.0 - ios_spring(1.0 - lin) };
+    let stretch = (1.0 - (2.0 * k - 1.0).abs()).max(0.0);
     if MD3_SWITCHES.load(Ordering::Relaxed) {
         let track = Rect::from_center_size(center, Vec2::new(38.0, 20.0));
         let off_fill = t_btn(TRACK_OFF).gamma_multiply(0.45);
@@ -84,14 +85,20 @@ fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
             );
         }
         let radius = 5.5 + 1.5 * k;
-        let knob = Pos2::new(track.left() + 10.0 + k * (track.width() - 20.0), center.y);
-        ui.painter().circle_filled(knob, radius, Color32::WHITE);
+        let knob_x = track.left() + 10.0 + k * (track.width() - 20.0);
+        let kw = radius * 2.0 + 4.8 * stretch;
+        let kh = radius * 2.0 - 0.8 * stretch;
+        let knob_r = Rect::from_center_size(Pos2::new(knob_x, center.y), Vec2::new(kw, kh));
+        ui.painter()
+            .rect_filled(knob_r, CornerRadius::same((kh * 0.5).round() as u8), Color32::WHITE);
     } else {
         let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
         let fill = lerp_color(t_btn(TRACK_OFF), t_btn(ORANGE), lin);
         ui.painter().rect_filled(track, CornerRadius::same(7), fill);
-        let knob = Pos2::new(track.left() + 7.0 + k * (track.width() - 14.0), center.y);
-        ui.painter().circle_filled(knob, 6.0, Color32::WHITE);
+        let knob_x = track.left() + 7.0 + k * (track.width() - 14.0);
+        let kw = 12.0 + 3.6 * stretch;
+        let knob_r = Rect::from_center_size(Pos2::new(knob_x, center.y), Vec2::new(kw, 12.0));
+        ui.painter().rect_filled(knob_r, CornerRadius::same(6), Color32::WHITE);
     }
 }
 

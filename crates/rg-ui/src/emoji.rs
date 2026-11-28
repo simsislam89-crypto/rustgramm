@@ -197,6 +197,31 @@ impl Emoji {
         self.tex.id()
     }
 
+    /// Подбирает базовый символ из атласа для обычных, VS16 (`❤️`) и составных ZWJ-реакций (`❤️‍🔥`, `👨‍💻`, `🤷‍♂️`).
+    pub fn lookup_str(&self, s: &str) -> Option<char> {
+        let trimmed = s.trim();
+        if let Some(mapped) = match trimmed {
+            "❤️‍🔥" | "❤‍🔥" => Some('🔥'),
+            "👨\u{200d}💻" => Some('💻'),
+            "🤷\u{200d}♂\u{fe0f}" | "🤷\u{200d}♂" | "🤷\u{200d}♀\u{fe0f}" | "🤷\u{200d}♀" => Some('🤷'),
+            "🕊\u{fe0f}" => Some('🕊'),
+            "☃\u{fe0f}" => Some('☃'),
+            _ => None,
+        } && self.index.contains_key(&mapped)
+        {
+            return Some(mapped);
+        }
+        trimmed
+            .chars()
+            .filter(|c| !is_modifier(*c))
+            .find(|c| self.index.contains_key(c))
+    }
+
+    /// Картинка эмодзи по строке (поддерживает составные реакции Telegram).
+    pub fn image_str(&self, s: &str, size: f32) -> Option<egui::Image<'static>> {
+        self.lookup_str(s).and_then(|c| self.image(c, size))
+    }
+
     /// Картинка эмодзи нужного размера (в логических пикселях).
     pub fn image(&self, c: char, size: f32) -> Option<egui::Image<'static>> {
         let n = *self.index.get(&c)?;
@@ -484,5 +509,17 @@ mod tests {
             }
         }
         let _elapsed = t0.elapsed();
+    }
+
+    #[test]
+    fn lookup_str_resolves_zwj_vs16_and_all_telegram_channel_reactions() {
+        let ctx = egui::Context::default();
+        let atlas = Emoji::load(&ctx).expect("emoji atlas must load");
+        for sample in ["❤️‍🔥", "❤‍🔥", "👍", "👎", "🔥", "🤯", "👨‍💻", "🕊️", "🫡", "🗿", "🤡", "⚡"] {
+            assert!(
+                atlas.image_str(sample, 18.0).is_some(),
+                "channel reaction `{sample}` failed to resolve in Emoji atlas"
+            );
+        }
     }
 }

@@ -90,8 +90,19 @@ impl App {
             .fixed_pos(Pos2::new(-(1.0 - open) * w, 0.0))
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(w, screen.height()), Sense::hover());
-                // Многослойное матовое стекло для левой шторки (глубже, чище, без плоского квадрата).
-                paint_frosted_glass_panel(ui.painter(), rect, 0.0, open);
+                // Многослойное матовое стекло для левой шторки (на мобильных — iOS 26 Liquid Glass).
+                if super::theme::mobile_glass_active() {
+                    ui.set_opacity(open);
+                    super::glass::paint_surface(
+                        ui.painter(),
+                        rect.shrink2(Vec2::new(0.0, 4.0)),
+                        18.0,
+                        super::glass::GlassVariant::Regular,
+                        0.0,
+                    );
+                } else {
+                    paint_frosted_glass_panel(ui.painter(), rect, 0.0, open);
+                }
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let ui = &mut child;
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
