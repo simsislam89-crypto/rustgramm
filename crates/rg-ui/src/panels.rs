@@ -39,6 +39,12 @@ pub(crate) enum StickerAct {
     ReloadGifs,
     /// Отправить бросок/игру (`🎲`, `🎯`, `🏀`, `⚽`, `🎰`, `🎳`).
     SendDice(String),
+    /// Очистить список недавних стикеров (`messages.clearRecentStickers`).
+    ClearRecent,
+    /// Добавить или убрать стикер из избранного (`messages.faveSticker`).
+    Fave(rg_core::engine::StickerRow, bool),
+    /// Добавить или убрать GIF из сохранённых (`messages.saveGif`).
+    SaveGif(rg_core::engine::StickerRow, bool),
 }
 
 impl App {
@@ -619,9 +625,20 @@ impl App {
                                 ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_rgba_unmultiplied(255, 255, 255, 12));
                             }
                         }
-                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
                             acts.push(StickerAct::Send(g.id));
                         }
+                        let g_clone = g.clone();
+                        egui::Popup::context_menu(&resp)
+                            .frame(super::kit::compact_popup_frame())
+                            .show(|ui| {
+                                ui.set_min_width(170.0);
+                                if super::kit::menu_item(ui, "menu/delete", "Убрать из GIF", true) {
+                                    acts.push(StickerAct::SaveGif(g_clone.clone(), true));
+                                    ui.close();
+                                }
+                            });
                     }
                 }
             },
@@ -753,7 +770,16 @@ impl App {
         let width = ui.available_width();
         let cell = (width / cols as f32).max(48.0);
         ui.add_space(4.0);
-        ui.label(egui::RichText::new(title).size(12.5).color(Color32::from_rgb(160, 160, 170)));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).size(12.5).color(Color32::from_rgb(160, 160, 170)));
+            if has_rec && cur == usize::from(has_fav) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Очистить").on_hover_text("Очистить недавние стикеры").clicked() {
+                        acts.push(StickerAct::ClearRecent);
+                    }
+                });
+            }
+        });
         ui.add_space(4.0);
         let total_rows = list.map_or(1, |l| l.len().div_ceil(cols));
         egui::ScrollArea::vertical()
@@ -791,9 +817,22 @@ impl App {
                         } else if let Some(img) = emoji.and_then(|e| st.emoji.chars().next().and_then(|c| e.image(c, 34.0))) {
                             img.paint_at(ui, Rect::from_center_size(r.center(), Vec2::splat(34.0)));
                         }
-                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
                             acts.push(StickerAct::Send(st.id));
                         }
+                        let is_fav = self.faved_stickers.iter().any(|f| f.id == st.id);
+                        let st_clone = st.clone();
+                        egui::Popup::context_menu(&resp)
+                            .frame(super::kit::compact_popup_frame())
+                            .show(|ui| {
+                                ui.set_min_width(176.0);
+                                let lbl = if is_fav { "Убрать из избранного" } else { "Добавить в избранное" };
+                                if super::kit::menu_item(ui, "menu/favorite", lbl, false) {
+                                    acts.push(StickerAct::Fave(st_clone.clone(), is_fav));
+                                    ui.close();
+                                }
+                            });
                     }
                 }
             });

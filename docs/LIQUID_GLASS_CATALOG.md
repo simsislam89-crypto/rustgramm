@@ -1,8 +1,8 @@
-# Каталог Liquid Glass и Fluid UI — Очередь оставшихся компонентов (62)
+# Каталог Liquid Glass и Fluid UI — Очередь оставшихся компонентов (61)
 
-Оставшиеся референсы и паттерны **iOS 26 Liquid Glass / матовое стекло / пружинные микроанимации**, ещё **не** портированные в Rustgramm (`v0.31.0`). В разделе 1 сохранены **15** неприсланных компонентов `21st.dev` из расширенного списка библиотеки для последующих этапов, а далее — оставшиеся **47** позиций из `ReactBits`, `Aceternity UI`, `Magic UI`, `Motion Primitives`, `GlassCN` и `Uiverse`. Все уже перенесённые компоненты (включая пакет `v0.31.0`: `Modal Dialog Frame`, `Command Palette Kbar`, `Tooltip Card`, `Flowing Menu`, `Elastic Slider`, `Bounce Cards`, `Animated List`, `Counter`, `Magnet Button`, `Star Border`, `Spotlight Card`, `Gooey Nav`, `Gradual Blur`, `Bubble Menu`, `Folder Reveal`, а также `v0.28–v0.30`: `GlassEffect`/`GlassDock`, `NotificationPopover`, `ExpandableSidebar`, `AppleSpotlight`, `ChatComposer`, `SegmentedTabs`, `OtpInput`, `GlassCard`, `PillButton`, `FloatingTabBar`, `Toast`, `SlidingPill`, `KeypadKeys`, `Switch`, `FloatingDock`, `ActionSheet`) удалены из очереди.
+Оставшиеся референсы и паттерны **iOS 26 Liquid Glass / матовое стекло / пружинные микроанимации**, ещё **не** портированные в Rustgramm (`v0.32.0`). В разделе 1 сохранены **15** неприсланных компонентов `21st.dev` из расширенного списка библиотеки для последующих этапов, а далее — оставшиеся **46** позиций из `Aceternity UI`, `Magic UI`, `Motion Primitives`, `GlassCN` и `Uiverse`. Все уже перенесённые компоненты (включая пакет `v0.32.0`: `Tilted Card` от ReactBits + глубокая переработка `GlassEffect`, `NotificationPopover`, `ExpandableSidebar`, `AppleSpotlight`, `AIComposer`, `macOS Dock`, `OtpInput`, а также `v0.28–v0.31`: `Modal Dialog Frame`, `Command Palette Kbar`, `Tooltip Card`, `Flowing Menu`, `Elastic Slider`, `Bounce Cards`, `Animated List`, `Counter`, `Magnet Button`, `Star Border`, `Spotlight Card`, `Gooey Nav`, `Gradual Blur`, `Bubble Menu`, `Folder Reveal`, `SegmentedTabs`, `GlassCard`, `PillButton`, `FloatingTabBar`, `Toast`, `SlidingPill`, `KeypadKeys`, `Switch`, `ActionSheet`) удалены из очереди.
 
-> **Стиль Rustgramm (`v0.31.0`):** строго монохромный чёрно-белый Liquid Glass для всего системного хрома (`#F2F2F6` акцент, `#0A0A0C` текст на белых элементах, матовый фон `#08080A` без цветных бликов) при сохранении живых фирменных цветов Telegram для аватарок, ников пользователей, полос ответов, ссылок и значков verified/premium. Для точности ссылки указывают на корневые каталоги библиотек (`21st.dev`, `reactbits.dev`, `ui.aceternity.com`, `magicui.design`, `motion-primitives.com`, `glasscn.app`, `uiverse.io`).
+> **Стиль Rustgramm (`v0.32.0`):** строго монохромный чёрно-белый Liquid Glass для всего системного хрома (`#F2F2F6` акцент, `#0A0A0C` текст на белых элементах, матовый обсидиан `#08080A` без цветных бликов) при сохранении живых фирменных цветов Telegram для аватарок, ников пользователей, полос ответов, ссылок и значков verified/premium. Для точности ссылки указывают на корневые каталоги библиотек (`21st.dev`, `ui.aceternity.com`, `magicui.design`, `motion-primitives.com`, `glasscn.app`, `uiverse.io`).
 
 ---
 
@@ -30,17 +30,7 @@
 
 ---
 
-## 2. ReactBits — Оставшиеся компоненты (1)
-
-Источник: <https://reactbits.dev/>
-
-| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
-|---|---|---|---|
-| 16 | Tilted Card | <https://reactbits.dev/components> | Наклоняющиеся 3D-карточки подарков и стикерпаков |
-
----
-
-## 3. Aceternity UI — Оставшиеся компоненты (12)
+## 2. Aceternity UI — Оставшиеся компоненты (12)
 
 Источник: <https://ui.aceternity.com/components>
 
@@ -61,7 +51,7 @@
 
 ---
 
-## 4. Magic UI — Оставшиеся компоненты (13)
+## 3. Magic UI — Оставшиеся компоненты (13)
 
 Источник: <https://magicui.design/docs/components/dock>
 
@@ -83,7 +73,7 @@
 
 ---
 
-## 5. Motion Primitives — Оставшиеся компоненты (12)
+## 4. Motion Primitives — Оставшиеся компоненты (12)
 
 Источник: <https://motion-primitives.com/docs>
 
@@ -104,7 +94,7 @@
 
 ---
 
-## 6. GlassCN & Uiverse — Оставшиеся компоненты (9)
+## 5. GlassCN & Uiverse — Оставшиеся компоненты (9)
 
 Источники: <https://glasscn.app> · <https://uiverse.io/elements?search=glassmorphism>
 

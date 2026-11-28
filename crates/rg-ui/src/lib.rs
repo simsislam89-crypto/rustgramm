@@ -51,6 +51,7 @@ pub(crate) enum AndroidPickTarget {
     ChatAttach,
     Story,
     Theme,
+    ProfilePhoto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,8 +648,20 @@ struct App {
     notify_feed: VecDeque<(i64, String, String, i64, bool)>,
     drawer_filter: String,
     drawer_accounts_open: bool,
+    drawer_collapsed: bool,
     new_topic_open: bool,
     new_topic_title: String,
+    composer_silent_mode: bool,
+    outbox_read_dates: HashMap<i32, Result<i32, String>>,
+    profile_photos: HashMap<i64, Vec<rg_core::engine::ProfilePhotoItem>>,
+    profile_photo_tex: HashMap<i64, egui::TextureHandle>,
+    profile_photos_idx: HashMap<i64, usize>,
+    profile_photos_req: HashSet<i64>,
+    global_privacy: Option<rg_core::engine::GlobalPrivacyInfo>,
+    global_privacy_req: bool,
+    admin_edit_title: String,
+    admin_edit_about: String,
+    admin_edit_for: Option<i64>,
 }
 
 pub(crate) struct ShotModal {
@@ -1236,8 +1249,20 @@ impl App {
             notify_feed: VecDeque::with_capacity(32),
             drawer_filter: String::new(),
             drawer_accounts_open: true,
+            drawer_collapsed: false,
             new_topic_open: false,
             new_topic_title: String::new(),
+            composer_silent_mode: false,
+            outbox_read_dates: HashMap::new(),
+            profile_photos: HashMap::new(),
+            profile_photo_tex: HashMap::new(),
+            profile_photos_idx: HashMap::new(),
+            profile_photos_req: HashSet::new(),
+            global_privacy: None,
+            global_privacy_req: false,
+            admin_edit_title: String::new(),
+            admin_edit_about: String::new(),
+            admin_edit_for: None,
         }
     }
 
@@ -3325,11 +3350,24 @@ impl App {
                     self.code.clear();
                     self.password.clear();
                     self.error.clear();
+                    self.login_busy = false;
+                    self.login_code_sent_at = None;
+                    self.login_code_hint.clear();
                     self.tgs.account = None;
                     self.tgs.open = false;
                     self.settings_open = false;
                     self.drawer_open = false;
                     self.miniapp_modal = None;
+                    self.outbox_read_dates.clear();
+                    self.profile_photos.clear();
+                    self.profile_photo_tex.clear();
+                    self.profile_photos_idx.clear();
+                    self.profile_photos_req.clear();
+                    self.global_privacy = None;
+                    self.global_privacy_req = false;
+                    self.admin_edit_for = None;
+                    self.admin_edit_title.clear();
+                    self.admin_edit_about.clear();
                 }
                 Ev::EmojiSets(s) => {
                     if self.emoji_pack.is_some_and(|i| i >= s.len()) {
@@ -3986,6 +4024,43 @@ impl App {
                 Ev::FolderInvitePreview(prev) => {
                     self.folder_invite_preview = Some(prev);
                 }
+                Ev::OutboxReadDate(mid, res) => {
+                    self.outbox_read_dates.insert(mid, res);
+                }
+                Ev::ProfilePhotos(tid, list) => {
+                    for item in &list {
+                        if let Some(ref path) = item.cache_path
+                            && !self.profile_photo_tex.contains_key(&item.id)
+                            && let Ok(bytes) = std::fs::read(path)
+                            && let Ok(img) = image::load_from_memory(&bytes)
+                        {
+                            let rgba = img.thumbnail(256, 256).to_rgba8();
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [rgba.width() as usize, rgba.height() as usize],
+                                rgba.as_raw(),
+                            );
+                            let tex = ctx.load_texture(
+                                format!("pphoto_{}", item.id),
+                                ci,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.profile_photo_tex.insert(item.id, tex);
+                        }
+                    }
+                    let len = list.len();
+                    self.profile_photos.insert(tid, list);
+                    if let Some(cur) = self.profile_photos_idx.get_mut(&tid) {
+                        if len == 0 {
+                            *cur = 0;
+                        } else if *cur >= len {
+                            *cur = len - 1;
+                        }
+                    }
+                }
+                Ev::GlobalPrivacy(info) => {
+                    self.global_privacy = Some(info.clone());
+                    self.tgs.global_privacy = Some(info);
+                }
                 Ev::Status(s) => {
                     self.status = s;
                     self.bot_btn_pending = None;
@@ -4039,6 +4114,9 @@ impl App {
                     Some(AndroidPickTarget::Theme) => {
                         self.apply_imported_theme(ctx, &picked);
                         self.send(Cmd::Settings(Box::new(self.settings.clone())));
+                    }
+                    Some(AndroidPickTarget::ProfilePhoto) => {
+                        self.send(Cmd::UploadProfilePhoto(picked));
                     }
                     _ => {
                         let reply = self.reply.take().map(|(id, _)| id);
@@ -5036,10 +5114,17 @@ impl App {
                 let mut enter_code = false;
                 let code_target_len = usize::from(self.login_code_len.clamp(4, 8));
                 ui.allocate_ui_with_layout(
-                    Vec2::new(form_w, 60.0),
+                    Vec2::new(form_w, 72.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
-                        if glass::otp_input(ui, "login-otp", &mut self.code, code_target_len, !self.error.is_empty()) {
+                        let status = if !self.error.is_empty() {
+                            glass::OtpStatus::Error
+                        } else {
+                            glass::OtpStatus::Idle
+                        };
+                        let status_msg = if self.error.is_empty() { "" } else { self.error.as_str() };
+                        let grp = if code_target_len == 6 { 3 } else { 0 };
+                        if glass::otp_input_ex(ui, "login-otp", &mut self.code, code_target_len, grp, status, status_msg) {
                             enter_code = true;
                         }
                     },
@@ -5340,7 +5425,7 @@ impl App {
                     self.global_results.clear();
                 }
             }
-            // #4 Notification Center Popover: кнопка колокольчика + бейдж.
+            // #4 Origin UI Notification Popover: колокольчик + чёткий бейдж + всплывающая панель с указателем.
             let feed_unread = self.notify_feed.iter().filter(|x| !x.4).count();
             let bell_cnt = if !self.notify_feed.is_empty() {
                 feed_unread
@@ -5358,11 +5443,11 @@ impl App {
                     bh,
                 );
             }
-            let bell_c = if self.notify_popover_open { Color32::WHITE } else { lerp_color(DIALOG_DATE, WHITE, bh) };
+            let bell_c = if self.notify_popover_open { theme::on_accent() } else { lerp_color(DIALOG_DATE, WHITE, bh) };
             icons::tg_sized(ui.painter(), "settings/notifications", br.center(), Vec2::splat(17.0), bell_c);
             if bell_cnt > 0 && !self.settings.ayu.hide_notification_counters {
                 let btxt = if bell_cnt > 99 { "99+".to_owned() } else { bell_cnt.to_string() };
-                let bw = (btxt.chars().count() as f32 * 5.6 + 7.0).max(15.0);
+                let bw = (btxt.chars().count() as f32 * 5.6 + 7.0).max(16.0);
                 let badge_r = egui::Rect::from_center_size(egui::pos2(br.right() - 6.0, br.top() + 7.0), Vec2::new(bw, 14.0));
                 ui.painter().rect_filled(badge_r, egui::CornerRadius::same(7), c_orange());
                 ui.painter().text(badge_r.center(), egui::Align2::CENTER_CENTER, btxt, FontId::proportional(9.5), theme::on_accent());
@@ -5389,35 +5474,69 @@ impl App {
             let mut open_did: Option<i64> = None;
             let mut dismiss_idx: Option<usize> = None;
             let mut read_all = false;
-            let pop_w = 332.0_f32.min(ui.ctx().content_rect().width() - 24.0);
-            let slide_y = (1.0 - pop_k) * -8.0;
-            let anchor = egui::pos2(ui.max_rect().left() + 12.0, ui.min_rect().bottom() + 4.0 + slide_y);
+            let mut pop_rect = egui::Rect::NOTHING;
+            let pop_w = 324.0_f32.min(ui.ctx().content_rect().width() - 24.0);
+            let slide_y = (1.0 - pop_k) * -6.0;
+            let anchor = egui::pos2(
+                (ui.max_rect().left() + 10.0).min(ui.ctx().content_rect().right() - pop_w - 16.0),
+                ui.min_rect().bottom() + 8.0 + slide_y,
+            );
             #[allow(deprecated)]
-            egui::Area::new(egui::Id::new("notify-center-popover"))
+            let area_resp = egui::Area::new(egui::Id::new("notify-center-popover"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(anchor)
                 .show(ui.ctx(), |ui| {
-                    egui::Frame::new()
+                    egui::Frame::NONE
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             ui.set_width(pop_w);
-                            glass::paint_modal_card(ui.painter(), ui.max_rect().expand(10.0), 16.0, pop_k.clamp(0.1, 1.0));
+                            let card_r = ui.max_rect().expand(10.0);
+                            pop_rect = card_r;
+                            glass::paint_modal_card(ui.painter(), card_r, 14.0, pop_k.clamp(0.1, 1.0));
+                            // Стрелка вверх у верхнего края карточки (#4 Popover arrow).
+                            let tip_x = (card_r.right() - 48.0).clamp(card_r.left() + 24.0, card_r.right() - 20.0);
+                            let tip_y = card_r.top() - 6.0;
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(tip_x - 6.0, card_r.top()),
+                                    egui::pos2(tip_x, tip_y),
+                                    egui::pos2(tip_x + 6.0, card_r.top()),
+                                ],
+                                Color32::from_rgb(16, 16, 18),
+                                egui::Stroke::new(1.0, Color32::from_white_alpha(28)),
+                            ));
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("Уведомления").strong().size(14.0).color(WHITE));
+                                ui.label(RichText::new("Уведомления").strong().size(13.5).color(WHITE));
                                 let unread_total = self.dialogs.iter().filter(|d| !d.muted).map(|d| i64::from(d.unread)).sum::<i64>();
                                 if unread_total > 0 {
                                     ui.add_space(4.0);
-                                    glass::animated_counter(ui, "nc-unread-cnt", unread_total, FontId::proportional(12.0), c_orange());
+                                    glass::animated_counter(ui, "nc-unread-cnt", unread_total, FontId::proportional(11.5), c_orange());
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if glass::pill_button(ui, "nc-read-all", Vec2::new(112.0, 26.0), None, "Прочитать все", true).clicked() {
+                                    let link_resp = ui.add(
+                                        egui::Button::new(RichText::new("Прочитать все").size(12.0).color(SUBTEXT))
+                                            .frame(false),
+                                    );
+                                    if link_resp.hovered() {
+                                        ui.painter().line_segment(
+                                            [egui::pos2(link_resp.rect.left(), link_resp.rect.bottom() - 2.0), egui::pos2(link_resp.rect.right(), link_resp.rect.bottom() - 2.0)],
+                                            egui::Stroke::new(1.0, WHITE),
+                                        );
+                                    }
+                                    if link_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                         read_all = true;
                                     }
                                 });
                             });
                             ui.add_space(6.0);
+                            let sep_r = ui.available_rect_before_wrap();
+                            ui.painter().line_segment(
+                                [egui::pos2(sep_r.left() - 10.0, sep_r.top()), egui::pos2(sep_r.right() + 10.0, sep_r.top())],
+                                egui::Stroke::new(1.0, Color32::from_white_alpha(18)),
+                            );
+                            ui.add_space(6.0);
                             let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
-                            egui::ScrollArea::vertical().max_height(260.0).id_salt("nc-list").show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(264.0).id_salt("nc-list").show(ui, |ui| {
                                 if self.notify_feed.is_empty() {
                                     let unread_dlgs: Vec<(i64, String, String, i64)> = self
                                         .dialogs
@@ -5430,24 +5549,25 @@ impl App {
                                         ui.label(RichText::new("Нет новых уведомлений").size(12.5).color(SUBTEXT));
                                     } else {
                                         for (did, title, sub, ts) in unread_dlgs {
-                                            let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 44.0), Sense::click());
+                                            let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 6.0, 52.0), Sense::click());
                                             let nh = theme::tween(ui.ctx(), ("nc-u", did), f32::from(u8::from(rresp.hovered())), 0.12);
                                             if nh > 0.02 {
-                                                glass::paint_spotlight_card(ui.painter(), rr, 10.0, ptr, nh * 0.5);
+                                                glass::paint_spotlight_card(ui.painter(), rr, 8.0, ptr, nh * 0.45);
                                             }
                                             draw_avatar(
                                                 ui,
-                                                egui::pos2(rr.left() + 20.0, rr.center().y),
+                                                egui::pos2(rr.left() + 22.0, rr.center().y),
                                                 &title,
                                                 did,
-                                                28.0,
+                                                36.0,
                                                 self.avatars.get(&did),
-                                                self.settings.extera.avatar_corners,
+                                                8,
                                             );
-                                            let tx = rr.left() + 40.0;
+                                            ui.painter().circle_filled(egui::pos2(rr.right() - 10.0, rr.center().y), 3.0, WHITE);
+                                            let tx = rr.left() + 48.0;
                                             if ts > 0 {
                                                 ui.painter().text(
-                                                    egui::pos2(rr.right() - 8.0, rr.center().y - 8.0),
+                                                    egui::pos2(rr.right() - 22.0, rr.center().y - 10.0),
                                                     egui::Align2::RIGHT_CENTER,
                                                     theme::hhmm(ts),
                                                     FontId::proportional(10.5),
@@ -5456,11 +5576,11 @@ impl App {
                                             }
                                             let clip = egui::Rect::from_min_max(
                                                 egui::pos2(tx, rr.top()),
-                                                egui::pos2((rr.right() - 48.0).max(tx + 40.0), rr.bottom()),
+                                                egui::pos2((rr.right() - 56.0).max(tx + 40.0), rr.bottom()),
                                             );
                                             let cp = ui.painter().with_clip_rect(clip);
-                                            cp.text(egui::pos2(tx, rr.center().y - 8.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
-                                            cp.text(egui::pos2(tx, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, sub, FontId::proportional(11.0), SUBTEXT);
+                                            cp.text(egui::pos2(tx, rr.center().y - 9.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
+                                            cp.text(egui::pos2(tx, rr.center().y + 9.0), egui::Align2::LEFT_CENTER, sub, FontId::proportional(11.5), SUBTEXT);
                                             if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                                 open_did = Some(did);
                                             }
@@ -5468,33 +5588,35 @@ impl App {
                                     }
                                 } else {
                                     for (idx, (did, title, body, ts, is_read)) in self.notify_feed.iter().enumerate() {
-                                        let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 44.0), Sense::click());
+                                        let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 6.0, 52.0), Sense::click());
                                         let nh = theme::tween(ui.ctx(), ("nc-f", idx), f32::from(u8::from(rresp.hovered())), 0.12);
                                         if nh > 0.02 {
-                                            glass::paint_spotlight_card(ui.painter(), rr, 10.0, ptr, nh * 0.5);
+                                            glass::paint_spotlight_card(ui.painter(), rr, 8.0, ptr, nh * 0.45);
                                         }
                                         draw_avatar(
                                             ui,
-                                            egui::pos2(rr.left() + 20.0, rr.center().y),
+                                            egui::pos2(rr.left() + 22.0, rr.center().y),
                                             title,
                                             *did,
-                                            28.0,
+                                            36.0,
                                             self.avatars.get(did),
-                                            self.settings.extera.avatar_corners,
+                                            8,
                                         );
                                         if !*is_read {
-                                            ui.painter().circle_filled(egui::pos2(rr.left() + 6.0, rr.center().y), 3.0, c_orange());
+                                            ui.painter().circle_filled(egui::pos2(rr.right() - 10.0, rr.center().y), 3.0, WHITE);
                                         }
-                                        let close_r = egui::Rect::from_center_size(egui::pos2(rr.right() - 14.0, rr.center().y), Vec2::splat(18.0));
+                                        let close_r = egui::Rect::from_center_size(egui::pos2(rr.right() - 24.0, rr.center().y + 8.0), Vec2::splat(16.0));
                                         let close_resp = ui.interact(close_r, ui.make_persistent_id(("nc-x", idx)), Sense::click());
                                         let close_hov = close_resp.hovered();
-                                        ui.painter().text(
-                                            close_r.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            "×",
-                                            FontId::proportional(13.0),
-                                            if close_hov { WHITE } else { SUBTEXT },
-                                        );
+                                        if rresp.hovered() || close_hov {
+                                            ui.painter().text(
+                                                close_r.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "×",
+                                                FontId::proportional(13.0),
+                                                if close_hov { WHITE } else { SUBTEXT },
+                                            );
+                                        }
                                         let close_clicked = close_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
                                         if close_clicked {
                                             dismiss_idx = Some(idx);
@@ -5502,21 +5624,21 @@ impl App {
                                         let ts_s = if *ts > 0 { theme::hhmm(*ts) } else { String::new() };
                                         if !ts_s.is_empty() {
                                             ui.painter().text(
-                                                egui::pos2(rr.right() - 28.0, rr.center().y - 8.0),
+                                                egui::pos2(rr.right() - 22.0, rr.center().y - 10.0),
                                                 egui::Align2::RIGHT_CENTER,
                                                 ts_s,
                                                 FontId::proportional(10.5),
                                                 SUBTEXT,
                                             );
                                         }
-                                        let tx = rr.left() + 40.0;
+                                        let tx = rr.left() + 48.0;
                                         let clip = egui::Rect::from_min_max(
                                             egui::pos2(tx, rr.top()),
                                             egui::pos2((rr.right() - 56.0).max(tx + 40.0), rr.bottom()),
                                         );
                                         let cp = ui.painter().with_clip_rect(clip);
-                                        cp.text(egui::pos2(tx, rr.center().y - 8.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
-                                        cp.text(egui::pos2(tx, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, body, FontId::proportional(11.0), SUBTEXT);
+                                        cp.text(egui::pos2(tx, rr.center().y - 9.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
+                                        cp.text(egui::pos2(tx, rr.center().y + 9.0), egui::Align2::LEFT_CENTER, body, FontId::proportional(11.5), SUBTEXT);
                                         if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !close_clicked {
                                             open_did = Some(*did);
                                         }
@@ -5525,6 +5647,13 @@ impl App {
                             });
                         });
                 });
+            let _ = &area_resp;
+            if ui.ctx().input(|i| i.pointer.any_pressed())
+                && let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos())
+                && !pop_rect.contains(p)
+            {
+                self.notify_popover_open = false;
+            }
             if let Some(rm_idx) = dismiss_idx
                 && rm_idx < self.notify_feed.len()
             {
@@ -7001,17 +7130,13 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 232))
+                    .fill(Color32::from_rgba_unmultiplied(16, 16, 19, 236))
                     .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(36)))
                     .corner_radius(egui::CornerRadius::same(16))
                     .inner_margin(egui::Margin::same(14)),
             )
             .show(ctx, |ui| {
                 ui.set_min_width(280.0);
-                let appear = theme::tween(ctx, "mdl-geo-send", 1.0, 0.16);
-                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
-                let appear = theme::tween(ctx, "mdl-contact-send", 1.0, 0.16);
-                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
                 ui.label(RichText::new("Телефон (E.164):").size(12.0).color(SUBTEXT));
                 ui.add(egui::TextEdit::singleline(&mut self.send_contact_phone).desired_width(270.0).hint_text("+79991234567"));
                 ui.add_space(4.0);
@@ -7064,17 +7189,13 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 20, 28, 232))
+                    .fill(Color32::from_rgba_unmultiplied(16, 16, 19, 236))
                     .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(36)))
                     .corner_radius(egui::CornerRadius::same(16))
                     .inner_margin(egui::Margin::same(14)),
             )
             .show(ctx, |ui| {
                 ui.set_min_width(280.0);
-                let appear = theme::tween(ctx, "mdl-geo-send", 1.0, 0.16);
-                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
-                let appear = theme::tween(ctx, "mdl-contact-send", 1.0, 0.16);
-                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
                 ui.label(RichText::new("Широта (-90..90):").size(12.0).color(SUBTEXT));
                 ui.add(egui::TextEdit::singleline(&mut self.geo_lat).desired_width(270.0));
                 ui.add_space(4.0);
@@ -7426,6 +7547,13 @@ fn demo_app(mode: &str) -> App {
         app.stage = Stage::NeedPhone;
         return app;
     }
+    if mode == "otp" {
+        app.stage = Stage::NeedCode;
+        app.login_code_len = 5;
+        app.login_last_phone = "+7 999 123-45-67".to_owned();
+        app.code = "42".to_owned();
+        return app;
+    }
     app.stage = Stage::Ready;
     app.me = "Демо".to_owned();
     let now = 1_763_730_000_i64;
@@ -7558,6 +7686,65 @@ fn demo_app(mode: &str) -> App {
     app.drawer_open = mode == "drawer";
     app.in_archive = mode == "archive";
     app.emoji_open = mode == "emoji";
+    if mode == "stars" {
+        app.stars_modal_open = true;
+        app.stars_tab = 1;
+        app.stars_summary = Some(rg_core::engine::StarsSummary {
+            balance: 1250,
+            nanos: 0,
+            transactions: Vec::new(),
+        });
+        app.my_saved_gifts = vec![
+            rg_core::engine::SavedGiftItem {
+                msg_id: Some(101),
+                saved_id: Some(1),
+                title: "Лунный кот".to_owned(),
+                stars: 150,
+                convert_stars: 125,
+                date: now - 3600,
+                message: "С релизом Rustgramm!".to_owned(),
+                unsaved: false,
+                pinned_to_top: true,
+                unique: true,
+            },
+            rg_core::engine::SavedGiftItem {
+                msg_id: Some(102),
+                saved_id: Some(2),
+                title: "Хрустальный шар".to_owned(),
+                stars: 300,
+                convert_stars: 255,
+                date: now - 86400,
+                message: "Монохромное стекло".to_owned(),
+                unsaved: false,
+                pinned_to_top: false,
+                unique: false,
+            },
+        ];
+        app.star_gifts_catalog = vec![
+            rg_core::engine::StarGiftItem {
+                id: 1,
+                title: "Бриллиант".to_owned(),
+                stars: 500,
+                convert_stars: 425,
+                limited: true,
+                sold_out: false,
+                remains: Some(42),
+                total: Some(100),
+                unique: true,
+            },
+            rg_core::engine::StarGiftItem {
+                id: 2,
+                title: "Ракета".to_owned(),
+                stars: 100,
+                convert_stars: 85,
+                limited: false,
+                sold_out: false,
+                remains: None,
+                total: None,
+                unique: false,
+            },
+        ];
+    }
     app
 }
 
@@ -8990,5 +9177,115 @@ mod tests {
             },
         );
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn expandable_sidebar_renders_expanded_and_collapsed() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("drawer");
+        app.drawer_open = true;
+        app.drawer_collapsed = false;
+        let mut expanded_txt = String::new();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 720.0))),
+                    ..Default::default()
+                },
+                |_ui| app.drawer(&ctx),
+            );
+            out.textures_delta.clear();
+            expanded_txt.clear();
+            out.shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut expanded_txt));
+        }
+        assert!(expanded_txt.contains("Настройки Rustgramm"), "expected drawer header in {expanded_txt}");
+        assert!(expanded_txt.contains("Мой профиль"), "expected drawer menu items in {expanded_txt}");
+
+        app.drawer_collapsed = true;
+        let mut collapsed_txt = String::new();
+        for _ in 0..40 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 720.0))),
+                    time: Some(2.0),
+                    ..Default::default()
+                },
+                |_ui| app.drawer(&ctx),
+            );
+            out.textures_delta.clear();
+            collapsed_txt.clear();
+            out.shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut collapsed_txt));
+        }
+        assert!(collapsed_txt.contains("v"), "expected compact version badge in collapsed sidebar");
+    }
+
+    #[test]
+    fn stars_gifts_window_renders_tilted_cards() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("stars");
+        let mut txt = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 720.0))),
+                    ..Default::default()
+                },
+                |_ui| app.stars_gifts_window(&ctx),
+            );
+            out.textures_delta.clear();
+            txt.clear();
+            out.shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut txt));
+        }
+        assert!(txt.contains("Telegram Stars"), "expected Stars title in {txt}");
+        assert!(txt.contains("Лунный кот") && txt.contains("Хрустальный шар"), "expected TiltedCard gifts in {txt}");
+    }
+
+    #[test]
+    fn demo_app_otp_renders_otp_input_ex() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("otp");
+        assert_eq!(app.stage, Stage::NeedCode);
+        assert_eq!(app.code, "42");
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 720.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.login_ui(ui));
+            },
+        );
+        out.textures_delta.clear();
+        let mut txt = String::new();
+        out.shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut txt));
+        assert!(txt.contains("+7 999 123-45-67"), "expected phone label on OTP stage: {txt}");
+    }
+
+    #[test]
+    fn unified_composer_renders_mode_selector_and_silent_toggle() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.selected = Some(0);
+        app.composer_silent_mode = true;
+        let mut txt = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(720.0, 620.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::bottom("cmp").show(ui, |ui| app.composer_ui(ui));
+                },
+            );
+            out.textures_delta.clear();
+            txt.clear();
+            out.shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut txt));
+        }
+        assert!(txt.contains("Без звука"), "expected silent mode pill inside unified capsule: {txt}");
     }
 }

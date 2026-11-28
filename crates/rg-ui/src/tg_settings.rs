@@ -130,6 +130,9 @@ pub(crate) struct State {
     pub profile_at: Option<std::time::Instant>,
     /// Строка приглашения на папку чатов (`t.me/addlist/...`) в разделе «Папки».
     pub folder_invite_link: String,
+    /// Глобальные настройки приватности Telegram (`account.getGlobalPrivacySettings`).
+    pub global_privacy: Option<rg_core::engine::GlobalPrivacyInfo>,
+    pub global_privacy_req: bool,
 }
 
 /// Фоновый подсчёт размера кэша и загрузок (без блокировки UI).
@@ -199,6 +202,8 @@ struct Actions {
     export_folder_invite: Option<(i32, String, Vec<grammers_session::types::PeerRef>)>,
     check_folder_invite: Option<String>,
     prompt_folder_link: bool,
+    request_global_privacy: bool,
+    save_global_privacy: Option<rg_core::engine::GlobalPrivacyInfo>,
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -761,6 +766,16 @@ impl App {
         if act.lock_now && !s.security.passcode_hash.is_empty() {
             self.app_locked = true;
             act.close = true;
+        }
+        if act.request_global_privacy && !st.global_privacy_req {
+            st.global_privacy_req = true;
+            self.global_privacy_req = true;
+            self.send(Cmd::LoadGlobalPrivacy);
+        }
+        if let Some(gp) = act.save_global_privacy {
+            st.global_privacy = Some(gp.clone());
+            self.global_privacy = Some(gp.clone());
+            self.send(Cmd::SaveGlobalPrivacy(gp));
         }
         self.tgs = st;
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
@@ -1541,6 +1556,27 @@ fn privacy_page(
             st.privacy_edit = Some(r.key);
             st.privacy_choice = Some(r.level);
         }
+    }
+
+    divider(ui);
+    section(ui, "Глобальная приватность Telegram");
+    if let Some(mut gp) = st.global_privacy.clone() {
+        let mut gp_changed = false;
+        gp_changed |= toggle(ui, "Архивировать и глушить новые чаты не из контактов", &mut gp.archive_and_mute_new_noncontact_peers);
+        gp_changed |= toggle(ui, "Скрывать время прочтения моих сообщений (Premium)", &mut gp.hide_read_marks);
+        gp_changed |= toggle(ui, "Новые сообщения не от контактов — только с Premium", &mut gp.new_noncontact_peers_require_premium);
+        gp_changed |= toggle(ui, "Показывать кнопку подарков в поле ввода", &mut gp.display_gifts_button);
+        if gp.sensitive_can_change {
+            gp_changed |= toggle(ui, "Показывать деликатный контент (18+)", &mut gp.sensitive_enabled);
+        }
+        if gp_changed {
+            act.save_global_privacy = Some(gp);
+        }
+    } else {
+        if !st.global_privacy_req {
+            act.request_global_privacy = true;
+        }
+        info_row(ui, "Загрузка глобальных правил приватности…", "");
     }
 
     divider(ui);
@@ -2464,8 +2500,26 @@ impl App {
             });
 
         let me_info = self.tgs.account.as_ref().map(|a| a.me.clone()).unwrap_or_default();
+        if self.profile_photos_req.insert(0) {
+            self.send(Cmd::LoadProfilePhotos(None));
+        }
+        let photo_owner_id = 0_i64;
+        let my_photos = self
+            .profile_photos
+            .get(&photo_owner_id)
+            .cloned()
+            .unwrap_or_default();
+        let my_photo_idx = if my_photos.is_empty() {
+            0
+        } else {
+            self.profile_photos_idx.get(&photo_owner_id).copied().unwrap_or(0).min(my_photos.len() - 1)
+        };
+        let active_photo = my_photos.get(my_photo_idx).cloned();
         let name = if me_info.name.is_empty() { self.me.clone() } else { me_info.name.clone() };
-        let me_tex = self.dialogs.iter().find(|d| d.saved).and_then(|d| self.avatars.get(&d.id));
+        let me_tex = active_photo
+            .as_ref()
+            .and_then(|p| self.profile_photo_tex.get(&p.id))
+            .or_else(|| self.dialogs.iter().find(|d| d.saved).and_then(|d| self.avatars.get(&d.id)));
         let corners = self.settings.ayu.avatar_corners;
         let streamer = self.settings.ayu.streamer_mode;
         let cur_audio_title = self.audio_title.clone();
@@ -2480,6 +2534,9 @@ impl App {
         let mut toggle_audio = false;
         let mut save_prof_un: Option<String> = None;
         let mut save_prof_bd: Option<Option<(i32, i32, Option<i32>)>> = None;
+        let mut photo_delta: i32 = 0;
+        let mut upload_photo = false;
+        let mut delete_photo: Option<(i64, i64, Vec<u8>)> = None;
 
         egui::Area::new(egui::Id::new("my-prof-box"))
             .order(egui::Order::Tooltip)
@@ -2496,8 +2553,8 @@ impl App {
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-                        // Верхняя панель: аватар по центру, карандаш редактирования и крестик справа (1 в 1 со скрином 10 AyuGram!).
-                        let (top, _) = ui.allocate_exact_size(Vec2::new(width, 168.0), Sense::hover());
+                        // Верхняя панель: аватар с галереей (1 / N), загрузкой и удалением, карандаш и крестик справа.
+                        let (top, _) = ui.allocate_exact_size(Vec2::new(width, 190.0), Sense::hover());
                         let ed_r = Rect::from_center_size(Pos2::new(top.right() - 58.0, top.top() + 24.0), Vec2::splat(32.0));
                         let ed_resp = ui.interact(ed_r, ui.make_persistent_id("mp-edit"), Sense::click());
                         icons::tg(ui.painter(), "info/info_edit", ed_r.center(), if ed_resp.hovered() { WHITE } else { SUBTEXT });
@@ -2513,16 +2570,33 @@ impl App {
 
                         let show_prem = !self.settings.ayu.hide_premium_statuses;
                         let mask_phone = streamer || self.settings.extera.hide_phone_number;
-                        draw_avatar(ui, Pos2::new(top.center().x, top.top() + 58.0), &name, 1, 82.0, me_tex, corners);
+                        draw_avatar(ui, Pos2::new(top.center().x, top.top() + 56.0), &name, 1, 82.0, me_tex, corners);
+                        if my_photos.len() > 1 {
+                            let prev_r = Rect::from_center_size(Pos2::new(top.center().x - 62.0, top.top() + 56.0), Vec2::splat(26.0));
+                            if ui.put(prev_r, egui::Button::new(RichText::new("<").size(12.0))).clicked() {
+                                photo_delta = -1;
+                            }
+                            let next_r = Rect::from_center_size(Pos2::new(top.center().x + 62.0, top.top() + 56.0), Vec2::splat(26.0));
+                            if ui.put(next_r, egui::Button::new(RichText::new(">").size(12.0))).clicked() {
+                                photo_delta = 1;
+                            }
+                            ui.painter().text(
+                                Pos2::new(top.center().x, top.top() + 104.0),
+                                Align2::CENTER_CENTER,
+                                format!("{} / {}", my_photo_idx + 1, my_photos.len()),
+                                FontId::proportional(10.5),
+                                SUBTEXT,
+                            );
+                        }
                         let p = ui.painter();
                         let ng = p.layout_no_wrap(name.clone(), FontId::proportional(17.5), WHITE);
                         let has_badge = (show_prem && me_info.emoji_status.is_some())
                             || me_info.verified
                             || (show_prem && me_info.premium);
                         let nx = top.center().x - if has_badge { 10.0 } else { 0.0 };
-                        p.text(Pos2::new(nx, top.top() + 120.0), Align2::CENTER_CENTER, &name, FontId::proportional(17.5), WHITE);
+                        p.text(Pos2::new(nx, top.top() + 124.0), Align2::CENTER_CENTER, &name, FontId::proportional(17.5), WHITE);
                         if has_badge {
-                            let bc = Pos2::new(nx + ng.size().x * 0.5 + 12.0, top.top() + 120.0);
+                            let bc = Pos2::new(nx + ng.size().x * 0.5 + 12.0, top.top() + 124.0);
                             if show_prem
                                 && let Some(doc_id) = me_info.emoji_status
                                 && let Some(tex) = self.sticker_tex.get(&doc_id)
@@ -2537,12 +2611,22 @@ impl App {
                             }
                         }
                         p.text(
-                            Pos2::new(top.center().x, top.top() + 144.0),
+                            Pos2::new(top.center().x, top.top() + 146.0),
                             Align2::CENTER_CENTER,
                             if me_info.status.is_empty() { "в сети" } else { &me_info.status },
                             FontId::proportional(13.0),
                             SUBTEXT,
                         );
+                        let btn_up = Rect::from_center_size(Pos2::new(top.center().x - if active_photo.is_some() { 54.0 } else { 0.0 }, top.top() + 172.0), Vec2::new(102.0, 24.0));
+                        if ui.put(btn_up, egui::Button::new(RichText::new("Загрузить фото").size(11.5))).clicked() {
+                            upload_photo = true;
+                        }
+                        if let Some(ap) = &active_photo {
+                            let btn_del = Rect::from_center_size(Pos2::new(top.center().x + 54.0, top.top() + 172.0), Vec2::new(96.0, 24.0));
+                            if ui.put(btn_del, egui::Button::new(RichText::new("Удалить фото").size(11.5).color(DANGER))).clicked() {
+                                delete_photo = Some((ap.id, ap.access_hash, ap.file_reference.clone()));
+                            }
+                        }
 
                         // Музыка в вашем профиле (если добавлена).
                         if !me_info.saved_music.is_empty() {
@@ -2719,6 +2803,29 @@ impl App {
                 paint_modal_subblur(ui.painter(), card.response.rect, 14.0, raw);
             });
 
+        if photo_delta != 0 && !my_photos.is_empty() {
+            let len = my_photos.len() as i32;
+            let next = (my_photo_idx as i32 + photo_delta).rem_euclid(len) as usize;
+            self.profile_photos_idx.insert(photo_owner_id, next);
+        }
+        if upload_photo {
+            #[cfg(not(target_os = "android"))]
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Изображение", &["jpg", "jpeg", "png", "webp"])
+                .pick_file()
+            {
+                self.send(Cmd::UploadProfilePhoto(path));
+            }
+            #[cfg(target_os = "android")]
+            {
+                self.android_pick_target = Some(super::AndroidPickTarget::ProfilePhoto);
+                let dir = worker::home().join("cache").join("picked");
+                crate::android_jni::pick_file("image/*", &dir);
+            }
+        }
+        if let Some((id, access_hash, file_ref)) = delete_photo {
+            self.send(Cmd::DeleteProfilePhoto { id, access_hash, file_ref });
+        }
         if let Some(u) = save_prof_un {
             self.send(Cmd::UpdateUsernameChecked(u));
         }

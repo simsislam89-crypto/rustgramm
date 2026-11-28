@@ -76,6 +76,10 @@ pub(crate) enum Act {
     ReplayEffect(i32),
     /// Открыть окно просмотра и установки набора стикеров.
     OpenStickerPack(i64, i64),
+    /// Добавить или убрать стикер из избранного (`messages.faveSticker`).
+    FaveSticker(i32, bool),
+    /// Сохранить или удалить GIF (`messages.saveGif`).
+    SaveGif(i32, bool),
 }
 
 /// Всё, что нужно для рисования пузыря, кроме самого сообщения.
@@ -878,6 +882,17 @@ impl App {
         }
         let is_group = d.id < 0;
         let is_user = !is_group && !d.saved && d.kind == rg_core::engine::DialogKind::User;
+        if is_user && self.profile_photos_req.insert(d.id) {
+            self.send(Cmd::LoadProfilePhotos(Some(d.id)));
+        }
+        let pphotos = self.profile_photos.get(&d.id).cloned().unwrap_or_default();
+        let pphoto_idx = if pphotos.is_empty() {
+            0
+        } else {
+            self.profile_photos_idx.get(&d.id).copied().unwrap_or(0).min(pphotos.len() - 1)
+        };
+        let pphoto_tex_id = pphotos.get(pphoto_idx).map(|p| p.id);
+        let mut pphoto_delta: i32 = 0;
         if is_group && self.participants_req.insert(d.id) {
             self.send(Cmd::Participants(d.id));
         }
@@ -931,7 +946,10 @@ impl App {
             let (top, _) = ui.allocate_exact_size(Vec2::new(w, 160.0), Sense::hover());
             let c = Pos2::new(top.center().x, top.top() + 50.0);
             let r = Rect::from_center_size(c, Vec2::splat(84.0));
-            match self.avatars.get(&d.id) {
+            let active_av = pphoto_tex_id
+                .and_then(|pid| self.profile_photo_tex.get(&pid))
+                .or_else(|| self.avatars.get(&d.id));
+            match active_av {
                 Some(t) => {
                     egui::Image::new(t).fit_to_exact_size(r.size()).corner_radius(42.0).paint_at(ui, r);
                 }
@@ -945,6 +963,23 @@ impl App {
                         Color32::WHITE,
                     );
                 }
+            }
+            if pphotos.len() > 1 {
+                let prev_r = Rect::from_center_size(Pos2::new(c.x - 62.0, c.y), Vec2::splat(26.0));
+                if ui.put(prev_r, egui::Button::new(RichText::new("<").size(12.0))).clicked() {
+                    pphoto_delta = -1;
+                }
+                let next_r = Rect::from_center_size(Pos2::new(c.x + 62.0, c.y), Vec2::splat(26.0));
+                if ui.put(next_r, egui::Button::new(RichText::new(">").size(12.0))).clicked() {
+                    pphoto_delta = 1;
+                }
+                ui.painter().text(
+                    Pos2::new(top.center().x, top.top() + 97.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{} / {}", pphoto_idx + 1, pphotos.len()),
+                    FontId::proportional(10.5),
+                    SUBTEXT,
+                );
             }
             let pname = if d.saved { "Избранное" } else { d.name.as_str() };
             let name_galley = ui.painter().layout_no_wrap(pname.to_owned(), FontId::proportional(17.5), WHITE);
@@ -1510,6 +1545,11 @@ impl App {
         });
 
         self.info_tab = info_tab;
+        if pphoto_delta != 0 && !pphotos.is_empty() {
+            let len = pphotos.len() as i32;
+            let next = (pphoto_idx as i32 + pphoto_delta).rem_euclid(len) as usize;
+            self.profile_photos_idx.insert(d.id, next);
+        }
         if let Some(track) = play_track {
             self.send(Cmd::PlayTrack(track));
         }
@@ -1852,7 +1892,7 @@ impl App {
             let shift_held = ui.input(|i| i.modifiers.shift);
             let kbar_appear = tween(ui.ctx(), "kbar-open", 1.0, 0.14);
             let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
-            kit::compact_popup_frame()
+            egui::Frame::NONE
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
                     super::glass::paint_modal_card(ui.painter(), ui.max_rect().expand(6.0), 12.0, kbar_appear);
@@ -1991,7 +2031,7 @@ impl App {
                         .size(14.5)
                         .color(WHITE),
                 );
-                let wave_w = (ui.available_width() - 190.0).clamp(60.0, 380.0);
+                let wave_w = (ui.available_width() - 210.0).clamp(60.0, 360.0);
                 let (wr, _) = ui.allocate_exact_size(Vec2::new(wave_w, 30.0), Sense::hover());
                 let count = ((wave_w / 5.0) as usize).clamp(10, 64);
                 for idx in 0..count {
@@ -2006,6 +2046,7 @@ impl App {
                         egui::Stroke::new(2.5, ORANGE),
                     );
                 }
+                super::glass::paint_voice_bars(ui.painter(), ui.ctx(), Pos2::new(wr.right() + 14.0, wr.center().y));
                 if ui.button("Отмена").clicked() {
                     cancel_rec = true;
                 }
@@ -2167,7 +2208,7 @@ impl App {
         }
         // Плашка быстрого отложенного таймера / напоминания (если открыта).
         let mut send_scheduled_now = false;
-        let mut send_silent_now = false;
+        let mut trigger_silent = false;
         if self.schedule_picker_open {
             egui::Frame::new()
                 .fill(t2(WINDOW_BG))
@@ -2211,7 +2252,7 @@ impl App {
                             self.send_menu_open = false;
                         }
                         if ui.button("Без звука").clicked() {
-                            send_silent_now = true;
+                            trigger_silent = true;
                             self.send_menu_open = false;
                         }
                         if ui.button("Чек-лист").clicked() {
@@ -2534,603 +2575,477 @@ impl App {
                 }
             }
         }
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), row_h),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            // Кнопка меню бота слева (≡), как в Telegram Desktop (Mini App или список команд бота).
-            if let Some((w_lbl, w_url)) = &bot_webapp {
-                let lbl = short(w_lbl, 11);
-                let bw = (lbl.chars().count() as f32 * 7.6 + 34.0).clamp(72.0, 140.0);
-                let (mrect, mresp) = ui.allocate_exact_size(Vec2::new(bw, 30.0), Sense::click());
-                let mh = tween(ui.ctx(), "cmp-botapp-h", f32::from(u8::from(mresp.hovered())), 0.12);
-                let mfill = lerp_color(t_btn(c_orange()), t_btn(ORANGE_OVER), mh);
-                ui.painter().rect_filled(mrect, egui::CornerRadius::same(15), mfill);
-                let bot_fg = super::theme::on_accent();
-                icons::tg_sized(
-                    ui.painter(),
-                    "dialogs/dialogs_menu",
-                    Pos2::new(mrect.left() + 14.0, mrect.center().y),
-                    Vec2::splat(14.0),
-                    bot_fg,
-                );
-                ui.painter().text(
-                    Pos2::new(mrect.left() + 26.0, mrect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    lbl,
-                    FontId::proportional(12.5),
-                    bot_fg,
-                );
-                if mresp
-                    .on_hover_text(format!("Меню бота: {w_lbl}"))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                    && let Some(did) = self.selected_dialog_id()
-                {
-                    self.send(Cmd::OpenMiniApp {
-                        dialog_id: did,
-                        msg_id: None,
-                        title: w_lbl.clone(),
-                        url: Some(w_url.clone()),
-                        start_param: None,
-                        simple: false,
-                    });
-                }
-                ui.add_space(2.0);
-            } else if !bot_cmds.is_empty() {
-                let (mrect, mresp) = ui.allocate_exact_size(Vec2::new(72.0, 30.0), Sense::click());
-                let mh = tween(ui.ctx(), "cmp-botmenu-h", f32::from(u8::from(mresp.hovered() || self.cmd_popup_open)), 0.12);
-                let mfill = if self.cmd_popup_open {
-                    t_btn(c_orange())
-                } else {
-                    lerp_color(Color32::from_white_alpha(20), Color32::from_white_alpha(36), mh)
-                };
-                let bm_fg = if self.cmd_popup_open { super::theme::on_accent() } else { Color32::WHITE };
-                ui.painter().rect_filled(mrect, egui::CornerRadius::same(15), mfill);
-                icons::tg_sized(
-                    ui.painter(),
-                    "dialogs/dialogs_menu",
-                    Pos2::new(mrect.left() + 14.0, mrect.center().y),
-                    Vec2::splat(14.0),
-                    bm_fg,
-                );
-                ui.painter().text(
-                    Pos2::new(mrect.left() + 26.0, mrect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    "Меню",
-                    FontId::proportional(12.5),
-                    bm_fg,
-                );
-                if mresp.on_hover_text("Команды и меню бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.cmd_popup_open = !self.cmd_popup_open;
-                    self.ttl_popup_open = false;
-                }
-                ui.add_space(2.0);
+        // #9 AIComposer (адаптировано под чат Telegram): единая морфинг-капсула
+        // с плавным раскрытием, режимом отправки («Обычно» / «Без звука» / «Отложить») и циклическим плейсхолдером.
+        let id = ui.make_persistent_id("composer-input");
+        let focused = ui.memory(|m| m.has_focus(id));
+        if focused {
+            if self.input.is_empty()
+                && self.editing.is_none()
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+                && let Some(last) = self.messages.iter().rev().find(|m| m.outgoing && !m.deleted && !m.text.is_empty())
+            {
+                self.reply = None;
+                self.editing = Some(last.id);
+                self.input = last.text.clone();
             }
-            // Все иконки поля ввода стоят на одной линии (высота слота 40 px, визуальный размер 19×19 px!).
-            if s.field_attach_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::click());
-                let ah = tween(ui.ctx(), "cmp-att-h", f32::from(u8::from(resp.hovered())), 0.12);
-                let att_c = rect.center() + super::glass::magnet_offset(ui.ctx(), "cmp-att-mag", rect.center(), 38.0, 2.5);
-                if ah > 0.02 {
-                    super::glass::paint_surface(
-                        ui.painter(),
-                        Rect::from_center_size(att_c, Vec2::splat(30.0)),
-                        15.0,
-                        super::glass::GlassVariant::Clear,
-                        ah,
-                    );
+            let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+            let redo = ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                    || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+            });
+            if undo {
+                if let Some(prev) = self.input_undo.pop() {
+                    let cur = std::mem::replace(&mut self.input, prev);
+                    self.input_redo.push(cur);
                 }
-                icons::attach(ui.painter(), att_c, lerp_color(DIALOG_DATE, WHITE, ah));
-                let resp = resp
-                    .on_hover_text(if s.show_attach_popup {
-                        "Меню вложений (файл, опрос, чек-лист, контакт)"
-                    } else {
-                        "Прикрепить файл · ПКМ: Чек-лист / Опрос / Отложенные"
-                    })
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                let mut render_att_items = |ui: &mut egui::Ui, att: &mut bool| {
-                    ui.set_min_width(178.0);
-                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
-                    if kit::menu_item(ui, "menu/photo", "Фото / Видео / Файл", false) {
-                        *att = true;
-                        ui.close();
-                    }
-                    if kit::menu_item(ui, "menu/select", "Чек-лист (To-Do)", false) {
-                        self.todo_modal_open = true;
-                        ui.close();
-                    }
-                    if kit::menu_item(ui, "menu/info", "Опрос / Викторина", false) {
-                        self.poll_modal_open = true;
-                        ui.close();
-                    }
-                    if kit::menu_item(ui, "settings/ttl", "Отложенные сообщения", false) {
-                        if let Some(did) = self.selected_dialog_id() {
-                            self.scheduled_open = true;
-                            self.send(Cmd::LoadScheduled(did));
+            } else if redo
+                && let Some(next) = self.input_redo.pop()
+            {
+                let cur = std::mem::replace(&mut self.input, next);
+                self.input_undo.push(cur);
+            }
+            let sel = self.composer_sel;
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
+                super::rich::wrap_selection(&mut self.input, sel, "**", "**");
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::I)) {
+                super::rich::wrap_selection(&mut self.input, sel, "__", "__");
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::X)) {
+                super::rich::wrap_selection(&mut self.input, sel, "~~", "~~");
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::M)) {
+                super::rich::wrap_selection(&mut self.input, sel, "`", "`");
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P)) {
+                super::rich::wrap_selection(&mut self.input, sel, "||", "||");
+            }
+        }
+        let before_input = self.input.clone();
+        let enter = focused
+            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+            && ui.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Enter));
+        let has_draft = !self.input.trim().is_empty();
+        let expanded = has_draft
+            || focused
+            || self.editing.is_some()
+            || self.reply.is_some()
+            || self.format_bar_open
+            || self.selected_effect.is_some()
+            || self.composer_silent_mode
+            || self.schedule_picker_open
+            || bot_webapp.is_some()
+            || !bot_cmds.is_empty()
+            || has_send_as;
+        let inp_focus = tween(ui.ctx(), "cmp-inp-focus", f32::from(u8::from(focused)), 0.14);
+        let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+        let cap_stroke = egui::Stroke::new(
+            1.0 + 0.3 * inp_focus,
+            lerp_color(Color32::from_white_alpha(26), WHITE.gamma_multiply(0.55), inp_focus),
+        );
+        let cap_fill = Color32::from_rgba_unmultiplied(
+            18,
+            18,
+            21,
+            ((216.0 + 16.0 * inp_focus) * opacity_f32()) as u8,
+        );
+        let mut text_resp_opt = None;
+        let mut trigger_send_or_rec = false;
+        let _cap_frame = egui::Frame::new()
+            .fill(cap_fill)
+            .stroke(cap_stroke)
+            .corner_radius(egui::CornerRadius::same(22))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                super::glass::paint_surface_interactive(
+                    ui.painter(),
+                    ui.max_rect(),
+                    22.0,
+                    if inp_focus > 0.25 { super::glass::GlassVariant::Tinted(c_orange()) } else { super::glass::GlassVariant::Clear },
+                    0.12 + 0.22 * inp_focus,
+                    ptr,
+                );
+                // Верхний ряд внутри единой капсулы: поле ввода (+ справа круглая кнопка, если 1-строчный покой).
+                let right_idle_w = if !expanded {
+                    44.0 + if s.field_emoji_button { 34.0 } else { 0.0 } + if s.field_attach_button { 34.0 } else { 0.0 }
+                } else {
+                    0.0
+                };
+                let text_w = (ui.available_width() - right_idle_w).max(96.0);
+                let ph_list = ["Написать сообщение…", "Введите / для команд или @ для упоминания…", "Shift+Enter — новая строка…"];
+                let ph_idx = ((ui.ctx().input(|i| i.time) / 4.0) as usize) % ph_list.len();
+                let hint_txt = if self.input.is_empty() && !focused { ph_list[ph_idx] } else { "Написать сообщение…" };
+                ui.horizontal(|ui| {
+                    if !expanded && s.field_attach_button {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 34.0), Sense::click());
+                        let ah = tween(ui.ctx(), "cmp-att-h", f32::from(u8::from(resp.hovered())), 0.12);
+                        icons::attach(ui.painter(), rect.center(), lerp_color(DIALOG_DATE, WHITE, ah));
+                        let resp = resp.on_hover_text("Прикрепить (ПКМ: опрос, чек-лист, отложенные)").on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            attach = true;
                         }
-                        ui.close();
                     }
-                    kit::menu_separator(ui);
-                    if kit::menu_item(ui, "contacts", "Контакт", false) {
-                        self.contact_modal_open = true;
-                        ui.close();
-                    }
-                    if kit::menu_item(ui, "menu/search", "Геопозиция (координаты)", false) {
-                        self.geo_modal_open = true;
-                        ui.close();
-                    }
-                };
-                if s.show_attach_popup {
-                    egui::Popup::menu(&resp)
-                        .frame(kit::compact_popup_frame())
-                        .show(|ui| render_att_items(ui, &mut attach));
-                } else {
-                    attach = resp.clicked();
-                    egui::Popup::context_menu(&resp)
-                        .frame(kit::compact_popup_frame())
-                        .show(|ui| render_att_items(ui, &mut attach));
-                }
-            }
-            if has_send_as && let Some((_, cid, _)) = cur_dlg_info {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
-                let sh = tween(ui.ctx(), "cmp-sas-h", f32::from(u8::from(resp.hovered() || self.send_as_popup_open)), 0.12);
-                let sel_id = self
-                    .selected_send_as
-                    .get(&cid)
-                    .map(|p| p.id.bot_api_dialog_id_unchecked())
-                    .unwrap_or(0);
-                let sel_name = self
-                    .send_as_map
-                    .get(&cid)
-                    .and_then(|v| v.iter().find(|x| x.id == sel_id).or_else(|| v.first()))
-                    .map(|x| x.title.clone())
-                    .unwrap_or_else(|| self.me.clone());
-                draw_avatar(
-                    ui,
-                    rect.center(),
-                    &sel_name,
-                    sel_id,
-                    24.0,
-                    self.avatars.get(&sel_id),
-                    23,
-                );
-                if sh > 0.05 {
-                    ui.painter().circle_stroke(rect.center(), 13.0, egui::Stroke::new(1.5, c_orange().gamma_multiply(sh)));
-                }
-                if resp.on_hover_text(format!("От имени: {sel_name}")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.send_as_popup_open = !self.send_as_popup_open;
-                }
-            }
-            if s.field_commands_button && has_cmds {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
-                let ch = tween(ui.ctx(), "cmp-cmd-h", f32::from(u8::from(resp.hovered() || self.cmd_popup_open)), 0.12);
-                if ch > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(ch));
-                }
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "/",
-                    FontId::proportional(17.5),
-                    if self.cmd_popup_open { c_orange() } else { lerp_color(DIALOG_DATE, WHITE, ch) },
-                );
-                if resp.on_hover_text("Команды бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.cmd_popup_open = !self.cmd_popup_open;
-                    self.ttl_popup_open = false;
-                }
-            }
-            // Правая часть композера: кнопка меню Mini App теперь вынесена влево (`≡`), как в Telegram.
-            // Точный расчёт правой части — все слоты 36×40, визуальные иконки 19×19.
-            let has_draft = !self.input.trim().is_empty();
-            let right_w = 40.0
-                + 36.0
-                + if has_draft { 36.0 } else { 0.0 }
-                + if has_reply_kb { 36.0 } else { 0.0 }
-                + if s.field_emoji_button { 38.0 } else { 0.0 }
-                + if s.field_auto_delete_button { 36.0 } else { 0.0 };
-            let width = (ui.available_width() - right_w).max(96.0);
-            let id = ui.make_persistent_id("composer-input");
-            let focused = ui.memory(|m| m.has_focus(id));
-            // Горячие клавиши в поле ввода:
-            // - Стрелка Вверх в пустом поле — редактировать последнее своё сообщение
-            // - Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z — откат / возврат текста
-            // - Ctrl+B / Ctrl+I / Ctrl+Shift+X / Ctrl+Shift+M / Ctrl+Shift+P — форматирование выделения
-            if focused {
-                if self.input.is_empty()
-                    && self.editing.is_none()
-                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
-                    && let Some(last) = self.messages.iter().rev().find(|m| m.outgoing && !m.deleted && !m.text.is_empty())
-                {
-                    self.reply = None;
-                    self.editing = Some(last.id);
-                    self.input = last.text.clone();
-                }
-                let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
-                let redo = ui.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
-                        || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
-                });
-                if undo {
-                    if let Some(prev) = self.input_undo.pop() {
-                        let cur = std::mem::replace(&mut self.input, prev);
-                        self.input_redo.push(cur);
-                    }
-                } else if redo
-                    && let Some(next) = self.input_redo.pop()
-                {
-                    let cur = std::mem::replace(&mut self.input, next);
-                    self.input_undo.push(cur);
-                }
-                let sel = self.composer_sel;
-                if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
-                    super::rich::wrap_selection(&mut self.input, sel, "**", "**");
-                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::I)) {
-                    super::rich::wrap_selection(&mut self.input, sel, "__", "__");
-                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::X)) {
-                    super::rich::wrap_selection(&mut self.input, sel, "~~", "~~");
-                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::M)) {
-                    super::rich::wrap_selection(&mut self.input, sel, "`", "`");
-                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::P)) {
-                    super::rich::wrap_selection(&mut self.input, sel, "||", "||");
-                }
-            }
-            let before_input = self.input.clone();
-            // Enter отправляет, Shift+Enter — новая строка.
-            let enter = focused
-                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
-                && ui.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Enter));
-            let inp_focus = tween(ui.ctx(), "cmp-inp-focus", f32::from(u8::from(focused)), 0.14);
-            let inp_stroke = egui::Stroke::new(
-                1.0 + 0.35 * inp_focus,
-                lerp_color(
-                    Color32::from_white_alpha(if super::theme::mobile_glass_active() { 38 } else { 22 }),
-                    c_orange().gamma_multiply(0.75),
-                    inp_focus,
-                ),
-            );
-            let inp_fill = if super::theme::mobile_glass_active() {
-                Color32::from_rgba_unmultiplied(20, 22, 30, ((196.0 + 18.0 * inp_focus) * opacity_f32()) as u8)
-            } else {
-                Color32::from_rgba_unmultiplied(18, 20, 26, (215.0 * opacity_f32()) as u8)
-            };
-            let text_out = egui::Frame::new()
-                .fill(inp_fill)
-                .stroke(inp_stroke)
-                .corner_radius(egui::CornerRadius::same(18))
-                .inner_margin(egui::Margin::symmetric(10, 2))
-                .show(ui, |ui| {
-                    let capsule_r = ui.max_rect();
-                    let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
-                    super::glass::paint_surface_interactive(
-                        ui.painter(),
-                        capsule_r,
-                        18.0,
-                        if inp_focus > 0.25 { super::glass::GlassVariant::Tinted(c_orange()) } else { super::glass::GlassVariant::Clear },
-                        0.15 + 0.3 * inp_focus,
-                        ptr,
-                    );
-                    ui.allocate_ui(Vec2::new((width - 22.0).max(74.0), (row_h - 10.0).max(34.0)), |ui| {
+                    let text_out = ui.allocate_ui(Vec2::new(text_w, (row_h - 8.0).max(32.0)), |ui| {
                         egui::TextEdit::multiline(&mut self.input)
                             .id(id)
-                            .desired_width((width - 22.0).max(74.0))
+                            .desired_width(text_w)
                             .desired_rows(1)
-                            .hint_text("Написать сообщение…")
+                            .hint_text(hint_txt)
                             .frame(egui::Frame::NONE)
-                            .margin(Vec2::new(2.0, 7.0))
+                            .margin(Vec2::new(4.0, 6.0))
                             .show(ui)
-                    })
-                    .inner
-                })
-                .inner;
-            if let Some(cr) = text_out.cursor_range {
-                self.composer_sel = Some((cr.primary.index.into(), cr.secondary.index.into()));
-            }
-            let r = text_out.response;
-            self.hook_android_text(&r, "chat_input", "Сообщение", "Написать сообщение…", &self.input.clone(), 0);
-            if r.changed() && self.input != before_input {
-                if self.input_undo.last() != Some(&before_input) {
-                    self.input_undo.push(before_input);
-                    if self.input_undo.len() > 64 {
-                        self.input_undo.remove(0);
+                    }).inner;
+                    if let Some(cr) = text_out.cursor_range {
+                        self.composer_sel = Some((cr.primary.index.into(), cr.secondary.index.into()));
                     }
-                }
-                self.input_redo.clear();
-                if let Some(idx) = self.selected {
-                    self.draft_dirty_at = Some((idx, ui.input(|i| i.time)));
-                    if self.input.trim().is_empty() {
-                        if let Some((prev_idx, _)) = self.last_typing_sent.take()
-                            && let Some(prev_did) = self.dialog_id_at(prev_idx)
-                        {
-                            self.send(Cmd::SetTyping(prev_did, false));
-                        }
-                    } else {
-                        let should_ping = self.last_typing_sent.is_none_or(|(pi, t0)| {
-                            pi != idx || t0.elapsed().as_secs_f32() >= 4.5
-                        });
-                        if should_ping {
-                            self.last_typing_sent = Some((idx, std::time::Instant::now()));
-                            if let Some(did) = self.dialog_id_at(idx) {
-                                self.send(Cmd::SetTyping(did, true));
+                    text_resp_opt = Some(text_out.response);
+                    if !expanded {
+                        if s.field_emoji_button {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 34.0), Sense::click());
+                            self.emoji_btn = rect;
+                            let k = tween(ui.ctx(), "emoji-btn", f32::from(u8::from(resp.hovered() || self.emoji_open || self.emoji_hover_open)), 0.14);
+                            icons::tg_sized(ui.painter(), "chat/input_smile_face", rect.center(), Vec2::splat(18.0), lerp_color(DIALOG_DATE, WHITE, k));
+                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.emoji_pinned = !self.emoji_pinned;
+                                self.emoji_open = self.emoji_pinned;
+                                self.emoji_hover_open = false;
                             }
                         }
-                    }
-                }
-            }
-            if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
-                self.input_custom_emojis.clear();
-            }
-            // Кнопка панели форматирования [Aa] — выровнена строго по центру и одного размера с остальными.
-            {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
-                let fh = tween(ui.ctx(), "cmp-fmt-h", f32::from(u8::from(resp.hovered() || self.format_bar_open)), 0.12);
-                if fh > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(fh));
-                }
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Aa",
-                    FontId::proportional(15.0),
-                    if self.format_bar_open { c_orange() } else { lerp_color(DIALOG_DATE, WHITE, fh) },
-                );
-                if resp.on_hover_text("Форматирование (**жирный**, __курсив__, `код`, ||спойлер||)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.format_bar_open = !self.format_bar_open;
-                }
-            }
-            if has_draft {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
-                let th = tween(ui.ctx(), "cmp-tr-h", f32::from(u8::from(resp.hovered() || self.translate_draft_popup)), 0.12);
-                if th > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(th));
-                }
-                icons::tg_sized(
-                    ui.painter(),
-                    "settings/language",
-                    rect.center(),
-                    Vec2::splat(18.0),
-                    if self.translate_draft_popup { c_orange() } else { lerp_color(DIALOG_DATE, WHITE, th) },
-                );
-                if resp
-                    .on_hover_text("Перевести перед отправкой")
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    self.translate_draft_popup = !self.translate_draft_popup;
-                }
-            } else {
-                self.translate_draft_popup = false;
-            }
-            if has_reply_kb {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
-                let kh = tween(ui.ctx(), "cmp-kb-h", f32::from(u8::from(resp.hovered() || self.bot_keyboard_open)), 0.12);
-                if kh > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(kh));
-                }
-                let kc = if self.bot_keyboard_open { c_orange() } else { lerp_color(DIALOG_DATE, WHITE, kh) };
-                let p = ui.painter();
-                let c = rect.center();
-                let kb_rect = Rect::from_center_size(c, Vec2::new(18.0, 13.0));
-                p.rect_stroke(kb_rect, egui::CornerRadius::same(2), egui::Stroke::new(1.5, kc), egui::StrokeKind::Inside);
-                for kx in [-4.5, 0.0, 4.5] {
-                    p.circle_filled(Pos2::new(c.x + kx, c.y - 2.0), 1.1, kc);
-                }
-                p.rect_filled(Rect::from_center_size(Pos2::new(c.x, c.y + 2.5), Vec2::new(9.0, 1.8)), 0.5, kc);
-                if resp.on_hover_text("Клавиатура бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.bot_keyboard_open = !self.bot_keyboard_open;
-                }
-            }
-            if s.field_auto_delete_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 40.0), Sense::click());
-                let th = tween(ui.ctx(), "cmp-ttl-h", f32::from(u8::from(resp.hovered() || self.ttl_popup_open)), 0.12);
-                if th > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(th));
-                }
-                let active_ttl = cur_ttl.is_some_and(|v| v > 0);
-                icons::tg_sized(
-                    ui.painter(),
-                    "settings/ttl",
-                    rect.center(),
-                    Vec2::splat(19.0),
-                    if active_ttl || self.ttl_popup_open { c_orange() } else { lerp_color(DIALOG_DATE, WHITE, th) },
-                );
-                if resp.on_hover_text("Таймер автоудаления сообщений").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.ttl_popup_open = !self.ttl_popup_open;
-                    self.cmd_popup_open = false;
-                }
-            }
-            if s.field_emoji_button {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::click());
-                self.emoji_btn = rect;
-                let k = tween(ui.ctx(), "emoji-btn", f32::from(u8::from(resp.hovered() || self.emoji_open || self.emoji_hover_open)), 0.14);
-                let sc = spring_scale(k, 0.0);
-                if k > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(k));
-                }
-                let color = lerp_color(DIALOG_DATE, if self.emoji_open { c_orange() } else { WHITE }, k);
-                // Единый визуальный размер 19 px (радиус 9.0) — идеально на одной линии с остальными иконками!
-                ui.painter().circle_stroke(rect.center(), 9.0 * sc.min(1.08), egui::Stroke::new(1.5, color));
-                icons::tg_sized(ui.painter(), "chat/input_smile_face", rect.center(), Vec2::splat(13.0 * sc.min(1.08)), color);
-                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                let is_scrolling = ui.input(|i| i.smooth_scroll_delta.y.abs() > 0.5);
-                let any_down = ui.input(|i| i.pointer.any_down());
-                let now_em = ui.input(|i| i.time);
-                if resp.clicked() {
-                    self.emoji_pinned = !self.emoji_pinned;
-                    self.emoji_open = self.emoji_pinned;
-                    self.emoji_hover_open = false;
-                    self.emoji_hover_since = None;
-                } else if resp.hovered() && s.show_emoji_popup && !is_scrolling && !any_down {
-                    if ui.ctx().content_rect().width() >= super::NARROW_WIDTH
-                        && !self.emoji_open
-                        && !self.emoji_hover_open
-                    {
-                        let t0 = *self.emoji_hover_since.get_or_insert(now_em);
-                        if now_em - t0 >= 0.26 {
-                            self.emoji_hover_open = true;
-                            self.emoji_leave_since = None;
+                        let (srect, sresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+                        let sh = tween(ui.ctx(), "send-hover", f32::from(u8::from(sresp.hovered())), 0.12);
+                        ui.painter().circle_filled(srect.center(), 15.0, if sh > 0.05 { WHITE.gamma_multiply(0.14 * sh) } else { Color32::from_white_alpha(14) });
+                        if s.field_microphone_button {
+                            let mc = lerp_color(DIALOG_DATE, WHITE, sh);
+                            let c = srect.center();
+                            ui.painter().rect_filled(Rect::from_center_size(Pos2::new(c.x, c.y - 2.0), Vec2::new(7.0, 10.5)), egui::CornerRadius::same(4), mc);
+                            ui.painter().line_segment([Pos2::new(c.x, c.y + 3.0), Pos2::new(c.x, c.y + 7.0)], egui::Stroke::new(1.4, mc));
                         } else {
-                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+                            icons::send(ui.painter(), srect.center(), lerp_color(DIALOG_DATE, WHITE, sh));
                         }
-                    }
-                } else if !self.emoji_hover_open {
-                    self.emoji_hover_since = None;
-                }
-            }
-            let (srect, sresp) = ui.allocate_exact_size(Vec2::new(38.0, 40.0), Sense::click());
-            let active = !self.input.trim().is_empty();
-            let mic_mode = s.field_microphone_button && !active && self.editing.is_none() && self.voice_rec.is_none();
-            let send_k = tween(ui.ctx(), "send-active", f32::from(u8::from(active)), 0.14);
-            let send_h = tween(ui.ctx(), "send-hover", f32::from(u8::from(sresp.hovered())), 0.12);
-            let send_p = tween(ui.ctx(), "send-press", f32::from(u8::from(sresp.is_pointer_button_down_on())), 0.08);
-            let sc = spring_scale(send_h, send_p);
-            let sc_center = srect.center() + super::glass::magnet_offset(ui.ctx(), "cmp-send-mag", srect.center(), 46.0, 3.5);
-            if send_k > 0.02 {
-                let r_btn = 16.0 * sc.min(1.12);
-                let base = lerp_color(c_orange(), ORANGE_OVER, send_h);
-                let fill = Color32::from_rgba_unmultiplied(
-                    base.r(),
-                    base.g(),
-                    base.b(),
-                    (f32::from(t_btn(base).a()) * send_k) as u8,
-                );
-                ui.painter().circle_filled(sc_center, r_btn, fill);
-            } else if mic_mode && send_h > 0.02 {
-                ui.painter().circle_filled(sc_center, 16.0, t(WINDOW_OVER).gamma_multiply(send_h));
-            }
-            if mic_mode {
-                let mc = lerp_color(DIALOG_DATE, c_orange(), send_h);
-                let c = sc_center;
-                let cap = Rect::from_center_size(Pos2::new(c.x, c.y - 2.5), Vec2::new(7.5, 11.5));
-                ui.painter().rect_filled(cap, egui::CornerRadius::same(4), mc);
-                ui.painter().line_segment([Pos2::new(c.x - 6.0, c.y - 0.5), Pos2::new(c.x - 6.0, c.y + 3.0)], egui::Stroke::new(1.5, mc));
-                ui.painter().line_segment([Pos2::new(c.x + 6.0, c.y - 0.5), Pos2::new(c.x + 6.0, c.y + 3.0)], egui::Stroke::new(1.5, mc));
-                ui.painter().line_segment([Pos2::new(c.x - 6.0, c.y + 3.0), Pos2::new(c.x + 6.0, c.y + 3.0)], egui::Stroke::new(1.5, mc));
-                ui.painter().line_segment([Pos2::new(c.x, c.y + 3.0), Pos2::new(c.x, c.y + 7.5)], egui::Stroke::new(1.5, mc));
-                ui.painter().line_segment([Pos2::new(c.x - 3.8, c.y + 7.5), Pos2::new(c.x + 3.8, c.y + 7.5)], egui::Stroke::new(1.5, mc));
-            } else {
-                let arrow_c = if active { super::theme::on_accent() } else { DIALOG_DATE };
-                icons::send(ui.painter(), sc_center, arrow_c);
-                if self.selected_effect.is_some() {
-                    ui.painter().circle_filled(
-                        srect.right_top() + Vec2::new(-5.0, 6.0),
-                        4.5,
-                        c_orange(),
-                    );
-                }
-            }
-            let sresp = sresp
-                .on_hover_text(if mic_mode {
-                    "Записать голосовое · ПКМ: Меню отправки"
-                } else {
-                    "Отправить · ПКМ: Без звука / Отложить / Эффекты"
-                })
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            egui::Popup::context_menu(&sresp)
-                .frame(kit::compact_popup_frame())
-                .show(|ui| {
-                    ui.set_min_width(178.0);
-                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
-                    if active && kit::menu_item(ui, "menu/mute", "Отправить без звука", false) {
-                        send_silent_now = true;
-                        ui.close();
-                    }
-                    if kit::menu_item(ui, "settings/ttl", "Отложить сообщение", false) {
-                        self.schedule_picker_open = true;
-                        ui.close();
-                    }
-                    if kit::menu_item(ui, "dialogs/dialogs_premium", "Эффекты / Опрос / Чек-лист", false) {
-                        self.send_menu_open = !self.send_menu_open;
-                        ui.close();
+                        if sresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            trigger_send_or_rec = true;
+                        }
                     }
                 });
-            if mic_mode && sresp.clicked() && self.selected.is_some() {
-                match super::audio_io::VoiceRecorder::start() {
-                    Ok(rec) => self.voice_rec = Some(rec),
-                    Err(e) => {
-                        self.error = e;
-                        self.error_at = self.now;
-                    }
+                if expanded {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        // Левые инструменты капсулы: Меню бота / Вложение / От имени / Режим отправки
+                        if let Some((w_lbl, w_url)) = &bot_webapp {
+                            let lbl = short(w_lbl, 11);
+                            if super::glass::pill_button(ui, "cmp-botapp", Vec2::new(108.0, 28.0), Some("dialogs/dialogs_menu"), &lbl, true).clicked()
+                                && let Some(did) = self.selected_dialog_id()
+                            {
+                                self.send(Cmd::OpenMiniApp {
+                                    dialog_id: did,
+                                    msg_id: None,
+                                    title: w_lbl.clone(),
+                                    url: Some(w_url.clone()),
+                                    start_param: None,
+                                    simple: false,
+                                });
+                            }
+                        } else if !bot_cmds.is_empty()
+                            && super::glass::pill_button(ui, "cmp-botmenu", Vec2::new(80.0, 28.0), Some("dialogs/dialogs_menu"), "Меню", self.cmd_popup_open).clicked()
+                        {
+                            self.cmd_popup_open = !self.cmd_popup_open;
+                            self.ttl_popup_open = false;
+                        }
+                        if s.field_attach_button {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
+                            let ah = tween(ui.ctx(), "cmp-att-h", f32::from(u8::from(resp.hovered())), 0.12);
+                            if ah > 0.02 {
+                                super::glass::paint_surface(ui.painter(), rect, 14.0, super::glass::GlassVariant::Clear, ah);
+                            }
+                            icons::attach(ui.painter(), rect.center(), lerp_color(DIALOG_DATE, WHITE, ah));
+                            let resp = resp.on_hover_text("Прикрепить (ПКМ: опрос, чек-лист, отложенные)").on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let mut render_att_items = |ui: &mut egui::Ui, att: &mut bool| {
+                                ui.set_min_width(178.0);
+                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                                if kit::menu_item(ui, "menu/photo", "Фото / Видео / Файл", false) { *att = true; ui.close(); }
+                                if kit::menu_item(ui, "menu/select", "Чек-лист (To-Do)", false) { self.todo_modal_open = true; ui.close(); }
+                                if kit::menu_item(ui, "menu/info", "Опрос / Викторина", false) { self.poll_modal_open = true; ui.close(); }
+                                if kit::menu_item(ui, "settings/ttl", "Отложенные сообщения", false) {
+                                    if let Some(did) = self.selected_dialog_id() { self.scheduled_open = true; self.send(Cmd::LoadScheduled(did)); }
+                                    ui.close();
+                                }
+                                kit::menu_separator(ui);
+                                if kit::menu_item(ui, "contacts", "Контакт", false) { self.contact_modal_open = true; ui.close(); }
+                                if kit::menu_item(ui, "menu/search", "Геопозиция (координаты)", false) { self.geo_modal_open = true; ui.close(); }
+                            };
+                            if s.show_attach_popup {
+                                egui::Popup::menu(&resp).frame(kit::compact_popup_frame()).show(|ui| render_att_items(ui, &mut attach));
+                            } else {
+                                attach = resp.clicked();
+                                egui::Popup::context_menu(&resp).frame(kit::compact_popup_frame()).show(|ui| render_att_items(ui, &mut attach));
+                            }
+                        }
+                        if has_send_as && let Some((_, cid, _)) = cur_dlg_info {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
+                            let sel_id = self.selected_send_as.get(&cid).map(|p| p.id.bot_api_dialog_id_unchecked()).unwrap_or(0);
+                            let sel_name = self.send_as_map.get(&cid).and_then(|v| v.iter().find(|x| x.id == sel_id).or_else(|| v.first())).map(|x| x.title.clone()).unwrap_or_else(|| self.me.clone());
+                            draw_avatar(ui, rect.center(), &sel_name, sel_id, 22.0, self.avatars.get(&sel_id), 23);
+                            if resp.on_hover_text(format!("От имени: {sel_name}")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.send_as_popup_open = !self.send_as_popup_open;
+                            }
+                        }
+                        // Селектор режима отправки (#9 Mode Selector pill)
+                        let mode_lbl = if self.schedule_picker_open {
+                            "Отложить"
+                        } else if self.composer_silent_mode {
+                            "Без звука"
+                        } else {
+                            "Обычно"
+                        };
+                        let mode_resp = super::glass::pill_button(
+                            ui,
+                            "cmp-mode-pill",
+                            Vec2::new(88.0, 26.0),
+                            Some(if self.composer_silent_mode { "menu/mute" } else { "settings/ttl" }),
+                            mode_lbl,
+                            self.composer_silent_mode || self.schedule_picker_open,
+                        );
+                        egui::Popup::menu(&mode_resp)
+                            .frame(kit::compact_popup_frame())
+                            .show(|ui| {
+                                ui.set_min_width(172.0);
+                                if kit::menu_item(ui, "settings/chat", "Обычная отправка", false) {
+                                    self.composer_silent_mode = false;
+                                    self.schedule_picker_open = false;
+                                    ui.close();
+                                }
+                                if kit::menu_item(ui, "menu/mute", "Без звука", false) {
+                                    self.composer_silent_mode = true;
+                                    self.schedule_picker_open = false;
+                                    ui.close();
+                                }
+                                if kit::menu_item(ui, "settings/ttl", "Отложить сообщение", false) {
+                                    self.schedule_picker_open = !self.schedule_picker_open;
+                                    ui.close();
+                                }
+                            });
+                        if s.field_commands_button && has_cmds {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "/", FontId::proportional(15.5), if self.cmd_popup_open { c_orange() } else { SUBTEXT });
+                            if resp.on_hover_text("Команды бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.cmd_popup_open = !self.cmd_popup_open;
+                                self.ttl_popup_open = false;
+                            }
+                        }
+                        {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Aa", FontId::proportional(13.5), if self.format_bar_open { c_orange() } else { SUBTEXT });
+                            if resp.on_hover_text("Форматирование").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.format_bar_open = !self.format_bar_open;
+                            }
+                        }
+                        if has_draft {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                            icons::tg_sized(ui.painter(), "settings/language", rect.center(), Vec2::splat(15.0), if self.translate_draft_popup { c_orange() } else { SUBTEXT });
+                            if resp.on_hover_text("Перевести перед отправкой").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.translate_draft_popup = !self.translate_draft_popup;
+                            }
+                        } else {
+                            self.translate_draft_popup = false;
+                        }
+                        if s.field_auto_delete_button {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                            let active_ttl = cur_ttl.is_some_and(|v| v > 0);
+                            icons::tg_sized(ui.painter(), "settings/ttl", rect.center(), Vec2::splat(16.0), if active_ttl || self.ttl_popup_open { c_orange() } else { SUBTEXT });
+                            if resp.on_hover_text("Таймер автоудаления сообщений").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.ttl_popup_open = !self.ttl_popup_open;
+                                self.cmd_popup_open = false;
+                            }
+                        }
+                        // Правая группа внутри капсулы: клавиатура, эмодзи и круглая кнопка отправки/микрофона
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (srect, sresp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+                            let mic_mode = s.field_microphone_button && !has_draft && self.editing.is_none() && self.voice_rec.is_none();
+                            let send_k = tween(ui.ctx(), "send-active", f32::from(u8::from(has_draft)), 0.14);
+                            let send_h = tween(ui.ctx(), "send-hover", f32::from(u8::from(sresp.hovered())), 0.12);
+                            let sc_center = srect.center();
+                            if send_k > 0.02 {
+                                ui.painter().circle_filled(sc_center, 15.0, lerp_color(c_orange(), ORANGE_OVER, send_h));
+                            } else if send_h > 0.02 {
+                                ui.painter().circle_filled(sc_center, 15.0, t(WINDOW_OVER).gamma_multiply(send_h));
+                            }
+                            if mic_mode {
+                                let mc = lerp_color(DIALOG_DATE, WHITE, send_h);
+                                ui.painter().rect_filled(Rect::from_center_size(Pos2::new(sc_center.x, sc_center.y - 2.0), Vec2::new(7.0, 10.5)), egui::CornerRadius::same(4), mc);
+                                ui.painter().line_segment([Pos2::new(sc_center.x, sc_center.y + 3.0), Pos2::new(sc_center.x, sc_center.y + 7.0)], egui::Stroke::new(1.4, mc));
+                            } else {
+                                let arrow_c = if has_draft { super::theme::on_accent() } else { DIALOG_DATE };
+                                icons::send(ui.painter(), sc_center, arrow_c);
+                            }
+                            let sresp = sresp.on_hover_text(if mic_mode { "Записать голосовое" } else { "Отправить (ПКМ: опции)" }).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            egui::Popup::context_menu(&sresp).frame(kit::compact_popup_frame()).show(|ui| {
+                                ui.set_min_width(172.0);
+                                if has_draft && kit::menu_item(ui, "menu/mute", "Отправить без звука", false) {
+                                    trigger_silent = true;
+                                    ui.close();
+                                }
+                                if kit::menu_item(ui, "settings/ttl", "Отложить сообщение", false) {
+                                    self.schedule_picker_open = true;
+                                    ui.close();
+                                }
+                                if kit::menu_item(ui, "dialogs/dialogs_premium", "Эффекты / Опрос / Чек-лист", false) {
+                                    self.send_menu_open = !self.send_menu_open;
+                                    ui.close();
+                                }
+                            });
+                            if sresp.clicked() {
+                                trigger_send_or_rec = true;
+                            }
+                            if s.field_emoji_button {
+                                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+                                self.emoji_btn = rect;
+                                let k = tween(ui.ctx(), "emoji-btn", f32::from(u8::from(resp.hovered() || self.emoji_open || self.emoji_hover_open)), 0.14);
+                                icons::tg_sized(ui.painter(), "chat/input_smile_face", rect.center(), Vec2::splat(17.0), lerp_color(DIALOG_DATE, WHITE, k));
+                                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let now_em = ui.input(|i| i.time);
+                                if resp.clicked() {
+                                    self.emoji_pinned = !self.emoji_pinned;
+                                    self.emoji_open = self.emoji_pinned;
+                                    self.emoji_hover_open = false;
+                                } else if resp.hovered() && s.show_emoji_popup && !self.emoji_open && !self.emoji_hover_open {
+                                    let t0 = *self.emoji_hover_since.get_or_insert(now_em);
+                                    if now_em - t0 >= 0.26 {
+                                        self.emoji_hover_open = true;
+                                    }
+                                } else if !self.emoji_hover_open {
+                                    self.emoji_hover_since = None;
+                                }
+                            }
+                            if has_reply_kb {
+                                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                                let kc = if self.bot_keyboard_open { c_orange() } else { SUBTEXT };
+                                ui.painter().rect_stroke(Rect::from_center_size(rect.center(), Vec2::new(16.0, 11.0)), egui::CornerRadius::same(2), egui::Stroke::new(1.3, kc), egui::StrokeKind::Inside);
+                                if resp.on_hover_text("Клавиатура бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    self.bot_keyboard_open = !self.bot_keyboard_open;
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+        let r = text_resp_opt.expect("composer input response");
+        self.hook_android_text(&r, "chat_input", "Сообщение", "Написать сообщение…", &self.input.clone(), 0);
+        if r.changed() && self.input != before_input {
+            if self.input_undo.last() != Some(&before_input) {
+                self.input_undo.push(before_input);
+                if self.input_undo.len() > 64 {
+                    self.input_undo.remove(0);
                 }
             }
-            if (sresp.clicked() || enter || send_scheduled_now || send_silent_now)
-                && active
-                && self.selected.is_some()
-            {
-                let lead = self.input.chars().take_while(|c| c.is_whitespace()).count();
-                let raw_text = self.input.trim().to_owned();
-                let text = if cfg!(feature = "plugins") && self.settings.plugins_enabled {
-                    match self.plugins.apply_outgoing(&raw_text) {
-                        rg_ayu::plugins::HookOutcome::Modified(s) => s,
-                        rg_ayu::plugins::HookOutcome::Unchanged => raw_text,
+            self.input_redo.clear();
+            if let Some(idx) = self.selected {
+                self.draft_dirty_at = Some((idx, ui.input(|i| i.time)));
+                if self.input.trim().is_empty() {
+                    if let Some((prev_idx, _)) = self.last_typing_sent.take()
+                        && let Some(prev_did) = self.dialog_id_at(prev_idx)
+                    {
+                        self.send(Cmd::SetTyping(prev_did, false));
                     }
                 } else {
-                    raw_text
-                };
-                let char_total = text.chars().count();
-                let custom: Vec<(usize, usize, i64)> = std::mem::take(&mut self.input_custom_emojis)
-                    .into_iter()
-                    .filter_map(|(st, ln, id)| {
-                        let ns = st.checked_sub(lead)?;
-                        (ns + ln <= char_total).then_some((ns, ln, id))
-                    })
-                    .collect();
-                self.input.clear();
-                self.input_undo.clear();
-                self.input_redo.clear();
-                self.composer_sel = None;
-                let (clean, ents) = super::rich::parse_formatted(&text, &custom);
-                if let Some(did) = self.selected_dialog_id() {
-                    if let Some(id) = self.editing.take() {
-                        self.send(Cmd::Edit(did, id, clean));
-                    } else {
-                        let reply = self.reply.take().map(|(id, _)| id);
-                        let effect = self.selected_effect.take();
-                        let schedule_date = if send_scheduled_now {
-                            self.schedule_picker_open = false;
-                            Some((self.now + i64::from(self.schedule_delay_mins.max(1)) * 60) as i32)
-                        } else {
-                            None
-                        };
-                        let send_as = cur_dlg_info.and_then(|(_, cid, _)| self.selected_send_as.get(&cid).copied());
-                        if schedule_date.is_some() || effect.is_some() || send_as.is_some() {
-                            self.send(Cmd::SendAdvanced {
-                                dialog_id: did,
-                                text: clean,
-                                entities: ents,
-                                reply_to: reply,
-                                schedule_date,
-                                effect,
-                                send_as,
-                                silent: send_silent_now,
-                            });
-                        } else if send_silent_now && ents.is_empty() {
-                            let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
-                            self.send(Cmd::SendSilent(did, clean, reply, temp_id));
-                        } else if send_silent_now {
-                            self.send(Cmd::SendAdvanced {
-                                dialog_id: did,
-                                text: clean,
-                                entities: ents,
-                                reply_to: reply,
-                                schedule_date: None,
-                                effect: None,
-                                send_as: None,
-                                silent: true,
-                            });
-                        } else if ents.is_empty() {
-                            let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
-                            self.send(Cmd::Send(did, clean, reply, temp_id));
-                        } else {
-                            let temp_id = self.push_optimistic_message(clean.clone(), ents.clone(), reply, None);
-                            self.send(Cmd::SendFormatted(did, clean, ents, reply, temp_id));
+                    let should_ping = self.last_typing_sent.is_none_or(|(pi, t0)| pi != idx || t0.elapsed().as_secs_f32() >= 4.5);
+                    if should_ping {
+                        self.last_typing_sent = Some((idx, std::time::Instant::now()));
+                        if let Some(did) = self.dialog_id_at(idx) {
+                            self.send(Cmd::SetTyping(did, true));
                         }
                     }
                 }
-                r.request_focus();
             }
-        });
+        }
+        if self.input.is_empty() && !self.input_custom_emojis.is_empty() {
+            self.input_custom_emojis.clear();
+        }
+        let send_silent_now = trigger_silent || self.composer_silent_mode;
+        let mic_start = trigger_send_or_rec && s.field_microphone_button && !has_draft && self.editing.is_none() && self.voice_rec.is_none();
+        if mic_start && self.selected.is_some() {
+            match super::audio_io::VoiceRecorder::start() {
+                Ok(rec) => self.voice_rec = Some(rec),
+                Err(e) => {
+                    self.error = e;
+                    self.error_at = self.now;
+                }
+            }
+        }
+        if (trigger_send_or_rec || enter || send_scheduled_now || trigger_silent)
+            && !mic_start
+            && has_draft
+            && self.selected.is_some()
+        {
+            let lead = self.input.chars().take_while(|c| c.is_whitespace()).count();
+            let raw_text = self.input.trim().to_owned();
+            let text = if cfg!(feature = "plugins") && self.settings.plugins_enabled {
+                match self.plugins.apply_outgoing(&raw_text) {
+                    rg_ayu::plugins::HookOutcome::Modified(s) => s,
+                    rg_ayu::plugins::HookOutcome::Unchanged => raw_text,
+                }
+            } else {
+                raw_text
+            };
+            let char_total = text.chars().count();
+            let custom: Vec<(usize, usize, i64)> = std::mem::take(&mut self.input_custom_emojis)
+                .into_iter()
+                .filter_map(|(st, ln, id)| {
+                    let ns = st.checked_sub(lead)?;
+                    (ns + ln <= char_total).then_some((ns, ln, id))
+                })
+                .collect();
+            self.input.clear();
+            self.input_undo.clear();
+            self.input_redo.clear();
+            self.composer_sel = None;
+            let (clean, ents) = super::rich::parse_formatted(&text, &custom);
+            if let Some(did) = self.selected_dialog_id() {
+                if let Some(id) = self.editing.take() {
+                    self.send(Cmd::Edit(did, id, clean));
+                } else {
+                    let reply = self.reply.take().map(|(id, _)| id);
+                    let effect = self.selected_effect.take();
+                    let schedule_date = if send_scheduled_now {
+                        self.schedule_picker_open = false;
+                        Some((self.now + i64::from(self.schedule_delay_mins.max(1)) * 60) as i32)
+                    } else {
+                        None
+                    };
+                    let send_as = cur_dlg_info.and_then(|(_, cid, _)| self.selected_send_as.get(&cid).copied());
+                    if schedule_date.is_some() || effect.is_some() || send_as.is_some() {
+                        self.send(Cmd::SendAdvanced {
+                            dialog_id: did,
+                            text: clean,
+                            entities: ents,
+                            reply_to: reply,
+                            schedule_date,
+                            effect,
+                            send_as,
+                            silent: send_silent_now,
+                        });
+                    } else if send_silent_now && ents.is_empty() {
+                        let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
+                        self.send(Cmd::SendSilent(did, clean, reply, temp_id));
+                    } else if send_silent_now {
+                        self.send(Cmd::SendAdvanced {
+                            dialog_id: did,
+                            text: clean,
+                            entities: ents,
+                            reply_to: reply,
+                            schedule_date: None,
+                            effect: None,
+                            send_as: None,
+                            silent: true,
+                        });
+                    } else if ents.is_empty() {
+                        let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
+                        self.send(Cmd::Send(did, clean, reply, temp_id));
+                    } else {
+                        let temp_id = self.push_optimistic_message(clean.clone(), ents.clone(), reply, None);
+                        self.send(Cmd::SendFormatted(did, clean, ents, reply, temp_id));
+                    }
+                }
+            }
+            r.request_focus();
+        }
         // Реплай-клавиатура бота под строкой ввода (`ReplyKeyboardMarkup`) с цветами и плавными анимациями.
         let kb_k = tween(
             ui.ctx(),
@@ -3434,6 +3349,26 @@ impl App {
                 A::VisibleDoc(doc_id) => {
                     self.visible_tgs_docs.insert(doc_id);
                 }
+                A::ClearRecent => {
+                    self.recent_stickers.clear();
+                    self.send(Cmd::ClearRecentStickers);
+                }
+                A::Fave(st, unfave) => {
+                    self.send(Cmd::FaveSticker {
+                        id: st.id,
+                        access_hash: st.access_hash,
+                        file_ref: st.file_ref,
+                        unfave,
+                    });
+                }
+                A::SaveGif(g, unsave) => {
+                    self.send(Cmd::SaveGif {
+                        id: g.id,
+                        access_hash: g.access_hash,
+                        file_ref: g.file_ref,
+                        unsave,
+                    });
+                }
             }
         }
         if let Some(c) = picked {
@@ -3519,17 +3454,50 @@ impl App {
 
     pub(crate) fn messages_ui(&mut self, ui: &mut egui::Ui) {
         if self.selected.is_none() {
+            let mut dock_pick: Option<usize> = None;
             ui.centered_and_justified(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(280.0, 40.0), Sense::hover());
-                ui.painter().rect_filled(rect, egui::CornerRadius::same(20), t(SERVICE_BG));
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Выберите, кому написать",
-                    FontId::proportional(14.0),
-                    Color32::WHITE,
-                );
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(260.0, 38.0), Sense::hover());
+                    super::glass::paint_surface(ui.painter(), rect, 19.0, super::glass::GlassVariant::Regular, 0.15);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Выберите, кому написать",
+                        FontId::proportional(13.5),
+                        Color32::WHITE,
+                    );
+                    ui.add_space(24.0);
+                    let dock_items = [
+                        ("menu/saved_messages", "Избранное", 0),
+                        ("menu/search", "Поиск", 0),
+                        ("contacts", "Контакты", 0),
+                        ("chat/input_gift", "Звёзды", 0),
+                        ("settings/settings", "Настройки", 0),
+                    ];
+                    dock_pick = super::glass::glass_dock(ui, "empty-chat-dock", &dock_items, None, false);
+                });
             });
+            match dock_pick {
+                Some(0) => {
+                    if let Some(idx) = self.dialogs.iter().position(|d| d.saved) {
+                        self.open_dialog(idx);
+                    }
+                }
+                Some(1) => self.palette_open = true,
+                Some(2) => {
+                    self.contacts_open = true;
+                    self.contact_search.clear();
+                    self.send(Cmd::Contacts);
+                }
+                Some(3) => {
+                    self.stars_modal_open = true;
+                    self.send(Cmd::LoadStarsStatus);
+                    self.send(Cmd::LoadSavedGifts(None));
+                    self.send(Cmd::LoadStarGiftsCatalog);
+                }
+                Some(4) => self.open_tg_settings(),
+                _ => {}
+            }
             return;
         }
         if self.discussion.is_some() {
@@ -4776,6 +4744,25 @@ impl App {
         });
     }
 
+    fn open_msg_details(&mut self, cur_did: Option<i64>, id: i32) {
+        self.details = Some(id);
+        self.details_tab = 0;
+        self.edit_history = None;
+        self.msg_activity = None;
+        if let Some(did) = cur_did {
+            self.send(Cmd::EditHistory(did, id));
+            self.send(Cmd::LoadMessageActivity(did, id));
+            let is_user_out = self
+                .selected
+                .and_then(|i| self.dialogs.get(i))
+                .is_some_and(|d| d.kind == rg_core::engine::DialogKind::User && !d.saved)
+                && self.messages.iter().any(|m| m.id == id && m.outgoing);
+            if is_user_out {
+                self.send(Cmd::LoadOutboxReadDate(did, id));
+            }
+        }
+    }
+
     pub(crate) fn apply(&mut self, ctx: &egui::Context, a: Act) {
         let cur_did = self.selected_dialog_id();
         match a {
@@ -4853,15 +4840,8 @@ impl App {
             Act::OpenStickerPack(set_id, access_hash) => {
                 self.send(Cmd::LoadStickerPack(set_id, access_hash));
             }
-            Act::Details(id) => {
-                self.details = Some(id);
-                self.details_tab = 0;
-                self.edit_history = None;
-                self.msg_activity = None;
-                if let Some(did) = cur_did {
-                    self.send(Cmd::EditHistory(did, id));
-                    self.send(Cmd::LoadMessageActivity(did, id));
-                }
+            Act::Details(id) | Act::History(id) => {
+                self.open_msg_details(cur_did, id);
             }
             Act::Hide(id) => {
                 self.hidden.insert(id);
@@ -4909,16 +4889,6 @@ impl App {
             Act::Viewer(id) => {
                 self.viewer = Some(id);
                 self.viewer_zoom = 1.0;
-            }
-            Act::History(id) => {
-                self.details = Some(id);
-                self.details_tab = 0;
-                self.edit_history = None;
-                self.msg_activity = None;
-                if let Some(did) = cur_did {
-                    self.send(Cmd::EditHistory(did, id));
-                    self.send(Cmd::LoadMessageActivity(did, id));
-                }
             }
             Act::Goto(id) => {
                 if self.messages.iter().any(|m| m.id == id) {
@@ -5099,6 +5069,16 @@ impl App {
             }
             Act::ReplayEffect(msg_id) => {
                 self.effect_bursts.insert(msg_id, ctx.input(|i| i.time));
+            }
+            Act::FaveSticker(msg_id, unfave) => {
+                if let Some(did) = cur_did {
+                    self.send(Cmd::FaveStickerMsg(did, msg_id, unfave));
+                }
+            }
+            Act::SaveGif(msg_id, unsave) => {
+                if let Some(did) = cur_did {
+                    self.send(Cmd::SaveGifMsg(did, msg_id, unsave));
+                }
             }
         }
     }
@@ -5289,7 +5269,26 @@ impl App {
                                         });
                                     }
                                     Some((_, readers, _)) if readers.is_empty() => {
-                                        ui.label(RichText::new("Нет сведений (доступно для своих сообщений в группах)").color(SUBTEXT));
+                                        let is_user_out = m.outgoing
+                                            && self
+                                                .selected
+                                                .and_then(|i| self.dialogs.get(i))
+                                                .is_some_and(|d| d.kind == rg_core::engine::DialogKind::User && !d.saved);
+                                        if is_user_out {
+                                            match self.outbox_read_dates.get(&id) {
+                                                Some(Ok(ts)) => {
+                                                    ui.label(RichText::new(format!("Прочитано: {}", full_date(i64::from(*ts)))).strong().color(WHITE));
+                                                }
+                                                Some(Err(err)) => {
+                                                    ui.label(RichText::new(err).color(SUBTEXT));
+                                                }
+                                                None => {
+                                                    ui.label(RichText::new("Запрос точной даты прочтения…").color(SUBTEXT));
+                                                }
+                                            }
+                                        } else {
+                                            ui.label(RichText::new("Нет сведений (доступно для своих сообщений в группах)").color(SUBTEXT));
+                                        }
                                     }
                                     Some((_, readers, _)) => {
                                         for r in readers {
@@ -6137,15 +6136,45 @@ impl App {
                 .default_size([380.0, 440.0])
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        if !pack.short_name.is_empty() {
-                            ui.label(RichText::new(format!("t.me/addstickers/{}", pack.short_name)).size(12.0).color(SUBTEXT));
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{} шт.", pack.stickers.len())).size(12.0).color(ORANGE));
-                        });
-                    });
-                    ui.add_space(6.0);
+                    // Заголовочная 3D-карточка набора стикеров (#16 TiltedCard)
+                    let card_cfg = super::glass::TiltedCardConfig {
+                        size: Vec2::new((ui.available_width() - 4.0).max(260.0), 68.0),
+                        radius: 14.0,
+                        rotate_amplitude: 10.0,
+                        scale_on_hover: 1.02,
+                        has_back: false,
+                        caption: String::new(),
+                        ..super::glass::TiltedCardConfig::default()
+                    };
+                    let out = super::glass::tilted_card(ui, ("stk-pack-hdr", pack.id), &card_cfg);
+                    let cover_r = Rect::from_center_size(Pos2::new(out.rect.left() + 34.0, out.rect.center().y), Vec2::splat(44.0));
+                    if let Some(first) = pack.stickers.first()
+                        && let Some(tex) = self.sticker_tex.get(&first.id)
+                    {
+                        egui::Image::new(tex).fit_to_exact_size(cover_r.size()).paint_at(ui, cover_r);
+                    } else {
+                        super::icons::tg_sized(ui.painter(), "settings/stickers", cover_r.center(), Vec2::splat(26.0), WHITE);
+                    }
+                    ui.painter().text(
+                        Pos2::new(out.rect.left() + 68.0, out.rect.center().y - 9.0) + out.parallax_offset(0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &pack.title,
+                        FontId::proportional(14.5),
+                        WHITE,
+                    );
+                    let sub_t = if !pack.short_name.is_empty() {
+                        format!("t.me/addstickers/{} · {} шт.", pack.short_name, pack.stickers.len())
+                    } else {
+                        format!("{} стикеров", pack.stickers.len())
+                    };
+                    ui.painter().text(
+                        Pos2::new(out.rect.left() + 68.0, out.rect.center().y + 10.0) + out.parallax_offset(0.3),
+                        egui::Align2::LEFT_CENTER,
+                        sub_t,
+                        FontId::proportional(11.5),
+                        SUBTEXT,
+                    );
+                    ui.add_space(8.0);
                     egui::ScrollArea::vertical()
                         .id_salt(("stk-pack-grid", pack.id))
                         .max_height(330.0)
@@ -7520,6 +7549,12 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     }
     if let Some((set_id, access_hash)) = m.media.as_ref().and_then(|i| i.sticker_set) {
         item(ui, "menu/stickers", "Набор стикеров", Act::OpenStickerPack(set_id, access_hash));
+    }
+    if m.media.as_ref().is_some_and(|i| i.kind == rg_core::media::MediaKind::Sticker) && m.id > 0 {
+        item(ui, "menu/favorite", "В избранные стикеры", Act::FaveSticker(m.id, false));
+    }
+    if m.media.as_ref().is_some_and(|i| i.kind == rg_core::media::MediaKind::Gif) && m.id > 0 {
+        item(ui, "menu/favorite", "Сохранить в GIF", Act::SaveGif(m.id, false));
     }
     if s.menu_user_messages.shown(env.shift) && env.group && m.sender_id != 0 {
         item(ui, "menu/search", "Сообщения участника", Act::FilterUser(m.sender_id, m.sender.clone()));

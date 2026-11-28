@@ -3751,6 +3751,461 @@ fn resolve_peer_list(
     out
 }
 
+// =========================================================================
+// Этап 45 (v0.32.0): 5 новых функций Telegram
+// =========================================================================
+
+/// Фотография профиля пользователя из `photos.getUserPhotos`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfilePhotoItem {
+    pub id: i64,
+    pub access_hash: i64,
+    pub file_reference: Vec<u8>,
+    pub dc_id: i32,
+    pub date: i32,
+    pub cache_path: Option<PathBuf>,
+}
+
+/// Глобальные настройки приватности (`account.getGlobalPrivacySettings`)
+/// и фильтр чувствительного контента (`account.getContentSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GlobalPrivacyInfo {
+    pub archive_and_mute_new_noncontact_peers: bool,
+    pub keep_archived_unmuted: bool,
+    pub keep_archived_folders: bool,
+    pub hide_read_marks: bool,
+    pub new_noncontact_peers_require_premium: bool,
+    pub display_gifts_button: bool,
+    pub noncontact_peers_paid_stars: Option<i64>,
+    pub sensitive_enabled: bool,
+    pub sensitive_can_change: bool,
+}
+
+/// Проверяет и нормализует новое название чата/канала перед отправкой.
+pub fn validate_chat_title(title: &str) -> Result<String, String> {
+    let clean = title.trim();
+    if clean.is_empty() {
+        return Err("Название не может быть пустым".to_owned());
+    }
+    if clean.chars().count() > 128 {
+        return Err("Название слишком длинное (макс. 128 символов)".to_owned());
+    }
+    Ok(clean.to_owned())
+}
+
+impl Engine {
+    fn extract_msg_input_document(media: &grammers_client::media::Media) -> Option<tl::enums::InputDocument> {
+        let doc = match media {
+            grammers_client::media::Media::Sticker(s) => s.document.raw.document.as_ref(),
+            grammers_client::media::Media::Document(d) => d.raw.document.as_ref(),
+            _ => None,
+        }?;
+        let tl::enums::Document::Document(d) = doc else {
+            return None;
+        };
+        Some(tl::enums::InputDocument::Document(tl::types::InputDocument {
+            id: d.id,
+            access_hash: d.access_hash,
+            file_reference: d.file_reference.clone(),
+        }))
+    }
+
+    /// 1а. Добавить/убрать стикер из избранного (`messages.faveSticker`).
+    pub async fn fave_sticker(
+        &self,
+        id: i64,
+        access_hash: i64,
+        file_ref: &[u8],
+        unfave: bool,
+    ) -> Result<(), String> {
+        let doc = tl::enums::InputDocument::Document(tl::types::InputDocument {
+            id,
+            access_hash,
+            file_reference: file_ref.to_vec(),
+        });
+        self.invoke_retry(
+            "messages.faveSticker",
+            &tl::functions::messages::FaveSticker { id: doc, unfave },
+        )
+        .await
+        .map_err(|e| format!("Избранные стикеры: {e}"))?;
+        Ok(())
+    }
+
+    async fn msg_input_document(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        kind_label: &str,
+    ) -> Result<tl::enums::InputDocument, String> {
+        let Some(m) = self
+            .message_by_id(peer, msg_id)
+            .await
+            .map_err(|e| format!("Поиск {kind_label}: {e}"))?
+        else {
+            return Err(format!("Сообщение ({kind_label}) не найдено"));
+        };
+        let Some(media) = m.media() else {
+            return Err(format!("В сообщении нет {kind_label}"));
+        };
+        Self::extract_msg_input_document(&media)
+            .ok_or_else(|| format!("Документ ({kind_label}) недоступен"))
+    }
+
+    /// 1б. Добавить/убрать стикер из избранного по сообщению в ленте.
+    pub async fn fave_sticker_from_msg(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        unfave: bool,
+    ) -> Result<(), String> {
+        let doc = self.msg_input_document(peer, msg_id, "стикера").await?;
+        self.invoke_retry(
+            "messages.faveSticker",
+            &tl::functions::messages::FaveSticker { id: doc, unfave },
+        )
+        .await
+        .map_err(|e| format!("Избранные стикеры: {e}"))?;
+        Ok(())
+    }
+
+    /// 1в. Сохранить или удалить GIF в коллекции (`messages.saveGif`).
+    pub async fn save_gif(
+        &self,
+        id: i64,
+        access_hash: i64,
+        file_ref: &[u8],
+        unsave: bool,
+    ) -> Result<(), String> {
+        let doc = tl::enums::InputDocument::Document(tl::types::InputDocument {
+            id,
+            access_hash,
+            file_reference: file_ref.to_vec(),
+        });
+        self.invoke_retry(
+            "messages.saveGif",
+            &tl::functions::messages::SaveGif { id: doc, unsave },
+        )
+        .await
+        .map_err(|e| format!("Сохранённые GIF: {e}"))?;
+        Ok(())
+    }
+
+    /// 1г. Сохранить/удалить GIF по сообщению в ленте (`messages.saveGif`).
+    pub async fn save_gif_from_msg(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        unsave: bool,
+    ) -> Result<(), String> {
+        let doc = self.msg_input_document(peer, msg_id, "GIF").await?;
+        self.invoke_retry(
+            "messages.saveGif",
+            &tl::functions::messages::SaveGif { id: doc, unsave },
+        )
+        .await
+        .map_err(|e| format!("Сохранённые GIF: {e}"))?;
+        Ok(())
+    }
+
+    /// 1д. Очистить историю недавних стикеров (`messages.clearRecentStickers`).
+    pub async fn clear_recent_stickers(&self) -> Result<(), String> {
+        self.invoke_retry(
+            "messages.clearRecentStickers",
+            &tl::functions::messages::ClearRecentStickers { attached: false },
+        )
+        .await
+        .map_err(|e| format!("Очистка недавних стикеров: {e}"))?;
+        Ok(())
+    }
+
+    /// 2. Точное время прочтения исходящего сообщения в личном чате (`messages.getOutboxReadDate`).
+    pub async fn outbox_read_date(&self, peer: PeerRef, msg_id: i32) -> Result<i32, String> {
+        let tl::enums::OutboxReadDate::Date(d) = self
+            .invoke_retry(
+                "messages.getOutboxReadDate",
+                &tl::functions::messages::GetOutboxReadDate {
+                    peer: peer.into(),
+                    msg_id,
+                },
+            )
+            .await
+            .map_err(|e| {
+                let s = e.to_string();
+                if s.contains("USER_PRIVACY_RESTRICTED") {
+                    "Время прочтения скрыто настройками приватности".to_owned()
+                } else if s.contains("MESSAGE_ID_INVALID") || s.contains("MESSAGE_NOT_READ") {
+                    "Сообщение ещё не прочитано или устарело".to_owned()
+                } else {
+                    format!("Время прочтения: {s}")
+                }
+            })?;
+        Ok(d.date)
+    }
+
+    /// 3а. Изменить название и/или описание группы или канала.
+    pub async fn edit_chat_title_and_about(
+        &self,
+        peer: PeerRef,
+        title: Option<&str>,
+        about: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(raw_title) = title {
+            let clean = validate_chat_title(raw_title)?;
+            match peer_to_input_channel(peer) {
+                Ok(channel) => {
+                    self.invoke_retry(
+                        "channels.editTitle",
+                        &tl::functions::channels::EditTitle { channel, title: clean },
+                    )
+                    .await
+                    .map_err(|e| format!("Изменение названия: {e}"))?;
+                }
+                Err(_) => {
+                    let tl::enums::InputPeer::Chat(c) = tl::enums::InputPeer::from(peer) else {
+                        return Err("Нужна группа или канал".to_owned());
+                    };
+                    self.invoke_retry(
+                        "messages.editChatTitle",
+                        &tl::functions::messages::EditChatTitle {
+                            chat_id: c.chat_id,
+                            title: clean,
+                        },
+                    )
+                    .await
+                    .map_err(|e| format!("Изменение названия: {e}"))?;
+                }
+            }
+        }
+        if let Some(raw_about) = about {
+            self.invoke_retry(
+                "messages.editChatAbout",
+                &tl::functions::messages::EditChatAbout {
+                    peer: peer.into(),
+                    about: raw_about.trim().chars().take(255).collect(),
+                },
+            )
+            .await
+            .map_err(|e| format!("Изменение описания: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// 3б. Запретить копирование, пересылку и сохранение контента (`messages.toggleNoForwards`).
+    pub async fn toggle_no_forwards(&self, peer: PeerRef, enabled: bool) -> Result<(), String> {
+        self.invoke_retry(
+            "messages.toggleNoForwards",
+            &tl::functions::messages::ToggleNoForwards {
+                peer: peer.into(),
+                enabled,
+                request_msg_id: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Защита контента: {e}"))?;
+        Ok(())
+    }
+
+    /// 3в. Скрывать или показывать историю чата для новых участников (`channels.togglePreHistoryHidden`).
+    pub async fn toggle_pre_history_hidden(&self, peer: PeerRef, enabled: bool) -> Result<(), String> {
+        let channel = peer_to_input_channel(peer)?;
+        self.invoke_retry(
+            "channels.togglePreHistoryHidden",
+            &tl::functions::channels::TogglePreHistoryHidden { channel, enabled },
+        )
+        .await
+        .map_err(|e| format!("История для новых участников: {e}"))?;
+        Ok(())
+    }
+
+    /// 4а. Загрузить фото профиля пользователя и закэшировать миниатюры (`photos.getUserPhotos`).
+    pub async fn user_profile_photos(
+        &self,
+        peer: Option<PeerRef>,
+        limit: i32,
+    ) -> Result<(i64, Vec<ProfilePhotoItem>), String> {
+        let (target_id, user_id) = match peer {
+            Some(p) => (p.id.bot_api_dialog_id_unchecked(), peer_to_input_user(p)?),
+            None => (0_i64, tl::enums::InputUser::UserSelf),
+        };
+        let res = self
+            .invoke_retry(
+                "photos.getUserPhotos",
+                &tl::functions::photos::GetUserPhotos {
+                    user_id,
+                    offset: 0,
+                    max_id: 0,
+                    limit: limit.clamp(1, 20),
+                },
+            )
+            .await
+            .map_err(|e| format!("Фото профиля: {e}"))?;
+        let raw_photos = match res {
+            tl::enums::photos::Photos::Photos(p) => p.photos,
+            tl::enums::photos::Photos::Slice(p) => p.photos,
+        };
+        let dir = self.dirs.cache.join("pphotos");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut out = Vec::new();
+        for p in raw_photos {
+            let tl::enums::Photo::Photo(ph) = p else { continue };
+            let thumb_size = ph
+                .sizes
+                .iter()
+                .rev()
+                .find_map(|s| match s {
+                    tl::enums::PhotoSize::Size(x) => Some(x.r#type.clone()),
+                    tl::enums::PhotoSize::Progressive(x) => Some(x.r#type.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "x".to_owned());
+            let dest = dir.join(format!("pp_{}.jpg", ph.id));
+            if !dest.exists() || std::fs::metadata(&dest).is_ok_and(|m| m.len() == 0) {
+                let loc = super::RawLoc {
+                    loc: tl::enums::InputFileLocation::InputPhotoFileLocation(tl::types::InputPhotoFileLocation {
+                        id: ph.id,
+                        access_hash: ph.access_hash,
+                        file_reference: ph.file_reference.clone(),
+                        thumb_size,
+                    }),
+                    dc_id: Some(ph.dc_id),
+                };
+                let _ = self.client.download_media(&loc, &dest).await;
+            }
+            let cache_path = dest.exists().then_some(dest);
+            out.push(ProfilePhotoItem {
+                id: ph.id,
+                access_hash: ph.access_hash,
+                file_reference: ph.file_reference,
+                dc_id: ph.dc_id,
+                date: ph.date,
+                cache_path,
+            });
+        }
+        Ok((target_id, out))
+    }
+
+    /// 4б. Загрузить новое фото профиля (`photos.uploadProfilePhoto`).
+    pub async fn upload_profile_photo(&self, path: &Path) -> Result<(), String> {
+        let uploaded = self
+            .client
+            .upload_file(path)
+            .await
+            .map_err(|e| format!("Загрузка файла фото: {e}"))?;
+        self.invoke_retry(
+            "photos.uploadProfilePhoto",
+            &tl::functions::photos::UploadProfilePhoto {
+                fallback: false,
+                bot: None,
+                file: Some(uploaded.raw),
+                video: None,
+                video_start_ts: None,
+                video_emoji_markup: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Установка аватара: {e}"))?;
+        Ok(())
+    }
+
+    /// 4в. Удалить фото профиля (`photos.deletePhotos`).
+    pub async fn delete_profile_photo(
+        &self,
+        id: i64,
+        access_hash: i64,
+        file_reference: &[u8],
+    ) -> Result<(), String> {
+        self.invoke_retry(
+            "photos.deletePhotos",
+            &tl::functions::photos::DeletePhotos {
+                id: vec![tl::enums::InputPhoto::Photo(tl::types::InputPhoto {
+                    id,
+                    access_hash,
+                    file_reference: file_reference.to_vec(),
+                })],
+            },
+        )
+        .await
+        .map_err(|e| format!("Удаление фото профиля: {e}"))?;
+        Ok(())
+    }
+
+    /// 5а. Загрузить глобальные настройки приватности и фильтр контента 18+.
+    pub async fn load_global_privacy(&self) -> Result<GlobalPrivacyInfo, String> {
+        let tl::enums::GlobalPrivacySettings::Settings(gp) = self
+            .invoke_retry(
+                "account.getGlobalPrivacySettings",
+                &tl::functions::account::GetGlobalPrivacySettings {},
+            )
+            .await
+            .map_err(|e| format!("Глобальная приватность: {e}"))?;
+        let content = self
+            .invoke_retry(
+                "account.getContentSettings",
+                &tl::functions::account::GetContentSettings {},
+            )
+            .await
+            .ok();
+        let (sensitive_enabled, sensitive_can_change) = match content {
+            Some(tl::enums::account::ContentSettings::Settings(c)) => {
+                (c.sensitive_enabled, c.sensitive_can_change)
+            }
+            None => (false, false),
+        };
+        Ok(GlobalPrivacyInfo {
+            archive_and_mute_new_noncontact_peers: gp.archive_and_mute_new_noncontact_peers,
+            keep_archived_unmuted: gp.keep_archived_unmuted,
+            keep_archived_folders: gp.keep_archived_folders,
+            hide_read_marks: gp.hide_read_marks,
+            new_noncontact_peers_require_premium: gp.new_noncontact_peers_require_premium,
+            display_gifts_button: gp.display_gifts_button,
+            noncontact_peers_paid_stars: gp.noncontact_peers_paid_stars,
+            sensitive_enabled,
+            sensitive_can_change,
+        })
+    }
+
+    /// 5б. Сохранить глобальные настройки приватности и фильтр контента 18+.
+    pub async fn save_global_privacy(&self, info: &GlobalPrivacyInfo) -> Result<(), String> {
+        let tl::enums::GlobalPrivacySettings::Settings(cur) = self
+            .invoke_retry(
+                "account.getGlobalPrivacySettings",
+                &tl::functions::account::GetGlobalPrivacySettings {},
+            )
+            .await
+            .map_err(|e| format!("Глобальная приватность: {e}"))?;
+        let disallowed_gifts = cur.disallowed_gifts;
+        self.invoke_retry(
+            "account.setGlobalPrivacySettings",
+            &tl::functions::account::SetGlobalPrivacySettings {
+                settings: tl::enums::GlobalPrivacySettings::Settings(tl::types::GlobalPrivacySettings {
+                    archive_and_mute_new_noncontact_peers: info.archive_and_mute_new_noncontact_peers,
+                    keep_archived_unmuted: info.keep_archived_unmuted,
+                    keep_archived_folders: info.keep_archived_folders,
+                    hide_read_marks: info.hide_read_marks,
+                    new_noncontact_peers_require_premium: info.new_noncontact_peers_require_premium,
+                    display_gifts_button: info.display_gifts_button,
+                    noncontact_peers_paid_stars: info.noncontact_peers_paid_stars,
+                    disallowed_gifts,
+                }),
+            },
+        )
+        .await
+        .map_err(|e| format!("Сохранение приватности: {e}"))?;
+        if info.sensitive_can_change {
+            self.invoke_retry(
+                "account.setContentSettings",
+                &tl::functions::account::SetContentSettings {
+                    sensitive_enabled: info.sensitive_enabled,
+                },
+            )
+            .await
+            .map_err(|e| format!("Фильтр контента: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod v22_ext_tests {
     use super::*;
@@ -3840,5 +4295,25 @@ mod v22_ext_tests {
         });
         let map = build_tl_peer_lookup(&[u], &[]);
         assert_eq!(map.get(&42).map(|(_, n)| n.as_str()), Some("Анна"));
+    }
+
+    #[test]
+    fn chat_title_validation_and_global_privacy_defaults() {
+        assert!(validate_chat_title("   ").is_err());
+        assert_eq!(validate_chat_title("  Rustgramm Chat  ").unwrap(), "Rustgramm Chat");
+        let long_title = "x".repeat(130);
+        assert!(validate_chat_title(&long_title).is_err());
+        let gp = GlobalPrivacyInfo::default();
+        assert!(!gp.hide_read_marks);
+        assert!(!gp.sensitive_can_change);
+        let ph = ProfilePhotoItem {
+            id: 1,
+            access_hash: 2,
+            file_reference: vec![3],
+            dc_id: 2,
+            date: 100,
+            cache_path: None,
+        };
+        assert_eq!(ph.dc_id, 2);
     }
 }

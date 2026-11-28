@@ -899,6 +899,51 @@ impl App {
                         });
                     }
                     1 => {
+                        if self.admin_edit_for != Some(st.chat_id) {
+                            self.admin_edit_for = Some(st.chat_id);
+                            self.admin_edit_title = st.title.clone();
+                            self.admin_edit_about = self
+                                .peer_infos
+                                .get(&st.chat_id)
+                                .map(|p| p.about.clone())
+                                .unwrap_or_default();
+                        }
+                        ui.label(RichText::new("Профиль группы / канала:").strong().color(WHITE));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Название:").size(12.5).color(SUBTEXT));
+                            ui.add(egui::TextEdit::singleline(&mut self.admin_edit_title).desired_width(240.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Описание:").size(12.5).color(SUBTEXT));
+                            ui.add(egui::TextEdit::singleline(&mut self.admin_edit_about).desired_width(240.0).hint_text("Описание чата…"));
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if orange_button(ui, "Сохранить профиль чата", Vec2::new(190.0, 30.0)).clicked() {
+                                cmds.push(Cmd::EditChatInfo {
+                                    dialog_id: st.chat_id,
+                                    title: Some(self.admin_edit_title.clone()),
+                                    about: Some(self.admin_edit_about.clone()),
+                                });
+                            }
+                            if ui.button("Запретить копирование").clicked() {
+                                cmds.push(Cmd::ToggleNoForwards(st.chat_id, true));
+                            }
+                            if ui.button("Разрешить копирование").clicked() {
+                                cmds.push(Cmd::ToggleNoForwards(st.chat_id, false));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Скрыть историю для новых").clicked() {
+                                cmds.push(Cmd::TogglePreHistoryHidden(st.chat_id, true));
+                            }
+                            if ui.button("Показывать историю новым").clicked() {
+                                cmds.push(Cmd::TogglePreHistoryHidden(st.chat_id, false));
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.separator();
                         ui.label(RichText::new("Запреты по умолчанию для всех участников группы (галочка = запрещено):").size(12.5).color(SUBTEXT));
                         ui.add_space(6.0);
                         ui.checkbox(&mut st.default_rights.send_messages, "Запретить отправку сообщений");
@@ -1120,79 +1165,148 @@ impl App {
                         1 => {
                             if self.my_saved_gifts.is_empty() {
                                 ui.label(RichText::new("У вас пока нет сохранённых подарков").color(SUBTEXT));
-                            }
-                            for g in &self.my_saved_gifts {
-                                egui::Frame::new()
-                                    .fill(t(SIDEBAR_BG))
-                                    .corner_radius(CornerRadius::same(8))
-                                    .inner_margin(egui::Margin::symmetric(10, 8))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new(format!("🎁 {}", g.title)).strong().color(WHITE));
-                                            if g.stars > 0 {
-                                                ui.label(RichText::new(format!("{} ⭐", g.stars)).color(ORANGE));
+                            } else {
+                                ui.label(RichText::new("Нажмите на 3D-карточку подарка, чтобы перевернуть").size(11.5).color(SUBTEXT));
+                                ui.add_space(6.0);
+                                let card_w = ((ui.available_width() - 12.0) * 0.5).max(170.0);
+                                for pair in self.my_saved_gifts.chunks(2) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        for (ci, g) in pair.iter().enumerate() {
+                                            let key = g.saved_id.unwrap_or(g.date ^ (ci as i64));
+                                            let cfg = super::glass::TiltedCardConfig {
+                                                size: Vec2::new(card_w, 128.0),
+                                                radius: 16.0,
+                                                rotate_amplitude: 14.0,
+                                                scale_on_hover: 1.04,
+                                                has_back: true,
+                                                caption: g.title.clone(),
+                                                ..super::glass::TiltedCardConfig::default()
+                                            };
+                                            let out = super::glass::tilted_card(ui, ("my-gift-3d", key), &cfg);
+                                            let c = out.rect.center();
+                                            if !out.is_back {
+                                                let p = ui.painter();
+                                                let badge_pos = Pos2::new(c.x, out.rect.top() + 30.0) + out.parallax_offset(1.2);
+                                                super::icons::tg_sized(p, "chat/input_gift", badge_pos, Vec2::splat(26.0), WHITE);
+                                                p.text(
+                                                    Pos2::new(c.x, c.y + 4.0) + out.parallax_offset(0.7),
+                                                    Align2::CENTER_CENTER,
+                                                    &g.title,
+                                                    FontId::proportional(13.5),
+                                                    WHITE,
+                                                );
+                                                let sub = if g.stars > 0 { format!("{} Stars", g.stars) } else { "Подарок".to_owned() };
+                                                p.text(
+                                                    Pos2::new(c.x, c.y + 24.0) + out.parallax_offset(0.5),
+                                                    Align2::CENTER_CENTER,
+                                                    sub,
+                                                    FontId::proportional(11.5),
+                                                    SUBTEXT,
+                                                );
+                                                if !g.message.is_empty() {
+                                                    p.text(
+                                                        Pos2::new(c.x, out.rect.bottom() - 16.0),
+                                                        Align2::CENTER_CENTER,
+                                                        g.message.chars().take(24).collect::<String>(),
+                                                        FontId::proportional(10.5),
+                                                        SUBTEXT,
+                                                    );
+                                                }
+                                            } else {
+                                                ui.painter().text(
+                                                    Pos2::new(c.x, out.rect.top() + 24.0),
+                                                    Align2::CENTER_CENTER,
+                                                    &g.title,
+                                                    FontId::proportional(12.5),
+                                                    WHITE,
+                                                );
+                                                let mut back_ui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(
+                                                    Pos2::new(out.rect.left() + 12.0, out.rect.top() + 44.0),
+                                                    Pos2::new(out.rect.right() - 12.0, out.rect.bottom() - 10.0),
+                                                )));
+                                                back_ui.vertical_centered(|ui| {
+                                                    let lbl = if g.unsaved { "Показать в профиле" } else { "Скрыть" };
+                                                    if super::glass::pill_button(ui, ("gift-save", key), Vec2::new(card_w - 28.0, 28.0), None, lbl, !g.unsaved).clicked() {
+                                                        cmds.push(Cmd::ToggleSaveStarGift {
+                                                            msg_id: g.msg_id,
+                                                            saved_id: g.saved_id,
+                                                            unsave: !g.unsaved,
+                                                        });
+                                                    }
+                                                    if g.convert_stars > 0 {
+                                                        ui.add_space(4.0);
+                                                        if super::glass::pill_button(ui, ("gift-conv", key), Vec2::new(card_w - 28.0, 28.0), None, &format!("Обменять ({} Stars)", g.convert_stars), false).clicked() {
+                                                            cmds.push(Cmd::ConvertStarGift {
+                                                                msg_id: g.msg_id,
+                                                                saved_id: g.saved_id,
+                                                            });
+                                                        }
+                                                    }
+                                                });
                                             }
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                if g.convert_stars > 0
-                                                    && ui.small_button(format!("Обменять ({} ⭐)", g.convert_stars)).clicked()
-                                                {
-                                                    cmds.push(Cmd::ConvertStarGift {
-                                                        msg_id: g.msg_id,
-                                                        saved_id: g.saved_id,
-                                                    });
-                                                }
-                                                let lbl = if g.unsaved { "Показать в профиле" } else { "Скрыть" };
-                                                if ui.small_button(lbl).clicked() {
-                                                    cmds.push(Cmd::ToggleSaveStarGift {
-                                                        msg_id: g.msg_id,
-                                                        saved_id: g.saved_id,
-                                                        unsave: !g.unsaved,
-                                                    });
-                                                }
-                                            });
-                                        });
-                                        if !g.message.is_empty() {
-                                            ui.label(RichText::new(&g.message).size(12.0).color(SUBTEXT));
+                                            out.paint_caption_badge(ui.painter());
                                         }
                                     });
-                                ui.add_space(4.0);
+                                    ui.add_space(10.0);
+                                }
                             }
                         }
                         _ => {
                             if self.star_gifts_catalog.is_empty() {
                                 ui.label(RichText::new("Загрузка каталога подарков…").color(SUBTEXT));
-                            }
-                            for (gi, g) in self.star_gifts_catalog.iter().enumerate() {
-                                let gfr = egui::Frame::new()
-                                    .fill(t(SIDEBAR_BG))
-                                    .corner_radius(CornerRadius::same(10))
-                                    .inner_margin(egui::Margin::symmetric(10, 6))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let badge = if g.unique { "✨" } else { "🎁" };
-                                            ui.label(RichText::new(format!("{badge} {}", g.title)).strong().color(WHITE));
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(RichText::new(format!("{} ⭐", g.stars)).strong().color(ORANGE));
-                                            });
-                                        });
-                                        if let (Some(rem), Some(tot)) = (g.remains, g.total) {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "Лимитированный: осталось {rem} из {tot}{}",
-                                                    if g.sold_out { " (распродан)" } else { "" }
-                                                ))
-                                                .size(11.5)
-                                                .color(SUBTEXT),
+                            } else {
+                                let card_w = ((ui.available_width() - 12.0) * 0.5).max(170.0);
+                                for pair in self.star_gifts_catalog.chunks(2) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        for g in pair {
+                                            let cfg = super::glass::TiltedCardConfig {
+                                                size: Vec2::new(card_w, 118.0),
+                                                radius: 16.0,
+                                                rotate_amplitude: 14.0,
+                                                scale_on_hover: 1.05,
+                                                has_back: false,
+                                                caption: format!("{} Stars", g.stars),
+                                                ..super::glass::TiltedCardConfig::default()
+                                            };
+                                            let out = super::glass::tilted_card(ui, ("cat-gift-3d", g.id), &cfg);
+                                            let p = ui.painter();
+                                            let c = out.rect.center();
+                                            if g.unique || out.hover_k > 0.05 {
+                                                super::glass::paint_star_border(p, ctx, out.rect, 16.0, out.hover_k > 0.2);
+                                            }
+                                            super::icons::tg_sized(
+                                                p,
+                                                "chat/input_gift",
+                                                Pos2::new(c.x, out.rect.top() + 30.0) + out.parallax_offset(1.2),
+                                                Vec2::splat(26.0),
+                                                WHITE,
                                             );
+                                            p.text(
+                                                Pos2::new(c.x, c.y + 4.0) + out.parallax_offset(0.7),
+                                                Align2::CENTER_CENTER,
+                                                &g.title,
+                                                FontId::proportional(13.5),
+                                                WHITE,
+                                            );
+                                            let sub = if let (Some(rem), Some(tot)) = (g.remains, g.total) {
+                                                format!("{} Stars · {rem}/{tot}", g.stars)
+                                            } else {
+                                                format!("{} Stars", g.stars)
+                                            };
+                                            p.text(
+                                                Pos2::new(c.x, c.y + 24.0) + out.parallax_offset(0.4),
+                                                Align2::CENTER_CENTER,
+                                                sub,
+                                                FontId::proportional(11.0),
+                                                SUBTEXT,
+                                            );
+                                            out.paint_caption_badge(p);
                                         }
                                     });
-                                let hov = ui.rect_contains_pointer(gfr.response.rect);
-                                let gk = tween(ctx, ("sg-cat", gi), f32::from(u8::from(hov)), 0.14);
-                                if hov || g.unique || gk > 0.02 {
-                                    let bounce_r = gfr.response.rect.expand(1.5 * ios_spring_bounce(gk));
-                                    super::glass::paint_star_border(ui.painter(), ctx, bounce_r, 10.0, hov);
+                                    ui.add_space(10.0);
                                 }
-                                ui.add_space(4.0);
                             }
                         }
                     }
@@ -1465,22 +1579,56 @@ impl App {
                         }
                     });
                     ui.add_space(8.0);
-                    ui.label(RichText::new("Готовые пресеты").strong().color(ORANGE));
-                    ui.horizontal_wrapped(|ui| {
-                        for (title, preset) in crate::theme_pack::builtin_presets() {
-                            let active = self.settings.theme.active_theme_name == preset.active_theme_name;
-                            if ui.selectable_label(active, title).clicked() {
-                                let wp = self.settings.theme.wallpaper_path.clone();
-                                let dim = self.settings.theme.wallpaper_dim;
-                                let ip = self.settings.theme.icon_pack.clone();
-                                self.settings.theme = preset;
-                                self.settings.theme.wallpaper_path = wp;
-                                self.settings.theme.wallpaper_dim = dim;
-                                self.settings.theme.icon_pack = ip;
-                                changed = true;
+                    ui.label(RichText::new("Готовые пресеты (3D TiltedCard)").strong().color(ORANGE));
+                    ui.add_space(4.0);
+                    let presets = crate::theme_pack::builtin_presets();
+                    let sw_w = ((ui.available_width() - 12.0) * 0.5).max(165.0);
+                    for pair in presets.chunks(2) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            for (title, preset) in pair {
+                                let active = self.settings.theme.active_theme_name == preset.active_theme_name;
+                                let cfg = super::glass::TiltedCardConfig {
+                                    size: Vec2::new(sw_w, 66.0),
+                                    radius: 12.0,
+                                    rotate_amplitude: 10.0,
+                                    scale_on_hover: 1.03,
+                                    has_back: false,
+                                    caption: String::new(),
+                                    ..super::glass::TiltedCardConfig::default()
+                                };
+                                let out = super::glass::tilted_card(ui, ("theme-3d", *title), &cfg);
+                                let p = ui.painter();
+                                if active {
+                                    p.rect_stroke(out.rect, CornerRadius::same(12), Stroke::new(1.5, WHITE), egui::StrokeKind::Inside);
+                                }
+                                let bg_c = crate::theme_pack::parse_hex_color(&preset.window_bg_hex).unwrap_or(WINDOW_BG);
+                                let acc_c = crate::theme_pack::parse_hex_color(&preset.accent_hex).unwrap_or(ORANGE);
+                                let msg_c = crate::theme_pack::parse_hex_color(&preset.msg_out_bg_hex).unwrap_or(MSG_OUT_BG);
+                                p.circle_filled(Pos2::new(out.rect.left() + 22.0, out.rect.center().y), 9.0, bg_c);
+                                p.circle_filled(Pos2::new(out.rect.left() + 34.0, out.rect.center().y), 9.0, acc_c);
+                                p.circle_filled(Pos2::new(out.rect.left() + 46.0, out.rect.center().y), 9.0, msg_c);
+                                p.text(
+                                    Pos2::new(out.rect.left() + 64.0, out.rect.center().y) + out.parallax_offset(0.5),
+                                    Align2::LEFT_CENTER,
+                                    *title,
+                                    FontId::proportional(13.0),
+                                    WHITE,
+                                );
+                                if out.response.clicked() {
+                                    let wp = self.settings.theme.wallpaper_path.clone();
+                                    let dim = self.settings.theme.wallpaper_dim;
+                                    let ip = self.settings.theme.icon_pack.clone();
+                                    self.settings.theme = preset.clone();
+                                    self.settings.theme.wallpaper_path = wp;
+                                    self.settings.theme.wallpaper_dim = dim;
+                                    self.settings.theme.icon_pack = ip;
+                                    changed = true;
+                                }
                             }
-                        }
-                    });
+                        });
+                        ui.add_space(6.0);
+                    }
 
                     ui.add_space(10.0);
                     ui.label(RichText::new("Живой конструктор палитры").strong().color(ORANGE));
@@ -1945,32 +2093,32 @@ impl App {
             Cmd(&'static str),
         }
         let q = self.palette_query.trim().to_lowercase();
-        let mut hits: Vec<(String, String, PaletteHit)> = Vec::new();
+        const ACTIONS: [(&str, &str, &str, &str); 10] = [
+            ("settings/settings", "Настройки Telegram", "Профиль, приватность, прокси, логи", "settings"),
+            ("chat/input_gift", "Мои звёзды и подарки", "Баланс Stars и витрина подарков", "stars"),
+            ("menu/saved_messages", "Telegram Бизнес", "Часы работы и быстрые ответы", "business"),
+            ("settings/themes", "Темы и иконки AyuGram", ".tdesktop-theme / .attheme / паки иконок", "themes"),
+            ("menu/lock", "Секретные чаты (E2E)", "Шифрование MTProto 2.0", "secret"),
+            ("menu/secret", "Переключить Режим призрака", "Не читать сообщения и истории", "ghost"),
+            ("menu/clear", "Очистить все облачные черновики", "Синхронизация messages.clearAllDrafts", "clear_drafts"),
+            ("menu/edit", "Создать чек-лист (To-Do)", "Интерактивный список в открытый чат", "todo"),
+            ("dialogs/dialogs_pinned", "Создать опрос / викторину", "В открытый чат", "poll"),
+            ("menu/add", "Добавить ещё один аккаунт", "Без ограничений на количество аккаунтов", "add_acc"),
+        ];
+        let mut hits: Vec<(Option<&'static str>, String, String, PaletteHit)> = Vec::new();
         for (idx, d) in self.dialogs.iter().enumerate() {
             let name = if d.saved { "Избранное" } else { d.name.as_str() };
             if q.is_empty() || name.to_lowercase().contains(&q) {
                 let sub = if d.archived { "Архив" } else if d.saved { "Личное хранилище" } else { &d.last };
-                hits.push((name.to_owned(), sub.chars().take(44).collect(), PaletteHit::Dialog(idx)));
+                hits.push((Some("menu/groups"), name.to_owned(), sub.chars().take(44).collect(), PaletteHit::Dialog(idx)));
                 if hits.len() >= 14 {
                     break;
                 }
             }
         }
-        const ACTIONS: [(&str, &str, &str); 10] = [
-            ("Настройки Telegram", "Профиль, приватность, прокси, логи", "settings"),
-            ("Мои звёзды и подарки ⭐", "Баланс Stars и витрина подарков", "stars"),
-            ("Telegram Бизнес", "Часы работы и быстрые ответы", "business"),
-            ("Темы и иконки AyuGram", ".tdesktop-theme / .attheme / паки иконок", "themes"),
-            ("Секретные чаты (E2E)", "Шифрование MTProto 2.0", "secret"),
-            ("Переключить Режим призрака", "Не читать сообщения и истории", "ghost"),
-            ("Очистить все облачные черновики", "Синхронизация messages.clearAllDrafts", "clear_drafts"),
-            ("Создать чек-лист (To-Do)", "Интерактивный список в открытый чат", "todo"),
-            ("Создать опрос / викторину", "В открытый чат", "poll"),
-            ("Добавить ещё один аккаунт", "Без ограничений на количество аккаунтов", "add_acc"),
-        ];
-        for (title, sub, key) in ACTIONS {
+        for (ico, title, sub, key) in ACTIONS {
             if q.is_empty() || title.to_lowercase().contains(&q) || sub.to_lowercase().contains(&q) {
-                hits.push((format!("⚡ {title}"), sub.to_owned(), PaletteHit::Cmd(key)));
+                hits.push((Some(ico), title.to_owned(), sub.to_owned(), PaletteHit::Cmd(key)));
             }
         }
         if !hits.is_empty() {
@@ -1988,125 +2136,169 @@ impl App {
                 self.palette_sel = if self.palette_sel == 0 { hits.len() - 1 } else { self.palette_sel - 1 };
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                && let Some((_, _, h)) = hits.get(self.palette_sel)
+                && let Some((_, _, _, h)) = hits.get(self.palette_sel)
             {
                 chosen = Some(h.clone());
             }
         }
 
-        let card_w = 460.0_f32.min(screen.width() - 28.0);
+        // #8 AppleSpotlight: плавающая 54px стеклянная капсула + 4 сферы быстрого доступа справа + выпадающий список.
+        const SHORTCUTS: [(&str, &str, &str); 4] = [
+            ("menu/secret", "Призрак", "ghost"),
+            ("menu/clear", "Черновики", "clear_drafts"),
+            ("menu/saved_messages", "Избранное", "saved"),
+            ("settings/settings", "Настройки", "settings"),
+        ];
+        let mut hovered_shortcut: Option<&'static str> = None;
+        let show_spheres = q.is_empty();
+        let cap_w = if show_spheres {
+            340.0_f32.min(screen.width() - 252.0).max(200.0)
+        } else {
+            540.0_f32.min(screen.width() - 32.0)
+        };
+        let list_w = 540.0_f32.min(screen.width() - 32.0);
         egui::Area::new(egui::Id::new("palette-box"))
             .order(egui::Order::Tooltip)
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 68.0 + (1.0 - appear) * 16.0))
             .show(ctx, |ui| {
                 ui.set_opacity(appear.clamp(0.02, 1.0));
-                egui::Frame::new()
-                    .fill(Color32::TRANSPARENT)
-                    .corner_radius(CornerRadius::same(16))
-                    .inner_margin(egui::Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.set_width(card_w);
-                        paint_frosted_glass_panel(ui.painter(), ui.max_rect().expand(12.0), 18.0, raw);
-                        // #8 AppleSpotlight: поисковая пилюля с иконкой и рядами быстрых действий.
-                        ui.horizontal(|ui| {
-                            let sw = (card_w - 8.0).max(160.0);
-                            let (sr, _) = ui.allocate_exact_size(Vec2::new(sw, 38.0), Sense::hover());
-                            super::glass::paint_surface(
-                                ui.painter(),
-                                sr,
-                                19.0,
-                                super::glass::GlassVariant::Clear,
-                                0.16,
-                            );
-                            super::icons::tg_sized(ui.painter(), "menu/search", Pos2::new(sr.left() + 18.0, sr.center().y), Vec2::splat(16.0), c_orange());
-                            let inner = Rect::from_min_max(
-                                sr.min + Vec2::new(34.0, 4.0),
-                                sr.max - Vec2::new(12.0, 4.0),
-                            );
-                            let inp = ui.put(
-                                inner,
-                                egui::TextEdit::singleline(&mut self.palette_query)
-                                    .hint_text("Spotlight: чат, команда, настройки… (Ctrl+K)")
-                                    .frame(egui::Frame::NONE)
-                                    .desired_width(inner.width()),
-                            );
-                            if self.palette_open {
-                                inp.request_focus();
-                            }
-                        });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let pills = [
-                                ("settings/settings", "Настройки", "settings"),
-                                ("menu/secret", "Призрак", "ghost"),
-                                ("menu/clear", "Черновики", "clear_drafts"),
-                                ("menu/lock", "Секрет", "secret"),
-                            ];
-                            let pw = ((card_w - 26.0) / pills.len() as f32).max(60.0);
-                            for (ico, lbl, key) in pills {
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        let (sr, _) = ui.allocate_exact_size(Vec2::new(cap_w, 54.0), Sense::hover());
+                        super::glass::paint_surface(
+                            ui.painter(),
+                            sr,
+                            27.0,
+                            super::glass::GlassVariant::Regular,
+                            0.25,
+                        );
+                        super::icons::tg_sized(ui.painter(), "menu/search", Pos2::new(sr.left() + 24.0, sr.center().y), Vec2::splat(18.0), WHITE);
+                        let ph_cycle = [
+                            "Spotlight: чат или команда…",
+                            "Поиск по контактам…",
+                            "Быстрый запуск действий (Ctrl+K)…",
+                        ];
+                        let cyc_idx = ((ctx.input(|i| i.time) / 3.0) as usize) % ph_cycle.len();
+                        let inner = Rect::from_min_max(sr.min + Vec2::new(44.0, 10.0), sr.max - Vec2::new(18.0, 10.0));
+                        let inp = ui.put(
+                            inner,
+                            egui::TextEdit::singleline(&mut self.palette_query)
+                                .hint_text(ph_cycle[cyc_idx])
+                                .frame(egui::Frame::NONE)
+                                .font(FontId::proportional(15.0))
+                                .desired_width(inner.width()),
+                        );
+                        if self.palette_open {
+                            inp.request_focus();
+                        }
+                        if show_spheres {
+                            let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                            for (ico, lbl, key) in SHORTCUTS {
+                                let (sph_r, sph_resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
                                 let is_on = key == "ghost" && self.settings.ghost.active;
-                                if super::glass::pill_button(ui, ("sp-qa", key), Vec2::new(pw, 30.0), Some(ico), lbl, is_on).clicked() {
+                                let hk = tween(ui.ctx(), ("sp-sph", key), f32::from(u8::from(sph_resp.hovered())), 0.14);
+                                super::glass::paint_surface_interactive(
+                                    ui.painter(),
+                                    sph_r.expand(hk * 2.0),
+                                    24.0,
+                                    if is_on { super::glass::GlassVariant::Tinted(c_orange()) } else { super::glass::GlassVariant::Regular },
+                                    hk,
+                                    ptr,
+                                );
+                                super::icons::tg_sized(
+                                    ui.painter(),
+                                    ico,
+                                    sph_r.center(),
+                                    Vec2::splat(18.0),
+                                    if is_on { super::theme::on_accent() } else { WHITE },
+                                );
+                                ui.painter().text(
+                                    Pos2::new(sph_r.center().x, sph_r.bottom() + 9.0),
+                                    Align2::CENTER_CENTER,
+                                    lbl,
+                                    FontId::proportional(10.0),
+                                    if sph_resp.hovered() { WHITE } else { SUBTEXT },
+                                );
+                                if sph_resp.hovered() {
+                                    hovered_shortcut = Some(lbl);
+                                }
+                                if sph_resp.on_hover_text(lbl).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                     chosen = Some(PaletteHit::Cmd(key));
                                 }
                             }
-                        });
-                        ui.add_space(8.0);
-                        egui::ScrollArea::vertical().max_height(310.0).id_salt("palette-list").show(ui, |ui| {
-                            let ptr = ui.ctx().input(|inp| inp.pointer.hover_pos());
-                            for (i, (title, sub, hit)) in hits.iter().enumerate() {
-                                let sel = i == self.palette_sel;
-                                let (r, resp) = ui.allocate_exact_size(Vec2::new(card_w - 8.0, 40.0), Sense::click());
-                                let hk = tween(ui.ctx(), ("sp-row", i), f32::from(u8::from(sel || resp.hovered())), 0.12);
-                                if sel || hk > 0.02 {
-                                    super::glass::paint_spotlight_card(
-                                        ui.painter(),
-                                        r,
-                                        10.0,
-                                        ptr,
-                                        if sel { 0.55 } else { hk * 0.25 },
-                                    );
-                                }
-                                ui.painter().text(
-                                    Pos2::new(r.left() + 12.0, r.center().y - 7.0),
-                                    Align2::LEFT_CENTER,
-                                    title,
-                                    FontId::proportional(13.5),
-                                    if sel { Color32::WHITE } else { WHITE },
-                                );
-                                ui.painter().text(
-                                    Pos2::new(r.left() + 12.0, r.center().y + 9.0),
-                                    Align2::LEFT_CENTER,
-                                    sub,
-                                    FontId::proportional(11.0),
-                                    SUBTEXT,
-                                );
-                                if sel {
-                                    let badge = Rect::from_center_size(Pos2::new(r.right() - 28.0, r.center().y), Vec2::new(42.0, 20.0));
-                                    ui.painter().rect_filled(badge, CornerRadius::same(6), Color32::from_white_alpha(24));
-                                    ui.painter().text(badge.center(), Align2::CENTER_CENTER, "Enter", FontId::proportional(10.0), WHITE);
-                                } else {
+                        }
+                    });
+                    if let Some(hlbl) = hovered_shortcut {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(hlbl).size(11.0).color(SUBTEXT));
+                    } else {
+                        ui.add_space(16.0);
+                    }
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(list_w);
+                            super::glass::paint_modal_card(ui.painter(), ui.max_rect().expand(10.0), 18.0, appear);
+                            egui::ScrollArea::vertical().max_height(310.0).id_salt("palette-list").show(ui, |ui| {
+                                let ptr = ui.ctx().input(|inp| inp.pointer.hover_pos());
+                                for (i, (ico, title, sub, hit)) in hits.iter().enumerate() {
+                                    let sel = i == self.palette_sel;
+                                    let (r, resp) = ui.allocate_exact_size(Vec2::new(list_w - 6.0, 42.0), Sense::click());
+                                    let hk = tween(ui.ctx(), ("sp-row", i), f32::from(u8::from(sel || resp.hovered())), 0.12);
+                                    if sel || hk > 0.02 {
+                                        super::glass::paint_spotlight_card(
+                                            ui.painter(),
+                                            r,
+                                            10.0,
+                                            ptr,
+                                            if sel { 0.55 } else { hk * 0.25 },
+                                        );
+                                    }
+                                    if let Some(ic) = ico {
+                                        super::icons::tg_sized(ui.painter(), ic, Pos2::new(r.left() + 20.0, r.center().y), Vec2::splat(16.0), if sel { WHITE } else { SUBTEXT });
+                                    }
                                     ui.painter().text(
-                                        Pos2::new(r.right() - 12.0, r.center().y),
-                                        Align2::RIGHT_CENTER,
-                                        "›",
-                                        FontId::proportional(16.0),
+                                        Pos2::new(r.left() + 40.0, r.center().y - 7.5),
+                                        Align2::LEFT_CENTER,
+                                        title,
+                                        FontId::proportional(13.5),
+                                        WHITE,
+                                    );
+                                    ui.painter().text(
+                                        Pos2::new(r.left() + 40.0, r.center().y + 8.5),
+                                        Align2::LEFT_CENTER,
+                                        sub,
+                                        FontId::proportional(11.0),
                                         SUBTEXT,
                                     );
+                                    if sel {
+                                        let badge = Rect::from_center_size(Pos2::new(r.right() - 28.0, r.center().y), Vec2::new(42.0, 20.0));
+                                        ui.painter().rect_filled(badge, CornerRadius::same(6), Color32::from_white_alpha(24));
+                                        ui.painter().text(badge.center(), Align2::CENTER_CENTER, "Enter", FontId::proportional(10.0), WHITE);
+                                    } else {
+                                        super::icons::chevron(ui.painter(), Pos2::new(r.right() - 14.0, r.center().y), false, SUBTEXT);
+                                    }
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        chosen = Some(hit.clone());
+                                    }
+                                    if i + 1 < hits.len() {
+                                        ui.painter().line_segment(
+                                            [Pos2::new(r.left() + 40.0, r.bottom()), Pos2::new(r.right() - 8.0, r.bottom())],
+                                            Stroke::new(1.0, Color32::from_white_alpha(12)),
+                                        );
+                                    }
                                 }
-                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                    chosen = Some(hit.clone());
-                                }
-                            }
-                        });
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("↑↓ выбор · Enter открыть · Esc закрыть").size(10.5).color(SUBTEXT));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                super::glass::animated_counter(ui, "sp-hits-cnt", hits.len() as i64, FontId::proportional(10.5), SUBTEXT);
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("↑↓ выбор · Enter открыть · Esc закрыть").size(10.5).color(SUBTEXT));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    super::glass::animated_counter(ui, "sp-hits-cnt", hits.len() as i64, FontId::proportional(10.5), SUBTEXT);
+                                });
                             });
                         });
-                    });
+                });
             });
 
         if let Some(hit) = chosen {
@@ -2119,6 +2311,11 @@ impl App {
                     self.open_dialog(idx);
                 }
                 PaletteHit::Cmd("settings") => self.open_tg_settings(),
+                PaletteHit::Cmd("saved") => {
+                    if let Some(idx) = self.dialogs.iter().position(|d| d.saved) {
+                        self.open_dialog(idx);
+                    }
+                }
                 PaletteHit::Cmd("stars") => {
                     self.stars_modal_open = true;
                     self.send(Cmd::LoadStarsStatus);
@@ -2384,8 +2581,6 @@ impl App {
             .default_width(330.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                let appear = tween(ctx, "mdl-date-jump", 1.0, 0.16);
-                super::glass::paint_modal_card(ui.painter(), ui.max_rect().expand(10.0), 16.0, appear);
                 ui.label(RichText::new("Быстрый переход:").size(12.5).color(SUBTEXT));
                 ui.horizontal_wrapped(|ui| {
                     for (lbl, ts) in [

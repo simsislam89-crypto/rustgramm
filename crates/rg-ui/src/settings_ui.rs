@@ -66,8 +66,18 @@ impl App {
             return;
         }
         let screen = ctx.content_rect();
-        let w = 275.0_f32.min(screen.width());
-        // Затемнение с iOS-блюром: клик вне панели закрывает её.
+        let target_w = if self.drawer_collapsed { 68.0 } else { 264.0 };
+        let w = super::glass::spring_anim(
+            ctx,
+            "drawer-w-spring",
+            target_w,
+            super::glass::SpringSpec::LAYOUT,
+        )
+        .min((screen.width() - 16.0).max(60.0));
+        let collapsed = w < 140.0;
+        let pad = 8.0;
+        let panel_h = (screen.height() - pad * 2.0).max(200.0);
+        // Затемнение с iOS-блюром: клик вне плавающей панели закрывает её.
         egui::Area::new(egui::Id::new("drawer-dim"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::ZERO)
@@ -85,317 +95,393 @@ impl App {
         let corners = s.ayu.avatar_corners;
         let mut act: Option<&str> = None;
         let mut switch_slot: Option<u32> = None;
+        let mut toggle_collapse = false;
+        let tooltip_to_paint = std::cell::RefCell::new(None::<(Pos2, String)>);
+        let panel_x = pad - (1.0 - open) * (w + pad + 12.0);
         egui::Area::new(egui::Id::new("drawer"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(Pos2::new(-(1.0 - open) * w, 0.0))
+            .fixed_pos(Pos2::new(panel_x, pad))
             .show(ctx, |ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(w, screen.height()), Sense::hover());
-                // Многослойное матовое стекло для левой шторки (на мобильных — iOS 26 Liquid Glass).
-                if super::theme::mobile_glass_active() {
-                    ui.set_opacity(open);
-                    super::glass::paint_surface(
-                        ui.painter(),
-                        rect.shrink2(Vec2::new(0.0, 4.0)),
-                        18.0,
-                        super::glass::GlassVariant::Regular,
-                        0.0,
-                    );
-                } else {
-                    paint_frosted_glass_panel(ui.painter(), rect, 0.0, open);
-                }
+                ui.set_opacity(open.clamp(0.02, 1.0));
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(w, panel_h), Sense::hover());
+                super::glass::paint_surface(
+                    ui.painter(),
+                    rect,
+                    24.0,
+                    super::glass::GlassVariant::Regular,
+                    0.18,
+                );
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let ui = &mut child;
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                let footer_h = 38.0;
-                // Полноценная вертикальная прокрутка левого меню (работает при любом числе аккаунтов и разрешении!).
-                egui::ScrollArea::vertical()
-                    .id_salt("drawer-scroll")
-                    .max_height((screen.height() - footer_h).max(160.0))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                // Шапка: аватар, имя, ссылка на настройки AyuGram.
-                let (head, _) = ui.allocate_exact_size(Vec2::new(w, 152.0), Sense::hover());
-                draw_avatar(ui, Pos2::new(head.left() + 46.0, head.top() + 46.0), &me, 1, 56.0, me_tex, corners);
-                let head_clip = Rect::from_min_max(
-                    Pos2::new(head.left() + 18.0, head.top() + 76.0),
-                    Pos2::new((head.right() - 16.0).max(head.left() + 30.0), head.top() + 144.0),
-                );
-                ui.painter().with_clip_rect(head_clip).text(
-                    Pos2::new(head.left() + 18.0, head.top() + 96.0),
-                    Align2::LEFT_CENTER,
-                    &me,
-                    FontId::proportional(15.0),
-                    WHITE,
-                );
-                let prefs = Rect::from_min_size(
-                    Pos2::new(head.left() + 8.0, head.top() + 108.0),
-                    Vec2::new(w - 16.0, 28.0),
-                );
-                let pr = ui.interact(prefs, ui.make_persistent_id("prefs-link"), Sense::click());
-                ui.painter().with_clip_rect(head_clip).text(
-                    Pos2::new(head.left() + 18.0, prefs.center().y),
-                    Align2::LEFT_CENTER,
-                    "Настройки Rustgramm",
-                    FontId::proportional(13.0),
-                    c_orange(),
-                );
-                icons::chevron_down(ui.painter(), Pos2::new(head.right() - 22.0, prefs.center().y), SUBTEXT);
-                if pr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    act = Some("prefs");
-                }
-                // #7 Expandable Liquid Glass Sidebar: встроенный фильтр разделов в шторке.
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    let fw = (w - 24.0).max(80.0);
-                    let (fr, _) = ui.allocate_exact_size(Vec2::new(fw, 30.0), Sense::hover());
-                    super::glass::paint_surface(
-                        ui.painter(),
-                        fr,
-                        15.0,
-                        super::glass::GlassVariant::Clear,
-                        if self.drawer_filter.is_empty() { 0.05 } else { 0.28 },
+                let footer_h = 46.0;
+
+                // Шапка бренда + кнопка сворачивания/разворачивания боковой панели (#7).
+                let (hdr, _) = ui.allocate_exact_size(Vec2::new(w, 56.0), Sense::hover());
+                let brand_pos = if collapsed {
+                    Pos2::new(hdr.center().x, hdr.center().y)
+                } else {
+                    Pos2::new(hdr.left() + 26.0, hdr.center().y)
+                };
+                let brand_rect = Rect::from_center_size(brand_pos, Vec2::splat(34.0));
+                ui.painter().rect_filled(brand_rect, CornerRadius::same(10), Color32::from_rgb(242, 242, 246));
+                icons::logo(ui.painter(), brand_pos, 11.0, Color32::from_rgb(12, 12, 15));
+                if !collapsed {
+                    let hclip = Rect::from_min_max(
+                        Pos2::new(hdr.left() + 50.0, hdr.top()),
+                        Pos2::new((hdr.right() - 42.0).max(hdr.left() + 64.0), hdr.bottom()),
                     );
-                    let inner = Rect::from_min_max(fr.min + Vec2::new(10.0, 2.0), fr.max - Vec2::new(10.0, 2.0));
-                    ui.put(
-                        inner,
-                        egui::TextEdit::singleline(&mut self.drawer_filter)
-                            .hint_text("Фильтр меню…")
-                            .frame(egui::Frame::NONE)
-                            .desired_width(inner.width()),
-                    );
-                });
-                ui.add_space(4.0);
-                let d_needle = self.drawer_filter.trim().to_lowercase();
-                // #7 Elastic Sidebar Glide: общая скользящая стеклянная подсветка под пунктом меню.
-                let glide_id = ui.make_persistent_id("drw-glide-rect");
-                let prev_glide: Option<Rect> = ui.ctx().data(|d| d.get_temp(glide_id));
-                if let Some(pr) = prev_glide {
-                    let gy = super::glass::spring_anim(ui.ctx(), "drw-glide-anim", pr.top(), super::glass::SpringSpec::SNAPPY);
-                    let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
-                    let gr = Rect::from_min_size(
-                        Pos2::new(pr.left() + 8.0, gy + 2.0),
-                        Vec2::new((pr.width() - 16.0).max(40.0), pr.height() - 4.0),
-                    );
-                    super::glass::paint_surface_interactive(
-                        ui.painter(),
-                        gr,
-                        10.0,
-                        super::glass::GlassVariant::Clear,
-                        0.45,
-                        ptr,
-                    );
-                }
-                let hovered_row_rect = std::cell::Cell::new(None::<Rect>);
-                let item = |ui: &mut egui::Ui, icon: icons::Ico, text: &str| -> bool {
-                    if !d_needle.is_empty() && !text.to_lowercase().contains(&d_needle) {
-                        return false;
-                    }
-                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
-                    let ih = tween(ui.ctx(), ("drw-it", text), f32::from(u8::from(resp.hovered())), 0.12);
-                    if resp.hovered() {
-                        hovered_row_rect.set(Some(r));
-                    }
-                    if ih > 0.01 && prev_glide.is_none() {
-                        let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
-                        super::glass::paint_surface_interactive(
-                            ui.painter(),
-                            r.shrink2(Vec2::new(8.0, 2.0)),
-                            10.0,
-                            super::glass::GlassVariant::Clear,
-                            ih,
-                            ptr,
-                        );
-                    }
-                    icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, lerp_color(DIALOG_DATE, WHITE, ih));
-                    let clip = Rect::from_min_max(
-                        Pos2::new(r.left() + 62.0, r.top()),
-                        Pos2::new((r.right() - 12.0).max(r.left() + 70.0), r.bottom()),
-                    );
-                    ui.painter().with_clip_rect(clip).text(
-                        Pos2::new(r.left() + 64.0 + 3.0 * ih, r.center().y),
+                    let hp = ui.painter().with_clip_rect(hclip);
+                    hp.text(
+                        Pos2::new(hdr.left() + 52.0, hdr.center().y - 8.0),
                         Align2::LEFT_CENTER,
-                        text,
+                        if me.is_empty() { "Rustgramm" } else { &me },
                         FontId::proportional(14.0),
                         WHITE,
                     );
-                    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
-                };
-                // Сворачиваемый блок аккаунтов (без лимита в 3 слота даже без Premium!).
-                if d_needle.is_empty() {
-                    let (ah_r, ah_resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
-                    ui.painter().text(
-                        Pos2::new(ah_r.left() + 18.0, ah_r.center().y),
+                    let prefs_resp = ui.interact(hclip, ui.make_persistent_id("prefs-link"), Sense::click());
+                    hp.text(
+                        Pos2::new(hdr.left() + 52.0, hdr.center().y + 9.0),
                         Align2::LEFT_CENTER,
-                        format!("АККАУНТЫ ({})", s.accounts.len()),
-                        FontId::proportional(11.0),
-                        SUBTEXT,
+                        "Настройки Rustgramm",
+                        FontId::proportional(11.5),
+                        if prefs_resp.hovered() { WHITE } else { SUBTEXT },
                     );
-                    ui.painter().text(
-                        Pos2::new(ah_r.right() - 18.0, ah_r.center().y),
-                        Align2::RIGHT_CENTER,
-                        if self.drawer_accounts_open { "▾" } else { "▸" },
-                        FontId::proportional(12.0),
-                        SUBTEXT,
-                    );
-                    if ah_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.drawer_accounts_open = !self.drawer_accounts_open;
+                    if prefs_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        act = Some("prefs");
                     }
-                }
-                let acc_k = tween(
-                    ui.ctx(),
-                    "drw-acc-open",
-                    f32::from(u8::from(self.drawer_accounts_open || !d_needle.is_empty())),
-                    0.18,
-                );
-                if acc_k > 0.02 {
-                for acc in &s.accounts {
-                    if !d_needle.is_empty() && !acc.title().to_lowercase().contains(&d_needle) {
-                        continue;
+                    let col_r = Rect::from_center_size(Pos2::new(hdr.right() - 22.0, hdr.center().y), Vec2::splat(28.0));
+                    let col_resp = ui.interact(col_r, ui.make_persistent_id("drw-collapse"), Sense::click());
+                    if col_resp.hovered() {
+                        super::glass::paint_surface(ui.painter(), col_r, 8.0, super::glass::GlassVariant::Clear, 0.35);
                     }
-                    let is_cur = acc.slot == s.active_account;
-                    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 44.0), Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER));
+                    // Векторный знак сворачивания панели (рамка + левая колонка).
+                    let stroke = egui::Stroke::new(1.4, if col_resp.hovered() { WHITE } else { SUBTEXT });
+                    let bx = Rect::from_center_size(col_r.center(), Vec2::splat(13.0));
+                    ui.painter().rect_stroke(bx, CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+                    ui.painter().line_segment([Pos2::new(bx.left() + 4.5, bx.top() + 1.5), Pos2::new(bx.left() + 4.5, bx.bottom() - 1.5)], stroke);
+                    if col_resp.on_hover_text("Свернуть панель").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        toggle_collapse = true;
                     }
-                    let title = if is_cur && !me.is_empty() {
-                        me.clone()
-                    } else {
-                        acc.title()
-                    };
-                    let av_pos = Pos2::new(r.left() + 30.0, r.center().y);
-                    let av_id = if acc.user_id != 0 { acc.user_id } else { i64::from(acc.slot) + 1 };
-                    draw_avatar(
-                        ui,
-                        av_pos,
-                        &title,
-                        av_id,
-                        28.0,
-                        if is_cur { me_tex } else { None },
-                        corners,
-                    );
-                    let sub = if !acc.username.is_empty() {
-                        mask_streamer(&format!("@{}", acc.username), s.ayu.streamer_mode)
-                    } else if !acc.phone.is_empty() {
-                        mask_streamer(&format!("+{}", acc.phone), s.ayu.streamer_mode || s.extera.hide_phone_number)
-                    } else if is_cur {
-                        "в сети".to_owned()
-                    } else {
-                        "нажмите для входа".to_owned()
-                    };
-                    let right_pad = if is_cur { 30.0 } else { 12.0 };
-                    let text_clip = Rect::from_min_max(
-                        Pos2::new(r.left() + 54.0, r.top()),
-                        Pos2::new((r.right() - right_pad).max(r.left() + 64.0), r.bottom()),
-                    );
-                    let cp = ui.painter().with_clip_rect(text_clip);
-                    cp.text(
-                        Pos2::new(r.left() + 56.0, r.center().y - 8.0),
-                        Align2::LEFT_CENTER,
-                        &title,
-                        FontId::proportional(13.5),
-                        if is_cur { c_orange() } else { WHITE },
-                    );
-                    cp.text(
-                        Pos2::new(r.left() + 56.0, r.center().y + 8.0),
-                        Align2::LEFT_CENTER,
-                        &sub,
-                        FontId::proportional(11.0),
-                        SUBTEXT,
-                    );
-                    if is_cur {
-                        ui.painter().text(
-                            Pos2::new(r.right() - 16.0, r.center().y),
-                            Align2::RIGHT_CENTER,
-                            "✓",
-                            FontId::proportional(13.5),
-                            c_orange(),
-                        );
-                    } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        switch_slot = Some(acc.slot);
-                    }
-                }
-                if item(ui, icons::Ico::Profile, "Добавить аккаунт") {
-                    act = Some("add_account");
-                }
-                }
-                kit::divider(ui);
-                if a.drawer_my_profile && item(ui, icons::Ico::Profile, "Мой профиль") {
-                    act = Some("profile");
-                }
-                if s.extera.change_status && item(ui, icons::Ico::Sticker, "Эмодзи-статус") {
-                    act = Some("emoji_status");
-                }
-                kit::divider(ui);
-                if a.drawer_new_group && item(ui, icons::Ico::Group, "Новая группа") {
-                    act = Some("group");
-                }
-                if a.drawer_new_channel && item(ui, icons::Ico::Channel, "Новый канал") {
-                    act = Some("channel");
-                }
-                if a.drawer_contacts && item(ui, icons::Ico::Contacts, "Контакты") {
-                    act = Some("contacts");
-                }
-                if a.drawer_calls && item(ui, icons::Ico::Calls, "Звонки") {
-                    act = Some("calls");
-                }
-                if item(ui, icons::Ico::Ghost, "Секретные чаты (E2E)") {
-                    act = Some("secret");
-                }
-                if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
-                    act = Some("saved");
-                }
-                if a.drawer_l_read_toggle && item(ui, icons::Ico::Read, "Прочитать локально") {
-                    act = Some("local_read");
-                }
-                if a.drawer_s_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
-                    act = Some("read");
-                }
-                // «Telegram Бизнес», «Мои звёзды» и «Подарки» перенесены в «Настройки» (как в официальном Telegram!).
-                if item(ui, icons::Ico::Settings, "Настройки") {
-                    act = Some("settings");
-                }
-                if let Some(hr) = hovered_row_rect.get() {
-                    ui.ctx().data_mut(|d| d.insert_temp(glide_id, hr));
                 } else {
-                    ui.ctx().data_mut(|d| d.remove::<Rect>(glide_id));
-                }
-                if a.drawer_night_mode_toggle {
-                    let mut night = true;
-                    kit::toggle_icon(ui, icons::Ico::Moon, "Ночной режим", &mut night);
-                }
-                if a.drawer_ghost_toggle {
-                    let mut ghost = s.ghost.active;
-                    if kit::toggle_icon(ui, icons::Ico::Ghost, "Режим призрака", &mut ghost) {
-                        s.ghost.set_active(ghost);
+                    let col_resp = ui
+                        .interact(brand_rect, ui.make_persistent_id("drw-expand"), Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if col_resp.clicked() {
+                        toggle_collapse = true;
+                    }
+                    if col_resp.hovered() {
+                        *tooltip_to_paint.borrow_mut() = Some((Pos2::new(rect.right() + 10.0, brand_rect.center().y), "Развернуть панель".to_owned()));
                     }
                 }
-                if a.drawer_streamer_toggle {
-                    let mut st = s.ayu.streamer_mode;
-                    if toggle(ui, "Режим стримера", &mut st) {
-                        s.ayu.streamer_mode = st;
-                    }
-                }
-                ui.add_space(10.0);
+
+                // Поисковая стеклянная капсула (только в развёрнутом режиме).
+                if !collapsed {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        let fw = (w - 20.0).max(80.0);
+                        let (fr, _) = ui.allocate_exact_size(Vec2::new(fw, 32.0), Sense::hover());
+                        super::glass::paint_surface(
+                            ui.painter(),
+                            fr,
+                            16.0,
+                            super::glass::GlassVariant::Clear,
+                            if self.drawer_filter.is_empty() { 0.08 } else { 0.32 },
+                        );
+                        icons::search(ui.painter(), Pos2::new(fr.left() + 15.0, fr.center().y), SUBTEXT);
+                        let inner = Rect::from_min_max(fr.min + Vec2::new(28.0, 4.0), fr.max - Vec2::new(10.0, 4.0));
+                        ui.put(
+                            inner,
+                            egui::TextEdit::singleline(&mut self.drawer_filter)
+                                .hint_text("Фильтр меню…")
+                                .frame(egui::Frame::NONE)
+                                .desired_width(inner.width()),
+                        );
                     });
-                // Аккуратная подпись версии внизу шторки с проверкой обновлений по клику.
+                    ui.add_space(6.0);
+                }
+
+                let d_needle = self.drawer_filter.trim().to_lowercase();
+                let scroll_top = ui.cursor().top();
+                let scroll_h = (panel_h - (scroll_top - rect.top()) - footer_h).max(120.0);
+                let scroll_rect = Rect::from_min_size(Pos2::new(rect.left(), scroll_top), Vec2::new(w, scroll_h));
+                egui::ScrollArea::vertical()
+                    .id_salt("drawer-scroll")
+                    .max_height(scroll_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        // Пружинная подсветка выбранного / наведённого пункта меню.
+                        let glide_id = ui.make_persistent_id("drw-glide-rect");
+                        let prev_glide: Option<Rect> = ui.ctx().data(|d| d.get_temp(glide_id));
+                        if let Some(pr) = prev_glide {
+                            let gy = super::glass::spring_anim(ui.ctx(), "drw-glide-anim", pr.top(), super::glass::SpringSpec::SNAPPY);
+                            let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                            let gr = Rect::from_min_size(
+                                Pos2::new(pr.left() + 8.0, gy + 2.0),
+                                Vec2::new((pr.width() - 16.0).max(36.0), pr.height() - 4.0),
+                            );
+                            super::glass::paint_surface_interactive(
+                                ui.painter(),
+                                gr,
+                                if collapsed { 12.0 } else { 10.0 },
+                                super::glass::GlassVariant::Clear,
+                                0.45,
+                                ptr,
+                            );
+                        }
+                        let hovered_row_rect = std::cell::Cell::new(None::<Rect>);
+                        let item = |ui: &mut egui::Ui, icon: icons::Ico, text: &str| -> bool {
+                            if !collapsed && !d_needle.is_empty() && !text.to_lowercase().contains(&d_needle) {
+                                return false;
+                            }
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
+                            let ih = tween(ui.ctx(), ("drw-it", text), f32::from(u8::from(resp.hovered())), 0.12);
+                            if resp.hovered() {
+                                hovered_row_rect.set(Some(r));
+                                if collapsed {
+                                    *tooltip_to_paint.borrow_mut() = Some((Pos2::new(rect.right() + 10.0, r.center().y), text.to_owned()));
+                                }
+                            }
+                            if ih > 0.01 && prev_glide.is_none() {
+                                let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                                super::glass::paint_surface_interactive(
+                                    ui.painter(),
+                                    r.shrink2(Vec2::new(8.0, 2.0)),
+                                    if collapsed { 12.0 } else { 10.0 },
+                                    super::glass::GlassVariant::Clear,
+                                    ih,
+                                    ptr,
+                                );
+                            }
+                            let ic_pos = if collapsed { r.center() } else { Pos2::new(r.left() + 26.0, r.center().y) };
+                            icons::ico(ui.painter(), ic_pos, icon, lerp_color(DIALOG_DATE, WHITE, ih));
+                            if !collapsed {
+                                let clip = Rect::from_min_max(
+                                    Pos2::new(r.left() + 50.0, r.top()),
+                                    Pos2::new((r.right() - 16.0).max(r.left() + 60.0), r.bottom()),
+                                );
+                                ui.painter().with_clip_rect(clip).text(
+                                    Pos2::new(r.left() + 52.0 + 2.5 * ih, r.center().y),
+                                    Align2::LEFT_CENTER,
+                                    text,
+                                    FontId::proportional(13.5),
+                                    lerp_color(Color32::from_rgb(212, 212, 218), WHITE, ih),
+                                );
+                                if ih > 0.35 {
+                                    ui.painter().circle_filled(Pos2::new(r.right() - 14.0, r.center().y), 2.2, WHITE);
+                                }
+                            }
+                            resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                        };
+
+                        // Сворачиваемый блок аккаунтов с векторным шевроном и вертикальной направляющей.
+                        if !collapsed && d_needle.is_empty() {
+                            let (ah_r, ah_resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::click());
+                            ui.painter().text(
+                                Pos2::new(ah_r.left() + 16.0, ah_r.center().y),
+                                Align2::LEFT_CENTER,
+                                format!("АККАУНТЫ ({})", s.accounts.len()),
+                                FontId::proportional(10.5),
+                                SUBTEXT,
+                            );
+                            icons::chevron(
+                                ui.painter(),
+                                Pos2::new(ah_r.right() - 20.0, ah_r.center().y),
+                                !self.drawer_accounts_open,
+                                SUBTEXT,
+                            );
+                            if ah_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.drawer_accounts_open = !self.drawer_accounts_open;
+                            }
+                        }
+                        let acc_k = tween(
+                            ui.ctx(),
+                            "drw-acc-open",
+                            f32::from(u8::from(self.drawer_accounts_open || !d_needle.is_empty() || collapsed)),
+                            0.18,
+                        );
+                        if acc_k > 0.02 {
+                            for acc in &s.accounts {
+                                if !collapsed && !d_needle.is_empty() && !acc.title().to_lowercase().contains(&d_needle) {
+                                    continue;
+                                }
+                                let is_cur = acc.slot == s.active_account;
+                                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 42.0), Sense::click());
+                                if !collapsed {
+                                    ui.painter().line_segment(
+                                        [Pos2::new(r.left() + 14.0, r.top()), Pos2::new(r.left() + 14.0, r.bottom())],
+                                        egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+                                    );
+                                }
+                                if resp.hovered() {
+                                    hovered_row_rect.set(Some(r));
+                                }
+                                let title = if is_cur && !me.is_empty() { me.clone() } else { acc.title() };
+                                let av_pos = if collapsed { r.center() } else { Pos2::new(r.left() + 30.0, r.center().y) };
+                                let av_id = if acc.user_id != 0 { acc.user_id } else { i64::from(acc.slot) + 1 };
+                                if collapsed && is_cur {
+                                    ui.painter().circle_stroke(av_pos, 16.5, egui::Stroke::new(1.5, WHITE));
+                                }
+                                draw_avatar(
+                                    ui,
+                                    av_pos,
+                                    &title,
+                                    av_id,
+                                    28.0,
+                                    if is_cur { me_tex } else { None },
+                                    corners,
+                                );
+                                if collapsed && resp.hovered() {
+                                    *tooltip_to_paint.borrow_mut() = Some((Pos2::new(rect.right() + 10.0, r.center().y), title.clone()));
+                                }
+                                if !collapsed {
+                                    let sub = if !acc.username.is_empty() {
+                                        mask_streamer(&format!("@{}", acc.username), s.ayu.streamer_mode)
+                                    } else if !acc.phone.is_empty() {
+                                        mask_streamer(&format!("+{}", acc.phone), s.ayu.streamer_mode || s.extera.hide_phone_number)
+                                    } else if is_cur {
+                                        "в сети".to_owned()
+                                    } else {
+                                        "нажмите для входа".to_owned()
+                                    };
+                                    let right_pad = if is_cur { 28.0 } else { 12.0 };
+                                    let text_clip = Rect::from_min_max(
+                                        Pos2::new(r.left() + 52.0, r.top()),
+                                        Pos2::new((r.right() - right_pad).max(r.left() + 62.0), r.bottom()),
+                                    );
+                                    let cp = ui.painter().with_clip_rect(text_clip);
+                                    cp.text(
+                                        Pos2::new(r.left() + 54.0, r.center().y - 7.5),
+                                        Align2::LEFT_CENTER,
+                                        &title,
+                                        FontId::proportional(13.0),
+                                        if is_cur { WHITE } else { Color32::from_rgb(215, 215, 222) },
+                                    );
+                                    cp.text(
+                                        Pos2::new(r.left() + 54.0, r.center().y + 7.5),
+                                        Align2::LEFT_CENTER,
+                                        &sub,
+                                        FontId::proportional(11.0),
+                                        SUBTEXT,
+                                    );
+                                    if is_cur {
+                                        icons::tick(ui.painter(), Pos2::new(r.right() - 18.0, r.center().y), WHITE, false);
+                                    }
+                                }
+                                if !is_cur && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    switch_slot = Some(acc.slot);
+                                }
+                            }
+                            if item(ui, icons::Ico::Profile, "Добавить аккаунт") {
+                                act = Some("add_account");
+                            }
+                        }
+                        kit::divider(ui);
+                        if a.drawer_my_profile && item(ui, icons::Ico::Profile, "Мой профиль") {
+                            act = Some("profile");
+                        }
+                        if s.extera.change_status && item(ui, icons::Ico::Sticker, "Эмодзи-статус") {
+                            act = Some("emoji_status");
+                        }
+                        kit::divider(ui);
+                        if a.drawer_new_group && item(ui, icons::Ico::Group, "Новая группа") {
+                            act = Some("group");
+                        }
+                        if a.drawer_new_channel && item(ui, icons::Ico::Channel, "Новый канал") {
+                            act = Some("channel");
+                        }
+                        if a.drawer_contacts && item(ui, icons::Ico::Contacts, "Контакты") {
+                            act = Some("contacts");
+                        }
+                        if a.drawer_calls && item(ui, icons::Ico::Calls, "Звонки") {
+                            act = Some("calls");
+                        }
+                        if item(ui, icons::Ico::Ghost, "Секретные чаты (E2E)") {
+                            act = Some("secret");
+                        }
+                        if a.drawer_saved_messages && item(ui, icons::Ico::Saved, "Избранное") {
+                            act = Some("saved");
+                        }
+                        if a.drawer_l_read_toggle && item(ui, icons::Ico::Read, "Прочитать локально") {
+                            act = Some("local_read");
+                        }
+                        if a.drawer_s_read_toggle && item(ui, icons::Ico::Read, "Прочитать на сервере") {
+                            act = Some("read");
+                        }
+                        if item(ui, icons::Ico::Settings, "Настройки") {
+                            act = Some("settings");
+                        }
+                        if let Some(hr) = hovered_row_rect.get() {
+                            ui.ctx().data_mut(|d| d.insert_temp(glide_id, hr));
+                        } else {
+                            ui.ctx().data_mut(|d| d.remove::<Rect>(glide_id));
+                        }
+                        if !collapsed {
+                            if a.drawer_night_mode_toggle {
+                                let mut night = true;
+                                kit::toggle_icon(ui, icons::Ico::Moon, "Ночной режим", &mut night);
+                            }
+                            if a.drawer_ghost_toggle {
+                                let mut ghost = s.ghost.active;
+                                if kit::toggle_icon(ui, icons::Ico::Ghost, "Режим призрака", &mut ghost) {
+                                    s.ghost.set_active(ghost);
+                                }
+                            }
+                            if a.drawer_streamer_toggle {
+                                let mut st = s.ayu.streamer_mode;
+                                if toggle(ui, "Режим стримера", &mut st) {
+                                    s.ayu.streamer_mode = st;
+                                }
+                            }
+                        }
+                        ui.add_space(10.0);
+                    });
+                super::glass::paint_gradual_blur_edges(ui.painter(), scroll_rect, 8.0, 10.0);
+
+                // Закреплённый нижний блок версии/обновлений с 1px верхним разделителем.
+                let foot_top = rect.bottom() - footer_h;
+                ui.painter().line_segment(
+                    [Pos2::new(rect.left() + 10.0, foot_top), Pos2::new(rect.right() - 10.0, foot_top)],
+                    egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+                );
                 let foot = Rect::from_min_max(
-                    Pos2::new(rect.left() + 18.0, rect.bottom() - 34.0),
-                    Pos2::new(rect.right() - 18.0, rect.bottom() - 10.0),
+                    Pos2::new(rect.left() + 10.0, foot_top + 4.0),
+                    Pos2::new(rect.right() - 10.0, rect.bottom() - 6.0),
                 );
                 let fresp = ui.interact(foot, ui.make_persistent_id("drawer-ver-check"), Sense::click());
-                ui.painter().text(
-                    foot.left_center(),
-                    Align2::LEFT_CENTER,
-                    format!("Rustgramm  v{} · Обновления", env!("CARGO_PKG_VERSION")),
-                    FontId::proportional(12.0),
-                    if fresp.hovered() { c_orange() } else { SUBTEXT },
-                );
+                if collapsed {
+                    ui.painter().text(
+                        foot.center(),
+                        Align2::CENTER_CENTER,
+                        format!("v{}", env!("CARGO_PKG_VERSION")),
+                        FontId::proportional(10.5),
+                        if fresp.hovered() { WHITE } else { SUBTEXT },
+                    );
+                    if fresp.hovered() {
+                        *tooltip_to_paint.borrow_mut() = Some((Pos2::new(rect.right() + 10.0, foot.center().y), format!("Rustgramm v{}", env!("CARGO_PKG_VERSION"))));
+                    }
+                } else {
+                    ui.painter().text(
+                        Pos2::new(foot.left() + 8.0, foot.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("Rustgramm  v{} · Обновления", env!("CARGO_PKG_VERSION")),
+                        FontId::proportional(12.0),
+                        if fresp.hovered() { WHITE } else { SUBTEXT },
+                    );
+                }
                 if fresp.on_hover_text("Проверить новую версию на GitHub").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     act = Some("check_updates");
                 }
+                if let Some((tip_pos, tip_txt)) = tooltip_to_paint.borrow().as_ref() {
+                    let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drw-tooltip")));
+                    super::glass::paint_tooltip_card(&fg, *tip_pos, tip_txt);
+                }
             });
+        if toggle_collapse {
+            self.drawer_collapsed = !self.drawer_collapsed;
+        }
         match act {
             Some("prefs") => {
                 self.drawer_open = false;

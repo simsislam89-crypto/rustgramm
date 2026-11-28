@@ -633,6 +633,52 @@ pub enum Cmd {
         dialog_id: i64,
         backups: Vec<(i32, String, i64, bool, String)>,
     },
+    /// 1а. Добавить/убрать стикер из избранного (`messages.faveSticker`).
+    FaveSticker {
+        id: i64,
+        access_hash: i64,
+        file_ref: Vec<u8>,
+        unfave: bool,
+    },
+    /// 1б. Добавить/убрать стикер из избранного по сообщению в ленте.
+    FaveStickerMsg(i64, i32, bool),
+    /// 1в. Сохранить/удалить GIF (`messages.saveGif`).
+    SaveGif {
+        id: i64,
+        access_hash: i64,
+        file_ref: Vec<u8>,
+        unsave: bool,
+    },
+    /// 1г. Сохранить/удалить GIF по сообщению в ленте.
+    SaveGifMsg(i64, i32, bool),
+    /// 1д. Очистить недавние стикеры (`messages.clearRecentStickers`).
+    ClearRecentStickers,
+    /// 2. Точное время прочтения исходящего сообщения в личном чате.
+    LoadOutboxReadDate(i64, i32),
+    /// 3а. Изменить название/описание группы или канала.
+    EditChatInfo {
+        dialog_id: i64,
+        title: Option<String>,
+        about: Option<String>,
+    },
+    /// 3б. Запретить копирование/пересылку контента (`messages.toggleNoForwards`).
+    ToggleNoForwards(i64, bool),
+    /// 3в. Скрыть/показать историю для новых участников (`channels.togglePreHistoryHidden`).
+    TogglePreHistoryHidden(i64, bool),
+    /// 4а. Загрузить галерею фото профиля (`None` = свой профиль).
+    LoadProfilePhotos(Option<i64>),
+    /// 4б. Загрузить новый аватар профиля (`photos.uploadProfilePhoto`).
+    UploadProfilePhoto(PathBuf),
+    /// 4в. Удалить фото профиля (`photos.deletePhotos`).
+    DeleteProfilePhoto {
+        id: i64,
+        access_hash: i64,
+        file_ref: Vec<u8>,
+    },
+    /// 5а. Загрузить глобальные настройки приватности и контента 18+.
+    LoadGlobalPrivacy,
+    /// 5б. Сохранить глобальные настройки приватности и контента 18+.
+    SaveGlobalPrivacy(rg_core::engine::GlobalPrivacyInfo),
     Settings(Box<Settings>),
 }
 
@@ -871,6 +917,12 @@ pub enum Ev {
     SelectDialogById(i64),
     /// Добавить разрешённую группу обсуждения в список и открыть её.
     OpenResolvedDialog(Box<DialogRow>),
+    /// 2. Точное время прочтения исходящего сообщения в личном чате.
+    OutboxReadDate(i32, Result<i32, String>),
+    /// 4. Галерея фотографий профиля (`dialog_id` или `0` для своего профиля).
+    ProfilePhotos(i64, Vec<rg_core::engine::ProfilePhotoItem>),
+    /// 5. Глобальные настройки приватности и фильтра контента.
+    GlobalPrivacy(rg_core::engine::GlobalPrivacyInfo),
     Status(String),
     Error(String),
 }
@@ -1475,6 +1527,21 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             let mut s = settings.clone();
                             s.active_account = slot;
                             let _ = std::fs::write(&settings_path, s.to_json());
+                            out.send(Ev::LoginBusy(false));
+                            out.send(Ev::ResetSession);
+                            continue 'account_loop;
+                        }
+                        Some(Cmd::AddAccountAuto) => {
+                            let mut s = settings.clone();
+                            let next_slot = s.accounts.iter().map(|a| a.slot).max().unwrap_or(0) + 1;
+                            let entropy = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_nanos() as u64);
+                            let prof = rg_settings::AccountProfile::isolated(next_slot, String::new(), String::new(), entropy);
+                            s.accounts.push(prof);
+                            s.active_account = next_slot;
+                            let _ = std::fs::write(&settings_path, s.to_json());
+                            out.send(Ev::LoginBusy(false));
                             out.send(Ev::ResetSession);
                             continue 'account_loop;
                         }
@@ -5522,6 +5589,218 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             reload(&eng, &out, peer).await;
                         }
                         Err(e) => out.err(format!("Пакетное удаление: {e}")),
+                    }
+                });
+            }
+            Cmd::FaveSticker { id, access_hash, file_ref, unfave } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.fave_sticker(id, access_hash, &file_ref, unfave).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if unfave {
+                                "Стикер убран из избранного".into()
+                            } else {
+                                "Стикер добавлен в избранное".into()
+                            }));
+                            if let Ok(list) = eng.faved_stickers().await {
+                                out.send(Ev::FavedStickers(list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::FaveStickerMsg(did, msg_id, unfave) => {
+                let Some(d) = find_dialog(&dialogs, did) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.fave_sticker_from_msg(peer, msg_id, unfave).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if unfave {
+                                "Стикер убран из избранного".into()
+                            } else {
+                                "Стикер добавлен в избранное".into()
+                            }));
+                            if let Ok(list) = eng.faved_stickers().await {
+                                out.send(Ev::FavedStickers(list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SaveGif { id, access_hash, file_ref, unsave } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.save_gif(id, access_hash, &file_ref, unsave).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if unsave {
+                                "GIF удалён из сохранённых".into()
+                            } else {
+                                "GIF сохранён".into()
+                            }));
+                            if let Ok(list) = eng.saved_gifs().await {
+                                out.send(Ev::Gifs(list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SaveGifMsg(did, msg_id, unsave) => {
+                let Some(d) = find_dialog(&dialogs, did) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.save_gif_from_msg(peer, msg_id, unsave).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if unsave {
+                                "GIF удалён из сохранённых".into()
+                            } else {
+                                "GIF сохранён".into()
+                            }));
+                            if let Ok(list) = eng.saved_gifs().await {
+                                out.send(Ev::Gifs(list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ClearRecentStickers => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.clear_recent_stickers().await {
+                        Ok(()) => {
+                            out.send(Ev::RecentStickers(Vec::new()));
+                            out.send(Ev::Status("Недавние стикеры очищены".into()));
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadOutboxReadDate(did, msg_id) => {
+                let Some(d) = find_dialog(&dialogs, did) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    let res = eng.outbox_read_date(peer, msg_id).await;
+                    out.send(Ev::OutboxReadDate(msg_id, res));
+                });
+            }
+            Cmd::EditChatInfo { dialog_id, title, about } => {
+                let Some(d) = find_dialog(&dialogs, dialog_id) else { continue };
+                let (eng, out, peer, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    d.peer,
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng
+                        .edit_chat_title_and_about(peer, title.as_deref(), about.as_deref())
+                        .await
+                    {
+                        Ok(()) => {
+                            out.send(Ev::Status("Сведения чата обновлены".into()));
+                            if let Ok(pi) = eng.peer_info(peer).await {
+                                out.send(Ev::PeerInfo(dialog_id, Box::new(pi)));
+                            }
+                            fetch_and_push_dialogs(&eng, &tx, &flag).await;
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::ToggleNoForwards(did, enabled) => {
+                let Some(d) = find_dialog(&dialogs, did) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.toggle_no_forwards(peer, enabled).await {
+                        Ok(()) => out.send(Ev::Status(if enabled {
+                            "Копирование и пересылка запрещены".into()
+                        } else {
+                            "Копирование и пересылка разрешены".into()
+                        })),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::TogglePreHistoryHidden(did, enabled) => {
+                let Some(d) = find_dialog(&dialogs, did) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.toggle_pre_history_hidden(peer, enabled).await {
+                        Ok(()) => out.send(Ev::Status(if enabled {
+                            "История скрыта для новых участников".into()
+                        } else {
+                            "История открыта для новых участников".into()
+                        })),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadProfilePhotos(opt_did) => {
+                let peer_opt = opt_did.and_then(|did| find_dialog(&dialogs, did).map(|d| d.peer));
+                if opt_did.is_some() && peer_opt.is_none() {
+                    continue;
+                }
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.user_profile_photos(peer_opt, 12).await {
+                        Ok((tid, list)) => out.send(Ev::ProfilePhotos(tid, list)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::UploadProfilePhoto(path) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.upload_profile_photo(&path).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Фото профиля обновлено".into()));
+                            if let Ok((tid, list)) = eng.user_profile_photos(None, 12).await {
+                                out.send(Ev::ProfilePhotos(tid, list));
+                            }
+                            if let Ok(ov) = eng.account_overview().await {
+                                out.send(Ev::Account(Box::new(ov)));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::DeleteProfilePhoto { id, access_hash, file_ref } => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.delete_profile_photo(id, access_hash, &file_ref).await {
+                        Ok(()) => {
+                            out.send(Ev::Status("Фото профиля удалено".into()));
+                            if let Ok((tid, list)) = eng.user_profile_photos(None, 12).await {
+                                out.send(Ev::ProfilePhotos(tid, list));
+                            }
+                        }
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::LoadGlobalPrivacy => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.load_global_privacy().await {
+                        Ok(info) => out.send(Ev::GlobalPrivacy(info)),
+                        Err(e) => out.err(e),
+                    }
+                });
+            }
+            Cmd::SaveGlobalPrivacy(info) => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.save_global_privacy(&info).await {
+                        Ok(()) => {
+                            out.send(Ev::GlobalPrivacy(info));
+                            out.send(Ev::Status("Глобальная приватность сохранена".into()));
+                        }
+                        Err(e) => out.err(e),
                     }
                 });
             }
