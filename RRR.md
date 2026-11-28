@@ -1299,3 +1299,29 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo test --workspace` — **2 210 тестов пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 69+274, `rg-net`: 6+1, `rg-settings`: 16+393, `rg-ui`: 98+631; добавлены тесты `glass::tests::glass_surface_pill_button_tab_bar_and_toast_render_cleanly`, `emoji::tests::lookup_str_resolves_zwj_vs16_and_all_telegram_channel_reactions` и 3 теста в `lib.rs` на `request_reaction_docs`, оптимистичный `ReactToggle` + `rx_pop` и мобильную Liquid Glass панель вкладок).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.28.0`) собран (**21 506 560 байт**, release 4m 26s); 3 живых smoke-запуска (`RG_DEMO=1`, `RG_DEMO=login`, `390x844 RG_MOBILE_GLASS=1 RG_DEMO=1`) — **ALIVE=True**.
 - Обновлена интерактивная веб-версия [dist/rustgramm-preview.html](file:///d:/working%20WIN/rustgramm/dist/rustgramm-preview.html) (`v0.28.0`).
+
+## Этап 42 (2026-11-28, v0.29.0)
+
+### Устойчивая маршрутизация по `dialog_id`, устранение крашей и таймаутов входа, UTF-8 DEX без иероглифов, скользящий индикатор чата и каталог 108 Liquid Glass компонентов
+
+1. **Надёжность ядра и маршрутизации (`Cargo.toml`, `rg-core/src/engine.rs`, `rg-ui/src/{worker,chat,settings_ui,features_ui,lib}.rs`)**:
+   - В `[profile.release]` включён `panic = "unwind"` вместо `panic = "abort"`, а `Engine::avatar` переписан с падающего на мульти-ответах `client.resolve_peer` на прямые TL-запросы `users.GetUsers` / `messages.GetChats` / `channels.GetChannels` с `extract_user_photo_meta` / `extract_chat_photo_meta` и `RawLoc`.
+   - Вся маршрутизация команд и событий (`Cmd::*`, `Ev::Older`/`Ev::Found`/`Ev::Image`) переведена с хрупкого позиционного индекса `Option<usize>` на неизменный `dialog_id: i64`; `open_dialog` всегда синхронизирует активный чат с воркером (`Cmd::Open(id, !fresh)`), а индексация `self.dialogs[i]` заменена безопасным `.get(i)`.
+   - Подавлено навязчивое всплывающее уведомление «Режим призрака: прочитано не отправлено» при обычном открытии чата (`Cmd::Open` при `Ok(false)` больше не пушит ошибку).
+
+2. **Исправление таймаута входа и кириллицы/глифов на Android (`rg-core/src/{transport,lib}.rs`, `rg-ui/src/{worker,theme,lib}.rs`, `scripts/dev/{build_android_bridge,test_rg_bridge}.py`)**:
+   - В `build_android_bridge.py` добавлен флаг `-encoding UTF-8` при вызове `javac` (на русской Windows ранее ломал кириллицу в `rg_bridge.dex` в CP1251-кракозябры); `rg_bridge.dex` пересобран (**21 932 байта**), а в `test_rg_bridge.py` добавлена проверка валидного UTF-8 для `«Готово»` / `«Отмена»` и отсутствия кракозябр.
+   - В `paint_android_keypad` (`lib.rs`) удалён системный глиф `⌫` (заменён векторной иконкой Backspace и Liquid Glass клавишами); в `theme.rs` добавлен фильтр `is_static_ttf` (предпочитает `RobotoStatic-Regular.ttf` и отсекает вариативные `fvar`-шрифты).
+   - В `transport.rs` и `rg-core/src/lib.rs` реализована живая MTProto-проверка `probe_reachable_dc` с отправкой реального `req_pq_multi#be7e8ef1` и проверкой `resPQ#05162463` (отбрасывает «мёртвые» IPv6-сокеты с 0 байтами ответа), `connect_with_updates_hint` и `guess_dc_for_phone` с 30с таймаутом и автопереключением на IPv4.
+
+3. **Плавный скользящий индикатор чата, полировка Liquid Glass и 108 компонентов (`rg-ui/src/{glass,chat,lib}.rs`, `docs/LIQUID_GLASS_CATALOG.md`)**:
+   - В `dialogs_ui` статичное выделение заменено непрерывным вертикально скользящим выделением (`dialogs-slide-row`) с матовой стеклянной подложкой и оранжевой 3.5 px полосой, плавно переезжающей вверх/вниз при смене чата; усилена спекулярная кромка в `glass::paint_surface` и фокус поля ввода `composer-input`.
+   - Создан справочник [docs/LIQUID_GLASS_CATALOG.md](file:///d:/working%20WIN/rustgramm/docs/LIQUID_GLASS_CATALOG.md) со 108 компонентами и проверенными ссылками (`21st.dev`, `ReactBits`, `Aceternity UI`, `Magic UI`, `Motion Primitives`, `GlassCN`, `Uiverse`).
+
+### Проверки (v0.29.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` и `cargo clippy -p rg-ui --no-default-features -- -D warnings` — **0 ошибок, 0 предупреждений**.
+- `cargo test --workspace` — **2 215 тестов пройдено, 0 провалено, 1 ignored** (`rg-ayu`: 32+370+320, `rg-core`: 71+274, `rg-net`: 6+1, `rg-settings`: 16+393, `rg-ui`: 101+631; добавлены тесты `extract_chat_photo_meta_handles_multiple_channels_without_panic`, `req_pq_probe_roundtrip_and_rejects_empty_dead_ipv6_reply`, `is_static_ttf_skips_variable_fvar_fonts`, `rapid_chat_switch_and_reorder_send_to_exact_selected_dialog_id` и `dialogs_active_indicator_slides_vertically_between_chats`).
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX UTF-8 check passed`, `21 932` байта, Full + Lite `aarch64-linux-android` OK).
+- `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.29.0`) собран (**23 825 920 байт**, release 5m 58s); 3 живых smoke-запуска (`demo1`, `login`, `mobile_glass` `390x844 RG_MOBILE_GLASS=1`) — **ALIVE=True**.
+- Обновлена интерактивная веб-версия [dist/rustgramm-preview.html](file:///d:/working%20WIN/rustgramm/dist/rustgramm-preview.html) (`v0.29.0`).

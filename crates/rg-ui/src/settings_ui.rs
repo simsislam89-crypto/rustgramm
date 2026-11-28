@@ -1644,8 +1644,8 @@ impl App {
                 .filter_map(|id| self.create_member_map.get(id).map(|c| c.peer))
                 .collect();
             if invite_only {
-                if let Some(i) = self.selected {
-                    self.send(Cmd::InviteMembers(i, members));
+                if let Some(did) = self.selected_dialog_id() {
+                    self.send(Cmd::InviteMembers(did, members));
                 }
             } else {
                 let title = self.create_title.trim().to_owned();

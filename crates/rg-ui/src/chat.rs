@@ -649,17 +649,17 @@ impl App {
                             open_sched = true;
                             ui.close();
                         }
-                        if let Some((i, did, dname, dkind, pinned, muted, archived, saved, unread, _peer)) = sel.clone() {
+                        if let Some((_i, did, dname, dkind, pinned, muted, archived, saved, unread, _peer)) = sel.clone() {
                             if kit::menu_item(ui, "menu/pin", "Все закреплённые", false) {
                                 open_pinned_list = Some(did);
                                 ui.close();
                             }
                             if kit::menu_item(ui, if pinned { "menu/unpin" } else { "menu/pin" }, if pinned { "Открепить" } else { "Закрепить" }, false) {
-                                act = Some(Cmd::PinDialog(i, !pinned));
+                                act = Some(Cmd::PinDialog(did, !pinned));
                                 ui.close();
                             }
                             if kit::menu_item(ui, if muted { "menu/unmute" } else { "menu/mute" }, if muted { "Включить звук" } else { "Отключить звук" }, false) {
-                                act = Some(Cmd::MuteDialog(i, !muted));
+                                act = Some(Cmd::MuteDialog(did, !muted));
                                 ui.close();
                             }
                             if unread > 0 && kit::menu_item(ui, "menu/read", "Прочитать локально", false) {
@@ -667,11 +667,11 @@ impl App {
                                 ui.close();
                             }
                             if kit::menu_item(ui, "menu/read", "Прочитать на сервере", false) {
-                                act = Some(Cmd::ForceRead);
+                                act = Some(Cmd::ForceRead(did));
                                 ui.close();
                             }
                             if kit::menu_item(ui, "menu/edited_status", "Удалённые и правки", false) {
-                                act = Some(Cmd::SavedHistory);
+                                act = Some(Cmd::SavedHistory(did));
                                 ui.close();
                             }
                             if kit::menu_item(ui, "menu/edited_status", "Глобальный журнал удалённых", false) {
@@ -690,7 +690,7 @@ impl App {
                                     false,
                                 )
                             {
-                                act = Some(Cmd::Archive(i, !archived));
+                                act = Some(Cmd::Archive(did, !archived));
                                 ui.close();
                             }
                             kit::menu_separator(ui);
@@ -722,7 +722,7 @@ impl App {
                     }
                 }
                 if self.settings.ayu.quick_admin_shortcuts
-                    && let Some((i, did, dname, dkind, .., dpeer)) = sel
+                    && let Some((_i, did, dname, dkind, .., dpeer)) = sel
                     && matches!(dkind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel)
                 {
                     let (ar, aresp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
@@ -749,7 +749,7 @@ impl App {
                             invite_limit: String::new(),
                             invite_request: false,
                         });
-                        self.send(Cmd::Participants(i));
+                        self.send(Cmd::Participants(did));
                         self.send(Cmd::AdminLoadLog { peer: dpeer, query: String::new() });
                         self.send(Cmd::AdminLoadInvites(dpeer));
                     }
@@ -772,19 +772,22 @@ impl App {
                 if do_local_read && let Some(i) = self.selected {
                     self.local_read_dialog(i);
                 }
-                if open_sched {
+                if open_sched && let Some(did) = self.selected_dialog_id() {
                     self.scheduled_open = true;
-                    self.send(Cmd::LoadScheduled);
+                    self.send(Cmd::LoadScheduled(did));
                 }
                 if let Some(cmd) = act {
-                    if matches!(cmd, Cmd::ForceRead)
-                        && let Some(i) = self.selected
-                        && let Some(d) = self.dialogs.get_mut(i)
+                    if let Cmd::ForceRead(did) = cmd
+                        && let Some(d) = self.dialogs.iter_mut().find(|d| d.id == did)
                     {
                         d.unread = 0;
                     }
-                    if let Cmd::MuteDialog(i, on) = cmd {
-                        self.toggle_mute_dialog(i, on);
+                    if let Cmd::MuteDialog(did, on) = cmd {
+                        if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
+                            self.toggle_mute_dialog(pos, on);
+                        } else {
+                            self.send(Cmd::MuteDialog(did, on));
+                        }
                     } else {
                         self.send(cmd);
                     }
@@ -851,14 +854,14 @@ impl App {
     /// Правая панель профиля (как в AyuGram Desktop): шапка, быстрые действия, сведения,
     /// общие медиа/файлы/ссылки и список участников с добавлением новых людей.
     pub(crate) fn info_ui(&mut self, ui: &mut egui::Ui) {
-        let Some((i, d)) = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.clone()))) else { return };
+        let Some((_i, d)) = self.selected.and_then(|i| self.dialogs.get(i).map(|d| (i, d.clone()))) else { return };
         if self.info_req.insert(d.id) {
-            self.send(Cmd::PeerInfo(i));
+            self.send(Cmd::PeerInfo(d.id));
         }
         let is_group = d.id < 0;
         let is_user = !is_group && !d.saved && d.kind == rg_core::engine::DialogKind::User;
         if is_group && self.participants_req.insert(d.id) {
-            self.send(Cmd::Participants(i));
+            self.send(Cmd::Participants(d.id));
         }
         let info = self.peer_infos.get(&d.id).cloned();
         if is_group
@@ -866,7 +869,7 @@ impl App {
             && !self.settings.ayu.hide_similar_channels
             && self.similar_req.insert(d.id)
         {
-            self.send(Cmd::SimilarChannels(i));
+            self.send(Cmd::SimilarChannels(d.id));
         }
         let members_list = self.participants.get(&d.id).cloned().unwrap_or_default();
         let w = ui.available_width();
@@ -1020,11 +1023,11 @@ impl App {
                     );
                     if bresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         match code {
-                            1 => cmd_after = Some(Cmd::MuteDialog(i, !d.muted)),
+                            1 => cmd_after = Some(Cmd::MuteDialog(d.id, !d.muted)),
                             2 => start_search = true,
                             3 => start_invite = true,
-                            4 => cmd_after = Some(Cmd::ExportInvite(i)),
-                            5 => cmd_after = Some(Cmd::BlockPeer(i, !blocked)),
+                            4 => cmd_after = Some(Cmd::ExportInvite(d.id)),
+                            5 => cmd_after = Some(Cmd::BlockPeer(d.id, !blocked)),
                             6 => start_call_video = Some(false),
                             7 => start_call_video = Some(true),
                             8 => open_admin = true,
@@ -1144,7 +1147,7 @@ impl App {
                         false,
                     );
                     if !self.peer_saved_gifts.contains_key(&d.id) && self.saved_gifts_req.insert(d.id) {
-                        cmd_after = Some(Cmd::LoadSavedGifts(Some(i)));
+                        cmd_after = Some(Cmd::LoadSavedGifts(Some(d.id)));
                     }
                     if let Some(gifts) = self.peer_saved_gifts.get(&d.id)
                         && !gifts.is_empty()
@@ -1394,7 +1397,7 @@ impl App {
                 _ => {
                     if is_user {
                         if self.common_chats_req.insert(d.id) {
-                            cmd_after = Some(Cmd::CommonChats(i));
+                            cmd_after = Some(Cmd::CommonChats(d.id));
                         }
                         let common = self.common_chats.get(&d.id).cloned().unwrap_or_default();
                         if common.is_empty() {
@@ -1436,7 +1439,7 @@ impl App {
                             || refetch
                         {
                             cmd_after = Some(Cmd::ParticipantsFiltered(
-                                i,
+                                d.id,
                                 self.participants_filter,
                                 self.participants_query.clone(),
                             ));
@@ -1481,7 +1484,7 @@ impl App {
                             {
                                 ui.add_space(6.0);
                                 if ui.button(format!("Загрузить ещё ({}/{})", members_list.len(), total_m)).clicked() {
-                                    cmd_after = Some(Cmd::ParticipantsPaged(i, members_list.len() as i32));
+                                    cmd_after = Some(Cmd::ParticipantsPaged(d.id, members_list.len() as i32));
                                 }
                             }
                         }
@@ -1491,13 +1494,13 @@ impl App {
             ui.add_space(16.0);
             if let Some((fnm, lnm, ph)) = contact_save {
                 cmd_after = Some(Cmd::AddContact {
-                    idx: i,
+                    dialog_id: d.id,
                     first_name: fnm,
                     last_name: lnm,
                     phone: ph,
                 });
             } else if contact_del {
-                cmd_after = Some(Cmd::DeleteContact(i));
+                cmd_after = Some(Cmd::DeleteContact(d.id));
             }
         });
 
@@ -1509,8 +1512,12 @@ impl App {
             self.toggle_audio_playback();
         }
         if let Some(cmd) = cmd_after {
-            if let Cmd::MuteDialog(i, on) = cmd {
-                self.toggle_mute_dialog(i, on);
+            if let Cmd::MuteDialog(did, on) = cmd {
+                if let Some(pos) = self.dialogs.iter().position(|x| x.id == did) {
+                    self.toggle_mute_dialog(pos, on);
+                } else {
+                    self.send(Cmd::MuteDialog(did, on));
+                }
             } else {
                 self.send(cmd);
             }
@@ -1534,7 +1541,7 @@ impl App {
             self.viewer_zoom = 1.0;
         }
         if let Some(mid) = open_save {
-            self.send(Cmd::Download(mid));
+            self.send(Cmd::Download(d.id, mid));
         }
         if let Some(video) = start_call_video {
             self.initiate_call(d.peer, d.id, d.name.clone(), video);
@@ -1561,7 +1568,7 @@ impl App {
                 invite_limit: String::new(),
                 invite_request: false,
             });
-            self.send(Cmd::Participants(i));
+            self.send(Cmd::Participants(d.id));
             self.send(Cmd::AdminLoadLog { peer: d.peer, query: String::new() });
             self.send(Cmd::AdminLoadInvites(d.peer));
         }
@@ -1592,8 +1599,8 @@ impl App {
                 self.hook_android_text(&r, "chat_search", "Поиск по чату", "Текст сообщения", &self.chat_search.clone(), 0);
                 let go = orange_button(ui, "Найти", Vec2::new(68.0, 28.0)).clicked()
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if go {
-                    self.send(Cmd::SearchFiltered(self.chat_search.clone(), self.chat_search_filter));
+                if go && let Some(did) = self.selected_dialog_id() {
+                    self.send(Cmd::SearchFiltered(did, self.chat_search.clone(), self.chat_search_filter));
                 }
                 if found_len > 0 {
                     let cur_one = (self.chat_search_idx.min(found_len - 1)) + 1;
@@ -1626,7 +1633,9 @@ impl App {
                     self.chat_search_filter = rg_core::engine::ChatSearchFilter::All;
                     self.chat_search_idx = 0;
                     self.found = None;
-                    self.send(Cmd::Search(String::new()));
+                    if let Some(did) = self.selected_dialog_id() {
+                        self.send(Cmd::Search(did, String::new()));
+                    }
                 }
             });
             ui.add_space(3.0);
@@ -1646,7 +1655,9 @@ impl App {
                     if ui.add(btn).clicked() {
                         self.chat_search_filter = flt;
                         self.chat_search_idx = 0;
-                        self.send(Cmd::SearchFiltered(self.chat_search.clone(), flt));
+                        if let Some(did) = self.selected_dialog_id() {
+                            self.send(Cmd::SearchFiltered(did, self.chat_search.clone(), flt));
+                        }
                     }
                 }
             });
@@ -1909,11 +1920,16 @@ impl App {
                 self.cmd_popup_open = false;
             } else if let Some(cmd_msg) = send_cmd_now {
                 self.input.clear();
-                let temp_id = self.push_optimistic_message(cmd_msg.clone(), Vec::new(), None, None);
-                self.send(Cmd::Send(cmd_msg, None, temp_id));
+                if let Some(did) = self.selected_dialog_id() {
+                    let temp_id = self.push_optimistic_message(cmd_msg.clone(), Vec::new(), None, None);
+                    self.send(Cmd::Send(did, cmd_msg, None, temp_id));
+                }
             }
-            if let Some(sid) = send_qr {
+            if let Some(sid) = send_qr
+                && let Some(did) = self.selected_dialog_id()
+            {
                 self.send(Cmd::SendQuickReply {
+                    dialog_id: did,
                     shortcut_id: sid,
                     msg_ids: Vec::new(),
                 });
@@ -1932,7 +1948,9 @@ impl App {
                             let active = cur_ttl.unwrap_or(0) == sec;
                             let txt = if active { RichText::new(lbl).color(ORANGE).strong() } else { RichText::new(lbl) };
                             if ui.small_button(txt).clicked() {
-                                self.send(Cmd::SetChatTtl(sec));
+                                if let Some(did) = self.selected_dialog_id() {
+                                    self.send(Cmd::SetChatTtl(did, sec));
+                                }
                                 self.ttl_popup_open = false;
                             }
                         }
@@ -1995,8 +2013,9 @@ impl App {
                         let reply_to = self.reply.take().map(|(id, _)| id);
                         if s.voice_confirmation {
                             self.pending_voice_confirm = Some((dest, dur, peaks, reply_to));
-                        } else {
+                        } else if let Some(did) = self.selected_dialog_id() {
                             self.send(Cmd::SendVoice {
+                                dialog_id: did,
                                 path: dest,
                                 duration: dur,
                                 waveform: peaks,
@@ -2037,12 +2056,15 @@ impl App {
                 });
             if do_send {
                 self.pending_voice_confirm = None;
-                self.send(Cmd::SendVoice {
-                    path: vpath,
-                    duration: vdur,
-                    waveform: vpeaks,
-                    reply_to: vreply,
-                });
+                if let Some(did) = self.selected_dialog_id() {
+                    self.send(Cmd::SendVoice {
+                        dialog_id: did,
+                        path: vpath,
+                        duration: vdur,
+                        waveform: vpeaks,
+                        reply_to: vreply,
+                    });
+                }
             } else if do_discard {
                 self.pending_voice_confirm = None;
                 let _ = std::fs::remove_file(vpath);
@@ -2053,12 +2075,12 @@ impl App {
         let cur_dlg_info = self.selected.and_then(|i| {
             self.dialogs.get(i).map(|d| (i, d.id, d.kind))
         });
-        if let Some((idx, cid, kind)) = cur_dlg_info {
+        if let Some((_idx, cid, kind)) = cur_dlg_info {
             if matches!(kind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel)
                 && cid < -1_000_000_000_000
                 && self.send_as_req.insert(cid)
             {
-                self.send(Cmd::LoadSendAs(idx));
+                self.send(Cmd::LoadSendAs(cid));
             }
             if let Some(info) = self.peer_infos.get(&cid) {
                 if info.slowmode_next_send_date > 0 && i64::from(info.slowmode_next_send_date) > self.now {
@@ -2225,12 +2247,15 @@ impl App {
             if let Some(at) = self.inline_bot_at {
                 if at.elapsed().as_millis() >= 320 {
                     self.inline_bot_at = None;
-                    self.inline_bot_loading = true;
-                    self.send(Cmd::QueryInlineBot {
-                        bot: bot.clone(),
-                        query: query.clone(),
-                        offset: String::new(),
-                    });
+                    if let Some(did) = self.selected_dialog_id() {
+                        self.inline_bot_loading = true;
+                        self.send(Cmd::QueryInlineBot {
+                            dialog_id: did,
+                            bot: bot.clone(),
+                            query: query.clone(),
+                            offset: String::new(),
+                        });
+                    }
                 } else {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
                 }
@@ -2295,19 +2320,25 @@ impl App {
                 ui.add_space(3.0);
             }
             if let Some((qid, rid)) = chosen_result {
-                self.send(Cmd::SendInlineResult {
-                    query_id: qid,
-                    id: rid,
-                    reply_to: reply_id,
-                });
+                if let Some(did) = self.selected_dialog_id() {
+                    self.send(Cmd::SendInlineResult {
+                        dialog_id: did,
+                        query_id: qid,
+                        id: rid,
+                        reply_to: reply_id,
+                    });
+                }
                 self.input.clear();
                 self.reply = None;
                 self.inline_bot_key = None;
                 self.inline_bot_page = None;
                 self.inline_bot_at = None;
-            } else if let Some(off) = next_offset_req {
+            } else if let Some(off) = next_offset_req
+                && let Some(did) = self.selected_dialog_id()
+            {
                 self.inline_bot_loading = true;
                 self.send(Cmd::QueryInlineBot {
+                    dialog_id: did,
                     bot,
                     query,
                     offset: off,
@@ -2346,6 +2377,7 @@ impl App {
                             if ui.small_button("Перевести в поле").clicked() {
                                 self.draft_translating = true;
                                 self.send(Cmd::TranslateDraft {
+                                    dialog_id: self.selected_dialog_id(),
                                     text: draft.clone(),
                                     to_lang: lang.clone(),
                                     send_after: false,
@@ -2356,6 +2388,7 @@ impl App {
                                 self.draft_translating = true;
                                 self.reply = None;
                                 self.send(Cmd::TranslateDraft {
+                                    dialog_id: self.selected_dialog_id(),
                                     text: draft,
                                     to_lang: lang,
                                     send_after: true,
@@ -2385,20 +2418,22 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
                 let bw = (ui.available_width() - 12.0).max(160.0);
-                if orange_button(ui, "Запустить бота (/start)", Vec2::new(bw, 38.0)).clicked() {
+                if orange_button(ui, "Запустить бота (/start)", Vec2::new(bw, 38.0)).clicked()
+                    && let Some(did) = self.selected_dialog_id()
+                {
                     let temp_id = self.push_optimistic_message("/start".to_owned(), Vec::new(), None, None);
-                    self.send(Cmd::Send("/start".to_owned(), None, temp_id));
+                    self.send(Cmd::Send(did, "/start".to_owned(), None, temp_id));
                 }
             });
             return;
         }
         // Автодополнение `@упоминаний` участников в группах и каналах.
-        if let Some((idx, cid, kind)) = cur_dlg_info
+        if let Some((_idx, cid, kind)) = cur_dlg_info
             && matches!(kind, rg_core::engine::DialogKind::Group | rg_core::engine::DialogKind::Channel)
             && let Some((at_pos, m_prefix)) = extract_mention_prefix(&self.input).map(|(p, q)| (p, q.to_owned()))
         {
             if !self.participants.contains_key(&cid) && self.participants_req.insert(cid) {
-                self.send(Cmd::Participants(idx));
+                self.send(Cmd::Participants(cid));
             }
             let needle = m_prefix.to_ascii_lowercase();
             let mut candidates: Vec<(i64, String, String)> = Vec::new();
@@ -2517,10 +2552,10 @@ impl App {
                     .on_hover_text(format!("Меню бота: {w_lbl}"))
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
-                    && let Some(idx) = self.selected
+                    && let Some(did) = self.selected_dialog_id()
                 {
                     self.send(Cmd::OpenMiniApp {
-                        idx,
+                        dialog_id: did,
                         msg_id: None,
                         title: w_lbl.clone(),
                         url: Some(w_url.clone()),
@@ -2589,8 +2624,10 @@ impl App {
                         ui.close();
                     }
                     if kit::menu_item(ui, "settings/ttl", "Отложенные сообщения", false) {
-                        self.scheduled_open = true;
-                        self.send(Cmd::LoadScheduled);
+                        if let Some(did) = self.selected_dialog_id() {
+                            self.scheduled_open = true;
+                            self.send(Cmd::LoadScheduled(did));
+                        }
                         ui.close();
                     }
                     kit::menu_separator(ui);
@@ -2722,13 +2759,22 @@ impl App {
             let enter = focused
                 && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
                 && ui.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Enter));
-            let inp_stroke = if focused {
-                egui::Stroke::new(1.0, c_orange().gamma_multiply(0.65))
+            let inp_focus = tween(ui.ctx(), "cmp-inp-focus", f32::from(u8::from(focused)), 0.14);
+            let inp_stroke = egui::Stroke::new(
+                1.0 + 0.35 * inp_focus,
+                lerp_color(
+                    Color32::from_white_alpha(if super::theme::mobile_glass_active() { 38 } else { 22 }),
+                    c_orange().gamma_multiply(0.75),
+                    inp_focus,
+                ),
+            );
+            let inp_fill = if super::theme::mobile_glass_active() {
+                Color32::from_rgba_unmultiplied(20, 22, 30, ((196.0 + 18.0 * inp_focus) * opacity_f32()) as u8)
             } else {
-                egui::Stroke::new(1.0, Color32::from_white_alpha(20))
+                Color32::from_rgba_unmultiplied(18, 20, 26, (215.0 * opacity_f32()) as u8)
             };
             let text_out = egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(18, 20, 26, (215.0 * opacity_f32()) as u8))
+                .fill(inp_fill)
                 .stroke(inp_stroke)
                 .corner_radius(egui::CornerRadius::same(18))
                 .inner_margin(egui::Margin::symmetric(10, 2))
@@ -2762,8 +2808,10 @@ impl App {
                 if let Some(idx) = self.selected {
                     self.draft_dirty_at = Some((idx, ui.input(|i| i.time)));
                     if self.input.trim().is_empty() {
-                        if let Some((prev_idx, _)) = self.last_typing_sent.take() {
-                            self.send(Cmd::SetTyping(prev_idx, false));
+                        if let Some((prev_idx, _)) = self.last_typing_sent.take()
+                            && let Some(prev_did) = self.dialog_id_at(prev_idx)
+                        {
+                            self.send(Cmd::SetTyping(prev_did, false));
                         }
                     } else {
                         let should_ping = self.last_typing_sent.is_none_or(|(pi, t0)| {
@@ -2771,7 +2819,9 @@ impl App {
                         });
                         if should_ping {
                             self.last_typing_sent = Some((idx, std::time::Instant::now()));
-                            self.send(Cmd::SetTyping(idx, true));
+                            if let Some(did) = self.dialog_id_at(idx) {
+                                self.send(Cmd::SetTyping(did, true));
+                            }
                         }
                     }
                 }
@@ -2998,47 +3048,51 @@ impl App {
                 self.input_redo.clear();
                 self.composer_sel = None;
                 let (clean, ents) = super::rich::parse_formatted(&text, &custom);
-                if let Some(id) = self.editing.take() {
-                    self.send(Cmd::Edit(id, clean));
-                } else {
-                    let reply = self.reply.take().map(|(id, _)| id);
-                    let effect = self.selected_effect.take();
-                    let schedule_date = if send_scheduled_now {
-                        self.schedule_picker_open = false;
-                        Some((self.now + i64::from(self.schedule_delay_mins.max(1)) * 60) as i32)
+                if let Some(did) = self.selected_dialog_id() {
+                    if let Some(id) = self.editing.take() {
+                        self.send(Cmd::Edit(did, id, clean));
                     } else {
-                        None
-                    };
-                    let send_as = cur_dlg_info.and_then(|(_, cid, _)| self.selected_send_as.get(&cid).copied());
-                    if schedule_date.is_some() || effect.is_some() || send_as.is_some() {
-                        self.send(Cmd::SendAdvanced {
-                            text: clean,
-                            entities: ents,
-                            reply_to: reply,
-                            schedule_date,
-                            effect,
-                            send_as,
-                            silent: send_silent_now,
-                        });
-                    } else if send_silent_now && ents.is_empty() {
-                        let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
-                        self.send(Cmd::SendSilent(clean, reply, temp_id));
-                    } else if send_silent_now {
-                        self.send(Cmd::SendAdvanced {
-                            text: clean,
-                            entities: ents,
-                            reply_to: reply,
-                            schedule_date: None,
-                            effect: None,
-                            send_as: None,
-                            silent: true,
-                        });
-                    } else if ents.is_empty() {
-                        let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
-                        self.send(Cmd::Send(clean, reply, temp_id));
-                    } else {
-                        let temp_id = self.push_optimistic_message(clean.clone(), ents.clone(), reply, None);
-                        self.send(Cmd::SendFormatted(clean, ents, reply, temp_id));
+                        let reply = self.reply.take().map(|(id, _)| id);
+                        let effect = self.selected_effect.take();
+                        let schedule_date = if send_scheduled_now {
+                            self.schedule_picker_open = false;
+                            Some((self.now + i64::from(self.schedule_delay_mins.max(1)) * 60) as i32)
+                        } else {
+                            None
+                        };
+                        let send_as = cur_dlg_info.and_then(|(_, cid, _)| self.selected_send_as.get(&cid).copied());
+                        if schedule_date.is_some() || effect.is_some() || send_as.is_some() {
+                            self.send(Cmd::SendAdvanced {
+                                dialog_id: did,
+                                text: clean,
+                                entities: ents,
+                                reply_to: reply,
+                                schedule_date,
+                                effect,
+                                send_as,
+                                silent: send_silent_now,
+                            });
+                        } else if send_silent_now && ents.is_empty() {
+                            let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
+                            self.send(Cmd::SendSilent(did, clean, reply, temp_id));
+                        } else if send_silent_now {
+                            self.send(Cmd::SendAdvanced {
+                                dialog_id: did,
+                                text: clean,
+                                entities: ents,
+                                reply_to: reply,
+                                schedule_date: None,
+                                effect: None,
+                                send_as: None,
+                                silent: true,
+                            });
+                        } else if ents.is_empty() {
+                            let temp_id = self.push_optimistic_message(clean.clone(), Vec::new(), reply, None);
+                            self.send(Cmd::Send(did, clean, reply, temp_id));
+                        } else {
+                            let temp_id = self.push_optimistic_message(clean.clone(), ents.clone(), reply, None);
+                            self.send(Cmd::SendFormatted(did, clean, ents, reply, temp_id));
+                        }
                     }
                 }
                 r.request_focus();
@@ -3279,9 +3333,9 @@ impl App {
                     let reply = self.reply.as_ref().map(|(r, _)| *r);
                     if confirm {
                         self.pending_confirm_media = Some((is_gif, id, reply));
-                    } else {
+                    } else if let Some(did) = self.selected_dialog_id() {
                         self.reply.take();
-                        self.send(Cmd::SendSticker(id, reply));
+                        self.send(Cmd::SendSticker(did, id, reply));
                     }
                 }
                 A::SelectSet(i) => self.sticker_cur = i,
@@ -3339,17 +3393,19 @@ impl App {
                     }
                 }
                 A::SendDice(em) => {
-                    let reply = self.reply.take().map(|(r, _)| r);
-                    let media = rg_core::media::MediaInfo::basic(
-                        rg_core::media::MediaKind::Dice {
-                            emoticon: em.clone(),
-                            value: 0,
-                        },
-                        &em,
-                        0,
-                    );
-                    let temp_id = self.push_optimistic_message(String::new(), Vec::new(), reply, Some(media));
-                    self.send(Cmd::SendDice(em, reply, temp_id));
+                    if let Some(did) = self.selected_dialog_id() {
+                        let reply = self.reply.take().map(|(r, _)| r);
+                        let media = rg_core::media::MediaInfo::basic(
+                            rg_core::media::MediaKind::Dice {
+                                emoticon: em.clone(),
+                                value: 0,
+                            },
+                            &em,
+                            0,
+                        );
+                        let temp_id = self.push_optimistic_message(String::new(), Vec::new(), reply, Some(media));
+                        self.send(Cmd::SendDice(did, em, reply, temp_id));
+                    }
                 }
                 A::VisibleDoc(doc_id) => {
                     self.visible_tgs_docs.insert(doc_id);
@@ -3550,7 +3606,7 @@ impl App {
                 }
             }
         }
-        if let Some((idx, cid, _, _, _)) = dlg_meta
+        if let Some((_idx, cid, _, _, _)) = dlg_meta
             && let Some(topics) = self.forum_topics.get(&cid).cloned()
             && !topics.is_empty()
         {
@@ -3579,9 +3635,11 @@ impl App {
                 });
             if let Some(pick) = picked_topic {
                 self.active_topic = pick;
-                if let Some(tid) = pick {
+                if let Some(tid) = pick
+                    && let Some(did) = self.selected_dialog_id()
+                {
                     self.topic_msgs = None;
-                    self.send(Cmd::TopicMessages(idx, tid));
+                    self.send(Cmd::TopicMessages(did, tid));
                 }
             }
         }
@@ -3599,7 +3657,7 @@ impl App {
                 });
         }
         if self.date_jump_active
-            && let Some(idx) = self.selected
+            && let Some(did) = self.selected_dialog_id()
         {
             egui::Frame::new()
                 .fill(t2(WINDOW_BG))
@@ -3610,7 +3668,7 @@ impl App {
                         if ui.small_button("← К новым сообщениям").clicked() {
                             self.date_jump_active = false;
                             self.history_loading = true;
-                            self.send(Cmd::Open(idx));
+                            self.send(Cmd::Open(did, true));
                         }
                     });
                 });
@@ -4104,9 +4162,13 @@ impl App {
                     ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, mentions_cnt.min(99).to_string(), FontId::proportional(10.5), Color32::WHITE);
                 }
                 if resp.clicked() {
-                    self.send(Cmd::JumpUnreadMention(sel));
-                } else if resp.secondary_clicked() {
-                    self.send(Cmd::ReadAllMentions(sel));
+                    if let Some(did) = self.dialog_id_at(sel) {
+                        self.send(Cmd::JumpUnreadMention(did));
+                    }
+                } else if resp.secondary_clicked()
+                    && let Some(did) = self.dialog_id_at(sel)
+                {
+                    self.send(Cmd::ReadAllMentions(did));
                 }
                 let _ = resp.on_hover_text("Следующее @упоминание (ПКМ — прочитать все)").on_hover_cursor(egui::CursorIcon::PointingHand);
                 fab_y -= 54.0;
@@ -4140,9 +4202,13 @@ impl App {
                     ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, reactions_cnt.min(99).to_string(), FontId::proportional(10.5), Color32::WHITE);
                 }
                 if resp.clicked() {
-                    self.send(Cmd::JumpUnreadReaction(sel));
-                } else if resp.secondary_clicked() {
-                    self.send(Cmd::ReadAllReactions(sel));
+                    if let Some(did) = self.dialog_id_at(sel) {
+                        self.send(Cmd::JumpUnreadReaction(did));
+                    }
+                } else if resp.secondary_clicked()
+                    && let Some(did) = self.dialog_id_at(sel)
+                {
+                    self.send(Cmd::ReadAllReactions(did));
                 }
                 let _ = resp.on_hover_text("Следующая реакция ❤ (ПКМ — прочитать все)").on_hover_cursor(egui::CursorIcon::PointingHand);
             }
@@ -4184,9 +4250,10 @@ impl App {
         }
         if want_older && !self.older_pending && !self.history_end
             && let Some(first) = self.messages.iter().find(|m| !m.deleted)
+            && let Some(did) = self.selected_dialog_id()
         {
             self.older_pending = true;
-            self.send(Cmd::Older(first.id));
+            self.send(Cmd::Older(did, first.id));
         }
         for a in acts {
             self.apply(ui.ctx(), a);
@@ -4605,6 +4672,7 @@ impl App {
     }
 
     pub(crate) fn apply(&mut self, ctx: &egui::Context, a: Act) {
+        let cur_did = self.selected_dialog_id();
         match a {
             Act::Reply(id, text) => {
                 self.editing = None;
@@ -4620,7 +4688,11 @@ impl App {
                 self.input = text;
             }
             Act::Forward(id) => self.forward = Some(id),
-            Act::Pin(id, on) => self.send(Cmd::Pin(id, on)),
+            Act::Pin(id, on) => {
+                if let Some(did) = cur_did {
+                    self.send(Cmd::Pin(did, id, on));
+                }
+            }
             Act::React(id, e) => {
                 self.rx_pop.insert((id, e.clone()), ctx.input(|i| i.time));
                 if let Some(m) = self.messages.iter_mut().find(|m| m.id == id) {
@@ -4643,7 +4715,9 @@ impl App {
                         });
                     }
                 }
-                self.send(Cmd::React(id, e));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::React(did, id, e));
+                }
             }
             Act::ReactToggle(id, e, chosen) => {
                 self.rx_pop.insert((id, e.clone()), ctx.input(|i| i.time));
@@ -4659,13 +4733,17 @@ impl App {
                     }
                     m.reaction_items.retain(|x| x.count > 0);
                 }
-                self.send(Cmd::ReactToggle(id, e, chosen));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::ReactToggle(did, id, e, chosen));
+                }
             }
             Act::PaidReact(id) => self.paid_react_msg = Some(id),
             Act::Delete(id) => self.confirm_delete = Some(id),
             Act::Repeat(text) => {
-                let tid = self.push_optimistic_message(text.clone(), Vec::new(), None, None);
-                self.send(Cmd::Send(text, None, tid));
+                if let Some(did) = cur_did {
+                    let tid = self.push_optimistic_message(text.clone(), Vec::new(), None, None);
+                    self.send(Cmd::Send(did, text, None, tid));
+                }
             }
             Act::OpenStickerPack(set_id, access_hash) => {
                 self.send(Cmd::LoadStickerPack(set_id, access_hash));
@@ -4675,8 +4753,10 @@ impl App {
                 self.details_tab = 0;
                 self.edit_history = None;
                 self.msg_activity = None;
-                self.send(Cmd::EditHistory(id));
-                self.send(Cmd::LoadMessageActivity(id));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::EditHistory(did, id));
+                    self.send(Cmd::LoadMessageActivity(did, id));
+                }
             }
             Act::Hide(id) => {
                 self.hidden.insert(id);
@@ -4697,17 +4777,29 @@ impl App {
                 crate::copy_text_to_clipboard(ctx, &s);
                 self.status = format!("ID {s} скопирован");
             }
-            Act::Save(id) => self.send(Cmd::Download(id)),
-            Act::SaveToSaved(id) => {
-                if let Some(saved_idx) = self.dialogs.iter().position(|d| d.saved) {
-                    self.send(Cmd::Forward(id, saved_idx, false));
-                    self.status = "Пересылка в «Избранное»…".to_owned();
-                } else {
-                    self.send(Cmd::Download(id));
+            Act::Save(id) => {
+                if let Some(did) = cur_did {
+                    self.send(Cmd::Download(did, id));
                 }
             }
-            Act::CopyPhoto(id) => self.send(Cmd::CopyPhoto(id)),
-            Act::Open(id) => self.send(Cmd::OpenFile(id)),
+            Act::SaveToSaved(id) => {
+                if let (Some(from_did), Some(saved_did)) = (cur_did, self.dialogs.iter().find(|d| d.saved).map(|d| d.id)) {
+                    self.send(Cmd::Forward(from_did, id, saved_did, false));
+                    self.status = "Пересылка в «Избранное»…".to_owned();
+                } else if let Some(did) = cur_did {
+                    self.send(Cmd::Download(did, id));
+                }
+            }
+            Act::CopyPhoto(id) => {
+                if let Some(did) = cur_did {
+                    self.send(Cmd::CopyPhoto(did, id));
+                }
+            }
+            Act::Open(id) => {
+                if let Some(did) = cur_did {
+                    self.send(Cmd::OpenFile(did, id));
+                }
+            }
             Act::CancelFetch(id) => self.send(Cmd::CancelFetch(id)),
             Act::Viewer(id) => {
                 self.viewer = Some(id);
@@ -4718,37 +4810,43 @@ impl App {
                 self.details_tab = 0;
                 self.edit_history = None;
                 self.msg_activity = None;
-                self.send(Cmd::EditHistory(id));
-                self.send(Cmd::LoadMessageActivity(id));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::EditHistory(did, id));
+                    self.send(Cmd::LoadMessageActivity(did, id));
+                }
             }
             Act::Goto(id) => {
                 if self.messages.iter().any(|m| m.id == id) {
                     self.scroll_to = Some(id);
                     self.highlight_msg = Some((id, ctx.input(|i| i.time)));
-                } else if let Some(did) = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id) {
+                } else if let Some(did) = cur_did {
                     self.send(Cmd::JumpToMessage(did, id));
                 }
             }
             Act::PurgeLocal(id) => {
                 self.messages.retain(|m| m.id != id);
                 self.msg_heights.remove(&id);
-                if let Some(did) = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id)
+                if let Some(did) = cur_did
                     && let Some(cached) = self.history_cache.get_mut(&did)
                 {
                     cached.retain(|m| m.id != id);
                 }
-                self.send(Cmd::PurgeLocal(id));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::PurgeLocal(did, id));
+                }
                 self.status = "Удалённое сообщение скрыто у вас".to_owned();
             }
             Act::PurgeAllDeleted => {
                 self.messages.retain(|m| !m.deleted);
                 self.msg_heights.clear();
-                if let Some(did) = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id)
+                if let Some(did) = cur_did
                     && let Some(cached) = self.history_cache.get_mut(&did)
                 {
                     cached.retain(|m| !m.deleted);
                 }
-                self.send(Cmd::PurgeAllDeleted);
+                if let Some(did) = cur_did {
+                    self.send(Cmd::PurgeAllDeleted(did));
+                }
                 self.status = "Все удалённые сообщения этого чата убраны у вас".to_owned();
             }
             Act::CopyLink(msg_id) => {
@@ -4799,7 +4897,9 @@ impl App {
                 }
             }
             Act::VotePoll(id, option) => {
-                self.send(Cmd::VotePoll(id, option));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::VotePoll(did, id, option));
+                }
             }
             Act::ToggleSelect(id) => {
                 if !self.selected_msgs.remove(&id) {
@@ -4807,8 +4907,8 @@ impl App {
                 }
             }
             Act::Discuss(post_id) => {
-                if let Some(idx) = self.selected {
-                    self.send(Cmd::Discussion(idx, post_id));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::Discussion(did, post_id));
                 }
             }
             Act::FilterUser(uid, uname) => {
@@ -4821,22 +4921,24 @@ impl App {
                 use rg_core::engine::BotBtnKind as K;
                 match kind {
                     K::Text => {
-                        let tid = self.push_optimistic_message(label.clone(), Vec::new(), None, None);
-                        self.send(Cmd::Send(label, None, tid));
+                        if let Some(did) = cur_did {
+                            let tid = self.push_optimistic_message(label.clone(), Vec::new(), None, None);
+                            self.send(Cmd::Send(did, label, None, tid));
+                        }
                     }
                     K::Callback(data) => {
-                        if let Some(idx) = self.selected {
+                        if let Some(did) = cur_did {
                             self.bot_btn_pending = Some((msg_id, label, ctx.input(|i| i.time)));
-                            self.send(Cmd::BotCallback(idx, msg_id, data));
+                            self.send(Cmd::BotCallback(did, msg_id, data));
                         }
                     }
                     K::Url(u) => {
                         self.apply(ctx, Act::OpenUrl(u));
                     }
                     K::WebView { url, simple } => {
-                        if let Some(idx) = self.selected {
+                        if let Some(did) = cur_did {
                             self.send(Cmd::OpenMiniApp {
-                                idx,
+                                dialog_id: did,
                                 msg_id: (msg_id > 0).then_some(msg_id),
                                 title: label,
                                 url: Some(url),
@@ -4868,8 +4970,10 @@ impl App {
                 }
             }
             Act::Transcribe(msg_id) => {
-                if self.transcribing.insert(msg_id) {
-                    self.send(Cmd::TranscribeVoice(msg_id));
+                if let Some(did) = cur_did
+                    && self.transcribing.insert(msg_id)
+                {
+                    self.send(Cmd::TranscribeVoice(did, msg_id));
                 }
             }
             Act::ToggleTodo(msg_id, item_id, completed) => {
@@ -4880,7 +4984,9 @@ impl App {
                 {
                     it.done = completed;
                 }
-                self.send(Cmd::ToggleTodo(msg_id, item_id, completed));
+                if let Some(did) = cur_did {
+                    self.send(Cmd::ToggleTodo(did, msg_id, item_id, completed));
+                }
             }
             Act::SearchHashtag(tag) => {
                 self.hashtag_modal = Some((tag.clone(), Vec::new()));
@@ -4936,10 +5042,13 @@ impl App {
                         },
                     );
                 });
-            if let Some(i) = chosen {
+            if let Some(i) = chosen
+                && let (Some(from_id), Some(to_id)) = (self.selected_dialog_id(), self.dialog_id_at(i))
+            {
                 self.send(Cmd::ForwardAdvanced {
+                    from_id,
                     ids: vec![id],
-                    to_idx: i,
+                    to_id,
                     drop_author: self.forward_no_author,
                     drop_media_captions: self.forward_no_captions,
                     silent: self.forward_silent,
@@ -5013,7 +5122,9 @@ impl App {
                                     m.deleted = true;
                                 }
                             }
-                            self.send(Cmd::Delete { id, backup });
+                            if let Some(did) = self.selected_dialog_id() {
+                                self.send(Cmd::Delete { dialog_id: did, id, backup });
+                            }
                             close = true;
                         }
                         if ui.button("Отмена").clicked() {
@@ -5230,10 +5341,13 @@ impl App {
                         },
                     );
                 });
-            if let Some(i) = chosen {
+            if let Some(i) = chosen
+                && let (Some(from_id), Some(to_id)) = (self.selected_dialog_id(), self.dialog_id_at(i))
+            {
                 self.send(Cmd::ForwardAdvanced {
+                    from_id,
                     ids,
-                    to_idx: i,
+                    to_id,
                     drop_author: self.forward_no_author,
                     drop_media_captions: self.forward_no_captions,
                     silent: self.forward_silent,
@@ -5437,8 +5551,10 @@ impl App {
                         }
                     });
                 });
-            if let Some(as_json) = export_fmt {
-                self.send(Cmd::ExportChatAudit { chat_title, as_json });
+            if let Some(as_json) = export_fmt
+                && let Some(did) = self.selected_dialog_id()
+            {
+                self.send(Cmd::ExportChatAudit { dialog_id: did, chat_title, as_json });
             }
             if open_global {
                 self.audit_history = None;
@@ -5488,7 +5604,9 @@ impl App {
                 let reply = self.reply.take().map(|(id, _)| id);
                 for (k, p) in paths.into_iter().enumerate() {
                     let c = if k == 0 { cap.trim().to_owned() } else { String::new() };
-                    self.send(Cmd::SendFile(p, c, if k == 0 { reply } else { None }));
+                    if let Some(did) = self.selected_dialog_id() {
+                        self.send(Cmd::SendFile(did, p, c, if k == 0 { reply } else { None }));
+                    }
                 }
             } else if cancel {
                 self.drop_paths.clear();
@@ -5868,7 +5986,7 @@ impl App {
                     self.open_dialog(pos);
                     let msg = format!("Ответ на историю: {reply_txt}");
                     let tid = self.push_optimistic_message(msg.clone(), Vec::new(), None, None);
-                    self.send(Cmd::Send(msg, None, tid));
+                    self.send(Cmd::Send(st.peer_id, msg, None, tid));
                     self.status = "Отправка ответа на историю…".to_owned();
                 }
                 if close_viewer || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -5964,7 +6082,9 @@ impl App {
             if let Some(doc_id) = send_doc {
                 let reply = self.reply.take().map(|(r, _)| r);
                 self.sticker_pack_modal = None;
-                self.send(Cmd::SendSticker(doc_id, reply));
+                if let Some(did) = self.selected_dialog_id() {
+                    self.send(Cmd::SendSticker(did, doc_id, reply));
+                }
             } else if let Some(install) = toggle_install {
                 self.send(Cmd::InstallStickerPack(pack.id, pack.access_hash, install));
             } else if !open {
@@ -5987,7 +6107,9 @@ impl App {
                         if orange_button(ui, "Отправить", Vec2::new(110.0, 32.0)).clicked() {
                             self.reply.take();
                             self.pending_confirm_media = None;
-                            self.send(Cmd::SendSticker(doc_id, reply));
+                            if let Some(did) = self.selected_dialog_id() {
+                                self.send(Cmd::SendSticker(did, doc_id, reply));
+                            }
                         }
                         if ui.button("Отмена").clicked() {
                             self.pending_confirm_media = None;
@@ -6123,9 +6245,9 @@ impl App {
             self.viewer = Some(new_id);
             self.viewer_zoom = 1.0;
             if !self.textures.contains_key(&new_id)
-                && let Some(idx) = self.selected
+                && let Some(did) = self.selected_dialog_id()
             {
-                self.send(Cmd::Preview(idx, new_id));
+                self.send(Cmd::Preview(did, new_id));
             }
         } else if close {
             self.viewer = None;

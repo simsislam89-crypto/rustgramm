@@ -1232,13 +1232,24 @@ impl App {
         let _ = self.cmd.send(c);
     }
 
+    pub(crate) fn dialog_id_at(&self, idx: usize) -> Option<i64> {
+        self.dialogs.get(idx).map(|d| d.id)
+    }
+
+    pub(crate) fn selected_dialog_id(&self) -> Option<i64> {
+        self.selected.and_then(|i| self.dialog_id_at(i))
+    }
+
     pub(crate) fn toggle_mute_dialog(&mut self, idx: usize, muted: bool) {
+        let did = self.dialog_id_at(idx);
         if let Some(d) = self.dialogs.get_mut(idx) {
             d.muted = muted;
             d.notify_explicit = Some(muted);
             self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
         }
-        self.send(Cmd::MuteDialog(idx, muted));
+        if let Some(did) = did {
+            self.send(Cmd::MuteDialog(did, muted));
+        }
     }
 
     fn flush_pending_notification(&mut self, ctx: &egui::Context) {
@@ -1268,11 +1279,13 @@ impl App {
         };
         let open_id = self.selected.and_then(|i| self.dialogs.get(i)).map(|d| d.id);
         let (date, outgoing, text) = row;
-        let old_date = self.dialogs[pos].date;
-        let old_pinned = self.dialogs[pos].pinned;
-        let old_archived = self.dialogs[pos].archived;
+        let Some((old_date, old_pinned, old_archived)) = self.dialogs.get(pos).map(|d| (d.date, d.pinned, d.archived)) else {
+            return true;
+        };
         let newer = *date >= old_date;
-        let d = &mut self.dialogs[pos];
+        let Some(d) = self.dialogs.get_mut(pos) else {
+            return true;
+        };
         if newer {
             if !text.is_empty() {
                 d.last.clone_from(text);
@@ -1358,7 +1371,7 @@ impl App {
                     }
                     // Окно в фокусе и чат открыт: отмечаем прочитанным (режим призрака учитывается).
                     if incoming && ctx.input(|i| i.focused) {
-                        self.send(Cmd::MarkRead);
+                        self.send(Cmd::MarkRead(key));
                     }
                 }
                 // Строка списка обновляется на месте; полный перезапрос (300 чатов + архив)
@@ -2213,9 +2226,10 @@ impl App {
     }
 
     fn request_previews(&mut self, idx: usize, rows: &[MessageRow]) {
+        let Some(did) = self.dialog_id_at(idx) else { return };
         // В больших группах (1000+ участников) подгружаем аватарки порциями (≤ 24 уникальных),
         // чтобы открытие чата не создавало лавину сетевых запросов.
-        if self.dialogs.get(idx).is_some_and(|d| d.id < 0) {
+        if did < 0 {
             let mut sent_av = 0usize;
             for r in rows.iter().rev().filter(|r| !r.outgoing && r.sender_id != 0) {
                 if self.contact_av_req.insert(r.sender_id) && !self.avatars.contains_key(&r.sender_id) {
@@ -2236,7 +2250,7 @@ impl App {
             .collect();
         for id in want {
             if self.requested.insert(id) {
-                let _ = self.cmd.send(Cmd::Preview(idx, id));
+                let _ = self.cmd.send(Cmd::Preview(did, id));
             }
         }
         // Для анимированных .tgs стикеров в ленте дополнительно качаем векторную Lottie-анимацию.
@@ -2253,7 +2267,7 @@ impl App {
             .collect();
         for id in tgs_want {
             if !self.tgs_msgs.contains_key(&id) && self.tgs_msg_req.insert(id) {
-                let _ = self.cmd.send(Cmd::TgsMessage(idx, id));
+                let _ = self.cmd.send(Cmd::TgsMessage(did, id));
             }
         }
         // Какие ролики уже скачаны: на них рисуется play, остальные — стрелка загрузки.
@@ -2267,7 +2281,7 @@ impl App {
             .map(|r| r.id)
             .collect();
         if !videos.is_empty() {
-            let _ = self.cmd.send(Cmd::CachedMedia(videos));
+            let _ = self.cmd.send(Cmd::CachedMedia(did, videos));
         }
         // Короткие GIF и видео-стикеры WebM до 4 МБ подгружаются в фоне для плавного автозапуска в ленте.
         if self.settings.auto_play_gifs {
@@ -2287,7 +2301,7 @@ impl App {
                 .collect();
             for id in gifs {
                 if !self.gif_paths.contains_key(&id) && self.gif_auto_req.insert(id) {
-                    let _ = self.cmd.send(Cmd::AutoFetchGif(id));
+                    let _ = self.cmd.send(Cmd::AutoFetchGif(did, id));
                 }
             }
         }
@@ -2402,14 +2416,15 @@ impl App {
         } else {
             None
         };
-        let text = if self.selected == Some(idx) {
-            self.input.clone()
-        } else if let Some(d) = self.dialogs.get(idx) {
-            self.drafts.get(&d.id).map(|(t, _)| t.clone()).unwrap_or_default()
-        } else {
-            return;
-        };
-        self.send(Cmd::SaveDraft(idx, text, reply_to));
+        if let Some(d) = self.dialogs.get(idx) {
+            let did = d.id;
+            let text = if self.selected == Some(idx) {
+                self.input.clone()
+            } else {
+                self.drafts.get(&did).map(|(t, _)| t.clone()).unwrap_or_default()
+            };
+            self.send(Cmd::SaveDraft(did, text, reply_to));
+        }
     }
 
     /// Открыть чат из списка (мгновенно из кэша в памяти, если уже открывался).
@@ -2451,7 +2466,7 @@ impl App {
                 self.input.clear();
             }
             if self.info_req.insert(id) {
-                self.send(Cmd::PeerInfo(i));
+                self.send(Cmd::PeerInfo(id));
             }
             if self.peer_infos.get(&id).and_then(|p| p.pinned_msg_id).is_some()
                 && self.pinned_list_req.insert(id)
@@ -2471,18 +2486,16 @@ impl App {
                     .history_fresh_at
                     .get(&id)
                     .is_some_and(|t| t.elapsed().as_millis() < 1500);
-                if !fresh {
-                    self.send(Cmd::Open(i));
-                }
+                self.send(Cmd::Open(id, !fresh));
                 return;
             } else {
                 self.history_loading = true;
             }
+            self.send(Cmd::Open(id, true));
         } else {
             self.input.clear();
             self.history_loading = true;
         }
-        self.send(Cmd::Open(i));
     }
 
     /// Закрыть открытый чат и сбросить состояние ленты.
@@ -3019,7 +3032,9 @@ impl App {
                 Ev::Contacts(c) => self.contacts = c,
                 Ev::Select(id) => {
                     if let Some(i) = self.dialogs.iter().position(|d| d.id == id) {
-                        self.in_archive = self.dialogs[i].archived;
+                        if let Some(d) = self.dialogs.get(i) {
+                            self.in_archive = d.archived;
+                        }
                         self.open_dialog(i);
                     }
                 }
@@ -3153,12 +3168,12 @@ impl App {
                     {
                         self.send(Cmd::CustomEmojiDocs(vec![doc_id]));
                     }
-                    if let Some(idx) = self.selected.filter(|&i| self.dialogs.get(i).is_some_and(|d| d.id == id)) {
+                    if let Some(did) = self.selected_dialog_id().filter(|&did| did == id) {
                         if let Some(pid) = info.pinned_msg_id {
                             if self.pinned_msgs.get(&id).is_none_or(|m| m.id != pid)
                                 && self.pinned_req.insert((id, pid))
                             {
-                                self.send(Cmd::LoadPinned(idx, pid));
+                                self.send(Cmd::LoadPinned(did, pid));
                             }
                             if self.pinned_list_req.insert(id) {
                                 self.send(Cmd::LoadPinnedMessages(id));
@@ -3168,7 +3183,7 @@ impl App {
                             && !self.forum_topics.contains_key(&id)
                             && self.forum_req.insert(id)
                         {
-                            self.send(Cmd::ForumTopics(idx));
+                            self.send(Cmd::ForumTopics(did));
                         }
                     }
                     self.peer_infos.insert(id, *info);
@@ -3220,7 +3235,9 @@ impl App {
                 }
                 Ev::NavigateTo { id, post } => {
                     if let Some(pos) = self.dialogs.iter().position(|d| d.id == id) {
-                        self.in_archive = self.dialogs[pos].archived;
+                        if let Some(d) = self.dialogs.get(pos) {
+                            self.in_archive = d.archived;
+                        }
                         self.open_dialog(pos);
                         if let Some(pid) = post {
                             self.scroll_to = Some(pid);
@@ -3362,7 +3379,7 @@ impl App {
                                 self.pending_jump_to_msg = None;
                             } else if jdate > 0 {
                                 self.pending_jump_to_msg = Some((jdid, jmid, 0));
-                                self.send(Cmd::JumpToDate(idx, (jdate + 2).min(i64::from(i32::MAX)) as i32));
+                                self.send(Cmd::JumpToDate(jdid, (jdate + 2).min(i64::from(i32::MAX)) as i32));
                             }
                         }
                         self.messages = m;
@@ -3382,11 +3399,11 @@ impl App {
                     self.error = err;
                     self.error_at = self.now;
                 }
-                Ev::Older(idx, rows) if self.selected == Some(idx) => {
+                Ev::Older(did, rows) if self.selected_dialog_id() == Some(did) => {
                     self.older_pending = false;
                     if rows.is_empty() {
                         self.history_end = true;
-                    } else {
+                    } else if let Some(idx) = self.selected {
                         let now_t = ctx.input(|i| i.time);
                         self.scroll_to = self.messages.first().map(|m| m.id);
                         self.request_previews(idx, &rows);
@@ -3401,14 +3418,16 @@ impl App {
                     }
                 }
                 Ev::Older(..) => {}
-                Ev::Found(idx, rows) if self.selected == Some(idx) => {
-                    self.request_previews(idx, &rows);
+                Ev::Found(did, rows) if self.selected_dialog_id() == Some(did) => {
+                    if let Some(idx) = self.selected {
+                        self.request_previews(idx, &rows);
+                    }
                     self.chat_search_idx = rows.len().saturating_sub(1);
                     if let Some(last) = rows.last() {
                         if self.messages.iter().any(|m| m.id == last.id) {
                             self.scroll_to = Some(last.id);
                             self.highlight_msg = Some((last.id, ctx.input(|i| i.time)));
-                        } else if let Some(did) = self.dialogs.get(idx).map(|d| d.id) {
+                        } else {
                             self.send(Cmd::JumpToMessage(did, last.id));
                         }
                     }
@@ -3416,7 +3435,7 @@ impl App {
                 }
                 Ev::Found(..) => {}
                 Ev::EditHistory(id, v) => self.edit_history = Some((id, v)),
-                Ev::Image(idx, id, img) if self.selected == Some(idx) => {
+                Ev::Image(did, id, img) if self.selected_dialog_id() == Some(did) => {
                     let tex = ctx.load_texture(format!("m{id}"), *img, egui::TextureOptions::LINEAR);
                     self.textures.insert(id, tex);
                     self.img_arrived.insert(id, ctx.input(|i| i.time));
@@ -3915,14 +3934,18 @@ impl App {
                 }
                 Ev::SelectDialogById(did) => {
                     if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
-                        self.in_archive = self.dialogs[pos].archived;
+                        if let Some(d) = self.dialogs.get(pos) {
+                            self.in_archive = d.archived;
+                        }
                         self.open_dialog(pos);
                     }
                 }
                 Ev::OpenResolvedDialog(dlg) => {
                     let did = dlg.id;
                     if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
-                        self.in_archive = self.dialogs[pos].archived;
+                        if let Some(d) = self.dialogs.get(pos) {
+                            self.in_archive = d.archived;
+                        }
                         self.open_dialog(pos);
                     } else {
                         self.dialogs.insert(0, *dlg);
@@ -4061,8 +4084,10 @@ impl App {
                         }
                         "chat_search" => {
                             self.chat_search = val;
-                            if !self.chat_search.trim().is_empty() {
-                                self.send(Cmd::Search(self.chat_search.clone()));
+                            if !self.chat_search.trim().is_empty()
+                                && let Some(did) = self.selected_dialog_id()
+                            {
+                                self.send(Cmd::Search(did, self.chat_search.clone()));
                             }
                         }
                         "comment_input" => {
@@ -4226,7 +4251,7 @@ impl App {
             &["1", "2", "3"],
             &["4", "5", "6"],
             &["7", "8", "9"],
-            &[if allow_plus { "+" } else { "Стереть" }, "0", "⌫"],
+            &[if allow_plus { "+" } else { "Стереть" }, "0", "BACK"],
         ];
         let kw = ((width - 12.0) / 3.0).floor().max(52.0);
         let gap = ((width - kw * 3.0) * 0.5).max(4.0);
@@ -4244,17 +4269,57 @@ impl App {
                         |ui| {
                             ui.spacing_mut().item_spacing.x = gap;
                             for &key in row {
-                                let glass = theme::mobile_glass_active();
-                                let btn = egui::Button::new(RichText::new(key).size(16.0).strong().color(WHITE))
-                                    .fill(Color32::from_white_alpha(if glass { 28 } else { 18 }))
-                                    .stroke(egui::Stroke::new(
-                                        1.0,
-                                        Color32::from_white_alpha(if glass { 46 } else { 26 }),
-                                    ))
-                                    .corner_radius(egui::CornerRadius::same(12));
-                                if ui.add_sized([kw, row_h], btn).clicked() {
+                                let is_glass = theme::mobile_glass_active();
+                                let (rect, resp) = ui.allocate_exact_size(Vec2::new(kw, row_h), Sense::click());
+                                let hk = theme::tween(ui.ctx(), ("akp", key, allow_plus), f32::from(u8::from(resp.hovered())), 0.12);
+                                if is_glass {
+                                    glass::paint_surface(ui.painter(), rect, 12.0, glass::GlassVariant::Clear, hk);
+                                } else {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        egui::CornerRadius::same(12),
+                                        Color32::from_white_alpha(if resp.hovered() { 26 } else { 18 }),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        egui::CornerRadius::same(12),
+                                        egui::Stroke::new(1.0, Color32::from_white_alpha(26)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if key == "BACK" {
+                                    // Векторная иконка Backspace (без системного Unicode-глифа ⌫).
+                                    let p = ui.painter();
+                                    let c = rect.center();
+                                    let stroke = egui::Stroke::new(1.7, WHITE);
+                                    let outline = vec![
+                                        egui::Pos2::new(c.x - 10.0, c.y),
+                                        egui::Pos2::new(c.x - 4.0, c.y - 6.5),
+                                        egui::Pos2::new(c.x + 9.0, c.y - 6.5),
+                                        egui::Pos2::new(c.x + 9.0, c.y + 6.5),
+                                        egui::Pos2::new(c.x - 4.0, c.y + 6.5),
+                                    ];
+                                    p.add(egui::Shape::closed_line(outline, stroke));
+                                    p.line_segment(
+                                        [egui::Pos2::new(c.x - 0.5, c.y - 3.0), egui::Pos2::new(c.x + 5.5, c.y + 3.0)],
+                                        stroke,
+                                    );
+                                    p.line_segment(
+                                        [egui::Pos2::new(c.x - 0.5, c.y + 3.0), egui::Pos2::new(c.x + 5.5, c.y - 3.0)],
+                                        stroke,
+                                    );
+                                } else {
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        key,
+                                        FontId::proportional(if key.len() > 2 { 13.5 } else { 16.5 }),
+                                        WHITE,
+                                    );
+                                }
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                     match key {
-                                        "⌫" => {
+                                        "BACK" => {
                                             target.pop();
                                             changed = true;
                                         }
@@ -5381,7 +5446,9 @@ impl App {
             if let Some(hit) = jump_hit {
                 self.pending_jump_to_msg = Some((hit.dialog_id, hit.msg_id, hit.date));
                 if let Some(pos) = self.dialogs.iter().position(|d| d.id == hit.dialog_id) {
-                    self.in_archive = self.dialogs[pos].archived;
+                    if let Some(d) = self.dialogs.get(pos) {
+                        self.in_archive = d.archived;
+                    }
                     if self.selected == Some(pos) {
                         let now_t = ui.ctx().input(|i| i.time);
                         if self.messages.iter().any(|m| m.id == hit.msg_id) {
@@ -5390,7 +5457,7 @@ impl App {
                             self.pending_jump_to_msg = None;
                         } else if hit.date > 0 {
                             self.pending_jump_to_msg = Some((hit.dialog_id, hit.msg_id, 0));
-                            self.send(Cmd::JumpToDate(pos, (hit.date + 2).min(i64::from(i32::MAX)) as i32));
+                            self.send(Cmd::JumpToDate(hit.dialog_id, (hit.date + 2).min(i64::from(i32::MAX)) as i32));
                         }
                     } else {
                         self.open_dialog(pos);
@@ -5493,12 +5560,46 @@ impl App {
             }
         }
         let show_global = !needle.is_empty() && !self.global_results.is_empty();
+        let sel_row_pos = self.selected.and_then(|sel| filtered.iter().position(|&idx| idx == sel));
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
             ui,
             DIALOG_ROW_HEIGHT,
             filtered.len() + if show_global { self.global_results.len() + 1 } else { 0 },
             |ui, row_range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                if let Some(target_row) = sel_row_pos {
+                    let list_top_y = ui.cursor().min.y - (row_range.start as f32) * DIALOG_ROW_HEIGHT;
+                    let list_left = ui.cursor().min.x;
+                    let list_w = ui.available_width();
+                    let slide_row = ui.ctx().animate_value_with_time(
+                        egui::Id::NULL.with("dialogs-slide-row"),
+                        target_row as f32,
+                        0.22,
+                    );
+                    let ind_y = list_top_y + slide_row * DIALOG_ROW_HEIGHT;
+                    if ind_y + DIALOG_ROW_HEIGHT >= ui.clip_rect().top() && ind_y <= ui.clip_rect().bottom() {
+                        let pill_rect = egui::Rect::from_min_max(
+                            egui::pos2(list_left + 4.0, ind_y + 2.0),
+                            egui::pos2((list_left + list_w - 4.0).max(list_left + 20.0), ind_y + DIALOG_ROW_HEIGHT - 2.0),
+                        );
+                        if theme::mobile_glass_active() {
+                            glass::paint_surface(ui.painter(), pill_rect, 12.0, glass::GlassVariant::Tinted(t(DIALOG_ACTIVE)), 0.15);
+                        } else {
+                            ui.painter().rect_filled(pill_rect, egui::CornerRadius::same(8), t(DIALOG_ACTIVE));
+                            ui.painter().rect_stroke(
+                                pill_rect,
+                                egui::CornerRadius::same(8),
+                                egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        let accent_bar = egui::Rect::from_min_max(
+                            egui::pos2(list_left + 1.0, ind_y + 9.0),
+                            egui::pos2(list_left + 4.5, ind_y + DIALOG_ROW_HEIGHT - 9.0),
+                        );
+                        ui.painter().rect_filled(accent_bar, egui::CornerRadius::same(2), c_orange());
+                    }
+                }
                 for row_pos in row_range {
                     if row_pos >= filtered.len() {
                         let g_idx = row_pos - filtered.len();
@@ -5530,31 +5631,23 @@ impl App {
                         continue;
                     }
                     let i = filtered[row_pos];
-                    let d = &self.dialogs[i];
+                    let Some(d) = self.dialogs.get(i) else { continue };
                     let (rect, resp) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), DIALOG_ROW_HEIGHT),
                         Sense::click(),
                     );
                     let selected = self.selected == Some(i);
                     let hover = theme::tween(ui.ctx(), ("dlg", i), f32::from(u8::from(resp.hovered())), 0.12);
-                    let fill = if selected {
-                        t(DIALOG_ACTIVE)
-                    } else {
-                        theme::lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover)
-                    };
                     let p = ui.painter();
-                    p.rect_filled(rect, 0.0, fill);
-                    let act_k = theme::tween(ui.ctx(), ("dlg-act", d.id), f32::from(u8::from(selected)), 0.16);
-                    if act_k > 0.02 {
-                        let pad = (rect.height() - 16.0) * (1.0 - ios_spring(act_k)) * 0.5;
-                        let accent_bar = egui::Rect::from_min_max(
-                            egui::pos2(rect.left(), rect.top() + 8.0 + pad),
-                            egui::pos2(rect.left() + 3.0, rect.bottom() - 8.0 - pad),
+                    if hover > 0.01 && !selected {
+                        p.rect_filled(
+                            rect.shrink2(Vec2::new(4.0, 2.0)),
+                            egui::CornerRadius::same(8),
+                            theme::lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover),
                         );
-                        p.rect_filled(accent_bar, egui::CornerRadius::same(2), c_orange().gamma_multiply(act_k));
                     }
                     if self.avatar_req.insert(d.id) {
-                        let _ = self.cmd.send(Cmd::Avatar(i));
+                        let _ = self.cmd.send(Cmd::Avatar(d.id));
                     }
                     draw_avatar(
                         ui,
@@ -5806,8 +5899,13 @@ impl App {
             self.send(Cmd::OpenContact(peer, id, name));
         }
         if let Some((i, a)) = dact {
+            let did = self.dialog_id_at(i);
             match a {
-                DialogAct::Pin(on) => self.send(Cmd::PinDialog(i, on)),
+                DialogAct::Pin(on) => {
+                    if let Some(did) = did {
+                        self.send(Cmd::PinDialog(did, on));
+                    }
+                }
                 DialogAct::Mute(on) => self.toggle_mute_dialog(i, on),
                 DialogAct::LocalRead => self.local_read_dialog(i),
                 DialogAct::Read => {
@@ -5815,17 +5913,29 @@ impl App {
                         d.unread = 0;
                         self.dialogs_gen += 1;
                     }
-                    self.send(Cmd::ReadDialog(i));
+                    if let Some(did) = did {
+                        self.send(Cmd::ReadDialog(did));
+                    }
                 }
                 DialogAct::Unread(on) => {
                     if let Some(d) = self.dialogs.get_mut(i) {
                         d.unread = if on { d.unread.max(1) } else { 0 };
                         self.dialogs_gen += 1;
                     }
-                    self.send(Cmd::MarkDialogUnread(i, on));
+                    if let Some(did) = did {
+                        self.send(Cmd::MarkDialogUnread(did, on));
+                    }
                 }
-                DialogAct::Archive(on) => self.send(Cmd::Archive(i, on)),
-                DialogAct::Peek => self.send(Cmd::PeekHistory(i)),
+                DialogAct::Archive(on) => {
+                    if let Some(did) = did {
+                        self.send(Cmd::Archive(did, on));
+                    }
+                }
+                DialogAct::Peek => {
+                    if let Some(did) = did {
+                        self.send(Cmd::PeekHistory(did));
+                    }
+                }
                 DialogAct::ConfirmClear => {
                     if let Some(d) = self.dialogs.get(i) {
                         self.confirm_chat_action = Some((d.id, d.name.clone(), false, false));
@@ -6064,7 +6174,7 @@ impl eframe::App for App {
             && self.stage == Stage::Ready
             && !self.is_demo
         {
-            self.send(Cmd::SyncOpenChat);
+            self.send(Cmd::SyncOpenChat(self.selected_dialog_id()));
         }
         self.was_focused = focused;
         self.flush_draft_if_dirty(false, ui_t);
@@ -6463,11 +6573,13 @@ impl App {
         self.confirm_unpin_modal(ctx);
         if let Some((path, caption, reply_to, opts)) =
             media_editor::media_editor_window(ctx, &mut self.media_editor, &worker::home().join("cache"))
+            && let Some(did) = self.selected_dialog_id()
         {
             let cleanup_temp = path
                 .parent()
                 .is_some_and(|p| p.ends_with("edited"));
             self.send(Cmd::SendMediaEdited {
+                dialog_id: did,
                 path,
                 caption,
                 reply_to,
@@ -6513,8 +6625,10 @@ impl App {
                 ui.label("Сообщение останется в истории чата, но пропадёт из закрепа.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if orange_button(ui, "Открепить", Vec2::new(112.0, 30.0)).clicked() {
-                        self.send(Cmd::Pin(mid, false));
+                    if orange_button(ui, "Открепить", Vec2::new(112.0, 30.0)).clicked()
+                        && let Some(did) = self.selected_dialog_id()
+                    {
+                        self.send(Cmd::Pin(did, mid, false));
                         close = true;
                     }
                     if ui.button("Отмена").clicked() {
@@ -6658,9 +6772,10 @@ impl App {
                     }
                 });
             });
-        if submit {
+        if submit && let Some(did) = self.selected_dialog_id() {
             let reply_to = self.reply.take().map(|(id, _)| id);
             self.send(Cmd::SendContact {
+                dialog_id: did,
                 phone: self.send_contact_phone.trim().to_owned(),
                 first_name: self.send_contact_first.trim().to_owned(),
                 last_name: self.send_contact_last.trim().to_owned(),
@@ -6670,7 +6785,7 @@ impl App {
             self.send_contact_first.clear();
             self.send_contact_last.clear();
             self.contact_modal_open = false;
-        } else if !open {
+        } else if submit || !open {
             self.contact_modal_open = false;
         }
     }
@@ -6716,15 +6831,16 @@ impl App {
                 });
             });
         if submit
+            && let Some(did) = self.selected_dialog_id()
             && let (Ok(lat), Ok(lon)) = (
                 self.geo_lat.trim().replace(',', ".").parse::<f64>(),
                 self.geo_lon.trim().replace(',', ".").parse::<f64>(),
             )
         {
             let reply_to = self.reply.take().map(|(id, _)| id);
-            self.send(Cmd::SendGeo { lat, lon, reply_to });
+            self.send(Cmd::SendGeo { dialog_id: did, lat, lon, reply_to });
             self.geo_modal_open = false;
-        } else if !open {
+        } else if submit || !open {
             self.geo_modal_open = false;
         }
     }
@@ -8340,5 +8456,97 @@ mod tests {
             "mobile Liquid Glass tabs missing: {txt}"
         );
         assert!(txt.contains("Скопировано в буфер обмена"), "floating glass toast text missing: {txt}");
+    }
+
+    #[test]
+    fn rapid_chat_switch_and_reorder_send_to_exact_selected_dialog_id() {
+        let ctx = egui::Context::default();
+        let mut app = demo_app("1");
+        let (cmd, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cmd = cmd;
+        assert!(app.dialogs.len() >= 2);
+        let did1 = app.dialogs[0].id;
+        let did2 = app.dialogs[1].id;
+        assert_ne!(did1, did2);
+
+        app.open_dialog(0);
+        while cmd_rx.try_recv().is_ok() {}
+
+        // Симулируем переключение на второй чат со свежим кэшем (<1500мс).
+        app.history_cache.insert(did2, vec![MessageRow::plain(1, "cached".into(), false, app.now)]);
+        app.history_fresh_at.insert(did2, std::time::Instant::now());
+        let pos2 = app.dialogs.iter().position(|d| d.id == did2).unwrap();
+        app.open_dialog(pos2);
+        assert_eq!(app.selected_dialog_id(), Some(did2));
+
+        // Сервер переупорядочивает список диалогов прямо перед отправкой (пришло сообщение в did2 -> вверх).
+        let mut reordered = app.dialogs.clone();
+        reordered.swap(0, 1);
+        app.handle_event(&ctx, Ev::Dialogs(reordered));
+        assert_eq!(app.dialogs[0].id, did2);
+
+        let cur_did = app.selected_dialog_id().unwrap();
+        assert_eq!(cur_did, did2);
+        let tid = app.push_optimistic_message("/start".to_owned(), Vec::new(), None, None);
+        app.send(Cmd::Send(cur_did, "/start".to_owned(), None, tid));
+
+        let mut saw_open_did2 = false;
+        let mut saw_send_did2 = false;
+        while let Ok(c) = cmd_rx.try_recv() {
+            match c {
+                Cmd::Open(id, fetch) => {
+                    assert_eq!(id, did2, "Open must switch worker to exact dialog_id");
+                    assert!(!fetch, "fresh cache open must still switch worker with fetch=false");
+                    saw_open_did2 = true;
+                }
+                Cmd::Send(id, txt, _, _) => {
+                    assert_eq!(id, did2, "Send must never route to stale dialog did1={did1}");
+                    assert_eq!(txt, "/start");
+                    saw_send_did2 = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_open_did2 && saw_send_did2, "expected both Cmd::Open(did2, false) and Cmd::Send(did2, ..)");
+    }
+
+    #[test]
+    fn dialogs_active_indicator_slides_vertically_between_chats() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        assert!(app.dialogs.len() >= 3);
+
+        let run_frame = |app: &mut App, t: f64| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(340.0, 640.0))),
+                time: Some(t),
+                predicted_dt: 0.04,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.dialogs_ui(ui));
+            });
+            out.textures_delta.clear();
+        };
+
+        // Кадр 1: активен чат 0 -> индикатор строго на 0.0
+        app.open_dialog(0);
+        run_frame(&mut app, 0.0);
+        let y0 = ctx.animate_value_with_time(egui::Id::NULL.with("dialogs-slide-row"), 0.0, 0.22);
+        assert!((y0 - 0.0).abs() < 0.01);
+
+        // Переключаемся на чат 2: через 1 шаг индикатор должен плавно скользить между 0 и 2 (без телепорта)
+        app.open_dialog(2);
+        run_frame(&mut app, 0.04);
+        let mid_y = ctx.animate_value_with_time(egui::Id::NULL.with("dialogs-slide-row"), 2.0, 0.22);
+        assert!(mid_y > 0.05 && mid_y < 1.95, "indicator must glide between chats smoothly, got {mid_y}");
+
+        // Через серию кадров индикатор достигает целевой строки 2.0
+        for step in 2..=12 {
+            run_frame(&mut app, step as f64 * 0.04);
+        }
+        let end_y = ctx.animate_value_with_time(egui::Id::NULL.with("dialogs-slide-row"), 2.0, 0.22);
+        assert!((end_y - 2.0).abs() < 0.15, "indicator should settle near target row 2.0, got {end_y}");
     }
 }

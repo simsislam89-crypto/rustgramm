@@ -1271,14 +1271,15 @@ impl App {
                     }
                 });
             });
-        if send_now {
+        if send_now && let Some(did) = self.selected_dialog_id() {
             self.send(Cmd::SendPaidReaction {
+                dialog_id: did,
                 msg_id,
                 count: self.paid_react_count,
                 anonymous: self.paid_react_anon,
             });
             self.paid_react_msg = None;
-        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        } else if send_now || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.paid_react_msg = None;
         }
     }
@@ -1365,10 +1366,11 @@ impl App {
                                         if ui.small_button(RichText::new("Удалить").color(DANGER)).clicked() {
                                             cmds.push(Cmd::DeleteQuickReplyShortcut(qr.shortcut_id));
                                         }
-                                        if self.selected.is_some()
+                                        if let Some(did) = self.selected_dialog_id()
                                             && ui.small_button("Отправить в чат").clicked()
                                         {
                                             cmds.push(Cmd::SendQuickReply {
+                                                dialog_id: did,
                                                 shortcut_id: qr.shortcut_id,
                                                 msg_ids: Vec::new(),
                                             });
@@ -1648,14 +1650,14 @@ impl App {
                     });
                 }
             });
-        if refresh {
-            self.send(Cmd::LoadScheduled);
+        if refresh && let Some(did) = self.selected_dialog_id() {
+            self.send(Cmd::LoadScheduled(did));
         }
-        if let Some(id) = send_now {
-            self.send(Cmd::SendScheduledNow(vec![id]));
+        if let Some(id) = send_now && let Some(did) = self.selected_dialog_id() {
+            self.send(Cmd::SendScheduledNow(did, vec![id]));
         }
-        if let Some(id) = delete_id {
-            self.send(Cmd::DeleteScheduled(vec![id]));
+        if let Some(id) = delete_id && let Some(did) = self.selected_dialog_id() {
+            self.send(Cmd::DeleteScheduled(did, vec![id]));
         }
         if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.scheduled_open = false;
@@ -1719,7 +1721,7 @@ impl App {
                     submit = true;
                 }
             });
-        if submit {
+        if submit && let Some(did) = self.selected_dialog_id() {
             let items: Vec<String> = self
                 .todo_items
                 .iter()
@@ -1727,6 +1729,7 @@ impl App {
                 .filter(|s| !s.is_empty())
                 .collect();
             self.send(Cmd::SendTodo {
+                dialog_id: did,
                 title: self.todo_title.trim().to_owned(),
                 items,
                 others_can_complete: self.todo_others_complete,
@@ -1735,7 +1738,7 @@ impl App {
             self.todo_title.clear();
             self.todo_items = vec![String::new(), String::new()];
             self.todo_modal_open = false;
-        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        } else if submit || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.todo_modal_open = false;
         }
     }
@@ -1813,7 +1816,7 @@ impl App {
                     submit = true;
                 }
             });
-        if submit {
+        if submit && let Some(did) = self.selected_dialog_id() {
             let options: Vec<String> = self
                 .poll_options
                 .iter()
@@ -1821,6 +1824,7 @@ impl App {
                 .filter(|s| !s.is_empty())
                 .collect();
             self.send(Cmd::SendPoll {
+                dialog_id: did,
                 question: self.poll_question.trim().to_owned(),
                 options,
                 anonymous: self.poll_anonymous,
@@ -1833,7 +1837,7 @@ impl App {
             self.poll_options = vec![String::new(), String::new()];
             self.poll_explanation.clear();
             self.poll_modal_open = false;
-        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        } else if submit || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.poll_modal_open = false;
         }
     }
@@ -2405,7 +2409,9 @@ impl App {
         if let Some(ts) = target_ts {
             self.date_jump_open = false;
             self.history_loading = true;
-            self.send(Cmd::JumpToDate(sel, ts));
+            if let Some(did) = self.dialog_id_at(sel) {
+                self.send(Cmd::JumpToDate(did, ts));
+            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.date_jump_open = false;
@@ -2545,7 +2551,7 @@ impl App {
             }
         }
         if let Some(mid) = unpin_one {
-            self.send(Cmd::Pin(mid, false));
+            self.send(Cmd::Pin(did, mid, false));
         }
         if unpin_all {
             self.send(Cmd::UnpinAllMessages(did));

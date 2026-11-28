@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from build_android_bridge import find_tool, JAVA_SRC
+from build_android_bridge import OUT_DEX, find_tool, JAVA_SRC
 
 TEST_JAVA_SRC = r"""package app.rustgramm;
 
@@ -149,6 +149,7 @@ def main():
         subprocess.check_call([
             javac,
             "--release", "8",
+            "-encoding", "UTF-8",
             "-classpath", android_jar,
             "-d", str(classes_dir),
             str(rg_bridge_java),
@@ -160,6 +161,14 @@ def main():
             "-cp", f"{classes_dir}{cp_sep}{android_jar}",
             "app.rustgramm.RgBridgeTest",
         ])
+
+    assert OUT_DEX.exists(), f"Missing prebuilt DEX: {OUT_DEX}"
+    dex_bytes = OUT_DEX.read_bytes()
+    for word in ("Готово", "Отмена"):
+        assert word.encode("utf-8") in dex_bytes, f"UTF-8 string {word!r} missing in {OUT_DEX}"
+        mojibake = word.encode("utf-8").decode("cp1251", errors="strict").encode("utf-8")
+        assert mojibake not in dex_bytes, f"CP1251 mojibake for {word!r} detected in {OUT_DEX}"
+    print(f"RgBridgeTest + DEX UTF-8 check passed ({OUT_DEX.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

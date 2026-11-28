@@ -94,9 +94,67 @@ impl Tagged for SafeIntermediate {
     }
 }
 
+/// Создаёт необфусцированный MTProto-транспорт `SafeIntermediate`.
+pub fn plain_intermediate_transport() -> Box<dyn Transport + Send> {
+    Box::new(SafeIntermediate::new())
+}
+
 /// Создаёт обфусцированный MTProto-транспорт `Obfuscated<SafeIntermediate>`.
 pub fn obfuscated_transport() -> Box<dyn Transport + Send> {
     Box::new(Obfuscated::new(SafeIntermediate::new()))
+}
+
+/// Выбирает транспорт MTProto (`Obfuscated<SafeIntermediate>` или обычный `SafeIntermediate`).
+pub fn transport_for(obfuscated: bool) -> Box<dyn Transport + Send> {
+    if obfuscated {
+        obfuscated_transport()
+    } else {
+        plain_intermediate_transport()
+    }
+}
+
+/// Формирует реальный незашифрованный пакет MTProto `req_pq_multi#be7e8ef1` для живой проверки DC.
+/// Возвращает готовые к отправке байты и парсер транспорта для проверки `resPQ`.
+pub fn build_req_pq_probe(obfuscated: bool) -> (Vec<u8>, Box<dyn Transport + Send>) {
+    const REQ_PQ_MULTI_ID: u32 = 0xbe7e_8ef1;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1_760_000_000_i64, |d| d.as_secs() as i64);
+    let msg_id = (secs << 32) & !3_i64;
+
+    let mut payload = Vec::with_capacity(40);
+    payload.extend_from_slice(&0_i64.to_le_bytes()); // auth_key_id = 0
+    payload.extend_from_slice(&msg_id.to_le_bytes()); // message_id
+    payload.extend_from_slice(&20_i32.to_le_bytes()); // message_data_length
+    payload.extend_from_slice(&REQ_PQ_MULTI_ID.to_le_bytes());
+    let nonce_hi = secs.wrapping_mul(0x517c_c1b7_2722_0a95_u64 as i64) as u64;
+    let nonce_lo = (secs ^ 0x4d59_5df4_d0f3_3173_i64) as u64;
+    payload.extend_from_slice(&nonce_hi.to_le_bytes());
+    payload.extend_from_slice(&nonce_lo.to_le_bytes());
+
+    let mut tr = transport_for(obfuscated);
+    let mut buf = DequeBuffer::with_capacity(payload.len(), 80);
+    buf.extend_back(&payload);
+    tr.pack(&mut buf);
+    (buf.as_ref().to_vec(), tr)
+}
+
+/// Проверяет, что сырые байты от сервера содержат корректный незашифрованный ответ `resPQ#05162463`.
+/// Отбрасывает «мёртвые» сокеты (например IPv6, принимающий TCP и закрывающий соединение с 0 байтами).
+pub fn is_valid_res_pq_reply(transport: &mut dyn Transport, raw: &mut [u8]) -> bool {
+    const RES_PQ_ID: u32 = 0x0516_2463;
+    let Ok(off) = transport.unpack(raw) else {
+        return false;
+    };
+    let body = &raw[off.data_range];
+    if body.len() < 24 || body[0..8] != [0_u8; 8] {
+        return false;
+    }
+    let msg_len = i32::from_le_bytes(body[16..20].try_into().unwrap());
+    if msg_len < 20 {
+        return false;
+    }
+    u32::from_le_bytes(body[20..24].try_into().unwrap()) == RES_PQ_ID
 }
 
 #[cfg(test)]
@@ -159,5 +217,36 @@ mod tests {
         partial.extend_from_slice(&16_i32.to_le_bytes());
         partial.extend_from_slice(&[0u8; 12]);
         assert_eq!(safe.unpack(&mut partial), Err(Error::MissingBytes));
+    }
+
+    #[test]
+    fn req_pq_probe_roundtrip_and_rejects_empty_dead_ipv6_reply() {
+        let (obf_pkt, mut obf_tr) = build_req_pq_probe(true);
+        assert!(obf_pkt.len() >= 68);
+        assert!(!is_valid_res_pq_reply(&mut *obf_tr, &mut []));
+
+        let (plain_pkt, mut plain_tr) = build_req_pq_probe(false);
+        assert_eq!(plain_pkt.len(), 48);
+        assert_eq!(&plain_pkt[0..4], &0xee_ee_ee_ee_u32.to_le_bytes());
+        assert!(!is_valid_res_pq_reply(&mut *plain_tr, &mut []));
+
+        // Синтетический ответ resPQ#05162463 через SafeIntermediate должен проходить проверку.
+        let mut srv_tr = SafeIntermediate::new();
+        let mut res_pq = vec![0_u8; 64];
+        res_pq[16..20].copy_from_slice(&44_i32.to_le_bytes());
+        res_pq[20..24].copy_from_slice(&0x0516_2463_u32.to_le_bytes());
+        let mut wire = DequeBuffer::with_capacity(res_pq.len(), 8);
+        wire.extend_back(&res_pq);
+        srv_tr.pack(&mut wire);
+        // Срезаем первые 4 байта серверного init-тега, т.к. серверный Intermediate шлёт только length+body.
+        let mut raw_reply = wire.as_ref()[4..].to_vec();
+        assert!(is_valid_res_pq_reply(&mut *plain_tr, &mut raw_reply));
+
+        // Испорченный конструктор (не resPQ) должен отклоняться.
+        res_pq[20..24].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        let mut bad_wire = DequeBuffer::with_capacity(res_pq.len(), 8);
+        bad_wire.extend_back(&res_pq);
+        srv_tr.pack(&mut bad_wire);
+        assert!(!is_valid_res_pq_reply(&mut *plain_tr, &mut bad_wire.as_mut()[..]));
     }
 }

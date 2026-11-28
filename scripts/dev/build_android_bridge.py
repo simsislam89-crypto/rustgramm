@@ -595,7 +595,7 @@ def main():
         classes_dir = td_path / "classes"
         classes_dir.mkdir()
         subprocess.check_call([
-            javac, "--release", "8", "-classpath", android_jar, "-d", str(classes_dir), str(java_file)
+            javac, "--release", "8", "-encoding", "UTF-8", "-classpath", android_jar, "-d", str(classes_dir), str(java_file)
         ])
         class_files = [str(p) for p in classes_dir.rglob("*.class")]
         dex_out = td_path / "dex"

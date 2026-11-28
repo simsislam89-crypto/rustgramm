@@ -3208,18 +3208,62 @@ impl Engine {
     }
 
     /// Фото профиля или чата в кэше (`cache/avatars/<id>.jpg`); `None`, если фото нет.
+    /// Работает напрямую через TL (`GetUsers`/`GetChats`/`GetChannels` + `RawLoc`), не вызывая
+    /// паникующий `client.resolve_peer` на ответах с несколькими чатами.
     pub async fn avatar(&self, peer: PeerRef) -> Result<Option<PathBuf>, BoxErr> {
+        use grammers_client::tl;
         let dir = self.dirs.cache.join("avatars");
         std::fs::create_dir_all(&dir)?;
         let file = dir.join(format!("{}.jpg", peer_key(&peer)));
         if file.exists() {
             return Ok(Some(file));
         }
-        let resolved = self.client.resolve_peer(peer).await?;
-        let Some(photo) = resolved.photo(false).await? else {
+        let target_id = peer.id.bare_id().unwrap_or(0);
+        let meta = match peer.id.kind() {
+            grammers_session::types::PeerKind::User => {
+                let users = self
+                    .client
+                    .invoke(&tl::functions::users::GetUsers { id: vec![peer.into()] })
+                    .await?;
+                extract_user_photo_meta(&users, target_id)
+            }
+            grammers_session::types::PeerKind::Chat => {
+                let chats = match self
+                    .client
+                    .invoke(&tl::functions::messages::GetChats { id: vec![target_id] })
+                    .await?
+                {
+                    tl::enums::messages::Chats::Chats(c) => c.chats,
+                    tl::enums::messages::Chats::Slice(c) => c.chats,
+                };
+                extract_chat_photo_meta(&chats, target_id)
+            }
+            grammers_session::types::PeerKind::Channel => {
+                let chats = match self
+                    .client
+                    .invoke(&tl::functions::channels::GetChannels { id: vec![peer.into()] })
+                    .await?
+                {
+                    tl::enums::messages::Chats::Chats(c) => c.chats,
+                    tl::enums::messages::Chats::Slice(c) => c.chats,
+                };
+                extract_chat_photo_meta(&chats, target_id)
+            }
+        };
+        let Some((photo_id, dc_id)) = meta else {
             return Ok(None);
         };
-        self.client.download_media(&photo, &file).await?;
+        let raw_loc = RawLoc {
+            loc: tl::enums::InputFileLocation::InputPeerPhotoFileLocation(
+                tl::types::InputPeerPhotoFileLocation {
+                    big: false,
+                    peer: peer.into(),
+                    photo_id,
+                },
+            ),
+            dc_id,
+        };
+        self.client.download_media(&raw_loc, &file).await?;
         Ok(Some(file))
     }
 
@@ -6492,6 +6536,54 @@ impl grammers_client::media::Downloadable for RawLoc {
     }
 }
 
+fn extract_user_photo_meta(
+    users: &[grammers_client::tl::enums::User],
+    target_id: i64,
+) -> Option<(i64, Option<i32>)> {
+    use grammers_client::tl;
+    let pick = users
+        .iter()
+        .find_map(|u| match u {
+            tl::enums::User::User(x) if x.id == target_id => Some(x),
+            _ => None,
+        })
+        .or_else(|| {
+            users.iter().find_map(|u| match u {
+                tl::enums::User::User(x) => Some(x),
+                _ => None,
+            })
+        })?;
+    match pick.photo.as_ref()? {
+        tl::enums::UserProfilePhoto::Photo(p) => Some((p.photo_id, Some(p.dc_id))),
+        tl::enums::UserProfilePhoto::Empty => None,
+    }
+}
+
+fn extract_chat_photo_meta(
+    chats: &[grammers_client::tl::enums::Chat],
+    target_id: i64,
+) -> Option<(i64, Option<i32>)> {
+    use grammers_client::tl;
+    let photo = chats
+        .iter()
+        .find_map(|c| match c {
+            tl::enums::Chat::Chat(x) if x.id == target_id => Some(&x.photo),
+            tl::enums::Chat::Channel(x) if x.id == target_id => Some(&x.photo),
+            _ => None,
+        })
+        .or_else(|| {
+            chats.iter().find_map(|c| match c {
+                tl::enums::Chat::Chat(x) => Some(&x.photo),
+                tl::enums::Chat::Channel(x) => Some(&x.photo),
+                _ => None,
+            })
+        })?;
+    match photo {
+        tl::enums::ChatPhoto::Photo(p) => Some((p.photo_id, Some(p.dc_id))),
+        tl::enums::ChatPhoto::Empty => None,
+    }
+}
+
 fn extract_rich_primary_media(rm: &grammers_client::tl::enums::RichMessage) -> Option<MediaInfo> {
     use grammers_client::tl;
     let tl::enums::RichMessage::Message(rm) = rm;
@@ -7480,5 +7572,82 @@ mod tests {
         // Когда `filters_enabled_in_chats = false` — глобальные молчат, а правила конкретного чата работают!
         assert!(!set.hides_with(555, "обычный спам", false));
         assert!(set.hides_with(555, "секретно", false));
+    }
+
+    #[test]
+    fn extract_chat_photo_meta_handles_multiple_channels_without_panic() {
+        use grammers_client::tl;
+        let mk_chan = |id: i64, photo_id: Option<i64>, dc_id: i32| {
+            tl::enums::Chat::Channel(tl::types::Channel {
+                creator: false,
+                left: false,
+                broadcast: true,
+                verified: false,
+                megagroup: false,
+                restricted: false,
+                signatures: false,
+                min: false,
+                scam: false,
+                has_link: false,
+                has_geo: false,
+                slowmode_enabled: false,
+                call_active: false,
+                call_not_empty: false,
+                fake: false,
+                gigagroup: false,
+                noforwards: false,
+                join_to_send: false,
+                join_request: false,
+                forum: false,
+                stories_hidden: false,
+                stories_hidden_min: false,
+                stories_unavailable: false,
+                signature_profiles: false,
+                autotranslation: false,
+                broadcast_messages_allowed: false,
+                monoforum: false,
+                forum_tabs: false,
+                in_news: false,
+                forum_sidebar: false,
+                id,
+                access_hash: Some(11),
+                title: format!("Chan {id}"),
+                username: None,
+                photo: match photo_id {
+                    Some(pid) => tl::enums::ChatPhoto::Photo(tl::types::ChatPhoto {
+                        has_video: false,
+                        photo_id: pid,
+                        stripped_thumb: None,
+                        dc_id,
+                    }),
+                    None => tl::enums::ChatPhoto::Empty,
+                },
+                date: 1_700_000_000,
+                restriction_reason: None,
+                admin_rights: None,
+                banned_rights: None,
+                default_banned_rights: None,
+                participants_count: None,
+                usernames: None,
+                stories_max_id: None,
+                color: None,
+                profile_color: None,
+                emoji_status: None,
+                level: None,
+                subscription_until_date: None,
+                bot_verification_icon: None,
+                send_paid_messages_stars: None,
+                linked_monoforum_id: None,
+                linked_community_id: None,
+                pinned_msg_id: None,
+            })
+        };
+        let multi = vec![
+            mk_chan(1001, Some(99_001), 4),
+            mk_chan(1002, Some(99_002), 2),
+        ];
+        assert_eq!(extract_chat_photo_meta(&multi, 1002), Some((99_002, Some(2))));
+        assert_eq!(extract_chat_photo_meta(&multi, 1001), Some((99_001, Some(4))));
+        assert_eq!(extract_chat_photo_meta(&[mk_chan(1003, None, 2)], 1003), None);
     }
 }

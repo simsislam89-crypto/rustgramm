@@ -65,8 +65,8 @@ pub fn paint_surface(p: &egui::Painter, rect: Rect, radius: f32, variant: GlassV
 
     p.rect_filled(rect, cr, fill);
 
-    // Внутренний верхний блик (имитация линзы / отражения света на верхней грани стекла).
-    let sheen_h = (rect.height() * 0.42).clamp(4.0, 18.0);
+    // Внутренний верхний блик (двухслойное матовое преломление без цветных пятен фона).
+    let sheen_h = (rect.height() * 0.44).clamp(4.0, 20.0);
     let sheen_rect = Rect::from_min_max(
         Pos2::new(rect.left() + 1.0, rect.top() + 1.0),
         Pos2::new(rect.right() - 1.0, (rect.top() + sheen_h).min(rect.bottom() - 1.0)),
@@ -74,8 +74,26 @@ pub fn paint_surface(p: &egui::Painter, rect: Rect, radius: f32, variant: GlassV
     let sheen_r = (r - 1.0).max(0.0).round() as u8;
     p.rect_filled(
         sheen_rect,
-        CornerRadius { nw: sheen_r, ne: sheen_r, sw: 2, se: 2 },
-        Color32::from_white_alpha((10.0 + 9.0 * hk) as u8),
+        CornerRadius { nw: sheen_r, ne: sheen_r, sw: 3, se: 3 },
+        Color32::from_white_alpha((12.0 + 10.0 * hk) as u8),
+    );
+    if rect.height() > 14.0 {
+        let micro_h = (rect.height() * 0.16).clamp(2.0, 6.0);
+        let micro_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
+            Pos2::new(rect.right() - 2.0, (rect.top() + micro_h).min(rect.bottom() - 2.0)),
+        );
+        p.rect_filled(
+            micro_rect,
+            CornerRadius { nw: sheen_r, ne: sheen_r, sw: 2, se: 2 },
+            Color32::from_white_alpha((8.0 + 6.0 * hk) as u8),
+        );
+    }
+    p.rect_stroke(
+        rect.shrink(1.0),
+        CornerRadius::same(sheen_r),
+        Stroke::new(0.8, Color32::from_white_alpha((12.0 + 12.0 * hk) as u8)),
+        StrokeKind::Inside,
     );
 
     // Внешний спекулярный контур + подчёркнутая верхняя грань + нижняя глубина.

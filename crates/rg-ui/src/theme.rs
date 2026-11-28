@@ -1066,6 +1066,18 @@ fn find_mono_font_bytes(name: &str) -> Option<Arc<FontData>> {
     None
 }
 
+fn is_static_ttf(bytes: &[u8]) -> bool {
+    !bytes.windows(4).any(|w| w == b"fvar")
+}
+
+fn read_static_face(path: &str) -> Option<Arc<FontData>> {
+    let bytes = std::fs::read(path).ok()?;
+    if !is_static_ttf(&bytes) {
+        return None;
+    }
+    Some(Arc::new(FontData::from_owned(bytes)))
+}
+
 fn install_fonts_with_mono(ctx: &egui::Context, mono_name: &str) {
     let mut fonts = FontDefinitions::default();
     let has_segoe = if let Some(f) = read_face("C:\\Windows\\Fonts\\segoeui.ttf") {
@@ -1116,8 +1128,8 @@ fn install_fonts_with_mono(ctx: &egui::Context, mono_name: &str) {
             .push("segoe".into());
     }
     if cfg!(target_os = "android") {
-        let android_reg = read_face("/system/fonts/Roboto-Regular.ttf")
-            .or_else(|| read_face("/system/fonts/RobotoStatic-Regular.ttf"));
+        let android_reg = read_static_face("/system/fonts/RobotoStatic-Regular.ttf")
+            .or_else(|| read_static_face("/system/fonts/Roboto-Regular.ttf"));
         if let Some(f) = android_reg {
             fonts.font_data.insert("android-roboto".to_owned(), f);
             for family in [
@@ -1127,7 +1139,7 @@ fn install_fonts_with_mono(ctx: &egui::Context, mono_name: &str) {
                 fonts.families.entry(family).or_default().insert(0, "android-roboto".to_owned());
             }
         }
-        if let Some(f) = read_face("/system/fonts/Roboto-Medium.ttf") {
+        if let Some(f) = read_static_face("/system/fonts/Roboto-Medium.ttf") {
             fonts.font_data.insert("android-roboto-med".to_owned(), f);
             fonts
                 .families
@@ -1388,5 +1400,11 @@ mod tests {
         assert_eq!(img.pixels[512 * 511 + 511], Color32::WHITE);
         let center_px = img.pixels[256 * 512 + 256];
         assert_eq!(center_px, Color32::from_rgb(42, 171, 238));
+    }
+
+    #[test]
+    fn is_static_ttf_skips_variable_fvar_fonts() {
+        assert!(is_static_ttf(b"\x00\x01\x00\x00glyfhead"));
+        assert!(!is_static_ttf(b"\x00\x01\x00\x00fvarhead"));
     }
 }

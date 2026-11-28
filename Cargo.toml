@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rg-net", "crates/rg-settings", "crates/rg-core", "crates/rg-ayu", "crates/rg-ui", "crates/rg-desktop", "crates/rg-android"]
 
 [workspace.package]
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 license = "GPL-3.0-only"
 publish = false
@@ -18,6 +18,6 @@ webview2-com-sys = { path = "vendor/webview2-com-sys" }
 [profile.release]
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 opt-level = 3
