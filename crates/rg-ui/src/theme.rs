@@ -55,12 +55,12 @@ pub const SERVICE_BG: Color32 = Color32::from_rgb(34, 34, 38);
 pub const COMPOSE_BG: Color32 = Color32::from_rgb(14, 14, 16);
 pub const DANGER: Color32 = Color32::from_rgb(242, 108, 108);
 pub const GREEN: Color32 = Color32::from_rgb(104, 224, 146);
-/// Основные кнопки и главный акцент (оранжевый).
-pub const ORANGE: Color32 = Color32::from_rgb(245, 130, 32);
-pub const ORANGE_OVER: Color32 = Color32::from_rgb(255, 148, 54);
-pub const ORANGE_ACTIVE: Color32 = Color32::from_rgb(218, 110, 20);
-pub const ORANGE_DISABLED: Color32 = Color32::from_rgb(122, 68, 24);
-pub const ACCENT_TEXT: Color32 = Color32::WHITE;
+/// Основные кнопки и главный акцент (монохромный снежно-белый в базовой теме).
+pub const ORANGE: Color32 = Color32::from_rgb(242, 242, 246);
+pub const ORANGE_OVER: Color32 = Color32::from_rgb(255, 255, 255);
+pub const ORANGE_ACTIVE: Color32 = Color32::from_rgb(212, 212, 218);
+pub const ORANGE_DISABLED: Color32 = Color32::from_rgb(104, 104, 112);
+pub const ACCENT_TEXT: Color32 = INK_DARK;
 /// Тонкая линия-разделитель стекла.
 pub const LINE: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
 
@@ -230,6 +230,15 @@ pub fn palette() -> LivePalette {
 pub fn c_orange() -> Color32 {
     palette().accent
 }
+/// Контрастные чернила для текста/иконок поверх сплошного цветного или монохромного фона.
+pub fn contrast_ink(bg: Color32) -> Color32 {
+    let lum = 0.299 * f32::from(bg.r()) + 0.587 * f32::from(bg.g()) + 0.114 * f32::from(bg.b());
+    if lum >= 150.0 { INK_DARK } else { Color32::WHITE }
+}
+/// Контрастные чернила для элементов поверх текущего главного акцента `c_orange()`.
+pub fn on_accent() -> Color32 {
+    contrast_ink(c_orange())
+}
 pub fn c_window_bg() -> Color32 {
     palette().window_bg
 }
@@ -258,6 +267,10 @@ pub fn c_button() -> Color32 {
 /// Задать скорость анимаций в процентах (0 — выключены, 200 — вдвое быстрее).
 pub fn set_anim_speed(pct: u8) {
     ANIM.store(u16::from(pct.min(200)), Ordering::Relaxed);
+}
+/// Множитель скорости анимаций (0.0 — выключены, 1.0 — 100%, 2.0 — вдвое быстрее).
+pub fn anim_scale() -> f32 {
+    f32::from(ANIM.load(Ordering::Relaxed)) / 100.0
 }
 /// Включить или выключить размытие стекла.
 pub fn set_blur(on: bool) {
@@ -848,7 +861,7 @@ pub fn orange_button_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, min_s
     if enabled {
         paint_glass_rim(p, draw_r, 10.0);
     }
-    let text_c = if enabled { Color32::WHITE } else { Color32::from_white_alpha(150) };
+    let text_c = if enabled { contrast_ink(base) } else { Color32::from_white_alpha(150) };
     p.text(draw_r.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.5), text_c);
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1311,12 +1324,27 @@ mod tests {
 
     #[test]
     fn palette_and_orange_buttons() {
-        for c in [ACCENT, BUTTON, UNREAD, DIALOG_ACTIVE, MSG_OUT_BG, OUT_TICK, WINDOW_BG, CHAT_BG] {
+        for c in [ACCENT, BUTTON, UNREAD, DIALOG_ACTIVE, MSG_OUT_BG, OUT_TICK, WINDOW_BG, CHAT_BG, ORANGE] {
             assert!(c.r().abs_diff(c.b()) <= 8 && c.g().abs_diff(c.b()) <= 8, "{c:?}");
         }
-        assert!(ORANGE.r() > ORANGE.g() && ORANGE.g() > ORANGE.b());
+        assert!(ORANGE.r() >= 230);
+        assert_eq!(ACCENT_TEXT, INK_DARK);
         let g = navy(0x5288c1);
         assert!(g.r() == g.g() && g.g() == g.b());
+    }
+
+    #[test]
+    fn on_accent_contrasts_monochrome_and_custom_themes() {
+        sync_custom_theme(&rg_settings::CustomThemeSettings::default());
+        assert_eq!(on_accent(), INK_DARK);
+        let custom = rg_settings::CustomThemeSettings {
+            accent_hex: "#1E3A8A".to_owned(),
+            ..Default::default()
+        };
+        sync_custom_theme(&custom);
+        assert_eq!(on_accent(), Color32::WHITE);
+        sync_custom_theme(&rg_settings::CustomThemeSettings::default());
+        assert_eq!(on_accent(), INK_DARK);
     }
 
     #[test]

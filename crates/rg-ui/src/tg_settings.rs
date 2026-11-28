@@ -171,6 +171,7 @@ struct Actions {
     save_folder: Option<rg_core::engine::FolderRow>,
     delete_folder: Option<i32>,
     clear_cache: bool,
+    clear_all_drafts: bool,
     open_downloads: bool,
     set_privacy: Option<(PrivacyKeyKind, PrivacyLevel)>,
     set_notify: Option<(NotifyScope, bool, bool)>,
@@ -595,6 +596,10 @@ impl App {
             self.cached_media.clear();
             self.history_cache.clear();
             self.status = format!("Кэш очищен: освобождено {}", size_text(freed));
+        }
+        if act.clear_all_drafts {
+            self.drafts.clear();
+            self.send(Cmd::ClearAllDrafts);
         }
         if act.open_downloads {
             let dir = worker::home().join("downloads");
@@ -1182,7 +1187,7 @@ fn notify_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act
     let p = ui.painter();
     p.rect_filled(card, CornerRadius::same(10), t(WINDOW_OVER));
     p.circle_filled(Pos2::new(card.left() + 30.0, card.center().y), 19.0, ORANGE);
-    p.text(Pos2::new(card.left() + 30.0, card.center().y), Align2::CENTER_CENTER, "R", FontId::proportional(17.0), Color32::WHITE);
+    p.text(Pos2::new(card.left() + 30.0, card.center().y), Align2::CENTER_CENTER, "R", FontId::proportional(17.0), super::theme::on_accent());
     let title_str = if s.notify.show_name { "Rustgramm" } else { "Новое сообщение" };
     let body_str = if s.notify.show_text { "Доброе утро в Telegram! 😎" } else { "У вас новое сообщение" };
     p.text(Pos2::new(card.left() + 60.0, card.center().y - 9.0), Align2::LEFT_CENTER, title_str, FontId::proportional(13.5), WHITE);
@@ -1197,7 +1202,8 @@ fn notify_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act
             let bg = if *flag { t_btn(ORANGE) } else { t(WINDOW_OVER) };
             ui.painter().rect_filled(r, CornerRadius::same(14), bg);
             let txt = if *flag { format!("✓ {lbl}") } else { lbl.to_owned() };
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(12.5), Color32::WHITE);
+            let fg = if *flag { super::theme::on_accent() } else { Color32::WHITE };
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(12.5), fg);
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 *flag = !*flag;
             }
@@ -1306,7 +1312,7 @@ fn notify_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act
             ui.painter().rect_filled(
                 Rect::from_min_size(Pos2::new(slot.left() + 5.0, y), Vec2::new(slot.width() - 10.0, 5.0)),
                 CornerRadius::same(2),
-                if active { Color32::WHITE } else { Color32::from_white_alpha(100) },
+                if active { super::theme::on_accent() } else { Color32::from_white_alpha(100) },
             );
         }
         if sr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -1400,7 +1406,7 @@ fn privacy_page(
             let btn = Rect::from_center_size(Pos2::new(rect.right() - 72.0, rect.center().y), Vec2::new(112.0, 28.0));
             let br = ui.interact(btn, ui.make_persistent_id(("unblk", u.id)), Sense::click());
             p.rect_filled(btn, CornerRadius::same(8), if br.hovered() { t_btn(ORANGE) } else { t(WINDOW_OVER) });
-            p.text(btn.center(), Align2::CENTER_CENTER, "Разблокировать", FontId::proportional(12.0), WHITE);
+            p.text(btn.center(), Align2::CENTER_CENTER, "Разблокировать", FontId::proportional(12.0), if br.hovered() { super::theme::on_accent() } else { WHITE });
             if br.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 act.unblock = Some((u.id, u.access_hash));
             }
@@ -1631,7 +1637,10 @@ fn data_page(ui: &mut egui::Ui, st: &State, s: &mut rg_settings::Settings, act: 
     if nav_row(ui, "menu/clear", "Очистить кэш", "") {
         act.clear_cache = true;
     }
-    desc(ui, "Удаляются скачанные ролики, музыка и кэш истории. Фото профилей и сохранённые удалённые сообщения остаются.");
+    if nav_row(ui, "menu/clear", "Очистить все облачные черновики", "") {
+        act.clear_all_drafts = true;
+    }
+    desc(ui, "Удаляются скачанные ролики, музыка и кэш истории. Очистка облачных черновиков убирает незавершённый текст со всех устройств.");
     divider(ui);
     section(ui, "Загрузки и сеть");
     info_row(ui, "Сохранённые файлы", &if busy && dl_bytes == 0 { "подсчёт…".to_owned() } else { size_text(dl_bytes) });
@@ -1962,7 +1971,7 @@ fn devices_page(ui: &mut egui::Ui, st: &mut State, now: i64, act: &mut Actions) 
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 60.0), Sense::hover());
         let p = ui.painter();
         p.circle_filled(Pos2::new(rect.left() + 34.0, rect.center().y), 18.0, t_btn(ORANGE));
-        icons::tg(p, "settings/laptop", Pos2::new(rect.left() + 34.0, rect.center().y), Color32::WHITE);
+        icons::tg(p, "settings/laptop", Pos2::new(rect.left() + 34.0, rect.center().y), super::theme::on_accent());
         p.text(Pos2::new(rect.left() + 64.0, rect.center().y - 16.0), Align2::LEFT_CENTER, &cur.device, FontId::proportional(14.0), WHITE);
         p.text(Pos2::new(rect.left() + 64.0, rect.center().y + 1.0), Align2::LEFT_CENTER, cur.app.trim(), FontId::proportional(12.5), WHITE);
         p.text(Pos2::new(rect.left() + 64.0, rect.center().y + 17.0), Align2::LEFT_CENTER, &cur.place, FontId::proportional(12.0), SUBTEXT);
@@ -2097,7 +2106,7 @@ fn rustgramm_page(ui: &mut egui::Ui, s: &mut rg_settings::Settings, act: &mut Ac
             Align2::CENTER_CENTER,
             format!("{}", acc.slot + 1),
             FontId::proportional(13.0),
-            Color32::WHITE,
+            if is_cur { super::theme::on_accent() } else { Color32::WHITE },
         );
         let right_lim = (rect.right() - if is_cur { 78.0 } else { 44.0 }).max(rect.left() + 70.0);
         let clip = Rect::from_min_max(Pos2::new(rect.left() + 54.0, rect.top()), Pos2::new(right_lim, rect.bottom()));
@@ -2389,7 +2398,7 @@ fn extera_page(
         }
         for em in choices {
             let sel = e.default_reaction == em;
-            let btn = egui::Button::new(RichText::new(&em).size(15.0).color(if sel { Color32::WHITE } else { WHITE }))
+            let btn = egui::Button::new(RichText::new(&em).size(15.0).color(if sel { super::theme::on_accent() } else { WHITE }))
                 .fill(if sel { t_btn(ORANGE) } else { t(BUTTON) })
                 .corner_radius(CornerRadius::same(8));
             if ui.add(btn).clicked() {
@@ -2404,7 +2413,7 @@ fn extera_page(
         ui.add_space(kit::PAD);
         if ui
             .add(
-                egui::Button::new(RichText::new("⭐ Открыть баланс Telegram Stars").size(12.5).color(Color32::WHITE))
+                egui::Button::new(RichText::new("⭐ Открыть баланс Telegram Stars").size(12.5).color(super::theme::on_accent()))
                     .fill(t_btn(ORANGE))
                     .corner_radius(CornerRadius::same(8)),
             )
@@ -2554,7 +2563,7 @@ impl App {
                                     if is_cur && cur_audio_playing { "media_pause" } else { "media_play" },
                                     ic_r.center(),
                                     Vec2::splat(14.0),
-                                    Color32::WHITE,
+                                    super::theme::on_accent(),
                                 );
                                 ui.painter().text(
                                     Pos2::new(ic_r.right() + 10.0, c_rect.center().y),
@@ -2696,13 +2705,13 @@ impl App {
                             Some(s) => format!("⭐ {} Stars", s.balance),
                             None => "⭐ Звёзды и Подарки".to_owned(),
                         };
-                        ui.painter().text(stars_r.center(), Align2::CENTER_CENTER, stars_lbl, FontId::proportional(12.5), Color32::WHITE);
+                        ui.painter().text(stars_r.center(), Align2::CENTER_CENTER, stars_lbl, FontId::proportional(12.5), if sr.hovered() { super::theme::on_accent() } else { Color32::WHITE });
                         if sr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             open_stars = true;
                         }
                         let br = ui.interact(biz_r, ui.make_persistent_id("mp-biz-btn"), Sense::click());
                         ui.painter().rect_filled(biz_r, CornerRadius::same(9), if br.hovered() { t_btn(ORANGE) } else { t(BUTTON) });
-                        ui.painter().text(biz_r.center(), Align2::CENTER_CENTER, "Бизнес-часы", FontId::proportional(12.5), Color32::WHITE);
+                        ui.painter().text(biz_r.center(), Align2::CENTER_CENTER, "Бизнес-часы", FontId::proportional(12.5), if br.hovered() { super::theme::on_accent() } else { Color32::WHITE });
                         if br.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             open_biz = true;
                         }

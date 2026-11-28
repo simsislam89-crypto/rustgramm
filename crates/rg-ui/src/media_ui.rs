@@ -320,9 +320,9 @@ pub fn card(
                 let fill_w = (r.width() * (f32::from(*pct) / 100.0)).clamp(4.0, r.width());
                 let fill_r = Rect::from_min_size(r.min, Vec2::new(fill_w, r.height()));
                 let bar_c = if *chosen {
-                    t_btn(ORANGE)
+                    t_btn(ORANGE).gamma_multiply(0.42)
                 } else {
-                    Color32::from_rgba_unmultiplied(245, 130, 32, (72.0 * opacity_f32()) as u8)
+                    Color32::from_rgba_unmultiplied(c_orange().r(), c_orange().g(), c_orange().b(), (52.0 * opacity_f32()) as u8)
                 };
                 p.rect_filled(fill_r, CornerRadius::same(7), bar_c);
                 p.text(

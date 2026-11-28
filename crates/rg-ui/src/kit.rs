@@ -89,8 +89,9 @@ fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
         let kw = radius * 2.0 + 4.8 * stretch;
         let kh = radius * 2.0 - 0.8 * stretch;
         let knob_r = Rect::from_center_size(Pos2::new(knob_x, center.y), Vec2::new(kw, kh));
+        let knob_c = lerp_color(Color32::WHITE, super::theme::on_accent(), lin);
         ui.painter()
-            .rect_filled(knob_r, CornerRadius::same((kh * 0.5).round() as u8), Color32::WHITE);
+            .rect_filled(knob_r, CornerRadius::same((kh * 0.5).round() as u8), knob_c);
     } else {
         let track = Rect::from_center_size(center, Vec2::new(34.0, 14.0));
         let fill = lerp_color(t_btn(TRACK_OFF), t_btn(ORANGE), lin);
@@ -98,7 +99,8 @@ fn switch(ui: &egui::Ui, center: Pos2, on: bool, key: &str) {
         let knob_x = track.left() + 7.0 + k * (track.width() - 14.0);
         let kw = 12.0 + 3.6 * stretch;
         let knob_r = Rect::from_center_size(Pos2::new(knob_x, center.y), Vec2::new(kw, 12.0));
-        ui.painter().rect_filled(knob_r, CornerRadius::same(6), Color32::WHITE);
+        let knob_c = lerp_color(Color32::WHITE, super::theme::on_accent(), lin);
+        ui.painter().rect_filled(knob_r, CornerRadius::same(6), knob_c);
     }
 }
 

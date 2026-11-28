@@ -245,7 +245,7 @@ impl App {
                         } else {
                             Color32::from_white_alpha(12)
                         };
-                        let fg = if active { Color32::WHITE } else { DIALOG_TEXT };
+                        let fg = if active { super::theme::on_accent() } else { DIALOG_TEXT };
                         let pill = ui
                             .add(
                                 egui::Button::new(egui::RichText::new(lbl).size(12.0).color(fg))
@@ -660,7 +660,7 @@ impl App {
                         p.text(btn.center(), Align2::CENTER_CENTER, "Добавлено", FontId::proportional(12.5), SUBTEXT);
                     } else {
                         p.rect_filled(btn, CornerRadius::same(14), t_btn(lerp_color(ORANGE, ORANGE_OVER, k)));
-                        p.text(btn.center(), Align2::CENTER_CENTER, "Добавить", FontId::proportional(12.5), Color32::WHITE);
+                        p.text(btn.center(), Align2::CENTER_CENTER, "Добавить", FontId::proportional(12.5), super::theme::on_accent());
                         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             acts.push(StickerAct::Install(i));
                         }
@@ -801,10 +801,11 @@ impl App {
                             let init = s.title.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "S".to_owned());
                             (None, Some(init), s.title.clone())
                         };
+                        let fg = if tab_i == cur { super::theme::on_accent() } else { WHITE };
                         if let Some(ico_n) = ico_name {
-                            icons::tg_sized(p, ico_n, c, Vec2::splat(16.0), WHITE);
+                            icons::tg_sized(p, ico_n, c, Vec2::splat(16.0), fg);
                         } else if let Some(lbl_s) = lbl {
-                            p.text(c, Align2::CENTER_CENTER, lbl_s, FontId::proportional(13.0), WHITE);
+                            p.text(c, Align2::CENTER_CENTER, lbl_s, FontId::proportional(13.0), fg);
                         }
                         if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             acts.push(StickerAct::SelectSet(tab_i));

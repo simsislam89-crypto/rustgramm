@@ -1325,3 +1325,33 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX UTF-8 check passed`, `21 932` байта, Full + Lite `aarch64-linux-android` OK).
 - `C:\Program Files\Git\bin\bash.exe scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.29.0`) собран (**23 825 920 байт**, release 5m 58s); 3 живых smoke-запуска (`demo1`, `login`, `mobile_glass` `390x844 RG_MOBILE_GLASS=1`) — **ALIVE=True**.
 - Обновлена интерактивная веб-версия [dist/rustgramm-preview.html](file:///d:/working%20WIN/rustgramm/dist/rustgramm-preview.html) (`v0.29.0`).
+
+## Этап 43 (2026-11-28, v0.30.0)
+
+### Монохромный чёрно-белый редизайн, первые 15 компонентов Liquid Glass + `OtpInput`, 5 новых функций Telegram/AyuGram, чистка каталога и обновление веб-превью
+
+1. **Монохромный чёрно-белый стиль и контрастность по всему клиенту (`rg-ui/src/{theme,kit,win,glass,panels,media_ui,settings_ui,tg_settings,features_ui,chat,lib}.rs`)**:
+   - Базовый акцент переведён с оранжевого на снежно-белый/серебристый (`#F2F2F6` / hover `#FFFFFF` / disabled `#686870`) поверх матового чёрного фона `#08080A`; добавлены `theme::contrast_ink` и `theme::on_accent()`, автоматически выбирающие тёмные чернила `INK_DARK` на белых кнопках/пилюлях/бейджах/переключателях и белый текст на тёмных кастомных темах; обновлена палитра иконки окна/трея в `win.rs` (`0x18181c` + белое/серебристое кольцо призрака).
+   - Полный аудит всех элементов поверх сплошного акцента: кнопки входа `ДАЛЕЕ`/`ВОЙТИ` и галочка «Оставаться в системе», `kit::switch`, бейджи непрочитанных и `@`-упоминаний, кнопки контакта/геопозиции/Mini App/`chat.rs` и `tg_settings.rs`.
+
+2. **Порт первых 15 компонентов Liquid Glass + пользовательские компоненты и `OtpInput` (`rg-ui/src/{glass,settings_ui,features_ui,chat,lib}.rs`)**:
+   - В `glass.rs` добавлена настоящая пружинная физика (`SpringSpec::{SNAPPY, BOUNCY, GENTLE}`, `SpringState::step`, `rubber_band`, `spring_anim`), `paint_surface_interactive` со следящим радиальным отбликом указателя, `floating_tab_bar` с proximity-масштабированием вкладок и всплывающим `DockLabel`, `segmented_tabs` для вкладок `Эмодзи / Стикеры / GIF` и `otp_input` со стеклянными ячейками кода (ввод, `Backspace`/стрелки, вставка `Ctrl+V`, pop-in масштабирование, мигающий курсор, горизонтальная встряска при ошибке) на экране входа `Stage::NeedCode`.
+   - `settings_ui::drawer`: встроенный живой фильтр пунктов шторки, сворачиваемый раздел аккаунтов и интерактивные стеклянные строки.
+   - `features_ui::quick_switcher_window` (`Ctrl+K`): дизайн AppleSpotlight с поисковой капсулой, рядом из 4 быстрых Liquid Glass кнопок (`Настройки`, `Призрак`, `Черновики`, `Секрет`) и шевронами `›`.
+   - `lib.rs::dialogs_ui`: скользящий индикатор `dialogs-slide-row` на `paint_surface_interactive` и кнопка колокольчика с поповером центра уведомлений; `chat.rs::composer_ui`: стеклянная капсула поля ввода и монохромная кнопка отправки/микрофона.
+
+3. **5 реальных функций Telegram и AyuGram + чистка каталога (`rg-core/src/engine.rs`, `rg-ui/src/{worker,tg_settings,features_ui,chat,lib}.rs`, `docs/LIQUID_GLASS_CATALOG.md`, `dist/rustgramm-preview.html`)**:
+   - **Центр уведомлений (Notification Popover)**: сбор входящих уведомлений в `notify_feed` с переходом к чату по клику и кнопкой «Прочитать все» (`Cmd::ForceReadAll`).
+   - **Временный мут на пресеты**: `Engine::set_muted_until` и `Cmd::MuteDialogFor(i64, i32)` (`1 ч`, `8 ч`, `2 д`, навсегда, включить звук) в контекстном меню диалогов и меню `⋮` чата.
+   - **Очистка всех облачных черновиков**: `Engine::clear_all_drafts` (`messages.clearAllDrafts`) + `Cmd::ClearAllDrafts` в Настройках и AppleSpotlight `Ctrl+K`.
+   - **Создание тем в супергруппах-форумах**: `Engine::create_forum_topic` (`messages.createForumTopic`) + `Cmd::CreateForumTopic` и кнопка `+ Тема` в панели форума.
+   - **Пакетные действия над выделенными сообщениями**: в плавающей стеклянной панели мультивыбора добавлены «В Избранное» (`Cmd::ForwardBatch`) и «Удалить» (`Cmd::DeleteBatch` с сохранением в локальный бэкап AyuGram).
+   - Каталог [docs/LIQUID_GLASS_CATALOG.md](file:///d:/working%20WIN/rustgramm/docs/LIQUID_GLASS_CATALOG.md) очищен от уже перенесённых компонентов (оставлены 62 нереализованные позиции); интерактивное веб-превью [dist/rustgramm-preview.html](file:///d:/working%20WIN/rustgramm/dist/rustgramm-preview.html) обновлено до монохромного `v0.30.0`.
+
+### Проверки (v0.30.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` и `cargo clippy -p rg-ui --no-default-features -- -D warnings` — **0 ошибок, 0 предупреждений**.
+- `cargo test --workspace` — **2 220 тестов пройдено, 0 провалено, 1 ignored** (`rg-ayu`: `32 + 370 + 320`, `rg-core`: `71 + 274`, `rg-net`: `6 + 1`, `rg-settings`: `16 + 393`, `rg-ui`: `106 + 631`; включая новые тесты `theme::tests::on_accent_contrasts_monochrome_and_custom_themes`, `glass::tests::spring_physics_rubber_band_segmented_and_otp_work`, `tests::notification_center_popover_renders_feed_and_read_all`, `tests::apple_spotlight_palette_renders_quick_actions`, `tests::multi_select_bar_renders_save_to_saved_and_batch_delete`).
+- `& "C:\Program Files\Git\bin\bash.exe" scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED!** (`RgBridgeTest: ALL CHECKS PASSED`, DEX UTF-8 `21 932` байта, Full + Lite `aarch64-linux-android` OK; физический телефон/эмулятор `adb` локально не подключён).
+- `& "C:\Program Files\Git\bin\bash.exe" scripts/make-dist.sh` — `dist/Rustgramm.exe` (`0.30.0`) собран (**23 939 072 байта**, release `4m 52s`); 3 живых smoke-запуска (`demo1`, `login`, `mobile_glass` `390x844 RG_MOBILE_GLASS=1`) — **ALIVE=True**.
+- Обновлена интерактивная веб-версия [dist/rustgramm-preview.html](file:///d:/working%20WIN/rustgramm/dist/rustgramm-preview.html) (`v0.30.0`).

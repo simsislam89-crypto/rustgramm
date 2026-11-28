@@ -658,9 +658,27 @@ impl App {
                                 act = Some(Cmd::PinDialog(did, !pinned));
                                 ui.close();
                             }
-                            if kit::menu_item(ui, if muted { "menu/unmute" } else { "menu/mute" }, if muted { "Включить звук" } else { "Отключить звук" }, false) {
-                                act = Some(Cmd::MuteDialog(did, !muted));
+                            if if muted {
+                                kit::menu_item(ui, "menu/unmute", "Включить звук", false)
+                            } else {
+                                kit::menu_item(ui, "menu/mute", "Отключить звук (1 ч)", false)
+                            } {
+                                act = Some(if muted { Cmd::MuteDialogFor(did, 0) } else { Cmd::MuteDialogFor(did, 3600) });
                                 ui.close();
+                            }
+                            if !muted {
+                                if kit::menu_item(ui, "menu/mute", "Отключить на 8 ч", false) {
+                                    act = Some(Cmd::MuteDialogFor(did, 8 * 3600));
+                                    ui.close();
+                                }
+                                if kit::menu_item(ui, "menu/mute", "Отключить на 2 д", false) {
+                                    act = Some(Cmd::MuteDialogFor(did, 2 * 86_400));
+                                    ui.close();
+                                }
+                                if kit::menu_item(ui, "menu/mute", "Отключить навсегда", false) {
+                                    act = Some(Cmd::MuteDialogFor(did, i32::MAX));
+                                    ui.close();
+                                }
                             }
                             if unread > 0 && kit::menu_item(ui, "menu/read", "Прочитать локально", false) {
                                 do_local_read = true;
@@ -1063,7 +1081,7 @@ impl App {
                     } else {
                         "media_play"
                     };
-                    icons::tg_sized(p, ico_name, ic_r.center(), Vec2::splat(14.0), Color32::WHITE);
+                    icons::tg_sized(p, ico_name, ic_r.center(), Vec2::splat(14.0), if is_cur { super::theme::on_accent() } else { Color32::WHITE });
                     let clip = Rect::from_min_max(Pos2::new(ic_r.right() + 8.0, card.top()), Pos2::new(card.right() - 8.0, card.bottom()));
                     p.with_clip_rect(clip).text(
                         Pos2::new(ic_r.right() + 8.0, card.center().y - if track.duration > 0 { 6.0 } else { 0.0 }),
@@ -1420,7 +1438,7 @@ impl App {
                                 (PF::Bots, "Боты"),
                             ] {
                                 let sel = self.participants_filter == flt;
-                                let btn = egui::Button::new(RichText::new(lbl).size(12.0).color(if sel { Color32::WHITE } else { SUBTEXT }))
+                                let btn = egui::Button::new(RichText::new(lbl).size(12.0).color(if sel { super::theme::on_accent() } else { SUBTEXT }))
                                     .fill(if sel { c_orange() } else { Color32::from_white_alpha(14) })
                                     .corner_radius(egui::CornerRadius::same(8));
                                 if ui.add(btn).clicked() && !sel {
@@ -1647,7 +1665,7 @@ impl App {
                     let btn = egui::Button::new(
                         RichText::new(flt.label())
                             .size(11.5)
-                            .color(if sel { Color32::WHITE } else { SUBTEXT }),
+                            .color(if sel { super::theme::on_accent() } else { SUBTEXT }),
                     )
                     .fill(if sel { t_btn(c_orange()) } else { Color32::from_white_alpha(14) })
                     .corner_radius(egui::CornerRadius::same(11))
@@ -2534,19 +2552,20 @@ impl App {
                 let mh = tween(ui.ctx(), "cmp-botapp-h", f32::from(u8::from(mresp.hovered())), 0.12);
                 let mfill = lerp_color(t_btn(c_orange()), t_btn(ORANGE_OVER), mh);
                 ui.painter().rect_filled(mrect, egui::CornerRadius::same(15), mfill);
+                let bot_fg = super::theme::on_accent();
                 icons::tg_sized(
                     ui.painter(),
                     "dialogs/dialogs_menu",
                     Pos2::new(mrect.left() + 14.0, mrect.center().y),
                     Vec2::splat(14.0),
-                    Color32::WHITE,
+                    bot_fg,
                 );
                 ui.painter().text(
                     Pos2::new(mrect.left() + 26.0, mrect.center().y),
                     egui::Align2::LEFT_CENTER,
                     lbl,
                     FontId::proportional(12.5),
-                    Color32::WHITE,
+                    bot_fg,
                 );
                 if mresp
                     .on_hover_text(format!("Меню бота: {w_lbl}"))
@@ -2572,20 +2591,21 @@ impl App {
                 } else {
                     lerp_color(Color32::from_white_alpha(20), Color32::from_white_alpha(36), mh)
                 };
+                let bm_fg = if self.cmd_popup_open { super::theme::on_accent() } else { Color32::WHITE };
                 ui.painter().rect_filled(mrect, egui::CornerRadius::same(15), mfill);
                 icons::tg_sized(
                     ui.painter(),
                     "dialogs/dialogs_menu",
                     Pos2::new(mrect.left() + 14.0, mrect.center().y),
                     Vec2::splat(14.0),
-                    Color32::WHITE,
+                    bm_fg,
                 );
                 ui.painter().text(
                     Pos2::new(mrect.left() + 26.0, mrect.center().y),
                     egui::Align2::LEFT_CENTER,
                     "Меню",
                     FontId::proportional(12.5),
-                    Color32::WHITE,
+                    bm_fg,
                 );
                 if mresp.on_hover_text("Команды и меню бота").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.cmd_popup_open = !self.cmd_popup_open;
@@ -2779,6 +2799,16 @@ impl App {
                 .corner_radius(egui::CornerRadius::same(18))
                 .inner_margin(egui::Margin::symmetric(10, 2))
                 .show(ui, |ui| {
+                    let capsule_r = ui.max_rect();
+                    let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                    super::glass::paint_surface_interactive(
+                        ui.painter(),
+                        capsule_r,
+                        18.0,
+                        if inp_focus > 0.25 { super::glass::GlassVariant::Tinted(c_orange()) } else { super::glass::GlassVariant::Clear },
+                        0.15 + 0.3 * inp_focus,
+                        ptr,
+                    );
                     ui.allocate_ui(Vec2::new((width - 22.0).max(74.0), (row_h - 10.0).max(34.0)), |ui| {
                         egui::TextEdit::multiline(&mut self.input)
                             .id(id)
@@ -2977,13 +3007,13 @@ impl App {
                 ui.painter().line_segment([Pos2::new(c.x, c.y + 3.0), Pos2::new(c.x, c.y + 7.5)], egui::Stroke::new(1.5, mc));
                 ui.painter().line_segment([Pos2::new(c.x - 3.8, c.y + 7.5), Pos2::new(c.x + 3.8, c.y + 7.5)], egui::Stroke::new(1.5, mc));
             } else {
-                let arrow_c = if active { Color32::WHITE } else { DIALOG_DATE };
+                let arrow_c = if active { super::theme::on_accent() } else { DIALOG_DATE };
                 icons::send(ui.painter(), srect.center(), arrow_c);
                 if self.selected_effect.is_some() {
                     ui.painter().circle_filled(
                         srect.right_top() + Vec2::new(-5.0, 6.0),
                         4.5,
-                        Color32::from_rgb(255, 224, 92),
+                        c_orange(),
                     );
                 }
             }
@@ -3185,22 +3215,13 @@ impl App {
         let mut jump = self.emoji_jump.take();
         let mut tab = self.emoji_tab;
         let mut sacts: Vec<super::panels::StickerAct> = Vec::new();
-        // Вкладки как в AyuGram: на всю ширину, оранжевое подчёркивание у выбранной + кнопка закрепления.
+        // Вкладки #13 Segmented Tab Switcher (монохромное стекло Liquid Glass + кнопка закрепления).
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.spacing_mut().item_spacing.x = 4.0;
             let pin_w = 34.0;
-            let w = ((ui.available_width() - pin_w) / 3.0).max(50.0);
-            for (n, name) in ["Эмодзи", "Стикеры", "GIF"].iter().enumerate() {
-                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
-                let k = tween(ui.ctx(), ("emtab", n), f32::from(u8::from(tab == n)), 0.16);
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(14.0), lerp_color(DIALOG_TEXT, WHITE, k));
-                ui.painter().rect_filled(
-                    Rect::from_center_size(egui::pos2(r.center().x, r.bottom() - 1.0), Vec2::new(44.0 * k, 2.5)),
-                    egui::CornerRadius::same(1),
-                    t_btn(ORANGE),
-                );
-                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                if resp.clicked() {
+            let seg_w = (ui.available_width() - pin_w - 8.0).max(160.0);
+            ui.allocate_ui(Vec2::new(seg_w, 34.0), |ui| {
+                if let Some(n) = super::glass::segmented_tabs(ui, "emoji-panel-seg", &["Эмодзи", "Стикеры", "GIF"], tab) {
                     tab = n;
                     if n == 0 {
                         // Возврат к вкладке «Эмодзи» всегда сбрасывает просматриваемый кастомный набор обратно к базовым эмодзи.
@@ -3208,7 +3229,7 @@ impl App {
                         self.emoji_add_open = false;
                     }
                 }
-            }
+            });
             let (pr, presp) = ui.allocate_exact_size(Vec2::new(pin_w, 34.0), Sense::click());
             let pin_c = if self.emoji_pinned { ORANGE } else if presp.hovered() { WHITE } else { SUBTEXT };
             icons::tg(ui.painter(), "dialogs/dialogs_pinned", pr.center(), pin_c);
@@ -3631,8 +3652,28 @@ impl App {
                                 picked_topic = Some(Some(t_row.id));
                             }
                         }
+                        if ui.small_button(if self.new_topic_open { "×" } else { "+ Тема" }).clicked() {
+                            self.new_topic_open = !self.new_topic_open;
+                        }
                     });
                 });
+            if self.new_topic_open {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_topic_title)
+                            .hint_text("Название новой темы…")
+                            .desired_width(180.0),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let valid = !self.new_topic_title.trim().is_empty();
+                    if (orange_button(ui, "Создать", Vec2::new(76.0, 24.0)).clicked() || enter) && valid {
+                        let title = std::mem::take(&mut self.new_topic_title).trim().to_owned();
+                        self.new_topic_open = false;
+                        self.send(Cmd::CreateForumTopic(cid, title));
+                    }
+                });
+            }
             if let Some(pick) = picked_topic {
                 self.active_topic = pick;
                 if let Some(tid) = pick
@@ -4126,7 +4167,7 @@ impl App {
                         egui::Align2::CENTER_CENTER,
                         unread_cnt.min(999).to_string(),
                         FontId::proportional(10.5),
-                        Color32::WHITE.gamma_multiply(down_raw),
+                        super::theme::on_accent().gamma_multiply(down_raw),
                     );
                 }
                 if resp.on_hover_text("Вниз").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -4155,11 +4196,11 @@ impl App {
                         ui.painter().circle_stroke(c, 20.0, egui::Stroke::new(1.0, Color32::from_white_alpha(32)));
                     }
                 }
-                ui.painter().text(c, egui::Align2::CENTER_CENTER, "@", FontId::proportional(17.0), WHITE);
+                ui.painter().text(c, egui::Align2::CENTER_CENTER, "@", FontId::proportional(17.0), if resp.hovered() && !super::theme::mobile_glass_active() { super::theme::on_accent() } else { WHITE });
                 if show_cnt {
                     let b = Rect::from_center_size(c - Vec2::new(0.0, 22.0), Vec2::new(24.0, 16.0));
                     ui.painter().rect_filled(b, egui::CornerRadius::same(8), t_btn(ORANGE));
-                    ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, mentions_cnt.min(99).to_string(), FontId::proportional(10.5), Color32::WHITE);
+                    ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, mentions_cnt.min(99).to_string(), FontId::proportional(10.5), super::theme::on_accent());
                 }
                 if resp.clicked() {
                     if let Some(did) = self.dialog_id_at(sel) {
@@ -4260,36 +4301,46 @@ impl App {
         }
         // Плавающая панель действий при множественном выделении сообщений.
         if !self.selected_msgs.is_empty() {
-            let bar_w = 460.0_f32.min(clip_rect.width() - 24.0);
+            let bar_w = 560.0_f32.min(clip_rect.width() - 16.0);
             let bar = Rect::from_min_size(
                 Pos2::new(clip_rect.center().x - bar_w * 0.5, clip_rect.bottom() - 48.0),
                 Vec2::new(bar_w, 40.0),
             );
-            ui.painter().rect_filled(bar, egui::CornerRadius::same(12), t2(WINDOW_BG));
-            ui.painter().rect_stroke(
+            super::glass::paint_surface_interactive(
+                ui.painter(),
                 bar,
-                egui::CornerRadius::same(12),
-                egui::Stroke::new(1.0, Color32::from_white_alpha(36)),
-                egui::StrokeKind::Inside,
+                14.0,
+                super::glass::GlassVariant::Regular,
+                0.18,
+                ptr_pos,
             );
             let mut clear_sel = false;
             let mut open_fwd = false;
             let mut open_shot = false;
+            let mut save_to_saved = false;
+            let mut delete_batch = false;
             let mut copy_sel = !ui.ctx().egui_wants_keyboard_input()
                 && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C));
             let count = self.selected_msgs.len();
+            let has_saved_dlg = self.dialogs.iter().any(|d| d.saved);
             ui.scope_builder(egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(10.0, 4.0))), |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new(format!("Выбрано: {count}")).strong().color(WHITE));
-                    ui.add_space(6.0);
-                    if orange_button(ui, "Переслать", Vec2::new(96.0, 28.0)).clicked() {
+                    ui.add_space(4.0);
+                    if orange_button(ui, "Переслать", Vec2::new(86.0, 28.0)).clicked() {
                         open_fwd = true;
+                    }
+                    if has_saved_dlg && ui.button("В Избранное").clicked() {
+                        save_to_saved = true;
                     }
                     if ui.button("Снимок").clicked() {
                         open_shot = true;
                     }
                     if ui.button("Копия").clicked() {
                         copy_sel = true;
+                    }
+                    if ui.button(RichText::new("Удалить").color(DANGER)).clicked() {
+                        delete_batch = true;
                     }
                     if ui.button("Снять").clicked() {
                         clear_sel = true;
@@ -4307,6 +4358,33 @@ impl App {
                 if !text.is_empty() {
                     crate::copy_text_to_clipboard(ui.ctx(), &text);
                     self.status = "Выделенные тексты скопированы".to_owned();
+                }
+                clear_sel = true;
+            }
+            if save_to_saved
+                && let Some(did) = self.selected_dialog_id()
+                && let Some(saved_did) = self.dialogs.iter().find(|d| d.saved).map(|d| d.id)
+            {
+                let ids: Vec<i32> = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selected_msgs.contains(&m.id) && m.id > 0)
+                    .map(|m| m.id)
+                    .collect();
+                if !ids.is_empty() {
+                    self.send(Cmd::ForwardBatch(did, ids, saved_did, false));
+                }
+                clear_sel = true;
+            }
+            if delete_batch && let Some(did) = self.selected_dialog_id() {
+                let backups: Vec<(i32, String, i64, bool, String)> = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selected_msgs.contains(&m.id) && m.id > 0)
+                    .map(|m| (m.id, m.text.clone(), m.date, m.outgoing, m.sender.clone()))
+                    .collect();
+                if !backups.is_empty() {
+                    self.send(Cmd::DeleteBatch { dialog_id: did, backups });
                 }
                 clear_sel = true;
             }
@@ -4538,7 +4616,7 @@ impl App {
                 egui::CornerRadius::same(17),
                 lerp_color(t_btn(c_orange()), t_btn(ORANGE_OVER), shk),
             );
-            icons::tg_sized(ui.painter(), "chat/input_send", send_r.center(), Vec2::splat(18.0), Color32::WHITE);
+            icons::tg_sized(ui.painter(), "chat/input_send", send_r.center(), Vec2::splat(18.0), super::theme::on_accent());
             let clicked_send = send_resp
                 .on_hover_text("Отправить комментарий")
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -6631,7 +6709,7 @@ fn bubble(
                                 let (cb_r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
                                 if it.done {
                                     ui.painter().rect_filled(cb_r, egui::CornerRadius::same(5), c_orange());
-                                    ui.painter().text(cb_r.center(), egui::Align2::CENTER_CENTER, "✓", FontId::proportional(12.0), Color32::WHITE);
+                                    ui.painter().text(cb_r.center(), egui::Align2::CENTER_CENTER, "✓", FontId::proportional(12.0), super::theme::on_accent());
                                 } else {
                                     ui.painter().rect_stroke(cb_r, egui::CornerRadius::same(5), egui::Stroke::new(1.5, date_c), egui::StrokeKind::Inside);
                                 }
@@ -7008,7 +7086,7 @@ fn bubble(
             let fresp = ui.interact(f_rect, ui.make_persistent_id(("fshare", m.id)), Sense::click());
             let bg = if fresp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
             ui.painter().circle_filled(f_center, 11.5, bg);
-            icons::tg_sized(ui.painter(), "info/info_media_forward", f_center, Vec2::splat(14.0), WHITE);
+            icons::tg_sized(ui.painter(), "info/info_media_forward", f_center, Vec2::splat(14.0), if fresp.hovered() { super::theme::on_accent() } else { WHITE });
             if fresp.on_hover_text("Быстрая пересылка").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 acts.push(Act::Forward(m.id));
             }
@@ -7023,7 +7101,7 @@ fn bubble(
             if show_copy {
                 let bg = if cresp.hovered() { t_btn(ORANGE) } else { t2(WINDOW_BG) };
                 ui.painter().circle_filled(c_center, 10.5, bg);
-                icons::tg_sized(ui.painter(), "menu/copy", c_center, Vec2::splat(12.5), WHITE);
+                icons::tg_sized(ui.painter(), "menu/copy", c_center, Vec2::splat(12.5), if cresp.hovered() { super::theme::on_accent() } else { WHITE });
             }
             if cresp.on_hover_text("Копировать текст").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 acts.push(Act::Copy(m.text.clone()));
@@ -7588,7 +7666,7 @@ fn render_rich_blocks(
                             if item.checked {
                                 ui.painter().rect_filled(rbox, egui::CornerRadius::same(4), c_orange());
                                 let c = rbox.center();
-                                let st = egui::Stroke::new(1.8, Color32::WHITE);
+                                let st = egui::Stroke::new(1.8, super::theme::on_accent());
                                 ui.painter().line_segment([c + Vec2::new(-3.2, 0.2), c + Vec2::new(-0.8, 2.8)], st);
                                 ui.painter().line_segment([c + Vec2::new(-0.8, 2.8), c + Vec2::new(3.5, -2.5)], st);
                             } else {

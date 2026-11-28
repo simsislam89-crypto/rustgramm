@@ -144,11 +144,46 @@ impl App {
                 if pr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     act = Some("prefs");
                 }
+                // #7 Expandable Liquid Glass Sidebar: встроенный фильтр разделов в шторке.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    let fw = (w - 24.0).max(80.0);
+                    let (fr, _) = ui.allocate_exact_size(Vec2::new(fw, 30.0), Sense::hover());
+                    super::glass::paint_surface(
+                        ui.painter(),
+                        fr,
+                        15.0,
+                        super::glass::GlassVariant::Clear,
+                        if self.drawer_filter.is_empty() { 0.05 } else { 0.28 },
+                    );
+                    let inner = Rect::from_min_max(fr.min + Vec2::new(10.0, 2.0), fr.max - Vec2::new(10.0, 2.0));
+                    ui.put(
+                        inner,
+                        egui::TextEdit::singleline(&mut self.drawer_filter)
+                            .hint_text("Фильтр меню…")
+                            .frame(egui::Frame::NONE)
+                            .desired_width(inner.width()),
+                    );
+                });
+                ui.add_space(4.0);
+                let d_needle = self.drawer_filter.trim().to_lowercase();
                 let item = |ui: &mut egui::Ui, icon: icons::Ico, text: &str| -> bool {
+                    if !d_needle.is_empty() && !text.to_lowercase().contains(&d_needle) {
+                        return false;
+                    }
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
                     let ih = tween(ui.ctx(), ("drw-it", text), f32::from(u8::from(resp.hovered())), 0.12);
                     if ih > 0.01 {
-                        ui.painter().rect_filled(r, 0.0, t(WINDOW_OVER).gamma_multiply(ih));
+                        let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                        super::glass::paint_surface_interactive(
+                            ui.painter(),
+                            r.shrink2(Vec2::new(8.0, 2.0)),
+                            10.0,
+                            super::glass::GlassVariant::Clear,
+                            ih,
+                            ptr,
+                        );
                     }
                     icons::ico(ui.painter(), Pos2::new(r.left() + 30.0, r.center().y), icon, lerp_color(DIALOG_DATE, WHITE, ih));
                     let clip = Rect::from_min_max(
@@ -164,8 +199,32 @@ impl App {
                     );
                     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 };
-                // Неограниченный список аккаунтов (без лимита в 3 слота даже без Premium!).
+                // Сворачиваемый блок аккаунтов (без лимита в 3 слота даже без Premium!).
+                if d_needle.is_empty() {
+                    let (ah_r, ah_resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
+                    ui.painter().text(
+                        Pos2::new(ah_r.left() + 18.0, ah_r.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("АККАУНТЫ ({})", s.accounts.len()),
+                        FontId::proportional(11.0),
+                        SUBTEXT,
+                    );
+                    ui.painter().text(
+                        Pos2::new(ah_r.right() - 18.0, ah_r.center().y),
+                        Align2::RIGHT_CENTER,
+                        if self.drawer_accounts_open { "▾" } else { "▸" },
+                        FontId::proportional(12.0),
+                        SUBTEXT,
+                    );
+                    if ah_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.drawer_accounts_open = !self.drawer_accounts_open;
+                    }
+                }
+                if self.drawer_accounts_open || !d_needle.is_empty() {
                 for acc in &s.accounts {
+                    if !d_needle.is_empty() && !acc.title().to_lowercase().contains(&d_needle) {
+                        continue;
+                    }
                     let is_cur = acc.slot == s.active_account;
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 44.0), Sense::click());
                     if resp.hovered() {
@@ -230,6 +289,7 @@ impl App {
                 }
                 if item(ui, icons::Ico::Profile, "Добавить аккаунт") {
                     act = Some("add_account");
+                }
                 }
                 kit::divider(ui);
                 if a.drawer_my_profile && item(ui, icons::Ico::Profile, "Мой профиль") {
@@ -1606,7 +1666,7 @@ impl App {
                                 let box_r = Rect::from_center_size(Pos2::new(r.left() + 16.0, r.center().y), Vec2::splat(16.0));
                                 if on {
                                     ui.painter().rect_filled(box_r, CornerRadius::same(4), t_btn(ORANGE));
-                                    ui.painter().text(box_r.center(), Align2::CENTER_CENTER, "✓", FontId::proportional(11.0), Color32::WHITE);
+                                    ui.painter().text(box_r.center(), Align2::CENTER_CENTER, "✓", FontId::proportional(11.0), super::theme::on_accent());
                                 } else {
                                     ui.painter().rect_stroke(box_r, CornerRadius::same(4), egui::Stroke::new(1.5, SUBTEXT), egui::StrokeKind::Middle);
                                 }

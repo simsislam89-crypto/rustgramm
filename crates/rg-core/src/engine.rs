@@ -2039,8 +2039,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Отключить звук чата навсегда или включить.
-    pub async fn set_muted(&self, peer: PeerRef, muted: bool) -> Result<(), grammers_client::InvocationError> {
+    /// Отключить звук чата до указанного Unix-времени (`0` — включить звук, `i32::MAX` — навсегда).
+    pub async fn set_muted_until(&self, peer: PeerRef, until_unix: i32) -> Result<(), grammers_client::InvocationError> {
         use grammers_client::tl;
         self.client
             .invoke(&tl::functions::account::UpdateNotifySettings {
@@ -2048,7 +2048,7 @@ impl Engine {
                 settings: tl::enums::InputPeerNotifySettings::Settings(tl::types::InputPeerNotifySettings {
                     show_previews: None,
                     silent: None,
-                    mute_until: Some(if muted { i32::MAX } else { 0 }),
+                    mute_until: Some(until_unix),
                     sound: None,
                     stories_muted: None,
                     stories_hide_sender: None,
@@ -2057,6 +2057,19 @@ impl Engine {
             })
             .await?;
         Ok(())
+    }
+
+    /// Отключить звук чата навсегда или включить.
+    pub async fn set_muted(&self, peer: PeerRef, muted: bool) -> Result<(), grammers_client::InvocationError> {
+        self.set_muted_until(peer, if muted { i32::MAX } else { 0 }).await
+    }
+
+    /// Очистить все облачные черновики во всех диалогах (`messages.clearAllDrafts`).
+    pub async fn clear_all_drafts(&self) -> Result<bool, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        self.client
+            .invoke(&tl::functions::messages::ClearAllDrafts {})
+            .await
     }
 
     pub async fn dialogs(&self, limit: usize) -> Result<Vec<DialogRow>, grammers_client::InvocationError> {
@@ -5681,6 +5694,33 @@ impl Engine {
                 _ => None,
             })
             .collect())
+    }
+
+    /// Создать новую тему в супергруппе-форуме (`messages.createForumTopic`) и вернуть обновлённый список.
+    pub async fn create_forum_topic(
+        &self,
+        peer: PeerRef,
+        title: &str,
+    ) -> Result<Vec<ForumTopicRow>, grammers_client::InvocationError> {
+        use grammers_client::tl;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static TOPIC_SEQ: AtomicI64 = AtomicI64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as i64);
+        let random_id = nanos ^ (TOPIC_SEQ.fetch_add(1, Ordering::Relaxed) << 20);
+        self.client
+            .invoke(&tl::functions::messages::CreateForumTopic {
+                title_missing: false,
+                peer: peer.into(),
+                title: title.trim().to_owned(),
+                icon_color: None,
+                icon_emoji_id: None,
+                random_id,
+                send_as: None,
+            })
+            .await?;
+        self.forum_topics(peer).await
     }
 
     /// Сообщения темы форума (`messages.getReplies`).

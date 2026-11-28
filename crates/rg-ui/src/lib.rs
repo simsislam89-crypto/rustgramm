@@ -642,6 +642,13 @@ struct App {
     /// Отслеживание последнего toast-статуса для автоскрытия и плавного появления.
     status_last: String,
     status_at: i64,
+    /// Попап центра уведомлений (#4), лента входящих уведомлений и поля новой UI-темы/шторки.
+    notify_popover_open: bool,
+    notify_feed: VecDeque<(i64, String, String, i64, bool)>,
+    drawer_filter: String,
+    drawer_accounts_open: bool,
+    new_topic_open: bool,
+    new_topic_title: String,
 }
 
 pub(crate) struct ShotModal {
@@ -1225,6 +1232,12 @@ impl App {
             chat_opened_at: 0.0,
             status_last: String::new(),
             status_at: 0,
+            notify_popover_open: false,
+            notify_feed: VecDeque::with_capacity(32),
+            drawer_filter: String::new(),
+            drawer_accounts_open: true,
+            new_topic_open: false,
+            new_topic_title: String::new(),
         }
     }
 
@@ -1382,20 +1395,26 @@ impl App {
                 self.history_fresh_at.remove(&key);
                 // Уведомление по настройкам с учётом мута (чат, архив, категория Telegram), `silent` и антиспама >3/сек.
                 if !row_snapshot.1 {
+                    let dialog = self.dialogs.iter().find(|d| d.id == key);
+                    let muted_dlg = is_dialog_muted_for_notify(dialog, self.tgs.account.as_ref());
+                    let title = dialog.map_or_else(|| "Rustgramm".to_owned(), |d| d.name.clone());
+                    let body = if row_snapshot.2.is_empty() {
+                        "Вложение".to_owned()
+                    } else {
+                        row_snapshot.2.clone()
+                    };
+                    if open_id != Some(key) && !row_silent && !muted_dlg {
+                        self.notify_feed.retain(|x| !(x.0 == key && x.2 == body));
+                        self.notify_feed.push_front((key, title.clone(), body.clone(), self.now.max(1), false));
+                        while self.notify_feed.len() > 25 {
+                            self.notify_feed.pop_back();
+                        }
+                    }
                     let now = std::time::Instant::now();
                     let is_spam = self.notify_gate.record_incoming(now, key);
-                    if !row_silent && !is_spam && !ctx.input(|i| i.focused) {
-                        let dialog = self.dialogs.iter().find(|d| d.id == key);
-                        if !is_dialog_muted_for_notify(dialog, self.tgs.account.as_ref()) {
-                            let title = dialog.map_or_else(|| "Rustgramm".to_owned(), |d| d.name.clone());
-                            let body = if row_snapshot.2.is_empty() {
-                                "Вложение".to_owned()
-                            } else {
-                                row_snapshot.2.clone()
-                            };
-                            self.notify_gate.enqueue(now, title, body);
-                            ctx.request_repaint_after(std::time::Duration::from_millis(360));
-                        }
+                    if !row_silent && !is_spam && !ctx.input(|i| i.focused) && !muted_dlg {
+                        self.notify_gate.enqueue(now, title, body);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(360));
                     }
                 }
             }
@@ -1707,7 +1726,7 @@ impl App {
                         egui::Align2::CENTER_CENTER,
                         "R",
                         FontId::proportional(14.0),
-                        Color32::WHITE,
+                        theme::on_accent(),
                     );
                     let clip = egui::Rect::from_min_max(
                         egui::pos2(rect.left() + 50.0, rect.top()),
@@ -1823,7 +1842,7 @@ impl App {
                 if playing { "media_pause" } else { "media_play" },
                 pr.center(),
                 Vec2::splat(13.0),
-                Color32::WHITE,
+                theme::on_accent(),
             );
             if presp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 toggle = true;
@@ -1954,7 +1973,7 @@ impl App {
             ui.add_space((ui.available_height() * 0.24).max(40.0));
             let (ir, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
             ui.painter().circle_filled(ir.center(), 30.0, t_btn(ORANGE));
-            icons::tg(ui.painter(), "settings/lock", ir.center(), Color32::WHITE);
+            icons::tg(ui.painter(), "settings/lock", ir.center(), theme::on_accent());
             ui.add_space(14.0);
             ui.label(RichText::new("Rustgramm заблокирован").size(20.0).strong().color(WHITE));
             ui.label(RichText::new("Введите локальный код-пароль").size(13.5).color(SUBTEXT));
@@ -2458,6 +2477,11 @@ impl App {
         self.selected = Some(i);
         self.chat_opened_at = -1.0;
         if let Some((id, unread, rim)) = self.dialogs.get(i).map(|d| (d.id, d.unread, d.read_inbox_max_id)) {
+            for item in &mut self.notify_feed {
+                if item.0 == id {
+                    item.4 = true;
+                }
+            }
             self.open_unread_anchor = (unread > 0 && rim > 0).then_some(rim);
             if let Some((draft_txt, draft_reply)) = self.drafts.get(&id).cloned() {
                 self.input = draft_txt;
@@ -4914,8 +4938,7 @@ impl App {
                             egui::StrokeKind::Inside,
                         );
                         if chk_k > 0.25 {
-                            let a = (255.0 * chk_k) as u8;
-                            let tick_col = Color32::from_white_alpha(a);
+                            let tick_col = theme::on_accent().gamma_multiply(chk_k);
                             let c = box_r.center();
                             ui.painter().add(egui::Shape::line(
                                 vec![
@@ -4948,10 +4971,15 @@ impl App {
                 };
                 let go_btn = ui.add_enabled(
                     !self.login_busy,
-                    egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
-                        .fill(btn_fill)
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .min_size(Vec2::new(form_w, 44.0)),
+                    egui::Button::new(
+                        RichText::new(btn_lbl)
+                            .size(14.0)
+                            .strong()
+                            .color(if self.login_busy { SUBTEXT } else { theme::on_accent() }),
+                    )
+                    .fill(btn_fill)
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .min_size(Vec2::new(form_w, 44.0)),
                 );
                 if (go_btn.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || enter_pressed) && !self.login_busy {
                     match countries::normalize_phone(&self.login_dial, &self.login_phone_full) {
@@ -5006,15 +5034,25 @@ impl App {
                 ui.add_space(14.0);
 
                 let mut enter_code = false;
-                let code_target_len = usize::from(self.login_code_len.clamp(4, 12));
-                let code_ph = format!("{code_target_len} цифр кода");
-                let code_prompt_hint = format!("Введите {code_target_len} цифр кода");
+                let code_target_len = usize::from(self.login_code_len.clamp(4, 8));
+                ui.allocate_ui_with_layout(
+                    Vec2::new(form_w, 60.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        if glass::otp_input(ui, "login-otp", &mut self.code, code_target_len, !self.error.is_empty()) {
+                            enter_code = true;
+                        }
+                    },
+                );
                 if cfg!(target_os = "android") {
+                    let code_ph = format!("{code_target_len} цифр кода");
+                    let code_prompt_hint = format!("Введите {code_target_len} цифр кода");
+                    ui.add_space(6.0);
                     if Self::outlined_login_button(
                         ui,
                         "code",
                         form_w,
-                        48.0,
+                        44.0,
                         "Код из Telegram",
                         true,
                         accent,
@@ -5033,30 +5071,6 @@ impl App {
                             2,
                         );
                     }
-                } else {
-                    let (_, r) = Self::outlined_login_field(
-                        ui,
-                        "code",
-                        form_w,
-                        48.0,
-                        "Код из Telegram",
-                        true,
-                        accent,
-                        bg_cut,
-                        |ui| {
-                            ui.add_sized(
-                                [(form_w - 34.0).max(160.0), 28.0],
-                                egui::TextEdit::singleline(&mut self.code)
-                                    .align(egui::Align2::LEFT_CENTER)
-                                    .frame(egui::Frame::NONE)
-                                    .font(FontId::proportional(17.0))
-                                    .hint_text("5 цифр кода"),
-                            )
-                        },
-                    );
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        enter_code = true;
-                    }
                 }
                 let mut auto_submit = false;
                 if cfg!(target_os = "android") {
@@ -5074,10 +5088,15 @@ impl App {
                 let go = ui
                     .add_enabled(
                         !self.login_busy,
-                        egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
-                            .fill(if self.login_busy { accent.gamma_multiply(0.55) } else { accent })
-                            .corner_radius(egui::CornerRadius::same(11))
-                            .min_size(Vec2::new(form_w, 46.0)),
+                        egui::Button::new(
+                            RichText::new(btn_lbl)
+                                .size(14.0)
+                                .strong()
+                                .color(if self.login_busy { SUBTEXT } else { theme::on_accent() }),
+                        )
+                        .fill(if self.login_busy { accent.gamma_multiply(0.55) } else { accent })
+                        .corner_radius(egui::CornerRadius::same(11))
+                        .min_size(Vec2::new(form_w, 46.0)),
                     )
                     .clicked()
                     || auto_submit
@@ -5210,10 +5229,15 @@ impl App {
                 let go = ui
                     .add_enabled(
                         !self.login_busy,
-                        egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
-                            .fill(if self.login_busy { accent.gamma_multiply(0.55) } else { accent })
-                            .corner_radius(egui::CornerRadius::same(11))
-                            .min_size(Vec2::new(form_w, 46.0)),
+                        egui::Button::new(
+                            RichText::new(btn_lbl)
+                                .size(14.0)
+                                .strong()
+                                .color(if self.login_busy { SUBTEXT } else { theme::on_accent() }),
+                        )
+                        .fill(if self.login_busy { accent.gamma_multiply(0.55) } else { accent })
+                        .corner_radius(egui::CornerRadius::same(11))
+                        .min_size(Vec2::new(form_w, 46.0)),
                     )
                     .clicked()
                     || enter_pw;
@@ -5285,7 +5309,7 @@ impl App {
                 self.drawer_open = true;
             }
             let has_lock = !self.settings.security.passcode_hash.is_empty();
-            let w = (ui.available_width() - 10.0 - if has_lock { 38.0 } else { 0.0 }).max(80.0);
+            let w = (ui.available_width() - 10.0 - 38.0 - if has_lock { 38.0 } else { 0.0 }).max(80.0);
             let (srect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
             ui.painter()
                 .rect_filled(srect, egui::CornerRadius::same(18), t(FILTER_INPUT));
@@ -5316,6 +5340,36 @@ impl App {
                     self.global_results.clear();
                 }
             }
+            // #4 Notification Center Popover: кнопка колокольчика + бейдж.
+            let feed_unread = self.notify_feed.iter().filter(|x| !x.4).count();
+            let bell_cnt = if !self.notify_feed.is_empty() {
+                feed_unread
+            } else {
+                self.dialogs.iter().filter(|d| d.unread > 0 && !d.muted).count()
+            };
+            let (br, bresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+            let bh = theme::tween(ui.ctx(), "notify-bell-h", f32::from(u8::from(bresp.hovered() || self.notify_popover_open)), 0.12);
+            if bh > 0.02 {
+                glass::paint_surface(
+                    ui.painter(),
+                    br,
+                    17.0,
+                    if self.notify_popover_open { glass::GlassVariant::Tinted(c_orange()) } else { glass::GlassVariant::Clear },
+                    bh,
+                );
+            }
+            let bell_c = if self.notify_popover_open { Color32::WHITE } else { lerp_color(DIALOG_DATE, WHITE, bh) };
+            icons::tg_sized(ui.painter(), "settings/notifications", br.center(), Vec2::splat(17.0), bell_c);
+            if bell_cnt > 0 && !self.settings.ayu.hide_notification_counters {
+                let btxt = if bell_cnt > 99 { "99+".to_owned() } else { bell_cnt.to_string() };
+                let bw = (btxt.chars().count() as f32 * 5.6 + 7.0).max(15.0);
+                let badge_r = egui::Rect::from_center_size(egui::pos2(br.right() - 6.0, br.top() + 7.0), Vec2::new(bw, 14.0));
+                ui.painter().rect_filled(badge_r, egui::CornerRadius::same(7), c_orange());
+                ui.painter().text(badge_r.center(), egui::Align2::CENTER_CENTER, btxt, FontId::proportional(9.5), theme::on_accent());
+            }
+            if bresp.on_hover_text("Центр уведомлений").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.notify_popover_open = !self.notify_popover_open;
+            }
             if has_lock {
                 let (lr, lresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                 if lresp.hovered() {
@@ -5327,6 +5381,102 @@ impl App {
                 }
             }
         });
+        if self.notify_popover_open {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.notify_popover_open = false;
+            }
+            let mut open_did: Option<i64> = None;
+            let mut read_all = false;
+            let pop_w = 320.0_f32.min(ui.ctx().content_rect().width() - 24.0);
+            let anchor = egui::pos2(ui.max_rect().left() + 12.0, ui.min_rect().bottom() + 4.0);
+            #[allow(deprecated)]
+            egui::Area::new(egui::Id::new("notify-center-popover"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(anchor)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(pop_w);
+                            glass::paint_surface(ui.painter(), ui.max_rect().expand(10.0), 16.0, glass::GlassVariant::Regular, 0.25);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Уведомления").strong().size(14.0).color(WHITE));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if glass::pill_button(ui, "nc-read-all", Vec2::new(112.0, 26.0), None, "Прочитать все", true).clicked() {
+                                        read_all = true;
+                                    }
+                                });
+                            });
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical().max_height(260.0).id_salt("nc-list").show(ui, |ui| {
+                                if self.notify_feed.is_empty() {
+                                    let unread_dlgs: Vec<(i64, String, String)> = self
+                                        .dialogs
+                                        .iter()
+                                        .filter(|d| d.unread > 0 && !d.muted)
+                                        .take(12)
+                                        .map(|d| (d.id, d.name.clone(), format!("{} непроч. — {}", d.unread, d.last)))
+                                        .collect();
+                                    if unread_dlgs.is_empty() {
+                                        ui.label(RichText::new("Нет новых уведомлений").size(12.5).color(SUBTEXT));
+                                    } else {
+                                        for (did, title, sub) in unread_dlgs {
+                                            let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 40.0), Sense::click());
+                                            if rresp.hovered() {
+                                                glass::paint_surface(ui.painter(), rr, 9.0, glass::GlassVariant::Clear, 0.35);
+                                            }
+                                            ui.painter().text(egui::pos2(rr.left() + 8.0, rr.center().y - 7.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
+                                            ui.painter().text(egui::pos2(rr.left() + 8.0, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, sub, FontId::proportional(11.0), SUBTEXT);
+                                            if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                                open_did = Some(did);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for (idx, (did, title, body, _, is_read)) in self.notify_feed.iter().enumerate() {
+                                        let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 42.0), Sense::click());
+                                        if rresp.hovered() {
+                                            glass::paint_surface(ui.painter(), rr, 9.0, glass::GlassVariant::Clear, 0.35);
+                                        }
+                                        if !*is_read {
+                                            ui.painter().circle_filled(egui::pos2(rr.left() + 8.0, rr.center().y), 3.0, c_orange());
+                                        }
+                                        let tx = rr.left() + 18.0;
+                                        ui.painter().text(egui::pos2(tx, rr.center().y - 7.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
+                                        ui.painter().text(egui::pos2(tx, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, body, FontId::proportional(11.0), SUBTEXT);
+                                        if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                            open_did = Some(*did);
+                                        }
+                                        let _ = idx;
+                                    }
+                                }
+                            });
+                        });
+                });
+            if read_all {
+                for item in &mut self.notify_feed {
+                    item.4 = true;
+                }
+                for d in &mut self.dialogs {
+                    d.unread = 0;
+                }
+                self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+                self.send(Cmd::ForceReadAll);
+                self.status = "Все уведомления прочитаны".to_owned();
+                self.notify_popover_open = false;
+            }
+            if let Some(did) = open_did {
+                for item in &mut self.notify_feed {
+                    if item.0 == did {
+                        item.4 = true;
+                    }
+                }
+                self.notify_popover_open = false;
+                if let Some(pos) = self.dialogs.iter().position(|d| d.id == did) {
+                    self.open_dialog(pos);
+                }
+            }
+        }
         ui.add_space(4.0);
         let needle = self.search.trim().to_lowercase();
         if !needle.is_empty() {
@@ -5582,17 +5732,16 @@ impl App {
                             egui::pos2(list_left + 4.0, ind_y + 2.0),
                             egui::pos2((list_left + list_w - 4.0).max(list_left + 20.0), ind_y + DIALOG_ROW_HEIGHT - 2.0),
                         );
-                        if theme::mobile_glass_active() {
-                            glass::paint_surface(ui.painter(), pill_rect, 12.0, glass::GlassVariant::Tinted(t(DIALOG_ACTIVE)), 0.15);
-                        } else {
-                            ui.painter().rect_filled(pill_rect, egui::CornerRadius::same(8), t(DIALOG_ACTIVE));
-                            ui.painter().rect_stroke(
-                                pill_rect,
-                                egui::CornerRadius::same(8),
-                                egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
+                        let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                        let rad = if theme::mobile_glass_active() { 12.0 } else { 9.0 };
+                        glass::paint_surface_interactive(
+                            ui.painter(),
+                            pill_rect,
+                            rad,
+                            glass::GlassVariant::Tinted(t(DIALOG_ACTIVE)),
+                            0.16,
+                            ptr,
+                        );
                         let accent_bar = egui::Rect::from_min_max(
                             egui::pos2(list_left + 1.0, ind_y + 9.0),
                             egui::pos2(list_left + 4.5, ind_y + DIALOG_ROW_HEIGHT - 9.0),
@@ -5684,12 +5833,19 @@ impl App {
                             t_btn(ORANGE)
                         };
                         p.rect_filled(b, egui::CornerRadius::same(10), bg);
+                        let badge_fg = if selected {
+                            t(DIALOG_ACTIVE)
+                        } else if d.muted {
+                            Color32::WHITE
+                        } else {
+                            theme::on_accent()
+                        };
                         p.text(
                             b.center(),
                             egui::Align2::CENTER_CENTER,
                             label,
                             FontId::proportional(12.0),
-                            if selected { t(DIALOG_ACTIVE) } else { Color32::WHITE },
+                            badge_fg,
                         );
                         right = b.left() - 6.0;
                     } else if d.pinned {
@@ -5709,7 +5865,7 @@ impl App {
                             egui::Align2::CENTER_CENTER,
                             "@",
                             FontId::proportional(11.5),
-                            if selected { t(DIALOG_ACTIVE) } else { Color32::WHITE },
+                            if selected { t(DIALOG_ACTIVE) } else { theme::on_accent() },
                         );
                         right = b.left() - 5.0;
                     }
@@ -5864,12 +6020,14 @@ impl App {
                                 if d.pinned { "Открепить" } else { "Закрепить" },
                                 DialogAct::Pin(!d.pinned),
                             );
-                            item(
-                                ui,
-                                if d.muted { "menu/unmute" } else { "menu/mute" },
-                                if d.muted { "Включить звук" } else { "Отключить звук" },
-                                DialogAct::Mute(!d.muted),
-                            );
+                            if d.muted {
+                                item(ui, "menu/unmute", "Включить звук", DialogAct::MuteFor(0));
+                            } else {
+                                item(ui, "menu/mute", "Отключить на 1 ч", DialogAct::MuteFor(3600));
+                                item(ui, "menu/mute", "Отключить на 8 ч", DialogAct::MuteFor(8 * 3600));
+                                item(ui, "menu/mute", "Отключить на 2 д", DialogAct::MuteFor(2 * 86_400));
+                                item(ui, "menu/mute", "Отключить навсегда", DialogAct::MuteFor(i32::MAX));
+                            }
                             if d.unread > 0 {
                                 item(ui, "menu/read", "Прочитать локально", DialogAct::LocalRead);
                                 item(ui, "menu/read", "Прочитать на сервере", DialogAct::Read);
@@ -5907,6 +6065,17 @@ impl App {
                     }
                 }
                 DialogAct::Mute(on) => self.toggle_mute_dialog(i, on),
+                DialogAct::MuteFor(secs) => {
+                    let muted = secs > 0;
+                    if let Some(d) = self.dialogs.get_mut(i) {
+                        d.muted = muted;
+                        d.notify_explicit = Some(muted);
+                        self.dialogs_gen = self.dialogs_gen.wrapping_add(1);
+                    }
+                    if let Some(did) = did {
+                        self.send(Cmd::MuteDialogFor(did, secs));
+                    }
+                }
                 DialogAct::LocalRead => self.local_read_dialog(i),
                 DialogAct::Read => {
                     if let Some(d) = self.dialogs.get_mut(i) {
@@ -5998,7 +6167,9 @@ fn notify_toast(title: &str, body: &str) {
 /// Действие из контекстного меню строки списка чатов.
 enum DialogAct {
     Pin(bool),
+    #[allow(dead_code)]
     Mute(bool),
+    MuteFor(i32),
     LocalRead,
     Read,
     Unread(bool),
@@ -6764,7 +6935,8 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let valid = !self.send_contact_phone.trim().is_empty() && !self.send_contact_first.trim().is_empty();
-                    if ui.add_enabled(valid, egui::Button::new("Отправить").fill(c_orange())).clicked() {
+                    let send_lbl = RichText::new("Отправить").color(if valid { theme::on_accent() } else { SUBTEXT });
+                    if ui.add_enabled(valid, egui::Button::new(send_lbl).fill(c_orange())).clicked() {
                         submit = true;
                     }
                     if ui.button("Отмена").clicked() {
@@ -6822,7 +6994,8 @@ impl App {
                 let ok = parsed.is_some_and(|(lat, lon)| (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(ok, egui::Button::new("Отправить точку").fill(c_orange())).clicked() {
+                    let send_lbl = RichText::new("Отправить точку").color(if ok { theme::on_accent() } else { SUBTEXT });
+                    if ui.add_enabled(ok, egui::Button::new(send_lbl).fill(c_orange())).clicked() {
                         submit = true;
                     }
                     if ui.button("Отмена").clicked() {
@@ -7035,10 +7208,10 @@ impl App {
                         egui::pos2(card_rect.right() - 10.0, card_rect.bottom() - 8.0),
                     );
                     let mbr = ui.interact(mb_rect, ui.make_persistent_id("miniapp-mainbtn"), Sense::click());
-                    let base_c = bridge.main_btn_color.map_or(ORANGE, |(r, g, b)| Color32::from_rgb(r, g, b));
+                    let base_c = bridge.main_btn_color.map_or(c_orange(), |(r, g, b)| Color32::from_rgb(r, g, b));
                     let fill_c = if mbr.hovered() { base_c.gamma_multiply(1.12) } else { base_c };
                     ui.painter().rect_filled(mb_rect, egui::CornerRadius::same(10), fill_c);
-                    ui.painter().text(mb_rect.center(), egui::Align2::CENTER_CENTER, &bridge.main_btn_text, FontId::proportional(14.0), Color32::WHITE);
+                    ui.painter().text(mb_rect.center(), egui::Align2::CENTER_CENTER, &bridge.main_btn_text, FontId::proportional(14.0), theme::contrast_ink(fill_c));
                     if mbr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         main_pressed = true;
                     }
@@ -8548,5 +8721,105 @@ mod tests {
         }
         let end_y = ctx.animate_value_with_time(egui::Id::NULL.with("dialogs-slide-row"), 2.0, 0.22);
         assert!((end_y - 2.0).abs() < 0.15, "indicator should settle near target row 2.0, got {end_y}");
+    }
+
+    fn collect_shape_text(s: &egui::Shape, out: &mut String) {
+        match s {
+            egui::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|x| collect_shape_text(x, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn notification_center_popover_renders_feed_and_read_all() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.notify_popover_open = true;
+        app.notify_feed.push_front((100, "Алиса".to_owned(), "Привет! Тестовое уведомление".to_owned(), 1_760_000_000, false));
+        let mut out_shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(420.0, 720.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.dialogs_ui(ui));
+                },
+            );
+            out.textures_delta.clear();
+            out_shapes = out.shapes;
+        }
+        let mut txt = String::new();
+        out_shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut txt));
+        assert!(txt.contains("Уведомления"), "expected Уведомления header in {txt}");
+        assert!(txt.contains("Прочитать все"), "expected Прочитать все action in {txt}");
+        assert!(txt.contains("Алиса") && txt.contains("Привет! Тестовое уведомление"));
+    }
+
+    #[test]
+    fn apple_spotlight_palette_renders_quick_actions() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.palette_open = true;
+        let mut out_shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(960.0, 720.0))),
+                    ..Default::default()
+                },
+                |_ui| app.quick_switcher_window(&ctx),
+            );
+            out.textures_delta.clear();
+            out_shapes = out.shapes;
+        }
+        let mut txt = String::new();
+        out_shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut txt));
+        assert!(txt.contains("Призрак") && txt.contains("Черновики"), "expected Spotlight shortcuts in {txt}");
+    }
+
+    #[test]
+    fn multi_select_bar_renders_save_to_saved_and_batch_delete() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.selected = Some(0);
+        if app.messages.is_empty() {
+            app.messages.push(MessageRow::plain(101, "Тест пакета".to_owned(), true, app.now));
+        }
+        if !app.dialogs.iter().any(|d| d.saved) && let Some(mut d) = app.dialogs.first().cloned() {
+            d.id = 999_001;
+            d.saved = true;
+            d.name = "Избранное".to_owned();
+            app.dialogs.push(d);
+        }
+        let target_id = app.messages.first().map(|m| m.id).unwrap();
+        app.selected_msgs.insert(target_id);
+        let mut out_shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+                },
+            );
+            out.textures_delta.clear();
+            out_shapes = out.shapes;
+        }
+        let mut txt = String::new();
+        out_shapes.iter().for_each(|cs| collect_shape_text(&cs.shape, &mut txt));
+        assert!(txt.contains("Удалить"), "expected Удалить batch button in {txt}");
+        assert!(txt.contains("В Избранное"), "expected В Избранное batch button in {txt}");
+        assert!(txt.contains("Выбрано: 1"), "expected selection count in {txt}");
     }
 }

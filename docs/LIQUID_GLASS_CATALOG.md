@@ -1,167 +1,121 @@
-# Каталог Liquid Glass и Fluid UI компонентов (108 элементов)
+# Каталог Liquid Glass и Fluid UI — Очередь оставшихся компонентов (62)
 
-Сводный справочник из **108 UI-компонентов и паттернов** в эстетике **iOS 26 Liquid Glass / матовое стекло / пружинные микроанимации**, собранных из открытых каталогов интерфейсов. Статус в таблице показывает, какие компоненты уже адаптированы и портированы в нативный Rust/egui-движок Rustgramm (`glass.rs`, `theme.rs`, `dialogs_ui`, `chat.rs`, `features_ui.rs`).
+Оставшиеся референсы и паттерны **iOS 26 Liquid Glass / матовое стекло / пружинные микроанимации**, ещё **не** портированные в Rustgramm (`v0.30.0`). Все уже реализованные компоненты (включая `#1–15`, `GlassEffect`/`GlassDock`, `NotificationPopover`, `ExpandableSidebar`, `AppleSpotlight`, `ChatComposer`, `SegmentedTabs`, `OtpInput`, а также ранее перенесённые `GlassCard`, `PillButton`, `FloatingTabBar`, `Toast`, `SlidingPill`, `KeypadKeys`, `Switch`, `FloatingDock`, `ActionSheet` и др.) удалены из очереди.
 
-> **Важно:** Rustgramm использует строго матовый тёмный фон без цветных пятен/бликов (в соответствии с требованиями дизайна) — перенесены геометрия капсул, спекулярная кромка, внутренний верхний блик, пружинная физика (`ios_spring`, `ios_spring_bounce`) и контраст оранжевого акцента `#FF7A1A`.
+> **Стиль Rustgramm (`v0.30.0`):** строго монохромный чёрно-белый Liquid Glass (`#F2F2F6` акцент, `#0A0A0C` текст на белых элементах, матовый фон `#08080A` без цветных бликов). Для точности ссылки указывают на корневые каталоги библиотек (`21st.dev`, `reactbits.dev`, `ui.aceternity.com`, `magicui.design`, `motion-primitives.com`, `glasscn.app`, `uiverse.io`).
 
 ---
 
-## 1. 21st.dev — Liquid Glass & iOS Frosted Components (22 компонента)
+## 1. 21st.dev — Оставшиеся компоненты (3)
 
-Источник: <https://21st.dev/s/liquid-glass> · <https://21st.dev/suraj-xd/liquid-glass> · <https://21st.dev/components>
+Источник: <https://21st.dev/s/liquid-glass> · <https://21st.dev/components>
 
-| № | Компонент | Ссылка | Статус в Rustgramm |
+| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 1 | Liquid Glass Card Container | <https://21st.dev/suraj-xd/liquid-glass> | Портирован (`glass::paint_surface` + `GlassVariant::Regular`) |
-| 2 | Liquid Glass Pill Button | <https://21st.dev/s/liquid-glass> | Портирован (`glass::pill_button`, `mobile_glass_active`) |
-| 3 | Liquid Glass Floating Tab Bar | <https://21st.dev/s/liquid-glass> | Портирован (`glass::floating_tab_bar`) |
-| 4 | Liquid Glass Toast Notification | <https://21st.dev/s/liquid-glass> | Портирован (`glass::paint_toast`) |
-| 5 | Liquid Glass Sliding Selection Pill | <https://21st.dev/s/liquid-glass> | Портирован (`dialogs_ui` `dialogs-slide-row`) |
-| 6 | Liquid Glass Specular Border Sheet | <https://21st.dev/s/liquid-glass> | Портирован (`glass::paint_surface` dual rim stroke) |
-| 7 | Liquid Glass Keypad Keys (iPhone Dialer) | <https://21st.dev/s/liquid-glass> | Портирован (`paint_android_keypad` + вектор `BACK`) |
-| 8 | Liquid Glass Search Capsule | <https://21st.dev/s/liquid-glass> | Портирован (поиск чатов / сообщений) |
-| 9 | Liquid Glass Composer Pill Input | <https://21st.dev/s/liquid-glass> | Портирован (`chat.rs` `composer-input` с оранжевым фокусом) |
-| 10 | Liquid Glass Quick-Action Header Dock | <https://21st.dev/s/liquid-glass> | Портирован (`chat.rs` `header_ui`) |
-| 11 | Liquid Glass Context Menu Frame | <https://21st.dev/s/liquid-glass> | Портирован (`kit::compact_popup_frame`) |
-| 12 | Liquid Glass Toggle Switch (iOS Spring) | <https://21st.dev/components> | Портирован (`theme::switch_ui` + `ios_spring`) |
-| 13 | Liquid Glass Segmented Tab Switcher | <https://21st.dev/components> | Портирован (вкладки Эмодзи / Стикеры / GIF, Профиль) |
-| 14 | Liquid Glass Bottom Sheet Scrim | <https://21st.dev/components> | Портирован (`paint_frosted_scrim`) |
-| 15 | Liquid Glass Floating Jump-Down FAB | <https://21st.dev/s/liquid-glass> | Портирован (`scroll-down-fab`, `@`, `❤`) |
-| 16 | Liquid Glass Reaction Pill Chip | <https://21st.dev/s/liquid-glass> | Портирован (`messages_ui` капсулы реакций) |
-| 17 | Liquid Glass Media Preview Scrim | <https://21st.dev/components> | Портирован (`viewer_window`) |
-| 18 | Liquid Glass Modal Dialog Frame | <https://21st.dev/components> | Референс для модальных окон |
-| 19 | Liquid Glass Command Palette Kbar | <https://21st.dev/components> | Референс (команды бота `/` + меню) |
-| 20 | Liquid Glass Tooltip Card | <https://21st.dev/components> | Референс (всплывающие подсказки) |
-| 21 | Liquid Glass Avatar Presence Badge | <https://21st.dev/components> | Портирован (`online` кольцо и бейдж канала) |
-| 22 | Liquid Glass Pinned Message Banner | <https://21st.dev/s/liquid-glass> | Портирован (шапка закреплённого сообщения во всю ширину) |
+| 1 | Liquid Glass Modal Dialog Frame | <https://21st.dev/components> | Модальные окна поверх ленты (перенос на единую рамку `glass.rs`) |
+| 2 | Liquid Glass Command Palette Kbar | <https://21st.dev/components> | Меню `/` команд бота в стиле Kbar |
+| 3 | Liquid Glass Tooltip Card | <https://21st.dev/components> | Единая стеклянная карточка hover-подсказок |
 
 ---
 
-## 2. ReactBits — Fluid Animations, Optical Glass & Micro-Interactions (20 компонентов)
+## 2. ReactBits — Оставшиеся компоненты (12)
 
 Источник: <https://reactbits.dev/>
 
-| № | Компонент | Ссылка | Назначение / статус |
+| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 23 | Glass Surface | <https://reactbits.dev/components/glass-surface> | Портирован (верхний блик преломления в `glass.rs`) |
-| 24 | Glass Icons | <https://reactbits.dev/components/glass-icons> | Портирован (иконки быстрой панели профиля) |
-| 25 | Dock (macOS / iOS Fluid Dock) | <https://reactbits.dev/components/dock> | Портирован (увеличение при наведении/нажатии `spring_scale`) |
-| 26 | Pill Nav | <https://reactbits.dev/components/pill-nav> | Портирован (скользящий индикатор выбранного чата) |
-| 27 | Flowing Menu | <https://reactbits.dev/components/flowing-menu> | Референс (список диалогов с плавным hover-слоем) |
-| 28 | Elastic Slider | <https://reactbits.dev/components/elastic-slider> | Референс (ползунки прозрачности в Настройках) |
-| 29 | Bounce Cards | <https://reactbits.dev/components/bounce-cards> | Референс (карточки историй / подарков Stars) |
-| 30 | Animated List | <https://reactbits.dev/components/animated-list> | Референс (появление новых сообщений в ленте) |
-| 31 | Counter (Animated Digits) | <https://reactbits.dev/components/counter> | Референс (счётчики непрочитанных и реакций) |
-| 32 | Magnet Button | <https://reactbits.dev/components/magnet> | Референс (кнопка отправки и FAB-кнопки) |
-| 33 | Glare Hover | <https://reactbits.dev/animations/glare-hover> | Адаптирован (нейтральный верхний блик без цветных пятен) |
-| 34 | Click Spark | <https://reactbits.dev/animations/click-spark> | Портирован (`rx_pop` анимация клика по реакции) |
-| 35 | Star Border | <https://reactbits.dev/animations/star-border> | Референс (рамка звёздной платной реакции `⭐`) |
-| 36 | Spotlight Card | <https://reactbits.dev/components/spotlight-card> | Референс (карточка предпросмотра чата) |
-| 37 | Gooey Nav | <https://reactbits.dev/components/gooey-nav> | Референс (плавный переход вкладок профиля) |
-| 38 | Gradual Blur | <https://reactbits.dev/animations/gradual-blur> | Референс (мягкий градиент у верхнего/нижнего края ленты) |
-| 39 | Bubble Menu | <https://reactbits.dev/components/bubble-menu> | Референс (всплывающая палитра реакций) |
-| 40 | Stepper (Smooth Wizard) | <https://reactbits.dev/components/stepper> | Портирован (шаги входа Телефон → Код → 2FA Пароль) |
-| 41 | Folder Reveal | <https://reactbits.dev/components/folder> | Референс (папки чатов и архива) |
-| 42 | Tilted Card | <https://reactbits.dev/components/tilted-card> | Референс (карточки подарков и стикеров) |
+| 4 | Flowing Menu | <https://reactbits.dev/components> | Плавный hover-слой в строках списка диалогов |
+| 5 | Elastic Slider | <https://reactbits.dev/components> | Ползунки прозрачности/скорости с резиновым отскоком в Настройках |
+| 6 | Bounce Cards | <https://reactbits.dev/components> | Карточки историй и витрины подарков Stars |
+| 7 | Animated List | <https://reactbits.dev/components> | Пружинное появление новых сообщений в ленте |
+| 8 | Counter (Animated Digits) | <https://reactbits.dev/components> | Перелистывающиеся цифры счётчиков непрочитанных и реакций |
+| 9 | Magnet Button | <https://reactbits.dev/components> | Магнитное притяжение указателя для FAB-кнопок |
+| 10 | Star Border | <https://reactbits.dev/components> | Монохромный мерцающий контур платной звёздной реакции |
+| 11 | Spotlight Card | <https://reactbits.dev/components> | Карточка предпросмотра чата (`Peek`) |
+| 12 | Gooey Nav | <https://reactbits.dev/components> | Плавное слияние вкладок профиля |
+| 13 | Gradual Blur | <https://reactbits.dev/components> | Мягкое растворение у верхнего и нижнего края ленты |
+| 14 | Bubble Menu | <https://reactbits.dev/components> | Радиальная всплывающая палитра реакций |
+| 15 | Folder Reveal | <https://reactbits.dev/components> | Папки чатов и архива |
+| 16 | Tilted Card | <https://reactbits.dev/components> | Карточки подарков и стикерпаков |
 
 ---
 
-## 3. Aceternity UI — Depth, Floating Docks & Tactile Panels (16 компонентов)
+## 3. Aceternity UI — Оставшиеся компоненты (12)
 
 Источник: <https://ui.aceternity.com/components>
 
-| № | Компонент | Ссылка | Назначение / статус |
+| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 43 | Floating Dock | <https://ui.aceternity.com/components/floating-dock> | Портирован (нижняя навигационная панель на телефоне) |
-| 44 | Floating Navbar | <https://ui.aceternity.com/components/floating-navbar> | Референс (верхняя шапка чата) |
-| 45 | Tabs (Sliding Pill Tabs) | <https://ui.aceternity.com/components/tabs> | Портирован (папки и вкладки настроек) |
-| 46 | Animated Tooltip | <https://ui.aceternity.com/components/animated-tooltip> | Референс (подписи при наведении на участников) |
-| 47 | Animated Modal | <https://ui.aceternity.com/components/animated-modal> | Референс (модалки подтверждения и Stars) |
-| 48 | Stateful Button | <https://ui.aceternity.com/components/stateful-button> | Референс (кнопка отправки с состоянием загрузки) |
-| 49 | Placeholders And Vanish Input | <https://ui.aceternity.com/components/placeholders-and-vanish-input> | Референс (поле ввода и поиск) |
-| 50 | Sidebar (Collapsible Navigation) | <https://ui.aceternity.com/components/sidebar> | Портирован (левая боковая панель папок и аккаунтов) |
-| 51 | File Upload Dropzone | <https://ui.aceternity.com/components/file-upload> | Портирован (drag-and-drop вложений с превью) |
-| 52 | Moving Border | <https://ui.aceternity.com/components/moving-border> | Референс (активный контур записи голосового) |
-| 53 | Focus Cards | <https://ui.aceternity.com/components/focus-cards> | Референс (карточки тем и паков стикеров) |
-| 54 | Glare Card | <https://ui.aceternity.com/components/glare-card> | Референс (просмотр стикерпака) |
-| 55 | Expandable Card | <https://ui.aceternity.com/components/expandable-card> | Референс (раскрытие комментариев поста и ответов) |
-| 56 | Timeline View | <https://ui.aceternity.com/components/timeline> | Референс (журнал удалённых/правок сообщения) |
-| 57 | Hover Border Gradient | <https://ui.aceternity.com/components/hover-border-gradient> | Референс (обводка кнопок меню бота) |
-| 58 | Layout Grid | <https://ui.aceternity.com/components/layout-grid> | Референс (сетка медиафайлов в правой панели) |
+| 17 | Floating Navbar | <https://ui.aceternity.com/components> | Верхняя плавающая шапка чата |
+| 18 | Animated Tooltip | <https://ui.aceternity.com/components> | Подписи участников над аватарками |
+| 19 | Animated Modal | <https://ui.aceternity.com/components> | Пружинные модалки Stars и подтверждений |
+| 20 | Stateful Button | <https://ui.aceternity.com/components> | Кнопки с встроенным индикатором загрузки |
+| 21 | Placeholders And Vanish Input | <https://ui.aceternity.com/components> | Анимированные подсказки поля ввода и поиска |
+| 22 | Moving Border | <https://ui.aceternity.com/components> | Контур активной записи голоса |
+| 23 | Focus Cards | <https://ui.aceternity.com/components> | Карточки тем и наборов стикеров |
+| 24 | Glare Card | <https://ui.aceternity.com/components> | Карточка просмотра стикерпака |
+| 25 | Expandable Card | <https://ui.aceternity.com/components> | Раскрытие комментариев поста и ответов |
+| 26 | Timeline View | <https://ui.aceternity.com/components> | Журнал удалённых и правок сообщения |
+| 27 | Hover Border Gradient | <https://ui.aceternity.com/components> | Световая кромка кнопок меню бота |
+| 28 | Layout Grid | <https://ui.aceternity.com/components> | Сетка медиафайлов в правой панели |
 
 ---
 
-## 4. Magic UI — Tactile Surface Micro-Motion & Dock Physics (16 компонентов)
+## 4. Magic UI — Оставшиеся компоненты (13)
 
 Источник: <https://magicui.design/docs/components/dock>
 
-| № | Компонент | Ссылка | Назначение / статус |
+| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 59 | Magic Dock | <https://magicui.design/docs/components/dock> | Портирован (панель вкладок с физикой масштаба) |
-| 60 | Animated List | <https://magicui.design/docs/components/animated-list> | Референс (лента входящих сообщений) |
-| 61 | Animated Beam | <https://magicui.design/docs/components/animated-beam> | Референс (пересылка / ответы на сообщения) |
-| 62 | Shimmer Button | <https://magicui.design/docs/components/shimmer-button> | Референс (CTA «Запустить бота /start» и «ДАЛЕЕ») |
-| 63 | Shine Border | <https://magicui.design/docs/components/shine-border> | Референс (кромка активного стекла) |
-| 64 | Border Beam | <https://magicui.design/docs/components/border-beam> | Референс (индикация звонка / синхронизации) |
-| 65 | Ripple Button | <https://magicui.design/docs/components/ripple-button> | Референс (отклик нажатия клавиатуры кода/номера) |
-| 66 | Pulsating Button | <https://magicui.design/docs/components/pulsating-button> | Адаптирован (строго для кнопки активной записи голоса) |
-| 67 | Number Ticker | <https://magicui.design/docs/components/number-ticker> | Референс (плавный счётчик звёзд/просмотров) |
-| 68 | Bento Grid | <https://magicui.design/docs/components/bento-grid> | Референс (обзор аккаунта / профиля) |
-| 69 | Marquee | <https://magicui.design/docs/components/marquee> | Референс (бегущая строка длинного названия трека) |
-| 70 | Avatar Circles | <https://magicui.design/docs/components/avatar-circles> | Референс (прочитавшие сообщение в «Сведениях») |
-| 71 | Confetti Burst | <https://magicui.design/docs/components/confetti> | Портирован (эффекты сообщений и `⭐`) |
-| 72 | Blur Fade | <https://magicui.design/docs/components/blur-fade> | Референс (плавное открытие вьювера медиа) |
-| 73 | Lens Magnifier | <https://magicui.design/docs/components/lens> | Референс (зум вьювера фото) |
-| 74 | Hero Video Dialog | <https://magicui.design/docs/components/hero-video-dialog> | Референс (встроенный видео-просмотрщик) |
+| 29 | Animated List | <https://magicui.design/docs/components/dock> | Плавное появление входящих сообщений |
+| 30 | Animated Beam | <https://magicui.design/docs/components/dock> | Связь ответов и пересылки |
+| 31 | Shimmer Button | <https://magicui.design/docs/components/dock> | CTA «Запустить бота /start» и «ДАЛЕЕ» |
+| 32 | Shine Border | <https://magicui.design/docs/components/dock> | Монохромная световая кромка стекла |
+| 33 | Border Beam | <https://magicui.design/docs/components/dock> | Индикатор активного звонка / синхронизации |
+| 34 | Ripple Button | <https://magicui.design/docs/components/dock> | Волна нажатия клавиш набора |
+| 35 | Number Ticker | <https://magicui.design/docs/components/dock> | Плавный счётчик звёзд и просмотров |
+| 36 | Bento Grid | <https://magicui.design/docs/components/dock> | Сетка профиля и обзора аккаунта |
+| 37 | Marquee | <https://magicui.design/docs/components/dock> | Бегущая строка длинного названия трека |
+| 38 | Avatar Circles | <https://magicui.design/docs/components/dock> | Прочитавшие сообщение в «Сведениях» |
+| 39 | Blur Fade | <https://magicui.design/docs/components/dock> | Плавное открытие просмотрщика медиа |
+| 40 | Lens Magnifier | <https://magicui.design/docs/components/dock> | Лупа масштабирования фото во вьювере |
+| 41 | Hero Video Dialog | <https://magicui.design/docs/components/dock> | Модальный видео-просмотрщик |
 
 ---
 
-## 5. Motion Primitives — Smooth Springs, Morphing Popovers & Sliders (14 компонентов)
+## 5. Motion Primitives — Оставшиеся компоненты (12)
 
 Источник: <https://motion-primitives.com/docs>
 
-| № | Компонент | Ссылка | Назначение / статус |
+| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 75 | Animated Background (Sliding Highlight) | <https://motion-primitives.com/docs> | Портирован (`dialogs-slide-row` скользящая плашка чатов) |
-| 76 | Morphing Popover | <https://motion-primitives.com/docs> | Референс (меню выбора эмодзи и реакций) |
-| 77 | Morphing Dialog | <https://motion-primitives.com/docs> | Референс (переход в предпросмотр чата и профиль) |
-| 78 | Disclosure Collapse | <https://motion-primitives.com/docs> | Референс (сворачиваемые разделы настроек AyuGram) |
-| 79 | Sliding Number | <https://motion-primitives.com/docs> | Референс (счётчики непрочитанных сообщений) |
-| 80 | Text Morph | <https://motion-primitives.com/docs> | Референс (переключение статуса «в сети» / «печатает…») |
-| 81 | Magnetic Action Trigger | <https://motion-primitives.com/docs> | Референс (кнопка отправки / микрофона) |
-| 82 | Transition Panel | <https://motion-primitives.com/docs> | Референс (смена экрана Телефон → Код → Чаты) |
-| 83 | Toolbar Dynamic | <https://motion-primitives.com/docs> | Референс (панель форматирования `[Aa]`) |
-| 84 | Toolbar Expandable | <https://motion-primitives.com/docs> | Референс (панель множественного выделения) |
-| 85 | Scroll Progress Bar | <https://motion-primitives.com/docs> | Референс (индикатор прокрутки историй) |
-| 86 | Cursor Context Tag | <https://motion-primitives.com/docs> | Референс (автоскролл по средней кнопке мыши) |
-| 87 | Border Trail | <https://motion-primitives.com/docs> | Референс (рамка активной загрузки файла) |
-| 88 | Glow Effect (Monochrome Specular) | <https://motion-primitives.com/docs> | Адаптирован (только белый спекулярный контур, без цветного свечения) |
+| 42 | Morphing Popover | <https://motion-primitives.com/docs> | Меню выбора эмодзи и реакций |
+| 43 | Morphing Dialog | <https://motion-primitives.com/docs> | Переход в предпросмотр чата и профиль |
+| 44 | Disclosure Collapse | <https://motion-primitives.com/docs> | Сворачиваемые разделы настроек AyuGram |
+| 45 | Sliding Number | <https://motion-primitives.com/docs> | Скользящие цифры счётчиков непрочитанных |
+| 46 | Text Morph | <https://motion-primitives.com/docs> | Переход статуса «в сети» ↔ «печатает…» |
+| 47 | Magnetic Action Trigger | <https://motion-primitives.com/docs> | Кнопка отправки / микрофона |
+| 48 | Transition Panel | <https://motion-primitives.com/docs> | Переходы экранов Телефон → Код → Чаты |
+| 49 | Toolbar Dynamic | <https://motion-primitives.com/docs> | Динамическая панель форматирования `[Aa]` |
+| 50 | Toolbar Expandable | <https://motion-primitives.com/docs> | Расширяемая панель пакетного выделения |
+| 51 | Scroll Progress Bar | <https://motion-primitives.com/docs> | Полоса прогресса историй |
+| 52 | Cursor Context Tag | <https://motion-primitives.com/docs> | Иконка автоскролла у курсора |
+| 53 | Border Trail | <https://motion-primitives.com/docs> | Индикатор активной загрузки файла |
 
 ---
 
-## 6. GlassCN & Uiverse — Матовые стеклянные примитивы (20 компонентов)
+## 6. GlassCN & Uiverse — Оставшиеся компоненты (9)
 
 Источники: <https://glasscn.app> · <https://uiverse.io/elements?search=glassmorphism>
 
-| № | Компонент | Ссылка | Назначение / статус |
+| № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 89 | GlassCN Frost Card | <https://glasscn.app> | Портирован (`GlassVariant::Regular`) |
-| 90 | GlassCN Clear Pill | <https://glasscn.app> | Портирован (`GlassVariant::Clear`) |
-| 91 | GlassCN Tinted Surface | <https://glasscn.app> | Портирован (`GlassVariant::Tinted`) |
-| 92 | GlassCN Modal Drawer | <https://glasscn.app> | Референс (мобильная шторка) |
-| 93 | GlassCN Action Sheet | <https://glasscn.app> | Портирован (контекстные действия сообщения) |
-| 94 | GlassCN Dropdown Menu | <https://glasscn.app> | Референс (меню заголовка чата) |
-| 95 | GlassCN Slider Track | <https://glasscn.app> | Референс (настройки прозрачности) |
-| 96 | GlassCN Switch Pill | <https://glasscn.app> | Портирован (`switch_ui`) |
-| 97 | GlassCN Badge Chip | <https://glasscn.app> | Портирован (бейджи `BOT`, `ADMIN`, реакции) |
-| 98 | GlassCN Breadcrumb Bar | <https://glasscn.app> | Референс (ветка форума и комментарии) |
-| 99 | Uiverse Frosted Dark Button | <https://uiverse.io/elements?search=glassmorphism> | Портирован (клавиатура цифр входа) |
-| 100 | Uiverse Translucent Input Bar | <https://uiverse.io/elements?search=glassmorphism> | Портирован (`composer-input`) |
-| 101 | Uiverse Frosted Search Box | <https://uiverse.io/elements?search=glassmorphism> | Портирован (поиск в списке чатов) |
-| 102 | Uiverse Specular Neon Edge Card | <https://uiverse.io/elements?search=glassmorphism> | Адаптирован (монохромный + `#FF7A1A` фокус) |
-| 103 | Uiverse Glass Toggle Group | <https://uiverse.io/elements?search=glassmorphism> | Референс (фильтры поиска по чату) |
-| 104 | Uiverse Glass Profile Card | <https://uiverse.io/elements?search=glassmorphism> | Референс (правая панель сведений о чате) |
-| 105 | Uiverse Glass Audio Mini-Player | <https://uiverse.io/elements?search=glassmorphism> | Портирован (плеер трека и голосовых сообщений) |
-| 106 | Uiverse Glass Audio Progress Pill | <https://uiverse.io/elements?search=glassmorphism> | Референс (прогресс воспроизведения) |
-| 107 | Uiverse Glass Call Control Dock | <https://uiverse.io/elements?search=glassmorphism> | Референс (оверлей активного звонка) |
-| 108 | Uiverse Glass Floating Banner | <https://uiverse.io/elements?search=glassmorphism> | Портирован (верхний закреплённый баннер) |
+| 54 | GlassCN Modal Drawer | <https://glasscn.app> | Мобильная нижняя шторка |
+| 55 | GlassCN Dropdown Menu | <https://glasscn.app> | Выпадающее меню заголовка чата |
+| 56 | GlassCN Slider Track | <https://glasscn.app> | Стеклянные треки ползунков настроек |
+| 57 | GlassCN Breadcrumb Bar | <https://glasscn.app> | Навигация по темам форума и комментариям |
+| 58 | Uiverse Glass Toggle Group | <https://uiverse.io/elements?search=glassmorphism> | Фильтры поиска по чату |
+| 59 | Uiverse Glass Profile Card | <https://uiverse.io/elements?search=glassmorphism> | Правая панель сведений о чате |
+| 60 | Uiverse Glass Audio Progress Pill | <https://uiverse.io/elements?search=glassmorphism> | Пилюля прогресса аудио/голосовых |
+| 61 | Uiverse Glass Call Control Dock | <https://uiverse.io/elements?search=glassmorphism> | Оверлей управления звонком |
+| 62 | Uiverse Specular Card Overlay | <https://uiverse.io/elements?search=glassmorphism> | Двойная кромка карточек галереи медиа |

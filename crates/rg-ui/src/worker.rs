@@ -622,6 +622,17 @@ pub enum Cmd {
     SearchFiltered(i64, String, rg_core::engine::ChatSearchFilter),
     /// Отправить сообщение без звука (`silent = true`) с оптимистичным temp_id.
     SendSilent(i64, String, Option<i32>, i32),
+    /// Отключить звук диалога на указанное число секунд (`0` — включить звук, `i32::MAX` — навсегда).
+    MuteDialogFor(i64, i32),
+    /// Очистить все облачные черновики во всех чатах (`messages.clearAllDrafts`).
+    ClearAllDrafts,
+    /// Создать новую тему в супергруппе-форуме (`messages.createForumTopic`).
+    CreateForumTopic(i64, String),
+    /// Пакетно удалить выделенные сообщения (с резервной копией для AyuGram).
+    DeleteBatch {
+        dialog_id: i64,
+        backups: Vec<(i32, String, i64, bool, String)>,
+    },
     Settings(Box<Settings>),
 }
 
@@ -5331,6 +5342,75 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             out.send(Ev::SendFailed(did, temp_id, msg.clone()));
                             out.err(msg);
                         }
+                    }
+                });
+            }
+            Cmd::MuteDialogFor(did, secs) => {
+                let Some(d) = find_dialog_mut(&mut dialogs, did) else { continue };
+                let peer = d.peer;
+                let muted = secs > 0;
+                d.muted = muted;
+                d.notify_explicit = Some(muted);
+                out.send(Ev::Dialogs(dialogs.clone()));
+                let until_unix = if secs <= 0 {
+                    0
+                } else if secs == i32::MAX {
+                    i32::MAX
+                } else {
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |x| x.as_secs() as i32);
+                    now_s.saturating_add(secs)
+                };
+                let (eng, out, tx, flag) = (
+                    engine.clone(),
+                    out.clone(),
+                    dialog_refresh_tx.clone(),
+                    std::sync::Arc::clone(&refresh_in_flight),
+                );
+                tokio::spawn(async move {
+                    match eng.set_muted_until(peer, until_unix).await {
+                        Ok(()) => {
+                            out.send(Ev::Status(if muted { "Уведомления отключены".into() } else { "Уведомления включены".into() }));
+                            fetch_and_push_dialogs(&eng, &tx, &flag).await;
+                        }
+                        Err(e) => out.err(format!("Звук: {e}")),
+                    }
+                });
+            }
+            Cmd::ClearAllDrafts => {
+                let (eng, out) = (engine.clone(), out.clone());
+                tokio::spawn(async move {
+                    match eng.clear_all_drafts().await {
+                        Ok(_) => out.send(Ev::Status("Все облачные черновики очищены".into())),
+                        Err(e) => out.err(format!("Очистка черновиков: {e}")),
+                    }
+                });
+            }
+            Cmd::CreateForumTopic(did, title) => {
+                let Some(d) = find_dialog(&dialogs, did) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                tokio::spawn(async move {
+                    match eng.create_forum_topic(peer, &title).await {
+                        Ok(list) => {
+                            out.send(Ev::ForumTopics(did, list));
+                            out.send(Ev::Status(format!("Тема «{}» создана", title.trim())));
+                        }
+                        Err(e) => out.err(format!("Создание темы: {e}")),
+                    }
+                });
+            }
+            Cmd::DeleteBatch { dialog_id, backups } => {
+                let Some(d) = find_dialog(&dialogs, dialog_id) else { continue };
+                let (eng, out, peer) = (engine.clone(), out.clone(), d.peer);
+                let cnt = backups.len();
+                tokio::spawn(async move {
+                    match eng.delete_with_backup(peer, &backups).await {
+                        Ok(_) => {
+                            out.send(Ev::Status(format!("Удалено сообщений: {cnt}")));
+                            reload(&eng, &out, peer).await;
+                        }
+                        Err(e) => out.err(format!("Пакетное удаление: {e}")),
                     }
                 });
             }

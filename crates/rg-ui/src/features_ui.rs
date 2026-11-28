@@ -109,7 +109,7 @@ impl App {
             Align2::CENTER_CENTER,
             if self.update_progress.is_some() { "Загрузка…" } else { "Обновить" },
             FontId::proportional(12.5),
-            Color32::WHITE,
+            super::theme::on_accent(),
         );
         if self.update_progress.is_none()
             && ur.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
@@ -1941,13 +1941,14 @@ impl App {
                 }
             }
         }
-        const ACTIONS: [(&str, &str, &str); 9] = [
+        const ACTIONS: [(&str, &str, &str); 10] = [
             ("Настройки Telegram", "Профиль, приватность, прокси, логи", "settings"),
             ("Мои звёзды и подарки ⭐", "Баланс Stars и витрина подарков", "stars"),
             ("Telegram Бизнес", "Часы работы и быстрые ответы", "business"),
             ("Темы и иконки AyuGram", ".tdesktop-theme / .attheme / паки иконок", "themes"),
             ("Секретные чаты (E2E)", "Шифрование MTProto 2.0", "secret"),
             ("Переключить Режим призрака", "Не читать сообщения и истории", "ghost"),
+            ("Очистить все облачные черновики", "Синхронизация messages.clearAllDrafts", "clear_drafts"),
             ("Создать чек-лист (To-Do)", "Интерактивный список в открытый чат", "todo"),
             ("Создать опрос / викторину", "В открытый чат", "poll"),
             ("Добавить ещё один аккаунт", "Без ограничений на количество аккаунтов", "add_acc"),
@@ -1990,30 +1991,65 @@ impl App {
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.set_width(card_w);
-                        paint_frosted_glass_panel(ui.painter(), ui.max_rect().expand(12.0), 16.0, raw);
-                        let inp = ui.add(
-                            egui::TextEdit::singleline(&mut self.palette_query)
-                                .hint_text("Быстрый переход: чат, команда, настройки… (Ctrl+K)")
-                                .desired_width(card_w - 8.0)
-                                .margin(Vec2::new(10.0, 8.0)),
-                        );
-                        if self.palette_open {
-                            inp.request_focus();
-                        }
+                        paint_frosted_glass_panel(ui.painter(), ui.max_rect().expand(12.0), 18.0, raw);
+                        // #8 AppleSpotlight: поисковая пилюля с иконкой и рядами быстрых действий.
+                        ui.horizontal(|ui| {
+                            let sw = (card_w - 8.0).max(160.0);
+                            let (sr, _) = ui.allocate_exact_size(Vec2::new(sw, 38.0), Sense::hover());
+                            super::glass::paint_surface(
+                                ui.painter(),
+                                sr,
+                                19.0,
+                                super::glass::GlassVariant::Clear,
+                                0.16,
+                            );
+                            super::icons::tg_sized(ui.painter(), "menu/search", Pos2::new(sr.left() + 18.0, sr.center().y), Vec2::splat(16.0), c_orange());
+                            let inner = Rect::from_min_max(
+                                sr.min + Vec2::new(34.0, 4.0),
+                                sr.max - Vec2::new(12.0, 4.0),
+                            );
+                            let inp = ui.put(
+                                inner,
+                                egui::TextEdit::singleline(&mut self.palette_query)
+                                    .hint_text("Spotlight: чат, команда, настройки… (Ctrl+K)")
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(inner.width()),
+                            );
+                            if self.palette_open {
+                                inp.request_focus();
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let pills = [
+                                ("settings/settings", "Настройки", "settings"),
+                                ("menu/secret", "Призрак", "ghost"),
+                                ("menu/clear", "Черновики", "clear_drafts"),
+                                ("menu/lock", "Секрет", "secret"),
+                            ];
+                            let pw = ((card_w - 26.0) / pills.len() as f32).max(60.0);
+                            for (ico, lbl, key) in pills {
+                                let is_on = key == "ghost" && self.settings.ghost.active;
+                                if super::glass::pill_button(ui, ("sp-qa", key), Vec2::new(pw, 30.0), Some(ico), lbl, is_on).clicked() {
+                                    chosen = Some(PaletteHit::Cmd(key));
+                                }
+                            }
+                        });
                         ui.add_space(8.0);
-                        egui::ScrollArea::vertical().max_height(330.0).id_salt("palette-list").show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(310.0).id_salt("palette-list").show(ui, |ui| {
+                            let ptr = ui.ctx().input(|inp| inp.pointer.hover_pos());
                             for (i, (title, sub, hit)) in hits.iter().enumerate() {
                                 let sel = i == self.palette_sel;
                                 let (r, resp) = ui.allocate_exact_size(Vec2::new(card_w - 8.0, 40.0), Sense::click());
                                 if sel || resp.hovered() {
-                                    ui.painter().rect_filled(
+                                    super::glass::paint_surface_interactive(
+                                        ui.painter(),
                                         r,
-                                        CornerRadius::same(9),
-                                        if sel {
-                                            Color32::from_rgba_unmultiplied(c_orange().r(), c_orange().g(), c_orange().b(), 44)
-                                        } else {
-                                            t(WINDOW_OVER)
-                                        },
+                                        10.0,
+                                        if sel { super::glass::GlassVariant::Tinted(c_orange()) } else { super::glass::GlassVariant::Clear },
+                                        if sel { 0.4 } else { 0.2 },
+                                        ptr,
                                     );
                                 }
                                 ui.painter().text(
@@ -2021,7 +2057,7 @@ impl App {
                                     Align2::LEFT_CENTER,
                                     title,
                                     FontId::proportional(13.5),
-                                    if sel { c_orange() } else { WHITE },
+                                    if sel { Color32::WHITE } else { WHITE },
                                 );
                                 ui.painter().text(
                                     Pos2::new(r.left() + 12.0, r.center().y + 9.0),
@@ -2029,6 +2065,13 @@ impl App {
                                     sub,
                                     FontId::proportional(11.0),
                                     SUBTEXT,
+                                );
+                                ui.painter().text(
+                                    Pos2::new(r.right() - 12.0, r.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    "›",
+                                    FontId::proportional(16.0),
+                                    if sel { Color32::WHITE } else { SUBTEXT },
                                 );
                                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                     chosen = Some(hit.clone());
@@ -2068,6 +2111,7 @@ impl App {
                     self.settings.ghost.set_active(on);
                     self.send(Cmd::Settings(Box::new(self.settings.clone())));
                 }
+                PaletteHit::Cmd("clear_drafts") => self.send(Cmd::ClearAllDrafts),
                 PaletteHit::Cmd("todo") if self.selected.is_some() => self.todo_modal_open = true,
                 PaletteHit::Cmd("poll") if self.selected.is_some() => self.poll_modal_open = true,
                 PaletteHit::Cmd("add_acc") => self.send(Cmd::AddAccountAuto),
