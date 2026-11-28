@@ -284,8 +284,10 @@ pub fn isolated_connection_params(cfg: &Config) -> grammers_mtsender::Connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeWinner {
     pub dc_id: i32,
+    pub addr: std::net::SocketAddr,
     pub use_ipv6: bool,
     pub use_obfuscated: bool,
+    pub mode: crate::transport::TransportMode,
     pub rtt_ms: u32,
 }
 
@@ -293,7 +295,7 @@ async fn probe_single_endpoint(
     dc_id: i32,
     addr: std::net::SocketAddr,
     use_ipv6: bool,
-    use_obfuscated: bool,
+    mode: crate::transport::TransportMode,
     delay_ms: u64,
 ) -> Option<ProbeWinner> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -305,7 +307,7 @@ async fn probe_single_endpoint(
     tokio::time::timeout(deadline, async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
         let _ = stream.set_nodelay(true);
-        let (pkt, mut tr) = crate::transport::build_req_pq_probe(use_obfuscated);
+        let (pkt, mut tr) = crate::transport::build_req_pq_probe_mode(mode);
         stream.write_all(&pkt).await.ok()?;
         let _ = stream.flush().await;
         let mut buf = vec![0_u8; 512];
@@ -315,16 +317,21 @@ async fn probe_single_endpoint(
             if n == 0 {
                 break;
             }
+            let prev = filled;
             filled += n;
-            let mut copy = buf[..filled].to_vec();
-            if crate::transport::is_valid_res_pq_reply(&mut *tr, &mut copy) {
+            // Расшифровываем единый накопительный буфер на месте, чтобы Obfuscated::decrypt_tail
+            // не рассинхронизировался при приходе ответа частями.
+            if crate::transport::is_valid_res_pq_reply(&mut *tr, &mut buf[..filled]) {
                 return Some(ProbeWinner {
                     dc_id,
+                    addr,
                     use_ipv6,
-                    use_obfuscated,
+                    use_obfuscated: mode.is_obfuscated(),
+                    mode,
                     rtt_ms: started.elapsed().as_millis() as u32,
                 });
             }
+            let _ = prev;
         }
         None
     })
@@ -333,68 +340,175 @@ async fn probe_single_endpoint(
     .flatten()
 }
 
-/// Живая MTProto-проверка официальных DC Telegram (`req_pq_multi` -> `resPQ`):
-/// отбрасывает IPv6/заблокированные маршруты, принимающие TCP и обрывающие поток с 0 байтами,
-/// и выбирает первый реально отвечающий дата-центр с самым низким RTT.
-pub async fn probe_reachable_dc(preferred_dc: i32) -> Option<ProbeWinner> {
-    let data = grammers_session::SessionData::default();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProbeWinner>(32);
-    let mut handles = Vec::new();
-    for (&dc_id, dc) in &data.dc_options {
-        let v4: std::net::SocketAddr = dc.ipv4.into();
-        let v6: std::net::SocketAddr = dc.ipv6.into();
-        let is_pref = dc_id == preferred_dc;
+/// Дополнительные официальные IP-адреса Telegram DC1..DC5 для устойчивой связности на мобильных сетях.
+fn dc_ipv4_candidates(dc_id: i32, primary: std::net::SocketAddrV4) -> Vec<std::net::SocketAddrV4> {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    let mut out = vec![primary];
+    let extras: &[Ipv4Addr] = match dc_id {
+        1 => &[Ipv4Addr::new(149, 154, 175, 50), Ipv4Addr::new(149, 154, 175, 53)],
+        2 => &[Ipv4Addr::new(149, 154, 167, 51), Ipv4Addr::new(149, 154, 167, 41)],
+        3 => &[Ipv4Addr::new(149, 154, 175, 100)],
+        4 => &[Ipv4Addr::new(149, 154, 167, 91), Ipv4Addr::new(149, 154, 167, 92)],
+        5 => &[Ipv4Addr::new(91, 108, 56, 130), Ipv4Addr::new(91, 108, 56, 104)],
+        _ => &[],
+    };
+    for ip in extras {
+        if *ip != *primary.ip() {
+            out.push(SocketAddrV4::new(*ip, 443));
+        }
+    }
+    out
+}
 
-        for (addr, is_v6, obf, delay) in [
-            (v4, false, true, if is_pref { 0_u64 } else { 80 }),
-            (v4, false, false, if is_pref { 450 } else { 550 }),
-            (v6, true, true, 700),
-        ] {
+/// Живая многопоточная MTProto-проверка всех официальных DC Telegram (`req_pq_multi` -> `resPQ`):
+/// отбирает по одному самому быстрому живому эндпоинту на каждый DC и порт (`443`, опционально `80`/`5222`).
+pub async fn probe_reachable_dcs(
+    preferred_dc: i32,
+    force_ipv4: bool,
+    allow_alt_ports: bool,
+) -> Vec<ProbeWinner> {
+    use crate::transport::TransportMode;
+    let data = grammers_session::SessionData::default();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProbeWinner>(64);
+    let mut handles = Vec::new();
+    let ports: &[u16] = if allow_alt_ports { &[443, 80, 5222] } else { &[443, 80] };
+    for (&dc_id, dc) in &data.dc_options {
+        let is_pref = dc_id == preferred_dc;
+        let base_delay = if is_pref { 0_u64 } else { 70_u64 };
+        for v4 in dc_ipv4_candidates(dc_id, dc.ipv4) {
+            for &port in ports {
+                let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(*v4.ip(), port));
+                let port_delay = match port {
+                    443 => 0_u64,
+                    80 => if allow_alt_ports { 40 } else { 420 },
+                    _ => 180,
+                };
+                for (mode, mode_delay) in [
+                    (TransportMode::ObfuscatedIntermediate, 0_u64),
+                    (TransportMode::ObfuscatedAbridged, 140),
+                    (TransportMode::PlainIntermediate, 320),
+                    (TransportMode::Full, 480),
+                ] {
+                    let tx_c = tx.clone();
+                    let d = base_delay + port_delay + mode_delay;
+                    handles.push(tokio::spawn(async move {
+                        if let Some(win) = probe_single_endpoint(dc_id, addr, false, mode, d).await {
+                            let _ = tx_c.send(win).await;
+                        }
+                    }));
+                }
+            }
+        }
+        if !force_ipv4 {
+            let v6: std::net::SocketAddr = dc.ipv6.into();
             let tx_c = tx.clone();
             handles.push(tokio::spawn(async move {
-                if let Some(win) = probe_single_endpoint(dc_id, addr, is_v6, obf, delay).await {
+                if let Some(win) = probe_single_endpoint(dc_id, v6, true, TransportMode::ObfuscatedIntermediate, 700).await {
                     let _ = tx_c.send(win).await;
                 }
             }));
         }
     }
     drop(tx);
-    let winner = tokio::time::timeout(std::time::Duration::from_millis(3200), rx.recv())
-        .await
-        .ok()
-        .flatten();
+    let mut best_by_dc: std::collections::HashMap<i32, ProbeWinner> = std::collections::HashMap::new();
+    let total_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2800);
+    let mut after_first: Option<tokio::time::Instant> = None;
+    loop {
+        let wait_until = match after_first {
+            Some(t) => total_deadline.min(t),
+            None => total_deadline,
+        };
+        let Ok(msg) = tokio::time::timeout_at(wait_until, rx.recv()).await else {
+            break;
+        };
+        let Some(w) = msg else { break };
+        if after_first.is_none() {
+            after_first = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(650));
+        }
+        best_by_dc
+            .entry(w.dc_id)
+            .and_modify(|cur| {
+                if w.rtt_ms < cur.rtt_ms {
+                    *cur = w;
+                }
+            })
+            .or_insert(w);
+        if best_by_dc.contains_key(&preferred_dc) && best_by_dc.len() >= 4 {
+            break;
+        }
+    }
     for h in handles {
         h.abort();
     }
-    winner
+    let mut list: Vec<ProbeWinner> = best_by_dc.into_values().collect();
+    list.sort_by_key(|w| (i32::from(w.dc_id != preferred_dc), w.rtt_ms));
+    list
 }
 
-/// Подключение: пул отправителей с защищённой сессией и подсказкой DC / форсированным IPv4.
-pub async fn connect_with_updates_hint(
+/// Живая MTProto-проверка официальных DC Telegram (`req_pq_multi` -> `resPQ`):
+/// отбрасывает IPv6/заблокированные маршруты, принимающие TCP и обрывающие поток с 0 байтами,
+/// и выбирает первый реально отвечающий дата-центр с самым низким RTT.
+pub async fn probe_reachable_dc(preferred_dc: i32) -> Option<ProbeWinner> {
+    probe_reachable_dcs(preferred_dc, false, false).await.into_iter().next()
+}
+
+/// Подключение с гибкой стратегией (подсказка DC, IPv4-фоллбэк, порты 80/5222 и выбор `TransportMode`).
+pub async fn connect_with_strategy(
     cfg: &Config,
     preferred_dc_override: Option<i32>,
     force_ipv4: bool,
-) -> Result<Connected, Box<dyn std::error::Error>> {
+    allow_alt_ports: bool,
+    transport_override: Option<crate::transport::TransportMode>,
+    clear_unauth_keys: bool,
+) -> Result<(Connected, crate::transport::TransportMode), Box<dyn std::error::Error>> {
+    use crate::transport::TransportMode;
     use grammers_mtsender::SenderPool;
     let session = open_session(cfg).await?;
     let mut params = isolated_connection_params(cfg);
     if force_ipv4 {
         params.use_ipv6 = false;
     }
+    let mut chosen_mode = transport_override.unwrap_or(TransportMode::ObfuscatedIntermediate);
+    let is_logged_in = session.peer(PeerId::self_user()).await.ok().flatten().is_some();
+    if clear_unauth_keys && !is_logged_in {
+        for dc_id in 1..=5 {
+            if let Ok(Some(mut opt)) = session.dc_option(dc_id)
+                && opt.auth_key.is_some()
+            {
+                opt.auth_key = None;
+                let _ = session.set_dc_option(&opt).await;
+            }
+        }
+    }
     if cfg.proxy_url.is_none() {
         let session_home = session.home_dc_id().unwrap_or(2);
         let preferred_dc = preferred_dc_override.unwrap_or(session_home);
-        if let Some(win) = probe_reachable_dc(preferred_dc).await {
+        let winners = probe_reachable_dcs(preferred_dc, force_ipv4, allow_alt_ports).await;
+        for w in &winners {
+            if let std::net::SocketAddr::V4(v4) = w.addr
+                && let Ok(Some(mut opt)) = session.dc_option(w.dc_id)
+            {
+                opt.ipv4 = v4;
+                let _ = session.set_dc_option(&opt).await;
+            }
+        }
+        if let Some(win) = winners.first().copied() {
+            if transport_override.is_none() {
+                chosen_mode = win.mode;
+            }
             crate::diag::info(
                 "connect",
                 &format!(
-                    "DC probe winner: dc={} ipv6={} obf={} rtt={}ms",
-                    win.dc_id, win.use_ipv6, win.use_obfuscated, win.rtt_ms
+                    "DC probe winner: dc={} addr={} ipv6={} mode={} rtt={}ms (discovered {} DCs)",
+                    win.dc_id,
+                    win.addr,
+                    win.use_ipv6,
+                    chosen_mode.label(),
+                    win.rtt_ms,
+                    winners.len(),
                 ),
             );
             params.use_ipv6 = if force_ipv4 { false } else { win.use_ipv6 };
-            let obf = win.use_obfuscated;
-            params.transport = Box::new(move || crate::transport::transport_for(obf));
             let has_key = session
                 .dc_option(session_home)
                 .ok()
@@ -406,6 +520,7 @@ pub async fn connect_with_updates_hint(
             }
         }
     }
+    params.transport = Box::new(move || chosen_mode.build());
     let SenderPool {
         runner,
         handle,
@@ -414,12 +529,26 @@ pub async fn connect_with_updates_hint(
     let pool_handle = handle.clone();
     let client = grammers_client::Client::new(handle);
     tokio::spawn(runner.run());
-    Ok(Connected {
-        session,
-        client,
-        pool_handle,
-        updates,
-    })
+    Ok((
+        Connected {
+            session,
+            client,
+            pool_handle,
+            updates,
+        },
+        chosen_mode,
+    ))
+}
+
+/// Подключение: пул отправителей с защищённой сессией и подсказкой DC / форсированным IPv4.
+pub async fn connect_with_updates_hint(
+    cfg: &Config,
+    preferred_dc_override: Option<i32>,
+    force_ipv4: bool,
+) -> Result<Connected, Box<dyn std::error::Error>> {
+    Ok(connect_with_strategy(cfg, preferred_dc_override, force_ipv4, false, None, false)
+        .await?
+        .0)
 }
 
 /// Подключение: пул отправителей с защищённой сессией. Сведений об устройстве не раскрываем.
@@ -700,5 +829,26 @@ mod tests {
         assert_eq!(iso.app_version, "5.14.3 x64");
         let _t1 = (p.transport)();
         let _t2 = (iso.transport)();
+    }
+
+    #[test]
+    fn dc_ipv4_candidates_include_official_fallbacks_and_split_probe_works() {
+        use grammers_mtproto::transport::Transport;
+        let c1 = dc_ipv4_candidates(1, "149.154.175.53:443".parse().unwrap());
+        assert!(c1.iter().any(|a| a.ip().to_string() == "149.154.175.50"));
+        assert!(c1.iter().any(|a| a.ip().to_string() == "149.154.175.53"));
+        let (_pkt, mut tr) = crate::transport::build_req_pq_probe_mode(crate::transport::TransportMode::PlainIntermediate);
+        let mut srv = crate::transport::SafeIntermediate::new();
+        let mut res_pq = vec![0_u8; 64];
+        res_pq[16..20].copy_from_slice(&44_i32.to_le_bytes());
+        res_pq[20..24].copy_from_slice(&0x0516_2463_u32.to_le_bytes());
+        let mut wire = grammers_mtproto::DequeBuffer::with_capacity(res_pq.len(), 8);
+        wire.extend_back(&res_pq);
+        srv.pack(&mut wire);
+        let raw = &wire.as_ref()[4..];
+        let mut acc = raw[..16].to_vec();
+        assert!(!crate::transport::is_valid_res_pq_reply(&mut *tr, &mut acc));
+        acc.extend_from_slice(&raw[16..]);
+        assert!(crate::transport::is_valid_res_pq_reply(&mut *tr, &mut acc));
     }
 }

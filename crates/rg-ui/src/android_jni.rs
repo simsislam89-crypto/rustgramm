@@ -562,6 +562,27 @@ mod imp {
         .unwrap_or(false)
     }
 
+    /// Публикует изображение в `MediaStore` и помещает его `content://` URI в `ClipboardManager` Android.
+    pub fn copy_image(path: &Path) -> bool {
+        let Some(p) = path.to_str() else { return false };
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let jpath = env.new_string(p).ok()?;
+            let ok = env
+                .call_static_method(
+                    &cls,
+                    "copyImageToClipboard",
+                    "(Landroid/app/Activity;Ljava/lang/String;)Z",
+                    &[JValue::Object(act), JValue::Object(&jpath)],
+                )
+                .ok()
+                .and_then(|v| v.z().ok())
+                .unwrap_or(false);
+            Some(ok)
+        })
+        .unwrap_or(false)
+    }
+
     /// Читает текст из системного буфера обмена Android.
     pub fn paste_text() -> Option<String> {
         with_env(|env, act| {
@@ -860,6 +881,9 @@ mod imp {
     }
     pub fn open_url(_url: &str) {}
     pub fn copy_text(_text: &str) -> bool {
+        false
+    }
+    pub fn copy_image(_path: &Path) -> bool {
         false
     }
     pub fn paste_text() -> Option<String> {

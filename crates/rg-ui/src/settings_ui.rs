@@ -168,13 +168,36 @@ impl App {
                 });
                 ui.add_space(4.0);
                 let d_needle = self.drawer_filter.trim().to_lowercase();
+                // #7 Elastic Sidebar Glide: общая скользящая стеклянная подсветка под пунктом меню.
+                let glide_id = ui.make_persistent_id("drw-glide-rect");
+                let prev_glide: Option<Rect> = ui.ctx().data(|d| d.get_temp(glide_id));
+                if let Some(pr) = prev_glide {
+                    let gy = super::glass::spring_anim(ui.ctx(), "drw-glide-anim", pr.top(), super::glass::SpringSpec::SNAPPY);
+                    let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                    let gr = Rect::from_min_size(
+                        Pos2::new(pr.left() + 8.0, gy + 2.0),
+                        Vec2::new((pr.width() - 16.0).max(40.0), pr.height() - 4.0),
+                    );
+                    super::glass::paint_surface_interactive(
+                        ui.painter(),
+                        gr,
+                        10.0,
+                        super::glass::GlassVariant::Clear,
+                        0.45,
+                        ptr,
+                    );
+                }
+                let hovered_row_rect = std::cell::Cell::new(None::<Rect>);
                 let item = |ui: &mut egui::Ui, icon: icons::Ico, text: &str| -> bool {
                     if !d_needle.is_empty() && !text.to_lowercase().contains(&d_needle) {
                         return false;
                     }
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
                     let ih = tween(ui.ctx(), ("drw-it", text), f32::from(u8::from(resp.hovered())), 0.12);
-                    if ih > 0.01 {
+                    if resp.hovered() {
+                        hovered_row_rect.set(Some(r));
+                    }
+                    if ih > 0.01 && prev_glide.is_none() {
                         let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
                         super::glass::paint_surface_interactive(
                             ui.painter(),
@@ -191,7 +214,7 @@ impl App {
                         Pos2::new((r.right() - 12.0).max(r.left() + 70.0), r.bottom()),
                     );
                     ui.painter().with_clip_rect(clip).text(
-                        Pos2::new(r.left() + 64.0, r.center().y),
+                        Pos2::new(r.left() + 64.0 + 3.0 * ih, r.center().y),
                         Align2::LEFT_CENTER,
                         text,
                         FontId::proportional(14.0),
@@ -220,7 +243,13 @@ impl App {
                         self.drawer_accounts_open = !self.drawer_accounts_open;
                     }
                 }
-                if self.drawer_accounts_open || !d_needle.is_empty() {
+                let acc_k = tween(
+                    ui.ctx(),
+                    "drw-acc-open",
+                    f32::from(u8::from(self.drawer_accounts_open || !d_needle.is_empty())),
+                    0.18,
+                );
+                if acc_k > 0.02 {
                 for acc in &s.accounts {
                     if !d_needle.is_empty() && !acc.title().to_lowercase().contains(&d_needle) {
                         continue;
@@ -326,6 +355,11 @@ impl App {
                 // «Telegram Бизнес», «Мои звёзды» и «Подарки» перенесены в «Настройки» (как в официальном Telegram!).
                 if item(ui, icons::Ico::Settings, "Настройки") {
                     act = Some("settings");
+                }
+                if let Some(hr) = hovered_row_rect.get() {
+                    ui.ctx().data_mut(|d| d.insert_temp(glide_id, hr));
+                } else {
+                    ui.ctx().data_mut(|d| d.remove::<Rect>(glide_id));
                 }
                 if a.drawer_night_mode_toggle {
                     let mut night = true;

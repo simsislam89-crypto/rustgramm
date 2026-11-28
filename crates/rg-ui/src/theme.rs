@@ -1189,11 +1189,47 @@ fn install_fonts_with_mono(ctx: &egui::Context, mono_name: &str) {
     ctx.set_fonts(fonts);
 }
 
-/// Серый оттенок аватарки по идентификатору: чёрно-белая палитра, ступени яркости.
+/// Фирменный синий Telegram для ссылок, галочек верификации и звёздочек Premium.
+pub const TG_BLUE: Color32 = Color32::from_rgb(92, 168, 248);
+
+/// 7 официальных цветов пользователей/ответов/ников Telegram для тёмной темы.
+pub const PEER_COLORS: [Color32; 7] = [
+    Color32::from_rgb(242, 116, 116), // 0 Красный
+    Color32::from_rgb(246, 166, 76),  // 1 Оранжевый
+    Color32::from_rgb(172, 134, 250), // 2 Фиолетовый
+    Color32::from_rgb(102, 210, 126), // 3 Зелёный
+    Color32::from_rgb(88, 206, 224),  // 4 Бирюзовый
+    Color32::from_rgb(102, 174, 250), // 5 Синий
+    Color32::from_rgb(242, 118, 178), // 6 Розовый
+];
+
+/// Пары градиента для аватарок без фото (светлый верх -> насыщенный низ), как в Telegram.
+pub const PEER_AVATAR_GRADIENTS: [(Color32, Color32); 7] = [
+    (Color32::from_rgb(245, 118, 108), Color32::from_rgb(212, 68, 68)),
+    (Color32::from_rgb(246, 174, 82), Color32::from_rgb(220, 118, 44)),
+    (Color32::from_rgb(176, 142, 248), Color32::from_rgb(122, 86, 222)),
+    (Color32::from_rgb(112, 214, 132), Color32::from_rgb(58, 168, 86)),
+    (Color32::from_rgb(96, 208, 226), Color32::from_rgb(48, 152, 186)),
+    (Color32::from_rgb(112, 184, 250), Color32::from_rgb(56, 124, 224)),
+    (Color32::from_rgb(244, 126, 182), Color32::from_rgb(206, 68, 138)),
+];
+
+/// Цвет ника/ответа пользователя по серверному `PeerColor` (0..6) или стабильному хэшу `id`.
+pub fn peer_color(id: i64, color_id: Option<i32>) -> Color32 {
+    let idx = color_id
+        .map(|c| c.rem_euclid(PEER_COLORS.len() as i32) as usize)
+        .unwrap_or_else(|| (id.unsigned_abs() % PEER_COLORS.len() as u64) as usize);
+    PEER_COLORS[idx]
+}
+
+/// Двухцветный градиент аватарки по идентификатору (`(top, bottom)`).
+pub fn avatar_gradient(id: i64) -> (Color32, Color32) {
+    PEER_AVATAR_GRADIENTS[(id.unsigned_abs() % PEER_AVATAR_GRADIENTS.len() as u64) as usize]
+}
+
+/// Основной цвет аватарки/подписи по идентификатору (полноцветная палитра Telegram).
 pub fn avatar_color(id: i64) -> Color32 {
-    const SHADES: [u8; 7] = [58, 74, 90, 104, 66, 82, 98];
-    let g = SHADES[(id.unsigned_abs() % SHADES.len() as u64) as usize];
-    Color32::from_rgb(g, g, g + 4)
+    PEER_COLORS[(id.unsigned_abs() % PEER_COLORS.len() as u64) as usize]
 }
 
 /// Аватарка с первой буквой имени (круг).
@@ -1202,8 +1238,7 @@ pub fn avatar(ui: &mut egui::Ui, name: &str, id: i64, size: f32, tex: Option<&eg
     draw_avatar(ui, rect.center(), name, id, size, tex, corners);
 }
 
-/// Аватарка: фото, если оно загружено, иначе серый круг с буквой. `corners` — скругление
-/// из настроек AyuGram (0..=23 для размера 48; 23 и больше — круг).
+/// Аватарка: фото, если оно загружено, иначе двухтоновый градиент Telegram с буквой.
 pub fn draw_avatar(
     ui: &egui::Ui,
     center: egui::Pos2,
@@ -1224,7 +1259,16 @@ pub fn draw_avatar(
         return;
     }
     let painter = ui.painter();
-    painter.rect_filled(rect, cr, avatar_color(id));
+    let (top_c, bot_c) = avatar_gradient(id);
+    painter.rect_filled(rect, cr, bot_c);
+    let top_h = (rect.height() * 0.56).max(2.0);
+    let top_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), top_h));
+    painter.with_clip_rect(rect).rect_filled(
+        top_rect,
+        CornerRadius { nw: cr.nw, ne: cr.ne, sw: 0, se: 0 },
+        top_c.gamma_multiply(0.88),
+    );
+    painter.rect_stroke(rect, cr, Stroke::new(1.0, Color32::from_white_alpha(34)), egui::StrokeKind::Inside);
     let initial = name
         .chars()
         .find(|c| c.is_alphanumeric())
@@ -1362,13 +1406,15 @@ mod tests {
     }
 
     #[test]
-    fn avatar_colors_are_stable_greys() {
+    fn avatar_and_peer_colors_are_vibrant_and_stable() {
         assert_eq!(avatar_color(5), avatar_color(5));
         assert_eq!(avatar_color(-5), avatar_color(5));
         for id in 0..7 {
             let c = avatar_color(id);
-            assert!(c.b().abs_diff(c.r()) <= 4, "{c:?}");
+            assert!(c.r() != c.g() || c.g() != c.b(), "expected vibrant Telegram peer color: {c:?}");
         }
+        assert_eq!(peer_color(123, Some(2)), PEER_COLORS[2]);
+        assert_eq!(peer_color(123, Some(-1)), PEER_COLORS[6]);
     }
 
     #[test]

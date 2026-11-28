@@ -96,11 +96,21 @@ impl App {
                             need_avatar.push((st.peer, st.peer_id));
                         }
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 72.0), Sense::click());
-                        let center = Pos2::new(rect.center().x, rect.top() + 26.0);
                         let hk = tween(ui.ctx(), ("st-h", st.story_id), f32::from(u8::from(resp.hovered())), 0.14);
-                        let sc = 1.0 + 0.06 * ios_spring_bounce(hk);
+                        let bounce = ios_spring_bounce(hk);
+                        // #6 Bounce Cards: мягкий вертикальный подскок и масштаб обводки при наведении.
+                        let lift_y = -4.0 * bounce;
+                        let center = Pos2::new(rect.center().x, rect.top() + 26.0 + lift_y);
+                        let sc = 1.0 + 0.08 * bounce;
                         let ring = if st.unread { c_orange() } else { SUBTEXT.gamma_multiply(0.55) };
-                        ui.painter().circle_stroke(center, 21.0 * sc, Stroke::new(2.1, ring));
+                        if hk > 0.03 {
+                            ui.painter().circle_filled(
+                                Pos2::new(rect.center().x, rect.top() + 29.0),
+                                21.0 * sc,
+                                Color32::from_black_alpha((70.0 * hk) as u8),
+                            );
+                        }
+                        ui.painter().circle_stroke(center, 21.0 * sc, Stroke::new(2.1 + 0.4 * hk, ring));
                         draw_avatar(
                             ui,
                             center,
@@ -213,6 +223,23 @@ impl App {
                         let k = tween(ui.ctx(), ("ftab", id.unwrap_or(-1)), f32::from(u8::from(selected)), 0.18);
                         let hover = tween(ui.ctx(), ("ftabh", id.unwrap_or(-1)), f32::from(u8::from(resp.hovered())), 0.12);
                         let p = ui.painter();
+                        // #15 Folder Reveal: стеклянная подложка раскрывается на активной/подсвеченной вкладке.
+                        let pill_k = k.max(hover * 0.55);
+                        if pill_k > 0.04 {
+                            let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
+                            super::glass::paint_surface_interactive(
+                                p,
+                                rect.shrink2(Vec2::new(2.0, 4.0)),
+                                10.0,
+                                if selected {
+                                    super::glass::GlassVariant::Tinted(c_orange())
+                                } else {
+                                    super::glass::GlassVariant::Clear
+                                },
+                                pill_k * 0.65,
+                                ptr,
+                            );
+                        }
                         let color = lerp_color(lerp_color(DIALOG_TEXT, WHITE, hover), WHITE, k);
                         if color == WHITE {
                             let pos = rect.center() - g.size() * 0.5 - Vec2::new(0.0, 1.0);
@@ -220,8 +247,8 @@ impl App {
                         } else {
                             p.text(rect.center() - Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, label, FontId::proportional(14.0), color);
                         }
-                        // Полоска под выбранной вкладкой растёт от центра.
-                        let w = (rect.width() - 14.0) * k;
+                        // Полоска под выбранной вкладкой растёт от центра с пружиной.
+                        let w = (rect.width() - 14.0) * ios_spring_bounce(k);
                         p.rect_filled(
                             Rect::from_center_size(Pos2::new(rect.center().x, rect.bottom() - 1.5), Vec2::new(w, 2.5)),
                             CornerRadius::same(1),

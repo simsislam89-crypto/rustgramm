@@ -1044,15 +1044,23 @@ impl App {
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.set_max_width(460.0);
-                // Карточка баланса
-                egui::Frame::new()
+                // Карточка баланса (#10 Star Border + #8 Counter)
+                let bal_frame = egui::Frame::new()
                     .fill(t(SIDEBAR_BG))
                     .corner_radius(CornerRadius::same(12))
                     .inner_margin(egui::Margin::symmetric(14, 10))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let bal = self.stars_summary.as_ref().map_or(0, |s| s.balance);
-                            ui.label(RichText::new(format!("⭐ {bal} Telegram Stars")).size(18.0).strong().color(ORANGE));
+                            ui.label(RichText::new("⭐").size(18.0).strong().color(ORANGE));
+                            super::glass::animated_counter(
+                                ui,
+                                "stars-balance-cnt",
+                                bal,
+                                FontId::proportional(18.0),
+                                ORANGE,
+                            );
+                            ui.label(RichText::new("Telegram Stars").size(16.5).strong().color(WHITE));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Обновить").clicked() {
                                     cmds.push(Cmd::LoadStarsStatus);
@@ -1062,6 +1070,7 @@ impl App {
                             });
                         });
                     });
+                super::glass::paint_star_border(ui.painter(), ctx, bal_frame.response.rect, 12.0, true);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     for (t_idx, lbl) in [(0u8, "Транзакции"), (1, "Мои подарки"), (2, "Каталог подарков")] {
@@ -1153,10 +1162,10 @@ impl App {
                             if self.star_gifts_catalog.is_empty() {
                                 ui.label(RichText::new("Загрузка каталога подарков…").color(SUBTEXT));
                             }
-                            for g in &self.star_gifts_catalog {
-                                egui::Frame::new()
+                            for (gi, g) in self.star_gifts_catalog.iter().enumerate() {
+                                let gfr = egui::Frame::new()
                                     .fill(t(SIDEBAR_BG))
-                                    .corner_radius(CornerRadius::same(8))
+                                    .corner_radius(CornerRadius::same(10))
                                     .inner_margin(egui::Margin::symmetric(10, 6))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
@@ -1177,6 +1186,12 @@ impl App {
                                             );
                                         }
                                     });
+                                let hov = ui.rect_contains_pointer(gfr.response.rect);
+                                let gk = tween(ctx, ("sg-cat", gi), f32::from(u8::from(hov)), 0.14);
+                                if hov || g.unique || gk > 0.02 {
+                                    let bounce_r = gfr.response.rect.expand(1.5 * ios_spring_bounce(gk));
+                                    super::glass::paint_star_border(ui.painter(), ctx, bounce_r, 10.0, hov);
+                                }
                                 ui.add_space(4.0);
                             }
                         }
@@ -2042,14 +2057,14 @@ impl App {
                             for (i, (title, sub, hit)) in hits.iter().enumerate() {
                                 let sel = i == self.palette_sel;
                                 let (r, resp) = ui.allocate_exact_size(Vec2::new(card_w - 8.0, 40.0), Sense::click());
-                                if sel || resp.hovered() {
-                                    super::glass::paint_surface_interactive(
+                                let hk = tween(ui.ctx(), ("sp-row", i), f32::from(u8::from(sel || resp.hovered())), 0.12);
+                                if sel || hk > 0.02 {
+                                    super::glass::paint_spotlight_card(
                                         ui.painter(),
                                         r,
                                         10.0,
-                                        if sel { super::glass::GlassVariant::Tinted(c_orange()) } else { super::glass::GlassVariant::Clear },
-                                        if sel { 0.4 } else { 0.2 },
                                         ptr,
+                                        if sel { 0.55 } else { hk * 0.25 },
                                     );
                                 }
                                 ui.painter().text(
@@ -2066,17 +2081,30 @@ impl App {
                                     FontId::proportional(11.0),
                                     SUBTEXT,
                                 );
-                                ui.painter().text(
-                                    Pos2::new(r.right() - 12.0, r.center().y),
-                                    Align2::RIGHT_CENTER,
-                                    "›",
-                                    FontId::proportional(16.0),
-                                    if sel { Color32::WHITE } else { SUBTEXT },
-                                );
+                                if sel {
+                                    let badge = Rect::from_center_size(Pos2::new(r.right() - 28.0, r.center().y), Vec2::new(42.0, 20.0));
+                                    ui.painter().rect_filled(badge, CornerRadius::same(6), Color32::from_white_alpha(24));
+                                    ui.painter().text(badge.center(), Align2::CENTER_CENTER, "Enter", FontId::proportional(10.0), WHITE);
+                                } else {
+                                    ui.painter().text(
+                                        Pos2::new(r.right() - 12.0, r.center().y),
+                                        Align2::RIGHT_CENTER,
+                                        "›",
+                                        FontId::proportional(16.0),
+                                        SUBTEXT,
+                                    );
+                                }
                                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                     chosen = Some(hit.clone());
                                 }
                             }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("↑↓ выбор · Enter открыть · Esc закрыть").size(10.5).color(SUBTEXT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                super::glass::animated_counter(ui, "sp-hits-cnt", hits.len() as i64, FontId::proportional(10.5), SUBTEXT);
+                            });
                         });
                     });
             });
@@ -2356,6 +2384,8 @@ impl App {
             .default_width(330.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                let appear = tween(ctx, "mdl-date-jump", 1.0, 0.16);
+                super::glass::paint_modal_card(ui.painter(), ui.max_rect().expand(10.0), 16.0, appear);
                 ui.label(RichText::new("Быстрый переход:").size(12.5).color(SUBTEXT));
                 ui.horizontal_wrapped(|ui| {
                     for (lbl, ts) in [
@@ -2529,6 +2559,8 @@ impl App {
             .default_width(380.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                let appear = tween(ctx, "mdl-pinned-list", 1.0, 0.16);
+                super::glass::paint_modal_card(ui.painter(), ui.max_rect().expand(10.0), 16.0, appear);
                 if self.pinned_list.is_empty() {
                     ui.label(RichText::new("Нет закреплённых сообщений").color(SUBTEXT));
                 } else {

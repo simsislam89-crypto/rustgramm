@@ -1,42 +1,42 @@
 # Каталог Liquid Glass и Fluid UI — Очередь оставшихся компонентов (62)
 
-Оставшиеся референсы и паттерны **iOS 26 Liquid Glass / матовое стекло / пружинные микроанимации**, ещё **не** портированные в Rustgramm (`v0.30.0`). Все уже реализованные компоненты (включая `#1–15`, `GlassEffect`/`GlassDock`, `NotificationPopover`, `ExpandableSidebar`, `AppleSpotlight`, `ChatComposer`, `SegmentedTabs`, `OtpInput`, а также ранее перенесённые `GlassCard`, `PillButton`, `FloatingTabBar`, `Toast`, `SlidingPill`, `KeypadKeys`, `Switch`, `FloatingDock`, `ActionSheet` и др.) удалены из очереди.
+Оставшиеся референсы и паттерны **iOS 26 Liquid Glass / матовое стекло / пружинные микроанимации**, ещё **не** портированные в Rustgramm (`v0.31.0`). В разделе 1 сохранены **15** неприсланных компонентов `21st.dev` из расширенного списка библиотеки для последующих этапов, а далее — оставшиеся **47** позиций из `ReactBits`, `Aceternity UI`, `Magic UI`, `Motion Primitives`, `GlassCN` и `Uiverse`. Все уже перенесённые компоненты (включая пакет `v0.31.0`: `Modal Dialog Frame`, `Command Palette Kbar`, `Tooltip Card`, `Flowing Menu`, `Elastic Slider`, `Bounce Cards`, `Animated List`, `Counter`, `Magnet Button`, `Star Border`, `Spotlight Card`, `Gooey Nav`, `Gradual Blur`, `Bubble Menu`, `Folder Reveal`, а также `v0.28–v0.30`: `GlassEffect`/`GlassDock`, `NotificationPopover`, `ExpandableSidebar`, `AppleSpotlight`, `ChatComposer`, `SegmentedTabs`, `OtpInput`, `GlassCard`, `PillButton`, `FloatingTabBar`, `Toast`, `SlidingPill`, `KeypadKeys`, `Switch`, `FloatingDock`, `ActionSheet`) удалены из очереди.
 
-> **Стиль Rustgramm (`v0.30.0`):** строго монохромный чёрно-белый Liquid Glass (`#F2F2F6` акцент, `#0A0A0C` текст на белых элементах, матовый фон `#08080A` без цветных бликов). Для точности ссылки указывают на корневые каталоги библиотек (`21st.dev`, `reactbits.dev`, `ui.aceternity.com`, `magicui.design`, `motion-primitives.com`, `glasscn.app`, `uiverse.io`).
+> **Стиль Rustgramm (`v0.31.0`):** строго монохромный чёрно-белый Liquid Glass для всего системного хрома (`#F2F2F6` акцент, `#0A0A0C` текст на белых элементах, матовый фон `#08080A` без цветных бликов) при сохранении живых фирменных цветов Telegram для аватарок, ников пользователей, полос ответов, ссылок и значков verified/premium. Для точности ссылки указывают на корневые каталоги библиотек (`21st.dev`, `reactbits.dev`, `ui.aceternity.com`, `magicui.design`, `motion-primitives.com`, `glasscn.app`, `uiverse.io`).
 
 ---
 
-## 1. 21st.dev — Оставшиеся компоненты (3)
+## 1. 21st.dev — Неприсланные и дополнительные компоненты Liquid Glass (15)
 
 Источник: <https://21st.dev/s/liquid-glass> · <https://21st.dev/components>
 
 | № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 1 | Liquid Glass Modal Dialog Frame | <https://21st.dev/components> | Модальные окна поверх ленты (перенос на единую рамку `glass.rs`) |
-| 2 | Liquid Glass Command Palette Kbar | <https://21st.dev/components> | Меню `/` команд бота в стиле Kbar |
-| 3 | Liquid Glass Tooltip Card | <https://21st.dev/components> | Единая стеклянная карточка hover-подсказок |
+| 1 | Liquid Glass Floating Navigation Bar | <https://21st.dev/components> | Плавающая верхняя панель навигации с прозрачностью при скролле |
+| 2 | Liquid Glass Calendar & Date Range Picker | <https://21st.dev/components> | Стеклянный календарь перехода к дате и фильтров истории |
+| 3 | Liquid Glass Media / Music Player Card | <https://21st.dev/components> | Плавающий мини-плеер музыки и голосовых заметок |
+| 4 | Liquid Glass Profile Hover Card / Avatar Popover | <https://21st.dev/components> | Быстрая карточка участника при наведении на имя в группе |
+| 5 | Liquid Glass Accordion / Disclosure List | <https://21st.dev/components> | Сворачиваемые группы настроек приватности и прокси |
+| 6 | Liquid Glass Toast / Notification Stack | <https://21st.dev/components> | Стек всплывающих уведомлений поверх ленты |
+| 7 | Liquid Glass Bottom Sheet / Action Drawer | <https://21st.dev/components> | Выезжающая снизу стеклянная шторка действий на телефоне |
+| 8 | Liquid Glass Context / Action Menu Sheet | <https://21st.dev/components> | Многоуровневое стеклянное контекстное меню сообщений |
+| 9 | Liquid Glass Audio Waveform Player Pill | <https://21st.dev/components> | Капсула воспроизведения и перемотки голосового с волной |
+| 10 | Liquid Glass File Dropzone / Upload Card | <https://21st.dev/components> | Зона перетаскивания файлов и фото в чат (`Drag & Drop`) |
+| 11 | Liquid Glass Skeleton Shimmer Loader | <https://21st.dev/components> | Мерцающий стеклянный плейсхолдер при догрузке медиа и ленты |
+| 12 | Liquid Glass Stepper / Multi-Step Onboarding | <https://21st.dev/components> | Пошаговая стеклянная шкала экранов входа (`Телефон -> Код -> 2FA`) |
+| 13 | Liquid Glass Radial Speed Dial FAB | <https://21st.dev/components> | Веер быстрых действий (новое сообщение / канал / группа) |
+| 14 | Liquid Glass Glassmorphic Table / Data List | <https://21st.dev/components> | Таблицы и карточки журнала аудита, статистики и Stars |
+| 15 | Liquid Glass Interactive Map / Geo Pin Card | <https://21st.dev/components> | Стеклянная карточка геолокации и превью точки на карте |
 
 ---
 
-## 2. ReactBits — Оставшиеся компоненты (12)
+## 2. ReactBits — Оставшиеся компоненты (1)
 
 Источник: <https://reactbits.dev/>
 
 | № | Компонент | Ссылка | Потенциальное применение в Rustgramm |
 |---|---|---|---|
-| 4 | Flowing Menu | <https://reactbits.dev/components> | Плавный hover-слой в строках списка диалогов |
-| 5 | Elastic Slider | <https://reactbits.dev/components> | Ползунки прозрачности/скорости с резиновым отскоком в Настройках |
-| 6 | Bounce Cards | <https://reactbits.dev/components> | Карточки историй и витрины подарков Stars |
-| 7 | Animated List | <https://reactbits.dev/components> | Пружинное появление новых сообщений в ленте |
-| 8 | Counter (Animated Digits) | <https://reactbits.dev/components> | Перелистывающиеся цифры счётчиков непрочитанных и реакций |
-| 9 | Magnet Button | <https://reactbits.dev/components> | Магнитное притяжение указателя для FAB-кнопок |
-| 10 | Star Border | <https://reactbits.dev/components> | Монохромный мерцающий контур платной звёздной реакции |
-| 11 | Spotlight Card | <https://reactbits.dev/components> | Карточка предпросмотра чата (`Peek`) |
-| 12 | Gooey Nav | <https://reactbits.dev/components> | Плавное слияние вкладок профиля |
-| 13 | Gradual Blur | <https://reactbits.dev/components> | Мягкое растворение у верхнего и нижнего края ленты |
-| 14 | Bubble Menu | <https://reactbits.dev/components> | Радиальная всплывающая палитра реакций |
-| 15 | Folder Reveal | <https://reactbits.dev/components> | Папки чатов и архива |
-| 16 | Tilted Card | <https://reactbits.dev/components> | Карточки подарков и стикерпаков |
+| 16 | Tilted Card | <https://reactbits.dev/components> | Наклоняющиеся 3D-карточки подарков и стикерпаков |
 
 ---
 

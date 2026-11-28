@@ -22,6 +22,8 @@ import android.app.Fragment;
 import android.app.FragmentManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
@@ -30,6 +32,7 @@ import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.view.Gravity;
@@ -51,8 +54,10 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -252,6 +257,71 @@ public final class RgBridge {
             }
         });
         return true;
+    }
+
+    public static boolean copyImageToClipboard(final Activity act, final String filePath) {
+        if (act == null || filePath == null || filePath.isEmpty()) return false;
+        File src = new File(filePath);
+        if (!src.isFile()) return false;
+        final String low = src.getName().toLowerCase();
+        String mime = "image/jpeg";
+        String ext = "jpg";
+        if (low.endsWith(".png")) {
+            mime = "image/png";
+            ext = "png";
+        } else if (low.endsWith(".webp")) {
+            mime = "image/webp";
+            ext = "webp";
+        }
+        try {
+            final ContentResolver cr = act.getContentResolver();
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Images.Media.DISPLAY_NAME, "rustgramm_" + System.currentTimeMillis() + "." + ext);
+            cv.put(MediaStore.Images.Media.MIME_TYPE, mime);
+            if (Build.VERSION.SDK_INT >= 29) {
+                cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Rustgramm");
+                cv.put(MediaStore.Images.Media.IS_PENDING, 1);
+            }
+            final Uri uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+            if (uri == null) return false;
+            try (InputStream in = new FileInputStream(src);
+                 OutputStream out = cr.openOutputStream(uri)) {
+                if (out == null) {
+                    cr.delete(uri, null, null);
+                    return false;
+                }
+                byte[] buf = new byte[16384];
+                int r;
+                while ((r = in.read(buf)) > 0) {
+                    out.write(buf, 0, r);
+                }
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                ContentValues done = new ContentValues();
+                done.put(MediaStore.Images.Media.IS_PENDING, 0);
+                cr.update(uri, done, null, null);
+            }
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm != null) {
+                    cm.setPrimaryClip(ClipData.newUri(cr, "Rustgramm Photo", uri));
+                    return true;
+                }
+            }
+            act.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+                        if (cm != null) {
+                            cm.setPrimaryClip(ClipData.newUri(cr, "Rustgramm Photo", uri));
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            return true;
+        } catch (Throwable ignored) {}
+        return false;
     }
 
     public static String getClipboardText(final Activity act) {

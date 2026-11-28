@@ -48,6 +48,7 @@ fn dummy_dialog(
         unread_mentions: 0,
         unread_reactions: 0,
         read_inbox_max_id: 0,
+        peer_color: None,
     }
 }
 

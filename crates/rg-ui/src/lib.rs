@@ -5385,10 +5385,13 @@ impl App {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.notify_popover_open = false;
             }
+            let pop_k = glass::spring_anim(ui.ctx(), "nc-pop-spring", 1.0, glass::SpringSpec::SNAPPY);
             let mut open_did: Option<i64> = None;
+            let mut dismiss_idx: Option<usize> = None;
             let mut read_all = false;
-            let pop_w = 320.0_f32.min(ui.ctx().content_rect().width() - 24.0);
-            let anchor = egui::pos2(ui.max_rect().left() + 12.0, ui.min_rect().bottom() + 4.0);
+            let pop_w = 332.0_f32.min(ui.ctx().content_rect().width() - 24.0);
+            let slide_y = (1.0 - pop_k) * -8.0;
+            let anchor = egui::pos2(ui.max_rect().left() + 12.0, ui.min_rect().bottom() + 4.0 + slide_y);
             #[allow(deprecated)]
             egui::Area::new(egui::Id::new("notify-center-popover"))
                 .order(egui::Order::Foreground)
@@ -5398,9 +5401,14 @@ impl App {
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             ui.set_width(pop_w);
-                            glass::paint_surface(ui.painter(), ui.max_rect().expand(10.0), 16.0, glass::GlassVariant::Regular, 0.25);
+                            glass::paint_modal_card(ui.painter(), ui.max_rect().expand(10.0), 16.0, pop_k.clamp(0.1, 1.0));
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Уведомления").strong().size(14.0).color(WHITE));
+                                let unread_total = self.dialogs.iter().filter(|d| !d.muted).map(|d| i64::from(d.unread)).sum::<i64>();
+                                if unread_total > 0 {
+                                    ui.add_space(4.0);
+                                    glass::animated_counter(ui, "nc-unread-cnt", unread_total, FontId::proportional(12.0), c_orange());
+                                }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if glass::pill_button(ui, "nc-read-all", Vec2::new(112.0, 26.0), None, "Прочитать все", true).clicked() {
                                         read_all = true;
@@ -5408,51 +5416,120 @@ impl App {
                                 });
                             });
                             ui.add_space(6.0);
+                            let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
                             egui::ScrollArea::vertical().max_height(260.0).id_salt("nc-list").show(ui, |ui| {
                                 if self.notify_feed.is_empty() {
-                                    let unread_dlgs: Vec<(i64, String, String)> = self
+                                    let unread_dlgs: Vec<(i64, String, String, i64)> = self
                                         .dialogs
                                         .iter()
                                         .filter(|d| d.unread > 0 && !d.muted)
                                         .take(12)
-                                        .map(|d| (d.id, d.name.clone(), format!("{} непроч. — {}", d.unread, d.last)))
+                                        .map(|d| (d.id, d.name.clone(), format!("{} непроч. — {}", d.unread, d.last), d.date))
                                         .collect();
                                     if unread_dlgs.is_empty() {
                                         ui.label(RichText::new("Нет новых уведомлений").size(12.5).color(SUBTEXT));
                                     } else {
-                                        for (did, title, sub) in unread_dlgs {
-                                            let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 40.0), Sense::click());
-                                            if rresp.hovered() {
-                                                glass::paint_surface(ui.painter(), rr, 9.0, glass::GlassVariant::Clear, 0.35);
+                                        for (did, title, sub, ts) in unread_dlgs {
+                                            let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 44.0), Sense::click());
+                                            let nh = theme::tween(ui.ctx(), ("nc-u", did), f32::from(u8::from(rresp.hovered())), 0.12);
+                                            if nh > 0.02 {
+                                                glass::paint_spotlight_card(ui.painter(), rr, 10.0, ptr, nh * 0.5);
                                             }
-                                            ui.painter().text(egui::pos2(rr.left() + 8.0, rr.center().y - 7.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
-                                            ui.painter().text(egui::pos2(rr.left() + 8.0, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, sub, FontId::proportional(11.0), SUBTEXT);
+                                            draw_avatar(
+                                                ui,
+                                                egui::pos2(rr.left() + 20.0, rr.center().y),
+                                                &title,
+                                                did,
+                                                28.0,
+                                                self.avatars.get(&did),
+                                                self.settings.extera.avatar_corners,
+                                            );
+                                            let tx = rr.left() + 40.0;
+                                            if ts > 0 {
+                                                ui.painter().text(
+                                                    egui::pos2(rr.right() - 8.0, rr.center().y - 8.0),
+                                                    egui::Align2::RIGHT_CENTER,
+                                                    theme::hhmm(ts),
+                                                    FontId::proportional(10.5),
+                                                    SUBTEXT,
+                                                );
+                                            }
+                                            let clip = egui::Rect::from_min_max(
+                                                egui::pos2(tx, rr.top()),
+                                                egui::pos2((rr.right() - 48.0).max(tx + 40.0), rr.bottom()),
+                                            );
+                                            let cp = ui.painter().with_clip_rect(clip);
+                                            cp.text(egui::pos2(tx, rr.center().y - 8.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
+                                            cp.text(egui::pos2(tx, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, sub, FontId::proportional(11.0), SUBTEXT);
                                             if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                                 open_did = Some(did);
                                             }
                                         }
                                     }
                                 } else {
-                                    for (idx, (did, title, body, _, is_read)) in self.notify_feed.iter().enumerate() {
-                                        let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 42.0), Sense::click());
-                                        if rresp.hovered() {
-                                            glass::paint_surface(ui.painter(), rr, 9.0, glass::GlassVariant::Clear, 0.35);
+                                    for (idx, (did, title, body, ts, is_read)) in self.notify_feed.iter().enumerate() {
+                                        let (rr, rresp) = ui.allocate_exact_size(Vec2::new(pop_w - 8.0, 44.0), Sense::click());
+                                        let nh = theme::tween(ui.ctx(), ("nc-f", idx), f32::from(u8::from(rresp.hovered())), 0.12);
+                                        if nh > 0.02 {
+                                            glass::paint_spotlight_card(ui.painter(), rr, 10.0, ptr, nh * 0.5);
                                         }
+                                        draw_avatar(
+                                            ui,
+                                            egui::pos2(rr.left() + 20.0, rr.center().y),
+                                            title,
+                                            *did,
+                                            28.0,
+                                            self.avatars.get(did),
+                                            self.settings.extera.avatar_corners,
+                                        );
                                         if !*is_read {
-                                            ui.painter().circle_filled(egui::pos2(rr.left() + 8.0, rr.center().y), 3.0, c_orange());
+                                            ui.painter().circle_filled(egui::pos2(rr.left() + 6.0, rr.center().y), 3.0, c_orange());
                                         }
-                                        let tx = rr.left() + 18.0;
-                                        ui.painter().text(egui::pos2(tx, rr.center().y - 7.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
-                                        ui.painter().text(egui::pos2(tx, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, body, FontId::proportional(11.0), SUBTEXT);
-                                        if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        let close_r = egui::Rect::from_center_size(egui::pos2(rr.right() - 14.0, rr.center().y), Vec2::splat(18.0));
+                                        let close_resp = ui.interact(close_r, ui.make_persistent_id(("nc-x", idx)), Sense::click());
+                                        let close_hov = close_resp.hovered();
+                                        ui.painter().text(
+                                            close_r.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "×",
+                                            FontId::proportional(13.0),
+                                            if close_hov { WHITE } else { SUBTEXT },
+                                        );
+                                        let close_clicked = close_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                                        if close_clicked {
+                                            dismiss_idx = Some(idx);
+                                        }
+                                        let ts_s = if *ts > 0 { theme::hhmm(*ts) } else { String::new() };
+                                        if !ts_s.is_empty() {
+                                            ui.painter().text(
+                                                egui::pos2(rr.right() - 28.0, rr.center().y - 8.0),
+                                                egui::Align2::RIGHT_CENTER,
+                                                ts_s,
+                                                FontId::proportional(10.5),
+                                                SUBTEXT,
+                                            );
+                                        }
+                                        let tx = rr.left() + 40.0;
+                                        let clip = egui::Rect::from_min_max(
+                                            egui::pos2(tx, rr.top()),
+                                            egui::pos2((rr.right() - 56.0).max(tx + 40.0), rr.bottom()),
+                                        );
+                                        let cp = ui.painter().with_clip_rect(clip);
+                                        cp.text(egui::pos2(tx, rr.center().y - 8.0), egui::Align2::LEFT_CENTER, title, FontId::proportional(13.0), WHITE);
+                                        cp.text(egui::pos2(tx, rr.center().y + 8.0), egui::Align2::LEFT_CENTER, body, FontId::proportional(11.0), SUBTEXT);
+                                        if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !close_clicked {
                                             open_did = Some(*did);
                                         }
-                                        let _ = idx;
                                     }
                                 }
                             });
                         });
                 });
+            if let Some(rm_idx) = dismiss_idx
+                && rm_idx < self.notify_feed.len()
+            {
+                self.notify_feed.remove(rm_idx);
+            }
             if read_all {
                 for item in &mut self.notify_feed {
                     item.4 = true;
@@ -5789,10 +5866,15 @@ impl App {
                     let hover = theme::tween(ui.ctx(), ("dlg", i), f32::from(u8::from(resp.hovered())), 0.12);
                     let p = ui.painter();
                     if hover > 0.01 && !selected {
-                        p.rect_filled(
+                        let ptr = ui.ctx().input(|inp| inp.pointer.hover_pos());
+                        // #4 Flowing Menu: стеклянный блеск по позиции курсора при наведении на чат.
+                        glass::paint_surface_interactive(
+                            p,
                             rect.shrink2(Vec2::new(4.0, 2.0)),
-                            egui::CornerRadius::same(8),
-                            theme::lerp_color(Color32::TRANSPARENT, t(DIALOG_OVER), hover),
+                            10.0,
+                            glass::GlassVariant::Clear,
+                            hover * 0.55,
+                            ptr,
                         );
                     }
                     if self.avatar_req.insert(d.id) {
@@ -5927,10 +6009,10 @@ impl App {
                         }
                         badge_x += 18.0;
                     } else if d.verified && badge_x < clip_right - 8.0 {
-                        icons::tg(ui.painter(), "dialogs/dialogs_verified_star", egui::pos2(badge_x, badge_y), ORANGE);
+                        icons::tg(ui.painter(), "dialogs/dialogs_verified_star", egui::pos2(badge_x, badge_y), theme::TG_BLUE);
                         badge_x += 18.0;
                     } else if show_prem && d.premium && badge_x < clip_right - 8.0 {
-                        icons::tg(ui.painter(), "dialogs/dialogs_premium", egui::pos2(badge_x, badge_y), ORANGE);
+                        icons::tg(ui.painter(), "dialogs/dialogs_premium", egui::pos2(badge_x, badge_y), theme::TG_BLUE);
                         badge_x += 18.0;
                     }
                     if d.muted && badge_x < clip_right - 8.0 {
@@ -6835,6 +6917,8 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.set_min_width(w - 24.0);
+                let appear = theme::tween(ctx, "mdl-peek", 1.0, 0.16);
+                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
                 ui.label(
                     RichText::new("Сообщения загружены локально — статус прочтения не отправляется")
                         .size(11.5)
@@ -6924,6 +7008,10 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.set_min_width(280.0);
+                let appear = theme::tween(ctx, "mdl-geo-send", 1.0, 0.16);
+                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
+                let appear = theme::tween(ctx, "mdl-contact-send", 1.0, 0.16);
+                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
                 ui.label(RichText::new("Телефон (E.164):").size(12.0).color(SUBTEXT));
                 ui.add(egui::TextEdit::singleline(&mut self.send_contact_phone).desired_width(270.0).hint_text("+79991234567"));
                 ui.add_space(4.0);
@@ -6983,6 +7071,10 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.set_min_width(280.0);
+                let appear = theme::tween(ctx, "mdl-geo-send", 1.0, 0.16);
+                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
+                let appear = theme::tween(ctx, "mdl-contact-send", 1.0, 0.16);
+                glass::paint_modal_card(ui.painter(), ui.max_rect().expand(14.0), 16.0, appear);
                 ui.label(RichText::new("Широта (-90..90):").size(12.0).color(SUBTEXT));
                 ui.add(egui::TextEdit::singleline(&mut self.geo_lat).desired_width(270.0));
                 ui.add_space(4.0);
@@ -7370,6 +7462,7 @@ fn demo_app(mode: &str) -> App {
             unread_mentions: 0,
             unread_reactions: 0,
             read_inbox_max_id: 0,
+            peer_color: Some((i % 7) as i32),
         });
     }
     for (i, (n, l)) in [("Старый чат", "Давно не писали"), ("Рассылка", "Скидки на всё")].iter().enumerate() {
@@ -7398,6 +7491,7 @@ fn demo_app(mode: &str) -> App {
             unread_mentions: 0,
             unread_reactions: 0,
             read_inbox_max_id: 0,
+            peer_color: Some((i % 7) as i32),
         });
     }
     app.selected = Some(0);
@@ -7515,6 +7609,7 @@ mod tests {
             unread_mentions: 0,
             unread_reactions: 0,
             read_inbox_max_id: 0,
+            peer_color: None,
         }
     }
 
@@ -8821,5 +8916,79 @@ mod tests {
         assert!(txt.contains("Удалить"), "expected Удалить batch button in {txt}");
         assert!(txt.contains("В Избранное"), "expected В Избранное batch button in {txt}");
         assert!(txt.contains("Выбрано: 1"), "expected selection count in {txt}");
+    }
+
+    fn has_vibrant_color(s: &egui::Shape) -> bool {
+        let non_gray = |c: Color32| {
+            let max_c = c.r().max(c.g()).max(c.b());
+            let min_c = c.r().min(c.g()).min(c.b());
+            c.a() > 40 && max_c.saturating_sub(min_c) >= 40
+        };
+        match s {
+            egui::Shape::Text(t) => non_gray(t.fallback_color) || t.galley.job.sections.iter().any(|sec| non_gray(sec.format.color)),
+            egui::Shape::LineSegment { stroke, .. } => non_gray(stroke.color),
+            egui::Shape::Rect(r) => non_gray(r.fill) || non_gray(r.stroke.color),
+            egui::Shape::Vec(v) => v.iter().any(has_vibrant_color),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn peer_nicknames_and_reply_bars_keep_telegram_colors() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        if let Some(d) = app.dialogs.first_mut() {
+            d.kind = rg_core::engine::DialogKind::Group;
+            d.peer_color = Some(0);
+        }
+        app.selected = Some(0);
+        let mut msg = MessageRow::plain(777, "Сообщение с цветным ником и ответом".to_owned(), false, app.now);
+        msg.sender_id = 42;
+        msg.sender = "Борис".to_owned();
+        msg.sender_color = Some(3);
+        msg.reply_to = Some((776, "Исходный текст".to_owned()));
+        msg.forwarded_from = Some("Алиса".to_owned());
+        app.messages.push(msg);
+
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 620.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            },
+        );
+        out.textures_delta.clear();
+        assert!(
+            out.shapes.iter().any(|cs| has_vibrant_color(&cs.shape)),
+            "expected vibrant Telegram peer colors on nicknames / reply bars"
+        );
+    }
+
+    #[test]
+    fn folder_reveal_and_gradual_blur_render_cleanly() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = demo_app("1");
+        app.selected = Some(0);
+        for k in 0..30 {
+            app.messages.push(MessageRow::plain(900 + k, format!("Строка прокрутки #{k}"), k % 2 == 0, app.now + i64::from(k)));
+        }
+        app.scrolled_up = true;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 620.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.folder_tabs(ui);
+                    app.messages_ui(ui);
+                });
+            },
+        );
+        out.textures_delta.clear();
     }
 }

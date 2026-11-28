@@ -67,6 +67,8 @@ pub struct DialogRow {
     pub unread_reactions: i32,
     /// Наибольший прочитанный входящий ID (`Dialog.read_inbox_max_id`) для плашки «Непрочитанные сообщения».
     pub read_inbox_max_id: i32,
+    /// Индекс персонального цвета акцента Telegram (`PeerColor.color`, 0..6 или выше).
+    pub peer_color: Option<i32>,
 }
 
 /// Фильтр типа сообщений для встроенного поиска в чате (`messages.search`).
@@ -1087,6 +1089,9 @@ pub struct MessageRow {
     /// Идентификаторы до 3 последних комментаторов поста (`MessageReplies.recent_repliers`).
     #[serde(default)]
     pub recent_repliers: Vec<i64>,
+    /// Индекс персонального цвета отправителя в Telegram (`PeerColor.color`).
+    #[serde(default)]
+    pub sender_color: Option<i32>,
 }
 
 impl MessageRow {
@@ -1121,6 +1126,7 @@ impl MessageRow {
             replies_count: 0,
             has_comments: false,
             recent_repliers: Vec::new(),
+            sender_color: None,
         }
     }
 }
@@ -1866,6 +1872,7 @@ impl Engine {
             let mut verified = false;
             let mut premium = false;
             let mut is_self = false;
+            let mut peer_color = None;
             let (name, peer) = match &d.peer {
                 tl::enums::Peer::User(u) => {
                     let Some(&user) = users_by_id.get(&u.user_id) else { continue };
@@ -1877,6 +1884,7 @@ impl Engine {
                             emoji_status = emoji_status_id(y.emoji_status.as_ref());
                             verified = y.verified;
                             premium = y.premium;
+                            peer_color = extract_peer_color(y.color.as_ref());
                             format!(
                                 "{} {}",
                                 y.first_name.clone().unwrap_or_default(),
@@ -1909,6 +1917,7 @@ impl Engine {
                             }
                             emoji_status = emoji_status_id(y.emoji_status.as_ref());
                             verified = y.verified;
+                            peer_color = extract_peer_color(y.color.as_ref());
                             y.title.clone()
                         }
                         _ => String::new(),
@@ -1969,6 +1978,7 @@ impl Engine {
                 unread_mentions: d.unread_mentions_count,
                 unread_reactions: d.unread_reactions_count,
                 read_inbox_max_id: d.read_inbox_max_id,
+                peer_color,
             });
         }
         (out, more_hint, last_off, users, chats, channel_pts)
@@ -2720,6 +2730,14 @@ impl Engine {
             replies_count,
             has_comments,
             recent_repliers,
+            sender_color: m.sender().and_then(|p| match p {
+                grammers_client::peer::Peer::User(u) => match &u.raw {
+                    grammers_client::tl::enums::User::User(y) => extract_peer_color(y.color.as_ref()),
+                    _ => None,
+                },
+                grammers_client::peer::Peer::Channel(c) => extract_peer_color(c.raw.color.as_ref()),
+                _ => None,
+            }),
         }
     }
 
@@ -2849,6 +2867,7 @@ impl Engine {
                     unread_mentions: 0,
                     unread_reactions: 0,
                     read_inbox_max_id: 0,
+                    peer_color: extract_peer_color(chan.color.as_ref()),
                 });
             }
         }
@@ -6396,6 +6415,7 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
         tl::enums::messages::Messages::NotModified(_) => return Vec::new(),
     };
     let mut user_names: HashMap<i64, String> = HashMap::with_capacity(users.len());
+    let mut user_colors: HashMap<i64, i32> = HashMap::with_capacity(users.len());
     for x in users {
         if let tl::enums::User::User(y) = x {
             let full = format!(
@@ -6406,13 +6426,20 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
             .trim()
             .to_owned();
             user_names.insert(y.id, full);
+            if let Some(cid) = extract_peer_color(y.color.as_ref()) {
+                user_colors.insert(y.id, cid);
+            }
         }
     }
     let mut chat_names: HashMap<i64, String> = HashMap::with_capacity(chats.len());
+    let mut chat_colors: HashMap<i64, i32> = HashMap::with_capacity(chats.len());
     for c in chats {
         match c {
             tl::enums::Chat::Channel(y) => {
                 chat_names.insert(y.id, y.title.clone());
+                if let Some(cid) = extract_peer_color(y.color.as_ref()) {
+                    chat_colors.insert(y.id, cid);
+                }
             }
             tl::enums::Chat::Chat(y) => {
                 chat_names.insert(y.id, y.title.clone());
@@ -6420,26 +6447,31 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
             _ => {}
         }
     }
-    let name_for_peer = |p: &Option<tl::enums::Peer>| -> (i64, String) {
+    let name_for_peer = |p: &Option<tl::enums::Peer>| -> (i64, String, Option<i32>) {
         match p {
-            Some(tl::enums::Peer::User(u)) => {
-                (u.user_id, user_names.get(&u.user_id).cloned().unwrap_or_default())
-            }
+            Some(tl::enums::Peer::User(u)) => (
+                u.user_id,
+                user_names.get(&u.user_id).cloned().unwrap_or_default(),
+                user_colors.get(&u.user_id).copied(),
+            ),
             Some(tl::enums::Peer::Channel(c)) => (
                 -1_000_000_000_000 - c.channel_id,
                 chat_names.get(&c.channel_id).cloned().unwrap_or_default(),
+                chat_colors.get(&c.channel_id).copied(),
             ),
-            Some(tl::enums::Peer::Chat(c)) => {
-                (-c.chat_id, chat_names.get(&c.chat_id).cloned().unwrap_or_default())
-            }
-            None => (0, String::new()),
+            Some(tl::enums::Peer::Chat(c)) => (
+                -c.chat_id,
+                chat_names.get(&c.chat_id).cloned().unwrap_or_default(),
+                None,
+            ),
+            None => (0, String::new(), None),
         }
     };
     let mut rows: Vec<MessageRow> = msgs
         .iter()
         .filter_map(|m| {
             let tl::enums::Message::Message(x) = m else { return None };
-            let (sender_id, sender) = name_for_peer(&x.from_id);
+            let (sender_id, sender, sender_color) = name_for_peer(&x.from_id);
             let entities = x
                 .entities
                 .as_deref()
@@ -6480,6 +6512,7 @@ fn tl_messages_to_rows(res: &grammers_client::tl::enums::messages::Messages) -> 
             Some(MessageRow {
                 sender,
                 sender_id,
+                sender_color,
                 entities,
                 reply_to,
                 reactions,
@@ -6723,6 +6756,14 @@ fn parse_notify_settings(
     }
 }
 
+/// Извлекает индекс персонального цвета акцента Telegram (`PeerColor::Color`).
+pub(crate) fn extract_peer_color(c: Option<&grammers_client::tl::enums::PeerColor>) -> Option<i32> {
+    match c {
+        Some(grammers_client::tl::enums::PeerColor::Color(pc)) => pc.color,
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
     let archived = matches!(
@@ -6736,21 +6777,23 @@ fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
         }
         _ => (0, false, false, None),
     };
-    let (emoji_status, verified, premium) = match d.peer() {
+    let (emoji_status, verified, premium, peer_color) = match d.peer() {
         grammers_client::peer::Peer::User(u) => match &u.raw {
             grammers_client::tl::enums::User::User(y) => (
                 emoji_status_id(y.emoji_status.as_ref()),
                 y.verified,
                 y.premium,
+                extract_peer_color(y.color.as_ref()),
             ),
-            _ => (None, false, false),
+            _ => (None, false, false, None),
         },
         grammers_client::peer::Peer::Channel(c) => (
             emoji_status_id(c.raw.emoji_status.as_ref()),
             c.raw.verified,
             false,
+            extract_peer_color(c.raw.color.as_ref()),
         ),
-        _ => (None, false, false),
+        _ => (None, false, false, None),
     };
     DialogRow {
         peer: d.peer_ref(),
@@ -6794,6 +6837,7 @@ fn dialog_row_from(d: &grammers_client::peer::Dialog, now: i64) -> DialogRow {
             grammers_client::tl::enums::Dialog::Dialog(x) => x.read_inbox_max_id,
             _ => 0,
         },
+        peer_color,
     }
 }
 
@@ -6991,6 +7035,7 @@ mod tests {
             unread_mentions: 0,
             unread_reactions: 0,
             read_inbox_max_id: 0,
+            peer_color: None,
         }
     }
 

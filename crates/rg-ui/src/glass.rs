@@ -87,7 +87,7 @@ pub enum GlassVariant {
 }
 
 /// Рисует матовую стеклянную поверхность с мягкой тенью, внутренним верхним бликом,
-/// двуслойной спекулярной кромкой и опциональным интерактивным свечением под указателем.
+/// двуслойной спекулярной кромкой и 5-кольцевым мягким отбликом под указателем.
 pub fn paint_surface_interactive(
     p: &egui::Painter,
     rect: Rect,
@@ -98,19 +98,19 @@ pub fn paint_surface_interactive(
 ) {
     paint_surface(p, rect, radius, variant, hover_k);
     if let Some(pt) = pointer_pos
-        && rect.expand(16.0).contains(pt)
+        && rect.expand(24.0).contains(pt)
     {
-        let r = radius.clamp(0.0, (rect.width().min(rect.height()) * 0.5).max(0.0));
         let clipped = p.with_clip_rect(rect);
-        let rad = rect.width().max(rect.height()).clamp(28.0, 96.0) * 0.42;
-        clipped.circle_filled(pt, rad, Color32::from_white_alpha((12.0 + 10.0 * hover_k) as u8));
-        clipped.circle_filled(pt, rad * 0.48, Color32::from_white_alpha((10.0 + 10.0 * hover_k) as u8));
-        let _ = r;
+        let max_rad = rect.width().max(rect.height()).clamp(36.0, 128.0) * 0.46;
+        let boost = 0.65 + 0.55 * hover_k.clamp(0.0, 1.0);
+        for (frac, base_a) in [(1.0_f32, 3.5_f32), (0.76, 4.5), (0.54, 5.5), (0.35, 6.5), (0.18, 8.0)] {
+            clipped.circle_filled(pt, max_rad * frac, Color32::from_white_alpha((base_a * boost) as u8));
+        }
     }
 }
 
-/// Рисует матовую стеклянную поверхность с мягкой тенью, внутренним верхним бликом
-/// и двуслойной спекулярной кромкой (сверху ярче, снизу глубже).
+/// Рисует многослойное матовое стекло в стиле iOS 26 Liquid Glass (контактная и рассеянная тень,
+/// трёхступенчатая вертикальная глубина преломления, двойной скошенный внутренний контур).
 pub fn paint_surface(p: &egui::Painter, rect: Rect, radius: f32, variant: GlassVariant, hover_k: f32) {
     if rect.width() <= 1.0 || rect.height() <= 1.0 {
         return;
@@ -121,37 +121,37 @@ pub fn paint_surface(p: &egui::Painter, rect: Rect, radius: f32, variant: GlassV
     let r = radius.clamp(0.0, max_r);
     let cr = CornerRadius::same(r.round() as u8);
 
-    // Мягкая двухслойная тень для отделения плавающих панелей и капсул от ленты.
+    // Контактная + рассеянная тень для отделения плавающих панелей и капсул.
     p.rect_filled(
-        rect.translate(Vec2::new(0.0, 2.5)).expand(1.5),
+        rect.translate(Vec2::new(0.0, 2.0)).expand(1.2),
         cr,
-        Color32::from_black_alpha((32.0 * op) as u8),
+        Color32::from_black_alpha((34.0 * op) as u8),
     );
     p.rect_filled(
-        rect.translate(Vec2::new(0.0, 6.0)).expand(2.5),
+        rect.translate(Vec2::new(0.0, 6.5)).expand(3.0),
         cr,
-        Color32::from_black_alpha((14.0 * op) as u8),
+        Color32::from_black_alpha((16.0 * op) as u8),
     );
 
     let (fill, rim_a, top_spec_a, accent_tint) = match variant {
         GlassVariant::Regular => (
-            Color32::from_rgba_unmultiplied(22, 24, 32, ((186.0 + 18.0 * hk) * op) as u8),
-            (36.0 + 28.0 * hk) as u8,
-            (74.0 + 36.0 * hk) as u8,
+            Color32::from_rgba_unmultiplied(20, 22, 29, ((190.0 + 18.0 * hk) * op) as u8),
+            (38.0 + 28.0 * hk) as u8,
+            (84.0 + 40.0 * hk) as u8,
             None,
         ),
         GlassVariant::Clear => (
-            Color32::from_rgba_unmultiplied(18, 20, 28, ((138.0 + 26.0 * hk) * op) as u8),
+            Color32::from_rgba_unmultiplied(16, 18, 24, ((140.0 + 26.0 * hk) * op) as u8),
             (30.0 + 30.0 * hk) as u8,
-            (62.0 + 36.0 * hk) as u8,
+            (66.0 + 38.0 * hk) as u8,
             None,
         ),
         GlassVariant::Tinted(col) => {
             let mix = lerp_color(Color32::from_rgb(24, 24, 30), col, 0.34 + 0.14 * hk);
             (
-                Color32::from_rgba_unmultiplied(mix.r(), mix.g(), mix.b(), (208.0 * op) as u8),
-                (70.0 + 40.0 * hk) as u8,
-                (92.0 + 40.0 * hk) as u8,
+                Color32::from_rgba_unmultiplied(mix.r(), mix.g(), mix.b(), (210.0 * op) as u8),
+                (72.0 + 42.0 * hk) as u8,
+                (100.0 + 42.0 * hk) as u8,
                 Some(col),
             )
         }
@@ -159,34 +159,56 @@ pub fn paint_surface(p: &egui::Painter, rect: Rect, radius: f32, variant: GlassV
 
     p.rect_filled(rect, cr, fill);
 
-    // Внутренний верхний блик (двухслойное матовое преломление без цветных пятен фона).
-    let sheen_h = (rect.height() * 0.44).clamp(4.0, 20.0);
-    let sheen_rect = Rect::from_min_max(
-        Pos2::new(rect.left() + 1.0, rect.top() + 1.0),
-        Pos2::new(rect.right() - 1.0, (rect.top() + sheen_h).min(rect.bottom() - 1.0)),
-    );
+    // Трёхступенчатая глубина матового преломления (верхнее свечение -> центр -> мягкий отсвет снизу).
     let sheen_r = (r - 1.0).max(0.0).round() as u8;
+    let upper_h = (rect.height() * 0.48).clamp(4.0, 26.0);
+    let upper_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 1.0, rect.top() + 1.0),
+        Pos2::new(rect.right() - 1.0, (rect.top() + upper_h).min(rect.bottom() - 1.0)),
+    );
     p.rect_filled(
-        sheen_rect,
-        CornerRadius { nw: sheen_r, ne: sheen_r, sw: 3, se: 3 },
-        Color32::from_white_alpha((12.0 + 10.0 * hk) as u8),
+        upper_rect,
+        CornerRadius { nw: sheen_r, ne: sheen_r, sw: 4, se: 4 },
+        Color32::from_white_alpha((9.0 + 8.0 * hk) as u8),
     );
     if rect.height() > 14.0 {
-        let micro_h = (rect.height() * 0.16).clamp(2.0, 6.0);
+        let mid_h = (rect.height() * 0.24).clamp(3.0, 12.0);
+        let mid_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 1.5, rect.top() + 1.0),
+            Pos2::new(rect.right() - 1.5, (rect.top() + mid_h).min(rect.bottom() - 2.0)),
+        );
+        p.rect_filled(
+            mid_rect,
+            CornerRadius { nw: sheen_r, ne: sheen_r, sw: 3, se: 3 },
+            Color32::from_white_alpha((10.0 + 8.0 * hk) as u8),
+        );
+        let micro_h = (rect.height() * 0.10).clamp(1.5, 4.0);
         let micro_rect = Rect::from_min_max(
-            Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
-            Pos2::new(rect.right() - 2.0, (rect.top() + micro_h).min(rect.bottom() - 2.0)),
+            Pos2::new(rect.left() + 2.5, rect.top() + 1.0),
+            Pos2::new(rect.right() - 2.5, (rect.top() + micro_h).min(rect.bottom() - 2.0)),
         );
         p.rect_filled(
             micro_rect,
             CornerRadius { nw: sheen_r, ne: sheen_r, sw: 2, se: 2 },
-            Color32::from_white_alpha((8.0 + 6.0 * hk) as u8),
+            Color32::from_white_alpha((11.0 + 8.0 * hk) as u8),
+        );
+        // Нижнее отражённое свечение стекла (bounce-light).
+        let bot_h = (rect.height() * 0.18).clamp(2.0, 9.0);
+        let bot_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 2.0, (rect.bottom() - bot_h).max(rect.top() + 2.0)),
+            Pos2::new(rect.right() - 2.0, rect.bottom() - 1.0),
+        );
+        p.rect_filled(
+            bot_rect,
+            CornerRadius { nw: 3, ne: 3, sw: sheen_r, se: sheen_r },
+            Color32::from_white_alpha((5.0 + 4.0 * hk) as u8),
         );
     }
+    // Внутренний скошенный спекулярный контур (1 px inside).
     p.rect_stroke(
         rect.shrink(1.0),
         CornerRadius::same(sheen_r),
-        Stroke::new(0.8, Color32::from_white_alpha((12.0 + 12.0 * hk) as u8)),
+        Stroke::new(0.85, Color32::from_white_alpha((14.0 + 14.0 * hk) as u8)),
         StrokeKind::Inside,
     );
 
@@ -291,12 +313,16 @@ pub fn segmented_tabs(
     let target_x = active.min(labels.len() - 1) as f32;
     let anim_x = spring_anim(ui.ctx(), ("seg-tab-x", id_salt), target_x, SpringSpec::BOUNCY)
         .clamp(-0.15, labels.len() as f32 - 0.85);
+    // #12 Gooey Nav: растяжение пилюли по горизонтали во время перелёта к новой вкладке.
+    let stretch = ((anim_x - target_x).abs() * 0.34).min(0.42);
+    let pill_w = slot_w * (1.0 + stretch);
+    let pill_x = track.left() + pad + anim_x * slot_w - (pill_w - slot_w) * 0.5;
     let pill = Rect::from_min_size(
-        Pos2::new(track.left() + pad + anim_x * slot_w, track.top() + pad),
-        Vec2::new(slot_w, slot_h),
+        Pos2::new(pill_x.clamp(track.left() + pad, track.right() - pad - pill_w), track.top() + pad),
+        Vec2::new(pill_w, slot_h),
     );
     let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
-    paint_surface_interactive(ui.painter(), pill, slot_h * 0.5, GlassVariant::Tinted(c_orange()), 0.35, ptr);
+    paint_surface_interactive(ui.painter(), pill, slot_h * 0.5, GlassVariant::Tinted(c_orange()), 0.35 + stretch * 0.4, ptr);
 
     let mut picked = None;
     for (idx, &lbl) in labels.iter().enumerate() {
@@ -354,6 +380,12 @@ pub fn otp_input(
 
     let (row_r, row_resp) = ui.allocate_exact_size(Vec2::new(avail, cell_h + 6.0), Sense::click());
     let group_id = ui.make_persistent_id(("otp-group", id_salt));
+    let mounted_k = egui::Id::NULL.with(("otp-mounted", id_salt));
+    let first_mount = !ui.ctx().data(|d| d.get_temp::<bool>(mounted_k).unwrap_or(false));
+    if first_mount {
+        ui.ctx().data_mut(|d| d.insert_temp(mounted_k, true));
+        ui.memory_mut(|m| m.request_focus(group_id));
+    }
     if row_resp.clicked() {
         ui.memory_mut(|m| m.request_focus(group_id));
     }
@@ -578,12 +610,131 @@ pub fn floating_tab_bar(
         }
     }
     if let Some((tip_c, tip_lbl)) = hovered_tip {
-        let g = ui.painter().layout_no_wrap(tip_lbl.to_owned(), FontId::proportional(11.0), WHITE);
-        let tip_r = Rect::from_center_size(tip_c - Vec2::new(0.0, 8.0), Vec2::new(g.size().x + 16.0, 22.0));
-        paint_surface(ui.painter(), tip_r, 11.0, GlassVariant::Regular, 0.25);
-        ui.painter().galley(tip_r.center() - g.size() * 0.5, g, WHITE);
+        paint_tooltip_card(ui.painter(), tip_c - Vec2::new(0.0, 8.0), tip_lbl);
     }
     picked
+}
+
+/// #1 Liquid Glass Modal Dialog Frame: пружинная стеклянная карточка модального окна.
+pub fn paint_modal_card(p: &egui::Painter, rect: Rect, radius: f32, appear_k: f32) {
+    let k = appear_k.clamp(0.0, 1.0);
+    if k <= 0.01 {
+        return;
+    }
+    paint_surface(p, rect, radius, GlassVariant::Regular, 0.14 * k);
+}
+
+/// #3 Liquid Glass Tooltip Card: компактная стеклянная подсказка с верхним бликом.
+pub fn paint_tooltip_card(p: &egui::Painter, anchor_center: Pos2, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let g = p.layout_no_wrap(text.to_owned(), FontId::proportional(11.0), WHITE);
+    let tip_r = Rect::from_center_size(anchor_center, Vec2::new(g.size().x + 16.0, 22.0));
+    paint_surface(p, tip_r, 11.0, GlassVariant::Regular, 0.28);
+    p.galley(tip_r.center() - g.size() * 0.5, g, WHITE);
+}
+
+/// #8 Counter (Animated Digits): плавно пересчитываемый цифровой счётчик на пружине.
+pub fn animated_counter(ui: &mut Ui, id_salt: impl Hash + std::fmt::Debug, value: i64, font: FontId, color: Color32) {
+    let cur = spring_anim(ui.ctx(), ("anim-cnt", &id_salt), value as f32, SpringSpec::SNAPPY);
+    let shown = cur.round() as i64;
+    let tilt = ((value as f32 - cur).clamp(-1.0, 1.0)) * 2.5;
+    let txt = shown.to_string();
+    let g = ui.painter().layout_no_wrap(txt, font, color);
+    let (r, _) = ui.allocate_exact_size(g.size() + Vec2::new(2.0, 0.0), Sense::hover());
+    ui.painter().galley(Pos2::new(r.left() + 1.0, r.center().y - g.size().y * 0.5 + tilt), g, color);
+}
+
+/// #9 Magnet Button: мягкое притяжение иконки/FAB к указателю в радиусе `radius`.
+pub fn magnet_offset(
+    ctx: &egui::Context,
+    id_salt: impl Hash + std::fmt::Debug,
+    center: Pos2,
+    radius: f32,
+    max_pull: f32,
+) -> Vec2 {
+    let target = ctx
+        .input(|i| i.pointer.hover_pos())
+        .and_then(|pt| {
+            let delta = pt - center;
+            let dist = delta.length();
+            if dist > 0.5 && dist < radius {
+                let strength = (1.0 - dist / radius).powi(2) * max_pull;
+                Some(delta / dist * strength)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Vec2::ZERO);
+    Vec2::new(
+        spring_anim(ctx, ("mag-x", &id_salt), target.x, SpringSpec::BOUNCY),
+        spring_anim(ctx, ("mag-y", &id_salt), target.y, SpringSpec::BOUNCY),
+    )
+}
+
+/// #10 Star Border: монохромный бегущий спекулярный контур вокруг карточек Stars и премиум-пилюль.
+pub fn paint_star_border(p: &egui::Painter, ctx: &egui::Context, rect: Rect, radius: f32, active: bool) {
+    let phase = (ctx.input(|i| i.time) * if active { 2.4 } else { 1.3 }) as f32;
+    if active {
+        ctx.request_repaint_after(std::time::Duration::from_millis(32));
+    }
+    let cr = CornerRadius::same(radius.clamp(0.0, rect.width().min(rect.height()) * 0.5).round() as u8);
+    p.rect_stroke(
+        rect,
+        cr,
+        Stroke::new(1.1, Color32::from_white_alpha(if active { 74 } else { 36 })),
+        StrokeKind::Inside,
+    );
+    // Два бегущих световых пятна вдоль верхней и нижней кромки.
+    let w = (rect.width() - radius * 1.4).max(8.0);
+    let t0 = phase.sin() * 0.5 + 0.5;
+    let t1 = 1.0 - t0;
+    let span = (w * 0.24).clamp(10.0, 34.0);
+    let top_x = rect.left() + radius * 0.7 + (w - span) * t0;
+    let bot_x = rect.left() + radius * 0.7 + (w - span) * t1;
+    p.line_segment(
+        [Pos2::new(top_x, rect.top() + 0.8), Pos2::new(top_x + span, rect.top() + 0.8)],
+        Stroke::new(1.8, Color32::from_white_alpha(if active { 210 } else { 140 })),
+    );
+    p.line_segment(
+        [Pos2::new(bot_x, rect.bottom() - 0.8), Pos2::new(bot_x + span, rect.bottom() - 0.8)],
+        Stroke::new(1.5, Color32::from_white_alpha(if active { 140 } else { 80 })),
+    );
+}
+
+/// #11 Spotlight Card: матовая стеклянная карточка с живым фонариком-подсветкой под курсором.
+pub fn paint_spotlight_card(p: &egui::Painter, rect: Rect, radius: f32, pointer_pos: Option<Pos2>, hover_k: f32) {
+    paint_surface_interactive(p, rect, radius, GlassVariant::Regular, hover_k, pointer_pos);
+}
+
+/// #13 Gradual Blur: многослойное матовое затухание у верхней и нижней кромки прокручиваемой ленты.
+pub fn paint_gradual_blur_edges(p: &egui::Painter, rect: Rect, top_h: f32, bot_h: f32) {
+    if rect.height() < 60.0 || rect.width() < 20.0 {
+        return;
+    }
+    let bg = theme::c_window_bg();
+    let op = theme::opacity_f32();
+    let steps = 6usize;
+    if top_h > 2.0 {
+        let step_h = top_h / steps as f32;
+        for i in 0..steps {
+            let k = 1.0 - i as f32 / steps as f32;
+            let a = (135.0 * k * k * op).clamp(0.0, 210.0) as u8;
+            let strip = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + i as f32 * step_h), Vec2::new(rect.width(), step_h + 0.5));
+            p.rect_filled(strip, 0.0, Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a));
+        }
+    }
+    if bot_h > 2.0 {
+        let step_h = bot_h / steps as f32;
+        for i in 0..steps {
+            let k = 1.0 - i as f32 / steps as f32;
+            let a = (145.0 * k * k * op).clamp(0.0, 220.0) as u8;
+            let y = rect.bottom() - (i as f32 + 1.0) * step_h;
+            let strip = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), step_h + 0.5));
+            p.rect_filled(strip, 0.0, Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a));
+        }
+    }
 }
 
 /// Плавное всплывающее Liquid Glass уведомление (тост) снизу по центру без скачков раскладки.
@@ -725,5 +876,47 @@ mod tests {
         out.shapes.iter().for_each(|cs| collect_t(&cs.shape, &mut txt));
         assert!(txt.contains("Эмодзи") && txt.contains("Стикеры") && txt.contains("GIF"));
         assert!(txt.contains('1') && txt.contains('2'));
+    }
+
+    #[test]
+    fn extended_liquid_glass_primitives_render_without_panic() {
+        let ctx = egui::Context::default();
+        let mut out_shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 480.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let card = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(300.0, 120.0));
+                        paint_modal_card(ui.painter(), card, 16.0, 1.0);
+                        paint_spotlight_card(ui.painter(), card, 16.0, Some(Pos2::new(80.0, 60.0)), 0.7);
+                        paint_star_border(ui.painter(), ui.ctx(), card, 16.0, false);
+                        paint_tooltip_card(ui.painter(), Pos2::new(140.0, 16.0), "Подсказка");
+                        animated_counter(ui, "cnt-test", 42, FontId::proportional(14.0), WHITE);
+                        let off = magnet_offset(ui.ctx(), "mag-test", card.center(), 48.0, 4.0);
+                        assert!(off.length() <= 5.0);
+                        paint_gradual_blur_edges(ui.painter(), card, 18.0, 18.0);
+                    });
+                },
+            );
+            out.textures_delta.clear();
+            out_shapes = out.shapes;
+        }
+        let mut txt = String::new();
+        fn collect_all(s: &egui::Shape, buf: &mut String) {
+            match s {
+                egui::Shape::Text(t) => {
+                    buf.push_str(t.galley.text());
+                    buf.push(' ');
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|x| collect_all(x, buf)),
+                _ => {}
+            }
+        }
+        out_shapes.iter().for_each(|cs| collect_all(&cs.shape, &mut txt));
+        assert!(txt.contains("Подсказка") && txt.contains("42"));
     }
 }

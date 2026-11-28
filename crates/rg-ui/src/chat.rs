@@ -549,9 +549,9 @@ impl App {
                         icons::tg(ui.painter(), "dialogs/dialogs_premium", badge_c, ORANGE);
                     }
                 } else if verified {
-                    icons::tg(ui.painter(), "dialogs/dialogs_verified_star", badge_c, ORANGE);
+                    icons::tg(ui.painter(), "dialogs/dialogs_verified_star", badge_c, TG_BLUE);
                 } else if premium {
-                    icons::tg(ui.painter(), "dialogs/dialogs_premium", badge_c, ORANGE);
+                    icons::tg(ui.painter(), "dialogs/dialogs_premium", badge_c, TG_BLUE);
                 }
                 if !subtitle.is_empty() {
                     let clip_s = Rect::from_min_max(Pos2::new(text_x, hrect.top()), Pos2::new(hrect.right(), hrect.bottom()));
@@ -1302,23 +1302,10 @@ impl App {
             if info_tab >= tabs.len() {
                 info_tab = 0;
             }
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let tw = w / tabs.len() as f32;
-                for (name, tid) in tabs {
-                    let (tr, tresp) = ui.allocate_exact_size(Vec2::new(tw, 36.0), Sense::click());
-                    let k = tween(ui.ctx(), ("inftab", *tid), f32::from(u8::from(info_tab == *tid)), 0.14);
-                    ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(13.0), lerp_color(SUBTEXT, WHITE, k));
-                    ui.painter().rect_filled(
-                        Rect::from_center_size(Pos2::new(tr.center().x, tr.bottom() - 1.5), Vec2::new((tw - 14.0) * k, 2.5)),
-                        egui::CornerRadius::same(1),
-                        t_btn(ORANGE),
-                    );
-                    if tresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        info_tab = *tid;
-                    }
-                }
-            });
+            let labels: Vec<&str> = tabs.iter().map(|(n, _)| *n).collect();
+            if let Some(new_tab) = super::glass::segmented_tabs(ui, "info-seg-tabs", &labels, info_tab) {
+                info_tab = new_tab;
+            }
             ui.add_space(6.0);
 
             match info_tab {
@@ -1863,13 +1850,16 @@ impl App {
                 fill_cmd = Some(format!("/{c} "));
             }
             let shift_held = ui.input(|i| i.modifiers.shift);
+            let kbar_appear = tween(ui.ctx(), "kbar-open", 1.0, 0.14);
+            let ptr = ui.ctx().input(|i| i.pointer.hover_pos());
             kit::compact_popup_frame()
-                .inner_margin(egui::Margin::symmetric(6, 5))
+                .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
+                    super::glass::paint_modal_card(ui.painter(), ui.max_rect().expand(6.0), 12.0, kbar_appear);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Команды бота").size(12.0).strong().color(c_orange()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new("↑↓ · Enter / Shift — вставить").size(10.5).color(SUBTEXT));
+                            ui.label(RichText::new("↑↓ · Tab / Enter").size(10.5).color(SUBTEXT));
                         });
                     });
                     ui.add_space(3.0);
@@ -1880,16 +1870,15 @@ impl App {
                             for (idx, (cmd, desc)) in popup_cmds.iter().enumerate() {
                                 let selected = idx == self.cmd_sel_idx;
                                 let row_w = ui.available_width();
-                                let (rr, rresp) = ui.allocate_exact_size(Vec2::new(row_w, 28.0), Sense::click());
-                                if selected || rresp.hovered() {
-                                    ui.painter().rect_filled(
+                                let (rr, rresp) = ui.allocate_exact_size(Vec2::new(row_w, 30.0), Sense::click());
+                                let rk = tween(ui.ctx(), ("kbar-r", idx), f32::from(u8::from(selected || rresp.hovered())), 0.12);
+                                if selected || rk > 0.02 {
+                                    super::glass::paint_spotlight_card(
+                                        ui.painter(),
                                         rr,
-                                        egui::CornerRadius::same(7),
-                                        if selected {
-                                            t_btn(c_orange()).gamma_multiply(0.22)
-                                        } else {
-                                            Color32::from_white_alpha(18)
-                                        },
+                                        8.0,
+                                        ptr,
+                                        if selected { 0.45 } else { rk * 0.25 },
                                     );
                                 }
                                 let cmd_t = format!("/{cmd}");
@@ -1903,7 +1892,8 @@ impl App {
                                 );
                                 if !desc.is_empty() {
                                     let desc_x = rr.left() + 16.0 + cmd_gal.size().x;
-                                    let avail_desc = ((rr.right() - 8.0) - desc_x).max(20.0);
+                                    let right_pad = if selected { 46.0 } else { 8.0 };
+                                    let avail_desc = ((rr.right() - right_pad) - desc_x).max(20.0);
                                     let max_c = ((avail_desc / 6.6) as usize).max(6);
                                     ui.painter().with_clip_rect(rr).text(
                                         Pos2::new(desc_x, rr.center().y),
@@ -1912,6 +1902,11 @@ impl App {
                                         FontId::proportional(12.0),
                                         DIALOG_DATE,
                                     );
+                                }
+                                if selected {
+                                    let badge = Rect::from_center_size(Pos2::new(rr.right() - 22.0, rr.center().y), Vec2::new(34.0, 18.0));
+                                    ui.painter().rect_filled(badge, egui::CornerRadius::same(5), Color32::from_white_alpha(20));
+                                    ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, "Tab", FontId::proportional(10.0), SUBTEXT);
                                 }
                                 if rresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                     if shift_held {
@@ -2617,10 +2612,17 @@ impl App {
             if s.field_attach_button {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::click());
                 let ah = tween(ui.ctx(), "cmp-att-h", f32::from(u8::from(resp.hovered())), 0.12);
+                let att_c = rect.center() + super::glass::magnet_offset(ui.ctx(), "cmp-att-mag", rect.center(), 38.0, 2.5);
                 if ah > 0.02 {
-                    ui.painter().circle_filled(rect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(ah));
+                    super::glass::paint_surface(
+                        ui.painter(),
+                        Rect::from_center_size(att_c, Vec2::splat(30.0)),
+                        15.0,
+                        super::glass::GlassVariant::Clear,
+                        ah,
+                    );
                 }
-                icons::attach(ui.painter(), rect.center(), lerp_color(DIALOG_DATE, WHITE, ah));
+                icons::attach(ui.painter(), att_c, lerp_color(DIALOG_DATE, WHITE, ah));
                 let resp = resp
                     .on_hover_text(if s.show_attach_popup {
                         "Меню вложений (файл, опрос, чек-лист, контакт)"
@@ -2983,6 +2985,7 @@ impl App {
             let send_h = tween(ui.ctx(), "send-hover", f32::from(u8::from(sresp.hovered())), 0.12);
             let send_p = tween(ui.ctx(), "send-press", f32::from(u8::from(sresp.is_pointer_button_down_on())), 0.08);
             let sc = spring_scale(send_h, send_p);
+            let sc_center = srect.center() + super::glass::magnet_offset(ui.ctx(), "cmp-send-mag", srect.center(), 46.0, 3.5);
             if send_k > 0.02 {
                 let r_btn = 16.0 * sc.min(1.12);
                 let base = lerp_color(c_orange(), ORANGE_OVER, send_h);
@@ -2992,13 +2995,13 @@ impl App {
                     base.b(),
                     (f32::from(t_btn(base).a()) * send_k) as u8,
                 );
-                ui.painter().circle_filled(srect.center(), r_btn, fill);
+                ui.painter().circle_filled(sc_center, r_btn, fill);
             } else if mic_mode && send_h > 0.02 {
-                ui.painter().circle_filled(srect.center(), 16.0, t(WINDOW_OVER).gamma_multiply(send_h));
+                ui.painter().circle_filled(sc_center, 16.0, t(WINDOW_OVER).gamma_multiply(send_h));
             }
             if mic_mode {
                 let mc = lerp_color(DIALOG_DATE, c_orange(), send_h);
-                let c = srect.center();
+                let c = sc_center;
                 let cap = Rect::from_center_size(Pos2::new(c.x, c.y - 2.5), Vec2::new(7.5, 11.5));
                 ui.painter().rect_filled(cap, egui::CornerRadius::same(4), mc);
                 ui.painter().line_segment([Pos2::new(c.x - 6.0, c.y - 0.5), Pos2::new(c.x - 6.0, c.y + 3.0)], egui::Stroke::new(1.5, mc));
@@ -3008,7 +3011,7 @@ impl App {
                 ui.painter().line_segment([Pos2::new(c.x - 3.8, c.y + 7.5), Pos2::new(c.x + 3.8, c.y + 7.5)], egui::Stroke::new(1.5, mc));
             } else {
                 let arrow_c = if active { super::theme::on_accent() } else { DIALOG_DATE };
-                icons::send(ui.painter(), srect.center(), arrow_c);
+                icons::send(ui.painter(), sc_center, arrow_c);
                 if self.selected_effect.is_some() {
                     ui.painter().circle_filled(
                         srect.right_top() + Vec2::new(-5.0, 6.0),
@@ -4087,6 +4090,13 @@ impl App {
         self.msgs_h = (out.content_size.y - pad).max(0.0);
         self.scrolled_up = out.content_size.y > out.inner_rect.height() + 20.0
             && (out.state.clamped_offset().y + out.inner_rect.height() < out.content_size.y - 48.0);
+        // #13 Gradual Blur: мягкое матовое затухание на верхней и нижней кромках ленты сообщений.
+        super::glass::paint_gradual_blur_edges(
+            ui.painter(),
+            out.inner_rect,
+            if out.state.clamped_offset().y > 6.0 { 16.0 } else { 0.0 },
+            if self.scrolled_up { 20.0 } else { 0.0 },
+        );
         if self.settings.extera.hide_keyboard_on_scroll && ui.input(|i| i.smooth_scroll_delta.y.abs() > 3.0) {
             if !self.emoji_pinned {
                 self.emoji_open = false;
@@ -4113,7 +4123,8 @@ impl App {
 
             if down_raw > 0.02 {
                 let slide_y = (1.0 - down_k) * 16.0;
-                let center = Pos2::new(clip_rect.right() - 32.0, clip_rect.bottom() - 32.0 + slide_y);
+                let base_center = Pos2::new(clip_rect.right() - 32.0, clip_rect.bottom() - 32.0 + slide_y);
+                let center = base_center + super::glass::magnet_offset(ui.ctx(), "scroll-down-mag", base_center, 52.0, 4.0);
                 let fab_sz = (42.0 * (0.68 + 0.32 * down_k)).max(4.0);
                 let fab_rect = Rect::from_center_size(center, Vec2::splat(fab_sz));
                 let resp = ui.interact(fab_rect, ui.make_persistent_id("scroll-down-fab"), Sense::click());
@@ -4358,6 +4369,20 @@ impl App {
                 if !text.is_empty() {
                     crate::copy_text_to_clipboard(ui.ctx(), &text);
                     self.status = "Выделенные тексты скопированы".to_owned();
+                } else if self.selected_msgs.len() == 1
+                    && let Some(&mid) = self.selected_msgs.iter().next()
+                    && let Some(did) = self.selected_dialog_id()
+                    && self.messages.iter().any(|m| {
+                        m.id == mid
+                            && m.media.as_ref().is_some_and(|i| {
+                                matches!(i.kind, rg_core::media::MediaKind::Photo | rg_core::media::MediaKind::Sticker)
+                                    || (i.kind == rg_core::media::MediaKind::File
+                                        && i.mime.starts_with("image/"))
+                            })
+                    })
+                {
+                    self.send(Cmd::CopyPhoto(did, mid));
+                    self.status = "Копируем фото в буфер обмена…".to_owned();
                 }
                 clear_sel = true;
             }
@@ -4545,10 +4570,12 @@ impl App {
                                         ui.set_max_width((avail * 0.72).clamp(180.0, 520.0));
                                         ui.vertical(|ui| {
                                             if !is_out {
-                                                ui.label(RichText::new(&who).strong().size(12.5).color(ORANGE));
+                                                let nc = peer_color(c.sender_id, c.sender_color);
+                                                ui.label(RichText::new(&who).strong().size(12.5).color(nc));
                                             }
                                             if let Some((_, rp_txt)) = &c.reply_to {
-                                                ui.label(RichText::new(format!("Ответ: {}", short(rp_txt, 48))).size(11.5).color(ORANGE));
+                                                let rc = peer_color(c.sender_id, c.sender_color);
+                                                ui.label(RichText::new(format!("Ответ: {}", short(rp_txt, 48))).size(11.5).color(rc));
                                             }
                                             let body = if c.text.is_empty() { "[Вложение]" } else { c.text.as_str() };
                                             ui.label(RichText::new(body).size(14.5).color(if is_out { MSG_OUT_TEXT } else { WHITE }));
@@ -6260,6 +6287,11 @@ impl App {
         let tex = self.textures.get(&id).cloned();
         let zoom = self.viewer_zoom;
         let mut acts: Vec<Act> = Vec::new();
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
+        {
+            acts.push(Act::CopyPhoto(id));
+        }
         egui::Area::new(egui::Id::new("viewer"))
             .order(egui::Order::Tooltip)
             .fixed_pos(egui::Pos2::ZERO)
@@ -6547,14 +6579,28 @@ fn bubble(
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if env.group && !m.outgoing && !m.sender.is_empty() {
-                        let c = avatar_color(m.sender.bytes().fold(7i64, |a, b| a * 31 + i64::from(b)));
+                        let key_id = if m.sender_id != 0 {
+                            m.sender_id
+                        } else {
+                            m.sender.bytes().fold(7i64, |a, b| a.wrapping_mul(31).wrapping_add(i64::from(b)))
+                        };
+                        let c = peer_color(key_id, m.sender_color);
                         ui.label(RichText::new(&m.sender).strong().size(13.0).color(c));
                     }
                     if let Some(f) = &m.forwarded_from {
-                        ui.label(RichText::new(format!("Переслано от {f}")).size(12.0).color(ACCENT));
+                        let fc = peer_color(
+                            f.bytes().fold(13i64, |a, b| a.wrapping_mul(31).wrapping_add(i64::from(b))),
+                            m.sender_color,
+                        );
+                        ui.label(RichText::new(format!("Переслано от {f}")).size(12.0).color(fc));
                     }
                     if let Some((rid, snippet)) = &m.reply_to {
-                        let bar_c = if s.show_colorful_replies { c_orange() } else { date_c };
+                        let bar_c = if s.show_colorful_replies {
+                            let rid_key = if m.sender_id != 0 { m.sender_id } else { i64::from(*rid) };
+                            peer_color(rid_key, m.sender_color)
+                        } else {
+                            date_c
+                        };
                         let snippet_t = if snippet.is_empty() { "сообщение" } else { snippet.as_str() };
                         let resp = if s.simple_quotes_and_replies {
                             ui.label(RichText::new(format!("Ответ: {}", short(snippet_t, 45))).size(12.5).color(bar_c))
@@ -6670,7 +6716,7 @@ fn bubble(
                             runs,
                             15.0,
                             text_c,
-                            c_orange(),
+                            TG_BLUE,
                             m.id,
                             env.spoilers,
                         ));
@@ -6887,12 +6933,16 @@ fn bubble(
                                     )
                                 };
                                 ui.painter().rect_filled(pr, egui::CornerRadius::same(13), bg);
-                                ui.painter().rect_stroke(
-                                    pr,
-                                    egui::CornerRadius::same(13),
-                                    egui::Stroke::new(1.0, border),
-                                    egui::StrokeKind::Inside,
-                                );
+                                if pill.paid {
+                                    super::glass::paint_star_border(ui.painter(), ui.ctx(), pr, 13.0, pill.chosen || presp.hovered());
+                                } else {
+                                    ui.painter().rect_stroke(
+                                        pr,
+                                        egui::CornerRadius::same(13),
+                                        egui::Stroke::new(1.0, border),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
                                 if glass_m {
                                     ui.painter().line_segment(
                                         [Pos2::new(pr.left() + 10.0, pr.top() + 0.8), Pos2::new(pr.right() - 10.0, pr.top() + 0.8)],
@@ -7365,17 +7415,21 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
                                 ui.close();
                             }
                         }
-                        for e in &allowed {
+                        let menu_open_t = tween(ui.ctx(), ("bm-strip", m.id), 1.0, 0.22);
+                        for (idx, e) in allowed.iter().enumerate() {
                             let (r_rect, r_resp) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
                             let hk = tween(ui.ctx(), ("mrx", m.id, e), f32::from(u8::from(r_resp.hovered())), 0.12);
+                            // #14 Bubble Menu: поэтапное каскадное появление эмодзи-реакций в меню.
+                            let stag = (menu_open_t * 1.45 - idx as f32 * 0.07).clamp(0.0, 1.0);
+                            let stag_k = 0.72 + 0.28 * ios_spring_bounce(stag);
                             if hk > 0.02 {
                                 ui.painter().circle_filled(
                                     r_rect.center(),
-                                    13.5,
+                                    13.5 * stag_k,
                                     Color32::from_white_alpha((26.0 * hk) as u8),
                                 );
                             }
-                            let scale_sz = 19.5 * (1.0 + 0.16 * ios_spring_bounce(hk));
+                            let scale_sz = 19.5 * stag_k * (1.0 + 0.16 * ios_spring_bounce(hk));
                             if let Some(img) = env.emoji.and_then(|em| em.image_str(e, scale_sz)) {
                                 img.paint_at(ui, Rect::from_center_size(r_rect.center(), Vec2::splat(scale_sz)));
                             } else {
@@ -7416,7 +7470,10 @@ fn menu(ui: &mut egui::Ui, m: &MessageRow, env: &Env, acts: &mut Vec<Act>) {
     if s.show_message_shot && (!m.text.is_empty() || m.media.is_some()) {
         item(ui, "menu/photo", "Снимок сообщения", Act::Shot(m.id));
     }
-    if m.media.as_ref().is_some_and(|i| i.kind == rg_core::media::MediaKind::Photo) {
+    if m.media.as_ref().is_some_and(|i| {
+        matches!(i.kind, rg_core::media::MediaKind::Photo | rg_core::media::MediaKind::Sticker)
+            || (i.kind == rg_core::media::MediaKind::File && i.mime.starts_with("image/"))
+    }) {
         item(ui, "menu/copy", "Копировать фото", Act::CopyPhoto(m.id));
     }
     if m.media.as_ref().is_some_and(|i| i.is_downloadable()) {
@@ -7530,7 +7587,7 @@ fn render_rich_blocks(
             &runs,
             size,
             col,
-            c_orange(),
+            TG_BLUE,
             msg_id,
             env.spoilers,
         ));

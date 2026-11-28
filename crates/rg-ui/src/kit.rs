@@ -278,15 +278,44 @@ pub fn slider(ui: &mut egui::Ui, label: &str, value: &mut i32, range: (i32, i32)
         }
     }
     let t = (*value - range.0) as f32 / (range.1 - range.0).max(1) as f32;
-    let knob_x = track.left() + t * track.width();
-    let p = ui.painter();
-    p.rect_filled(track, CornerRadius::same(2), t_btn(TRACK_OFF));
-    p.rect_filled(
-        Rect::from_min_max(track.min, Pos2::new(knob_x, track.max.y)),
-        CornerRadius::same(2),
-        t_btn(ORANGE),
+    let disp_t = super::glass::spring_anim(
+        ui.ctx(),
+        ("sl-el-t", label),
+        t.clamp(0.0, 1.0),
+        super::glass::SpringSpec::SNAPPY,
+    )
+    .clamp(0.0, 1.0);
+    let drag_k = tween(
+        ui.ctx(),
+        ("sl-el-d", label),
+        f32::from(u8::from(resp.hovered() || resp.dragged())),
+        0.12,
     );
-    p.circle_filled(Pos2::new(knob_x, track.center().y), 7.0, t_btn(ORANGE));
+    let knob_x = track.left() + disp_t * track.width();
+    // #5 Elastic Slider: трек утолщается при наведении/перетаскивании, бегунок пружинит и подсвечивается.
+    let track_half_h = 2.0 + 1.1 * drag_k;
+    let elastic_track = Rect::from_min_max(
+        Pos2::new(track.left(), track.center().y - track_half_h),
+        Pos2::new(track.right(), track.center().y + track_half_h),
+    );
+    let fill_track = Rect::from_min_max(
+        elastic_track.min,
+        Pos2::new(knob_x.max(elastic_track.left() + track_half_h), elastic_track.max.y),
+    );
+    let p = ui.painter();
+    p.rect_filled(elastic_track, CornerRadius::same(3), t_btn(TRACK_OFF));
+    p.rect_filled(fill_track, CornerRadius::same(3), t_btn(ORANGE));
+    let knob_pos = Pos2::new(knob_x, track.center().y);
+    let knob_r = 6.5 + 2.2 * super::theme::ios_spring_bounce(drag_k);
+    if drag_k > 0.02 {
+        p.circle_filled(
+            knob_pos,
+            knob_r + 5.0 * drag_k,
+            t_btn(ORANGE).gamma_multiply(0.18 * drag_k),
+        );
+    }
+    p.circle_filled(knob_pos, knob_r, t_btn(ORANGE));
+    p.circle_stroke(knob_pos, knob_r, egui::Stroke::new(1.0, Color32::from_white_alpha(120)));
     p.text(
         Pos2::new(rect.right() - PAD, rect.center().y),
         egui::Align2::RIGHT_CENTER,
@@ -394,5 +423,22 @@ mod tests {
         assert_eq!(frame.inner_margin, egui::Margin::symmetric(3, 4));
         assert_eq!(frame.corner_radius, CornerRadius::same(10));
         assert_eq!(frame.stroke.width, 1.0);
+    }
+
+    #[test]
+    fn elastic_slider_bounds_and_renders() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+            ..Default::default()
+        };
+        let mut val = 42;
+        let mut out = ctx.run_ui(raw, |ui| {
+            let shown = format!("{val}%");
+            let changed = slider(ui, "Elastic Test", &mut val, (0, 100), shown);
+            assert!(!changed);
+        });
+        out.textures_delta.clear();
+        assert_eq!(val, 42);
     }
 }

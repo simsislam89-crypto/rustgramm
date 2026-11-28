@@ -597,9 +597,10 @@ macro_rules! avatar_shade_tests {
             fn $name() {
                 let c = avatar_color($id);
                 assert_eq!(c, avatar_color(-($id as i64)));
-                assert_eq!(c.r(), c.g());
-                assert_eq!(c.b(), c.r() + 4);
-                assert!(c.a() == 255);
+                let max_c = c.r().max(c.g()).max(c.b());
+                let min_c = c.r().min(c.g()).min(c.b());
+                assert!(max_c.saturating_sub(min_c) >= 40, "expected vibrant Telegram color, got {c:?}");
+                assert_eq!(c.a(), 255);
             }
         )+
     };

@@ -94,14 +94,143 @@ impl Tagged for SafeIntermediate {
     }
 }
 
+/// Безопасная реализация Telegram Abridged MTProto transport (`0xef`).
+///
+/// Устраняет баг `grammers_mtproto::transport::Abridged::unpack` (`len >= 4`),
+/// который принимал пакеты с отрицательным `auth_key_id` за ошибку транспорта `-467886238`:
+/// статусные коды Telegram передаются только в однословных 4-байтных ответах (`byte_len == 4`).
+pub struct SafeAbridged {
+    init: bool,
+}
+
+impl SafeAbridged {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { init: false }
+    }
+}
+
+impl Default for SafeAbridged {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for SafeAbridged {
+    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+        let len = buffer.len();
+        assert_eq!(len % 4, 0, "MTProto payload must be 4-byte aligned");
+
+        let words = len / 4;
+        if words < 127 {
+            buffer.extend_front(&[words as u8]);
+        } else {
+            buffer.extend_front(&(0x7f | ((words as u32) << 8)).to_le_bytes());
+        }
+
+        if !self.init {
+            buffer.extend_front(&[0xef]);
+            self.init = true;
+        }
+    }
+
+    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+        if buffer.is_empty() {
+            return Err(Error::MissingBytes);
+        }
+
+        let (header_len, words) = if buffer[0] < 127 {
+            (1_usize, buffer[0] as usize)
+        } else {
+            if buffer.len() < 4 {
+                return Err(Error::MissingBytes);
+            }
+            let w = i32::from_le_bytes(buffer[0..4].try_into().unwrap()) >> 8;
+            if w <= 0 {
+                return Err(Error::BadLen { got: w });
+            }
+            (4_usize, w as usize)
+        };
+
+        let byte_len = words.saturating_mul(4);
+        if !(4..=MAX_PACKET_LEN as usize).contains(&byte_len) {
+            return Err(Error::BadLen {
+                got: byte_len as i32,
+            });
+        }
+
+        let need = header_len + byte_len;
+        if buffer.len() < need {
+            return Err(Error::MissingBytes);
+        }
+
+        if header_len == 1 && byte_len == 4 {
+            let data = i32::from_le_bytes(buffer[1..5].try_into().unwrap());
+            if data < 0 {
+                return Err(Error::BadStatus {
+                    status: (-data) as u32,
+                });
+            }
+        }
+
+        Ok(UnpackedOffset {
+            data_range: header_len..need,
+            next_offset: need,
+        })
+    }
+}
+
+impl Tagged for SafeAbridged {
+    fn init_tag(&mut self) -> [u8; 4] {
+        self.init = true;
+        [0xef, 0xef, 0xef, 0xef]
+    }
+}
+
+/// Поддерживаемые режимы MTProto-транспорта с авто-фоллбэком для мобильных сетей и VPN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    ObfuscatedIntermediate,
+    ObfuscatedAbridged,
+    PlainIntermediate,
+    Full,
+}
+
+impl TransportMode {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ObfuscatedIntermediate => "Obfuscated Intermediate",
+            Self::ObfuscatedAbridged => "Obfuscated Abridged",
+            Self::PlainIntermediate => "Plain Intermediate",
+            Self::Full => "Full",
+        }
+    }
+
+    #[must_use]
+    pub fn is_obfuscated(self) -> bool {
+        matches!(self, Self::ObfuscatedIntermediate | Self::ObfuscatedAbridged)
+    }
+
+    #[must_use]
+    pub fn build(self) -> Box<dyn Transport + Send> {
+        match self {
+            Self::ObfuscatedIntermediate => Box::new(Obfuscated::new(SafeIntermediate::new())),
+            Self::ObfuscatedAbridged => Box::new(Obfuscated::new(SafeAbridged::new())),
+            Self::PlainIntermediate => Box::new(SafeIntermediate::new()),
+            Self::Full => Box::new(grammers_mtproto::transport::Full::new()),
+        }
+    }
+}
+
 /// Создаёт необфусцированный MTProto-транспорт `SafeIntermediate`.
 pub fn plain_intermediate_transport() -> Box<dyn Transport + Send> {
-    Box::new(SafeIntermediate::new())
+    TransportMode::PlainIntermediate.build()
 }
 
 /// Создаёт обфусцированный MTProto-транспорт `Obfuscated<SafeIntermediate>`.
 pub fn obfuscated_transport() -> Box<dyn Transport + Send> {
-    Box::new(Obfuscated::new(SafeIntermediate::new()))
+    TransportMode::ObfuscatedIntermediate.build()
 }
 
 /// Выбирает транспорт MTProto (`Obfuscated<SafeIntermediate>` или обычный `SafeIntermediate`).
@@ -113,9 +242,8 @@ pub fn transport_for(obfuscated: bool) -> Box<dyn Transport + Send> {
     }
 }
 
-/// Формирует реальный незашифрованный пакет MTProto `req_pq_multi#be7e8ef1` для живой проверки DC.
-/// Возвращает готовые к отправке байты и парсер транспорта для проверки `resPQ`.
-pub fn build_req_pq_probe(obfuscated: bool) -> (Vec<u8>, Box<dyn Transport + Send>) {
+/// Формирует реальный пакет MTProto `req_pq_multi#be7e8ef1` для выбранного `TransportMode`.
+pub fn build_req_pq_probe_mode(mode: TransportMode) -> (Vec<u8>, Box<dyn Transport + Send>) {
     const REQ_PQ_MULTI_ID: u32 = 0xbe7e_8ef1;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -132,11 +260,21 @@ pub fn build_req_pq_probe(obfuscated: bool) -> (Vec<u8>, Box<dyn Transport + Sen
     payload.extend_from_slice(&nonce_hi.to_le_bytes());
     payload.extend_from_slice(&nonce_lo.to_le_bytes());
 
-    let mut tr = transport_for(obfuscated);
+    let mut tr = mode.build();
     let mut buf = DequeBuffer::with_capacity(payload.len(), 80);
     buf.extend_back(&payload);
     tr.pack(&mut buf);
     (buf.as_ref().to_vec(), tr)
+}
+
+/// Формирует реальный незашифрованный пакет MTProto `req_pq_multi#be7e8ef1` для живой проверки DC.
+/// Возвращает готовые к отправке байты и парсер транспорта для проверки `resPQ`.
+pub fn build_req_pq_probe(obfuscated: bool) -> (Vec<u8>, Box<dyn Transport + Send>) {
+    build_req_pq_probe_mode(if obfuscated {
+        TransportMode::ObfuscatedIntermediate
+    } else {
+        TransportMode::PlainIntermediate
+    })
 }
 
 /// Проверяет, что сырые байты от сервера содержат корректный незашифрованный ответ `resPQ#05162463`.
@@ -248,5 +386,28 @@ mod tests {
         bad_wire.extend_back(&res_pq);
         srv_tr.pack(&mut bad_wire);
         assert!(!is_valid_res_pq_reply(&mut *plain_tr, &mut bad_wire.as_mut()[..]));
+    }
+
+    #[test]
+    fn safe_abridged_handles_negative_auth_key_and_real_errors() {
+        let mut payload = vec![0xBB_u8; 40];
+        payload[0..4].copy_from_slice(&(-467_886_238_i32).to_le_bytes());
+
+        let mut safe = SafeAbridged::new();
+        let mut buf = DequeBuffer::with_capacity(payload.len(), 16);
+        buf.extend_back(&payload);
+        safe.pack(&mut buf);
+        assert_eq!(buf.as_ref()[0], 0xef);
+        let off = safe.unpack(&mut buf.as_mut()[1..]).expect("SafeAbridged must unpack 40 bytes");
+        assert_eq!(&buf.as_ref()[1 + off.data_range.start..1 + off.data_range.end], payload.as_slice());
+
+        // Реальная ошибка 4 байта (-429) распознаётся корректно.
+        let mut err_pkt = vec![1_u8];
+        err_pkt.extend_from_slice(&(-429_i32).to_le_bytes());
+        assert_eq!(safe.unpack(&mut err_pkt), Err(Error::BadStatus { status: 429 }));
+
+        // Неполный буфер возвращает MissingBytes.
+        let mut partial = vec![10_u8, 1, 2, 3];
+        assert_eq!(safe.unpack(&mut partial), Err(Error::MissingBytes));
     }
 }

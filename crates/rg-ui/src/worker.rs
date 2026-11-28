@@ -1001,6 +1001,8 @@ struct CachedDialog {
     premium: bool,
     #[serde(default)]
     read_inbox_max_id: i32,
+    #[serde(default)]
+    peer_color: Option<i32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1118,6 +1120,7 @@ fn save_disk_cache(home: &std::path::Path, me: &str, dialogs: &[DialogRow], fold
                 verified: d.verified,
                 premium: d.premium,
                 read_inbox_max_id: d.read_inbox_max_id,
+                peer_color: d.peer_color,
             })
             .collect(),
         folders: folders
@@ -1181,6 +1184,7 @@ fn load_disk_cache(home: &std::path::Path) -> Option<(String, Vec<DialogRow>, Ve
             unread_mentions: 0,
             unread_reactions: 0,
             read_inbox_max_id: d.read_inbox_max_id,
+            peer_color: d.peer_color,
         })
         .collect();
     let folders = cache
@@ -1311,6 +1315,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
     let mut auth_retry_count = 0u8;
     let mut hint_dc: Option<i32> = None;
     let mut force_ipv4 = false;
+    let mut allow_alt_ports = false;
+    let mut transport_override: Option<rg_core::transport::TransportMode> = None;
+    let mut clear_unauth_keys = false;
     'account_loop: loop {
         let mut settings = load_settings(&settings_path);
         if settings.accounts.is_empty() {
@@ -1408,9 +1415,12 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
 
         let cur_hint = hint_dc;
         let cur_v4 = std::mem::take(&mut force_ipv4);
-        let connected = match tokio::time::timeout(
+        let cur_alt_ports = std::mem::take(&mut allow_alt_ports);
+        let cur_tr = transport_override.take();
+        let cur_clear = std::mem::take(&mut clear_unauth_keys);
+        let (connected, active_mode) = match tokio::time::timeout(
             std::time::Duration::from_secs(14),
-            rg_core::connect_with_updates_hint(&cfg, cur_hint, cur_v4),
+            rg_core::connect_with_strategy(&cfg, cur_hint, cur_v4, cur_alt_ports, cur_tr, cur_clear),
         )
         .await
         {
@@ -1544,9 +1554,19 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         let fetches: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
             std::sync::Arc::default();
 
-        // На Android при отсутствии main.session не ждём 12с проверки авторизации — сразу открываем ввод номера.
-        let session_has_data = std::fs::metadata(home.join("main.session")).is_ok_and(|m| m.len() > 2048);
-        let authorized = if cfg!(target_os = "android") && !session_has_data {
+        // Проверяем наличие cached self_user в сессии вместо размера SQLite-файла
+        // (пустая инициализированная БД уже >24 КБ и на 2-й попытке входа блокировала старт на 8 с).
+        let has_self_peer = {
+            use grammers_session::Session as _;
+            connected
+                .session
+                .peer(grammers_session::types::PeerId::self_user())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        let authorized = if !has_self_peer {
             false
         } else {
             match tokio::time::timeout(
@@ -1569,6 +1589,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
         let mut qr_mode = false;
         let mut qr_fail_streak = 0u32;
         if authorized {
+            auth_retry_count = 0;
             pending_auth_cmd = None;
             enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
         } else if let Some(pending) = pending_auth_cmd.take() {
@@ -1576,9 +1597,9 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 Cmd::RequestCode(phone) => {
                     out.send(Ev::Stage(Stage::NeedPhone));
                     out.send(Ev::LoginBusy(true));
-                    out.send(Ev::Status("Подключение к серверам Telegram…".to_owned()));
+                    out.send(Ev::Status(format!("Подключение к Telegram ({})…", active_mode.label())));
                     let res = tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
+                        std::time::Duration::from_secs(18),
                         rg_core::auth::request_login_code(
                             &connected.client,
                             &*connected.session,
@@ -1589,10 +1610,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                         ),
                     )
                     .await;
-                    out.send(Ev::LoginBusy(false));
-                    out.send(Ev::Status(String::new()));
                     match res {
                         Ok(Ok(RequestCodeOutcome::CodeSent(info))) => {
+                            auth_retry_count = 0;
+                            out.send(Ev::LoginBusy(false));
+                            out.send(Ev::Status(String::new()));
                             out.send(Ev::CodeDeliveryHint(info.delivery_hint.clone()));
                             out.send(Ev::CodeMeta {
                                 length: info.code_length,
@@ -1602,10 +1624,56 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             out.send(Ev::Stage(Stage::NeedCode));
                         }
                         Ok(Ok(RequestCodeOutcome::AlreadyAuthorized)) => {
+                            auth_retry_count = 0;
+                            out.send(Ev::LoginBusy(false));
+                            out.send(Ev::Status(String::new()));
                             enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
                         }
-                        Ok(Err(e)) => out.err(friendly_login_error(&e)),
-                        Err(_) => out.err("Сервер Telegram не ответил за 20 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси»"),
+                        Ok(Err(ref e)) if is_retryable_transport_err(e) => {
+                            if let Some(msg) = advance_auth_fallback(
+                                &mut auth_retry_count,
+                                &mut force_ipv4,
+                                &mut allow_alt_ports,
+                                &mut transport_override,
+                                &mut clear_unauth_keys,
+                            ) {
+                                rg_core::diag::warn("auth", &format!("pending RequestCode err ({e}) -> {msg}"));
+                                out.send(Ev::Status(msg.to_owned()));
+                                connected.pool_handle.quit();
+                                pending_auth_cmd = Some(Cmd::RequestCode(phone));
+                                continue 'account_loop;
+                            }
+                            out.send(Ev::LoginBusy(false));
+                            out.send(Ev::Status(String::new()));
+                            out.err(format!("{} [{} · {}]", friendly_login_error(e), active_mode.label(), e));
+                        }
+                        Ok(Err(e)) => {
+                            auth_retry_count = 0;
+                            out.send(Ev::LoginBusy(false));
+                            out.send(Ev::Status(String::new()));
+                            out.err(friendly_login_error(&e));
+                        }
+                        Err(_) => {
+                            if let Some(msg) = advance_auth_fallback(
+                                &mut auth_retry_count,
+                                &mut force_ipv4,
+                                &mut allow_alt_ports,
+                                &mut transport_override,
+                                &mut clear_unauth_keys,
+                            ) {
+                                rg_core::diag::warn("auth", &format!("pending RequestCode 18s timeout ({}) -> {msg}", active_mode.label()));
+                                out.send(Ev::Status(msg.to_owned()));
+                                connected.pool_handle.quit();
+                                pending_auth_cmd = Some(Cmd::RequestCode(phone));
+                                continue 'account_loop;
+                            }
+                            out.send(Ev::LoginBusy(false));
+                            out.send(Ev::Status(String::new()));
+                            out.err(format!(
+                                "Сервер Telegram не ответил после 3 попыток ({}, IPv4+порт 80) — проверьте интернет, VPN или SOCKS5 прокси",
+                                active_mode.label()
+                            ));
+                        }
                     }
                 }
                 Cmd::UseQr | Cmd::RefreshQr => {
@@ -1773,10 +1841,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
             }
             Cmd::RequestCode(phone) => {
                 hint_dc = Some(guess_dc_for_phone(&phone));
+                auth_retry_count = 0;
                 out.send(Ev::LoginBusy(true));
-                out.send(Ev::Status("Подключение к серверам Telegram…".to_owned()));
+                out.send(Ev::Status(format!("Подключение к Telegram ({})…", active_mode.label())));
                 let res = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(18),
                     rg_core::auth::request_login_code(
                         &connected.client,
                         &*connected.session,
@@ -1787,11 +1856,11 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     ),
                 )
                 .await;
-                out.send(Ev::LoginBusy(false));
-                out.send(Ev::Status(String::new()));
                 match res {
                     Ok(Ok(RequestCodeOutcome::CodeSent(info))) => {
                         auth_retry_count = 0;
+                        out.send(Ev::LoginBusy(false));
+                        out.send(Ev::Status(String::new()));
                         out.send(Ev::CodeDeliveryHint(info.delivery_hint.clone()));
                         out.send(Ev::CodeMeta {
                             length: info.code_length,
@@ -1802,36 +1871,54 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                     }
                     Ok(Ok(RequestCodeOutcome::AlreadyAuthorized)) => {
                         auth_retry_count = 0;
+                        out.send(Ev::LoginBusy(false));
+                        out.send(Ev::Status(String::new()));
                         enter(&engine, &connected.session, &out, &mut updates, &mut dialogs, &home, &settings_path, &mut cached_me, &mut cached_folders, &dialog_stream_tx).await;
                     }
-                    Ok(Err(e))
-                        if auth_retry_count == 0
-                            && is_retryable_transport_err(&e) =>
-                    {
-                        auth_retry_count += 1;
-                        force_ipv4 = true;
-                        rg_core::diag::warn("auth", &format!("request_login_code transport err ({e}) — switching to IPv4 & retrying"));
-                        connected.pool_handle.quit();
-                        pending_auth_cmd = Some(Cmd::RequestCode(phone));
-                        break true;
+                    Ok(Err(ref e)) if is_retryable_transport_err(e) => {
+                        if let Some(msg) = advance_auth_fallback(
+                            &mut auth_retry_count,
+                            &mut force_ipv4,
+                            &mut allow_alt_ports,
+                            &mut transport_override,
+                            &mut clear_unauth_keys,
+                        ) {
+                            rg_core::diag::warn("auth", &format!("request_login_code transport err ({e}) -> {msg}"));
+                            out.send(Ev::Status(msg.to_owned()));
+                            connected.pool_handle.quit();
+                            pending_auth_cmd = Some(Cmd::RequestCode(phone));
+                            break true;
+                        }
+                        out.send(Ev::LoginBusy(false));
+                        out.send(Ev::Status(String::new()));
+                        out.err(friendly_login_error(e));
                     }
                     Ok(Err(e)) => {
                         auth_retry_count = 0;
+                        out.send(Ev::LoginBusy(false));
+                        out.send(Ev::Status(String::new()));
                         out.err(friendly_login_error(&e));
                     }
-                    Err(_) if auth_retry_count == 0 => {
-                        auth_retry_count += 1;
-                        force_ipv4 = true;
-                        rg_core::diag::warn("auth", "request_login_code 30s timeout — reconnecting IPv4 pool and retrying");
-                        connected.pool_handle.quit();
-                        pending_auth_cmd = Some(Cmd::RequestCode(phone));
-                        break true;
-                    }
                     Err(_) => {
-                        auth_retry_count = 0;
-                        out.err(
-                            "Сервер Telegram не ответил за 30 с — проверьте интернет, VPN или укажите SOCKS5 прокси в «Прокси»",
-                        );
+                        if let Some(msg) = advance_auth_fallback(
+                            &mut auth_retry_count,
+                            &mut force_ipv4,
+                            &mut allow_alt_ports,
+                            &mut transport_override,
+                            &mut clear_unauth_keys,
+                        ) {
+                            rg_core::diag::warn("auth", &format!("request_login_code 18s timeout ({}) -> {msg}", active_mode.label()));
+                            out.send(Ev::Status(msg.to_owned()));
+                            connected.pool_handle.quit();
+                            pending_auth_cmd = Some(Cmd::RequestCode(phone));
+                            break true;
+                        }
+                        out.send(Ev::LoginBusy(false));
+                        out.send(Ev::Status(String::new()));
+                        out.err(format!(
+                            "Сервер Telegram не ответил после 3 попыток ({}, IPv4+порт 80) — проверьте интернет, VPN или SOCKS5 прокси",
+                            active_mode.label()
+                        ));
                     }
                 }
             }
@@ -2461,6 +2548,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             unread_mentions: 0,
                             unread_reactions: 0,
                             read_inbox_max_id: 0,
+                            peer_color: None,
                         },
                     );
                     out.send(Ev::Dialogs(dialogs.clone()));
@@ -3493,6 +3581,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                             unread_mentions: 0,
                                             unread_reactions: 0,
                                             read_inbox_max_id: 0,
+                                            peer_color: None,
                                         },
                                     );
                                     out.send(Ev::Dialogs(dialogs.clone()));
@@ -3557,6 +3646,7 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                                             unread_mentions: 0,
                                             unread_reactions: 0,
                                             read_inbox_max_id: 0,
+                                            peer_color: None,
                                         },
                                     );
                                     out.send(Ev::Dialogs(dialogs.clone()));
@@ -4764,22 +4854,38 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                 tokio::spawn(async move {
                     let Ok(_permit) = limit.acquire().await else { return };
                     let cancel = std::sync::atomic::AtomicBool::new(false);
-                    match eng.fetch_media(peer, msg_id, false, &cancel, |_, _| {}).await {
-                        Ok(rg_core::engine::Fetched::Ready(path)) => {
+                    let path_res = match eng.fetch_media(peer, msg_id, false, &cancel, |_, _| {}).await {
+                        Ok(rg_core::engine::Fetched::Ready(path)) => Ok(path),
+                        _ => eng
+                            .preview_path(peer, msg_id)
+                            .await
+                            .and_then(|opt| opt.ok_or_else(|| "Фото недоступно".into())),
+                    };
+                    match path_res {
+                        Ok(path) => {
                             #[cfg(not(target_os = "android"))]
                             {
                                 let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                                    let img = image::open(&path).map_err(|e| format!("Декодирование фото: {e}"))?;
-                                    let rgba = img.to_rgba8();
-                                    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-                                    let mut cb = arboard::Clipboard::new().map_err(|e| format!("Буфер обмена: {e}"))?;
-                                    cb.set_image(arboard::ImageData {
-                                        width: w,
-                                        height: h,
-                                        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
-                                    })
-                                    .map_err(|e| format!("Копирование фото: {e}"))?;
-                                    Ok(())
+                                    let (w, h, bytes) = decode_image_from_path(&path)?;
+                                    let mut last_err = String::new();
+                                    for attempt in 0..5 {
+                                        match arboard::Clipboard::new().and_then(|mut cb| {
+                                            cb.set_image(arboard::ImageData {
+                                                width: w,
+                                                height: h,
+                                                bytes: std::borrow::Cow::Borrowed(&bytes),
+                                            })
+                                        }) {
+                                            Ok(()) => return Ok(()),
+                                            Err(e) => {
+                                                last_err = e.to_string();
+                                                if attempt < 4 {
+                                                    std::thread::sleep(std::time::Duration::from_millis(40));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(format!("Копирование фото: {last_err}"))
                                 })
                                 .await;
                                 match res {
@@ -4790,11 +4896,16 @@ async fn run(mut cmds: UnboundedReceiver<Cmd>, ev: Sender<Ev>, ctx: eframe::egui
                             }
                             #[cfg(target_os = "android")]
                             {
-                                let _ = path;
-                                out.send(Ev::Status("Копирование фото в буфер поддерживается на ПК".to_owned()));
+                                let copied = tokio::task::spawn_blocking(move || crate::android_jni::copy_image(&path))
+                                    .await
+                                    .unwrap_or(false);
+                                if copied {
+                                    out.send(Ev::Status("Фото скопировано в буфер обмена".to_owned()));
+                                } else {
+                                    out.err("Не удалось скопировать фото в буфер Android".to_owned());
+                                }
                             }
                         }
-                        Ok(_) => out.err("Фото недоступно".to_owned()),
                         Err(e) => out.err(format!("Копирование фото: {e}")),
                     }
                 });
@@ -5464,6 +5575,38 @@ fn guess_dc_for_phone(phone: &str) -> i32 {
     }
 }
 
+fn advance_auth_fallback(
+    retry_count: &mut u8,
+    force_ipv4: &mut bool,
+    allow_alt_ports: &mut bool,
+    transport_override: &mut Option<rg_core::transport::TransportMode>,
+    clear_unauth_keys: &mut bool,
+) -> Option<&'static str> {
+    use rg_core::transport::TransportMode;
+    match *retry_count {
+        0 => {
+            *retry_count = 1;
+            *force_ipv4 = true;
+            *allow_alt_ports = false;
+            *transport_override = Some(TransportMode::ObfuscatedAbridged);
+            *clear_unauth_keys = true;
+            Some("Повторное подключение (IPv4 · Obfuscated Abridged)…")
+        }
+        1 => {
+            *retry_count = 2;
+            *force_ipv4 = true;
+            *allow_alt_ports = true;
+            *transport_override = Some(TransportMode::PlainIntermediate);
+            *clear_unauth_keys = true;
+            Some("Повторное подключение (порт 80/5222 · Intermediate)…")
+        }
+        _ => {
+            *retry_count = 0;
+            None
+        }
+    }
+}
+
 fn is_retryable_transport_err(err: &str) -> bool {
     let low = err.to_ascii_lowercase();
     low.contains("timed out")
@@ -5800,6 +5943,17 @@ fn decode_story(path: &std::path::Path) -> Option<eframe::egui::ColorImage> {
     Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
 
+#[cfg(any(not(target_os = "android"), test))]
+fn decode_image_from_path(path: &std::path::Path) -> Result<(usize, usize, Vec<u8>), String> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| format!("Чтение фото: {e}"))?
+        .with_guessed_format()
+        .map_err(|e| format!("Формат фото: {e}"))?;
+    let img = reader.decode().map_err(|e| format!("Декодирование фото: {e}"))?;
+    let rgba = img.to_rgba8();
+    Ok((rgba.width() as usize, rgba.height() as usize, rgba.into_raw()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5834,6 +5988,7 @@ mod tests {
                 unread_mentions: 0,
                 unread_reactions: 0,
                 read_inbox_max_id: 0,
+                peer_color: None,
             })
             .collect();
         let folders = vec![FolderRow {
@@ -5874,5 +6029,35 @@ mod tests {
         let cfg = builtin_keys().expect("builtin_keys must fall back cleanly without API prompt");
         assert!(cfg.api_id > 0);
         assert!(!cfg.api_hash.is_empty());
+    }
+
+    #[test]
+    fn decode_image_from_path_guesses_format_without_extension() {
+        let dir = std::env::temp_dir().join("rg_copy_img_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("photo_payload.bin");
+        let mut raw = Vec::new();
+        let im = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 3, image::Rgba([10, 20, 30, 255])));
+        im.write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png).unwrap();
+        std::fs::write(&p, raw).unwrap();
+        let (w, h, bytes) = decode_image_from_path(&p).expect("must decode PNG magic bytes from .bin");
+        assert_eq!((w, h, bytes.len()), (2, 3, 2 * 3 * 4));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn auth_fallback_cycles_all_three_strategies_and_resets() {
+        use rg_core::transport::TransportMode;
+        let mut retry = 0u8;
+        let mut v4 = false;
+        let mut alt = false;
+        let mut mode = None;
+        let mut clear = false;
+        assert!(advance_auth_fallback(&mut retry, &mut v4, &mut alt, &mut mode, &mut clear).is_some());
+        assert_eq!((retry, v4, alt, mode, clear), (1, true, false, Some(TransportMode::ObfuscatedAbridged), true));
+        assert!(advance_auth_fallback(&mut retry, &mut v4, &mut alt, &mut mode, &mut clear).is_some());
+        assert_eq!((retry, v4, alt, mode, clear), (2, true, true, Some(TransportMode::PlainIntermediate), true));
+        assert!(advance_auth_fallback(&mut retry, &mut v4, &mut alt, &mut mode, &mut clear).is_none());
+        assert_eq!(retry, 0);
     }
 }
