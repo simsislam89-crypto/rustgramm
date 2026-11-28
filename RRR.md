@@ -1243,3 +1243,33 @@ bash scripts/make-dist.sh                  # launcher + installer в корен�
 - `cargo clippy --workspace --all-targets -- -D warnings` (Full) и `cargo clippy -p rg-ui --no-default-features -- -D warnings` (Lite) — **0 ошибок, 0 предупреждений**.
 - `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: 20768 bytes`, `aarch64-linux-android` Full & Lite OK).
 - Добавлены тесты `rg-core` (4 теста: `recent_repliers`, `ChatSearchFilter`, `format_compact_count` / `format_chat_export_txt`, `filters_enabled_in_chats`), `kit.rs` (`compact_menu_constants_and_frame_stay_tight`), `chat.rs` (4 теста, включая headless `menu_places_gold_star_reaction_in_top_strip_only_when_paid_available`) и `lib.rs` (3 headless-теста: полноширинный закреп + `Ev::Unpinned`, канал «Обсудить» + `recent_repliers`, разделитель непрочитанных + `voice_confirmation` + No-Lie аудит настроек).
+
+## Этап 40 (2026-11-28, v0.27.0)
+
+### Фикс входа Android (`SafeIntermediate` против `-467886238`), рабочий буфер обмена, очистка иероглифов, переработка талисманов входа и цветных реакций
+
+1. **Устранение ошибки транспорта на Android (`deserialization failed at transport level: bad status (negative length -467886238)`, `crates/rg-core/src/{transport,lib,auth}.rs`)**:
+   - *Причина:* в `grammers-mtproto 0.12.0` (`src/transport/abridged.rs:88`) проверка `if header_len == 1 && len >= 4` срабатывала для всех нормальных пакетов MTProto короче 508 байт, если первые 4 байта (`auth_key_id`) имели установленный старший бит (~50% сессий, включая `-467886238`), ошибочно возвращая `Error::BadStatus`. Кроме того, `Intermediate::unpack` проверял `buffer.len() < len` вместо `buffer.len() < 4 + len`.
+   - *Исправление:* реализован собственный `SafeIntermediate` (обёрнутый в `Obfuscated::new(SafeIntermediate::new())` внутри `transport::obfuscated_transport()`), где транспортная ошибка читается строго при `len == 4 && data < 0` (или `len < 0 && -len <= 1024`), а не по первым байтам `auth_key_id`. В `auth::invoke_with_dc_migrate` добавлен ретрай с переподключением пула также при `InvocationError::Deserialize(_)`. Воспроизведено и доказано модульным тестом `reproduces_upstream_abridged_negative_auth_key_bug_and_safe_intermediate_passes`.
+
+2. **Исправление копирования сообщений и текста на Windows и Android (`crates/rg-{desktop,ui}/Cargo.toml`, `crates/rg-ui/src/{android_jni,lib,chat,features_ui,settings_ui,tg_settings}.rs`, `scripts/dev/build_android_bridge.py`)**:
+   - *Причина:* `eframe` собирался с `default-features = false, features = ["glow"]` без фичи `"clipboard"`, из-за чего `ctx.copy_text(...)` на ПК молча ничего не клал в системный буфер обмена; на Android в `RgBridge` отсутствовали JNI-методы для `ClipboardManager`.
+   - *Исправление:* включена фича `"clipboard"` для не-Android сборок `eframe`, в `RgBridge.java` добавлены `copyToClipboard` и `getClipboardText` (`rg_bridge.dex` пересобран: `21 976` байт), создана единая функция `copy_text_to_clipboard(ctx, text)` (`arboard` + `egui` на ПК, `ClipboardManager` JNI на Android). Переведены все вызовы копирования, добавлено подтверждение в статус, шорткат `Ctrl+C` для выделенных сообщений и быстрая кнопка копирования при наведении на пузырь.
+
+3. **Устранение иероглифов, квадратов `□` и дешёвых Unicode-значков (`tg_settings.rs`, `theme.rs`, `lib.rs`, `chat.rs`, `media_editor.rs`, `features_ui.rs`, `panels.rs`)**:
+   - Убраны CJK-иероглифы (`中文`, `日本語`, `한국어`) из `LANG_CHOICES` (заменены на `Китайский (ZH)`, `Японский (JA)`, `Корейский (KO)`).
+   - На Android подключены `RobotoStatic-Regular.ttf` и `Roboto-Medium.ttf` + `NotoSansSymbols-Regular-Subsetted2.ttf`.
+   - Заменены `⌨`, `⤡`/`⤢`/`↻`, `➤`, `↪`, `⧉`, `🕒`, `★`, `⏱`, `⏰`, `🔕`, `📋`, `♥`/`♡`, `☑`/`☐` в UI на векторные и официальные иконки из `icons.idx`.
+
+4. **Переработка анимированных талисманов входа и мобильной вёрстки (`login_anim.rs`, `lib.rs`)**:
+   - Полностью перерисованы бумажный самолётик (адаптивный размер 78/104 px, мягкая тень, 5 граней, блик кромки) и обезьянка кода/2FA (скульптурный силуэт головы `PathShape`, двойная радужка/зрачок/блики, брови с реакцией на ошибку/подглядывание, лапки с пальцами; без кругов и бликов фона). Компактный мобильный экран входа (`390×844`) сжат по вертикали для аккуратной посадки.
+
+5. **Переработка реакций и полировка чата (`chat.rs`, `lib.rs`)**:
+   - Пилюли реакций переведены с монохромного текста на полноцветный атлас `Emoji` (`17.5 px` + пружинный ховер-масштаб), высоту `26 px`, скруглённые капсулы с мягкой обводкой и золотую векторную звезду `icons::paint_star` для платных реакций; верхняя полоса быстрых реакций в контекстном меню заключена в капсулу с ховер-увеличением.
+   - Пузыри сообщений получили деликатный контур `1 px`, пилюли дат — матовую окантовку, активный чат в списке — левую оранжевую полосу 3 px, а поле ввода — скруглённую матовую рамку.
+
+### Проверки (v0.27.0)
+
+- `cargo clippy --workspace --all-targets -- -D warnings` и `cargo clippy -p rg-ui --no-default-features -- -D warnings` — **0 ошибок, 0 предупреждений**.
+- `C:\Program Files\Git\bin\bash.exe scripts/test-apk.sh` — **ALL APK/BRIDGE & WORKSPACE GATES PASSED** (`RgBridgeTest: ALL CHECKS PASSED`, `DEX OK: 21976 bytes`, `aarch64-linux-android` Full & Lite OK).
+- Добавлены тесты `rg-core::transport::tests` (3 теста на воспроизведение бага `-467886238`, реальные коды `-404`/`-429` и частичные буферы) и `rg-ui` (`lang_choices_contain_zero_cjk_tofu`, `copy_text_to_clipboard_and_act_copy_update_status`, `login_anim_mascots_render_sculpted_geometry_without_circles_on_compact_phone`, `reaction_pills_render_color_emoji_atlas_quads_and_paid_star_mesh`).

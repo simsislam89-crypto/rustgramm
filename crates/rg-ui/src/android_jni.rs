@@ -542,6 +542,47 @@ mod imp {
         })
     }
 
+    /// Копирует текст в системный буфер обмена Android через `ClipboardManager`.
+    pub fn copy_text(text: &str) -> bool {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let jtxt = env.new_string(text).ok()?;
+            let ok = env
+                .call_static_method(
+                    &cls,
+                    "copyToClipboard",
+                    "(Landroid/app/Activity;Ljava/lang/String;)Z",
+                    &[JValue::Object(act), JValue::Object(&jtxt)],
+                )
+                .ok()
+                .and_then(|v| v.z().ok())
+                .unwrap_or(false);
+            Some(ok)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Читает текст из системного буфера обмена Android.
+    pub fn paste_text() -> Option<String> {
+        with_env(|env, act| {
+            let cls = bridge_class(env, act)?;
+            let obj = env
+                .call_static_method(
+                    &cls,
+                    "getClipboardText",
+                    "(Landroid/app/Activity;)Ljava/lang/String;",
+                    &[JValue::Object(act)],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            if obj.is_null() {
+                return None;
+            }
+            env.get_string(&JString::from(obj)).ok().map(Into::into)
+        })
+    }
+
     /// Включает edge-to-edge полупрозрачные системные панели и blur диалогов под glass UI.
     pub fn setup_glass_window() {
         with_env(|env, act| {
@@ -818,6 +859,12 @@ mod imp {
         false
     }
     pub fn open_url(_url: &str) {}
+    pub fn copy_text(_text: &str) -> bool {
+        false
+    }
+    pub fn paste_text() -> Option<String> {
+        None
+    }
     pub fn show_soft_input() {}
     pub fn prompt_text_input(_tag: &str, _title: &str, _hint: &str, _initial: &str, _kind: i32) {}
     pub fn poll_text_input() -> Option<(String, String)> {

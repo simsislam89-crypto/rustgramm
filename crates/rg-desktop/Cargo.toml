@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 rg-ui = { path = "../rg-ui" }
-eframe = { version = "0.37", default-features = false, features = ["glow"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "clipboard"] }
 
 [target.'cfg(not(windows))'.dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

@@ -1115,22 +1115,31 @@ fn install_fonts_with_mono(ctx: &egui::Context, mono_name: &str) {
             .or_default()
             .push("segoe".into());
     }
-    if cfg!(target_os = "android")
-        && let Ok(bytes) = std::fs::read("/system/fonts/Roboto-Regular.ttf")
-    {
-        fonts
-            .font_data
-            .insert("android-roboto".to_owned(), Arc::new(FontData::from_owned(bytes)));
-        for family in [
-            FontFamily::Proportional,
-            FontFamily::Name(FAM_DISPLAY.into()),
-        ] {
-            fonts.families.entry(family).or_default().insert(0, "android-roboto".to_owned());
+    if cfg!(target_os = "android") {
+        let android_reg = read_face("/system/fonts/Roboto-Regular.ttf")
+            .or_else(|| read_face("/system/fonts/RobotoStatic-Regular.ttf"));
+        if let Some(f) = android_reg {
+            fonts.font_data.insert("android-roboto".to_owned(), f);
+            for family in [
+                FontFamily::Proportional,
+                FontFamily::Name(FAM_DISPLAY.into()),
+            ] {
+                fonts.families.entry(family).or_default().insert(0, "android-roboto".to_owned());
+            }
+        }
+        if let Some(f) = read_face("/system/fonts/Roboto-Medium.ttf") {
+            fonts.font_data.insert("android-roboto-med".to_owned(), f);
+            fonts
+                .families
+                .entry(FontFamily::Name(FAM_DISPLAY.into()))
+                .or_default()
+                .insert(0, "android-roboto-med".to_owned());
         }
     }
     let fallback_paths = [
         ("segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
         ("noto-symbols2", "/system/fonts/NotoSansSymbols2-Regular.ttf"),
+        ("noto-symbols-sub2", "/system/fonts/NotoSansSymbols-Regular-Subsetted2.ttf"),
         ("noto-symbols", "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf"),
         ("dejavu-sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     ];

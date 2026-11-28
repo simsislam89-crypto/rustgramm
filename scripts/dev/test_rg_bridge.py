@@ -65,6 +65,10 @@ public final class RgBridgeTest {
         check(RgBridge.class.getMethod("setupGlassWindow", android.app.Activity.class) != null, "setupGlassWindow missing");
         check(RgBridge.class.getMethod("getSafeInsetsPx", android.app.Activity.class) != null, "getSafeInsetsPx missing");
         check(RgBridge.class.getMethod("pollInputEvent") != null, "pollInputEvent missing");
+        check(!RgBridge.copyToClipboard(null, "abc"), "copyToClipboard(null) must return false");
+        check(RgBridge.getClipboardText(null) == null, "getClipboardText(null) must return null");
+        check(RgBridge.class.getMethod("copyToClipboard", android.app.Activity.class, String.class) != null, "copyToClipboard missing");
+        check(RgBridge.class.getMethod("getClipboardText", android.app.Activity.class) != null, "getClipboardText missing");
 
         // 5. Конкурентная запись/чтение INPUT_EVENT без разрыва tag и value
         final int threads = 4;

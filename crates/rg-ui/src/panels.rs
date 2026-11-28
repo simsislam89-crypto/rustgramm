@@ -710,7 +710,7 @@ impl App {
         let recent_slice: Vec<rg_core::engine::StickerRow> = self.recent_stickers.iter().take(recent_cap).cloned().collect();
         let cur = self.sticker_cur.min(total_tabs - 1);
         let (title, list): (&str, Option<&[rg_core::engine::StickerRow]>) = if has_fav && cur == 0 {
-            ("★ Избранные стикеры", Some(self.faved_stickers.as_slice()))
+            ("Избранные стикеры", Some(self.faved_stickers.as_slice()))
         } else if has_rec && cur == usize::from(has_fav) {
             ("Недавние стикеры", Some(recent_slice.as_slice()))
         } else {
@@ -792,16 +792,20 @@ impl App {
                             lerp_color(Color32::from_rgb(48, 48, 56), Color32::from_rgb(76, 76, 86), sel)
                         };
                         p.circle_filled(c, 13.5, bg);
-                        let (lbl, tip) = if has_fav && tab_i == 0 {
-                            ("★".to_owned(), "Избранные стикеры".to_owned())
+                        let (ico_name, lbl, tip): (Option<&str>, Option<String>, String) = if has_fav && tab_i == 0 {
+                            (Some("menu/favorite"), None, "Избранные стикеры".to_owned())
                         } else if has_rec && tab_i == usize::from(has_fav) {
-                            ("⏱".to_owned(), "Недавние стикеры".to_owned())
+                            (Some("emoji/emoji_recent"), None, "Недавние стикеры".to_owned())
                         } else {
                             let s = &self.sticker_sets[tab_i - extra];
                             let init = s.title.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "S".to_owned());
-                            (init, s.title.clone())
+                            (None, Some(init), s.title.clone())
                         };
-                        p.text(c, Align2::CENTER_CENTER, lbl, FontId::proportional(13.0), WHITE);
+                        if let Some(ico_n) = ico_name {
+                            icons::tg_sized(p, ico_n, c, Vec2::splat(16.0), WHITE);
+                        } else if let Some(lbl_s) = lbl {
+                            p.text(c, Align2::CENTER_CENTER, lbl_s, FontId::proportional(13.0), WHITE);
+                        }
                         if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             acts.push(StickerAct::SelectSet(tab_i));
                         }

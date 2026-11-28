@@ -176,11 +176,7 @@ pub fn privacy_params(proxy_url: Option<String>) -> grammers_mtsender::Connectio
         lang_code: "en".to_owned(),
         proxy_url,
         updates_channel_capacity: std::num::NonZeroUsize::new(2048).expect("non-zero capacity"),
-        transport: Box::new(|| {
-            Box::new(grammers_mtproto::transport::Obfuscated::new(
-                grammers_mtproto::transport::Abridged::new(),
-            ))
-        }),
+        transport: Box::new(|| crate::transport::obfuscated_transport()),
         ..grammers_mtsender::ConnectionParams::default()
     }
 }
@@ -384,6 +380,7 @@ pub mod media;
 pub mod qr;
 pub mod rich_msg;
 pub mod secret;
+pub mod transport;
 
 #[cfg(test)]
 mod tests {

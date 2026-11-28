@@ -20,6 +20,8 @@ import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.Fragment;
 import android.app.FragmentManager;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
@@ -226,6 +228,42 @@ public final class RgBridge {
 
     public static String pollInputResult() {
         return INPUT_RESULT.getAndSet(null);
+    }
+
+    public static boolean copyToClipboard(final Activity act, final String text) {
+        if (act == null || text == null) return false;
+        final String label = "Rustgramm";
+        try {
+            ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null && android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                cm.setPrimaryClip(ClipData.newPlainText(label, text));
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cm != null) {
+                        cm.setPrimaryClip(ClipData.newPlainText(label, text));
+                    }
+                } catch (Throwable ignored) {}
+            }
+        });
+        return true;
+    }
+
+    public static String getClipboardText(final Activity act) {
+        if (act == null) return null;
+        try {
+            ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null && cm.getPrimaryClip().getItemCount() > 0) {
+                CharSequence cs = cm.getPrimaryClip().getItemAt(0).coerceToText(act);
+                return cs != null ? cs.toString() : null;
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     public static void setupGlassWindow(final Activity act) {

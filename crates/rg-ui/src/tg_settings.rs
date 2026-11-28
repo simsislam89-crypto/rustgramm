@@ -61,9 +61,9 @@ const LANG_CHOICES: &[(&str, &str, &str)] = &[
     ("it", "Italiano", "Итальянский"),
     ("pt", "Português", "Португальский"),
     ("tr", "Türkçe", "Турецкий"),
-    ("zh", "中文", "Китайский"),
-    ("ja", "日本語", "Японский"),
-    ("ko", "한국어", "Корейский"),
+    ("zh", "Китайский (ZH)", "Китайский"),
+    ("ja", "Японский (JA)", "Японский"),
+    ("ko", "Корейский (KO)", "Корейский"),
 ];
 
 fn lang_name(code: &str) -> &'static str {
@@ -746,7 +746,7 @@ impl App {
             let all = rg_core::diag::recent_lines();
             let start = all.len().saturating_sub(80);
             let txt = all[start..].join("\n");
-            ctx.copy_text(txt);
+            crate::copy_text_to_clipboard(ctx, &txt);
             self.status = "Последние 80 строк диагностического лога скопированы".to_owned();
         }
         if act.logout {
@@ -978,7 +978,7 @@ fn qr_profile_page(ui: &mut egui::Ui, st: &State, me: &str, streamer: bool) {
         ui.label(RichText::new(link_text).size(13.5).color(c_orange()));
         ui.add_space(14.0);
         if !user.is_empty() && orange_button(ui, "Скопировать ссылку", Vec2::new(200.0, 36.0)).clicked() {
-            ui.ctx().copy_text(url);
+            crate::copy_text_to_clipboard(ui.ctx(), &url);
         }
         ui.add_space(18.0);
     });
@@ -2604,7 +2604,7 @@ impl App {
                                     qr_clicked = true;
                                 }
                             } else if resp.on_hover_text("Нажмите, чтобы скопировать").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                ui.ctx().copy_text(val.to_owned());
+                                crate::copy_text_to_clipboard(ui.ctx(), val);
                             }
                             qr_clicked
                         };

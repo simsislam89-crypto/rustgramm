@@ -33,6 +33,7 @@ eframe = { version = "0.37", default-features = false, features = ["default_font
 wry = { version = "0.57", default-features = false }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "clipboard"] }
 rfd = { version = "0.15", default-features = false }
 arboard = "3"
 

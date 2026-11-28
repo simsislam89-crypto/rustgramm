@@ -469,11 +469,11 @@ pub(crate) fn media_editor_window(
                                 state.dirty = true;
                             }
                         }
-                        if ui.button("↻ 90°").clicked() {
+                        if ui.button("Повернуть 90°").clicked() {
                             state.rotation = (state.rotation + 1) % 4;
                             state.dirty = true;
                         }
-                        if ui.button("⇄ Отразить").clicked() {
+                        if ui.button("Отразить").clicked() {
                             state.flip_h = !state.flip_h;
                             state.dirty = true;
                         }

@@ -193,6 +193,10 @@ impl Emoji {
         self.index.contains_key(&c)
     }
 
+    pub fn tex_id(&self) -> egui::TextureId {
+        self.tex.id()
+    }
+
     /// Картинка эмодзи нужного размера (в логических пикселях).
     pub fn image(&self, c: char, size: f32) -> Option<egui::Image<'static>> {
         let n = *self.index.get(&c)?;

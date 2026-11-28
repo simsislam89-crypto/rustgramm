@@ -981,7 +981,7 @@ fn shared_page(
         ui.add_space(kit::PAD);
         if ui.button("Экспорт JSON").clicked() {
             let json = rg_ayu::filters::export_filters_json(&s.filters);
-            ui.ctx().copy_text(json);
+            crate::copy_text_to_clipboard(ui.ctx(), &json);
             *toast = Some(format!("Экспортировано правил: {}", s.filters.len()));
         }
         if ui.button("Импорт из буфера").clicked() {

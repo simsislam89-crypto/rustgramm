@@ -1015,7 +1015,7 @@ impl App {
             self.send(c);
         }
         if let Some(l) = copy_link {
-            ctx.copy_text(l.clone());
+            crate::copy_text_to_clipboard(ctx, &l);
             self.status = format!("Скопировано: {l}");
         }
         if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1236,7 +1236,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     for amt in [1, 5, 10, 25, 50, 100] {
                         if ui
-                            .selectable_label(self.paid_react_count == amt, format!("★ {amt}"))
+                            .selectable_label(self.paid_react_count == amt, format!("{amt} Stars"))
                             .clicked()
                         {
                             self.paid_react_count = amt;
@@ -1259,8 +1259,8 @@ impl App {
                 ui.horizontal(|ui| {
                     if orange_button(
                         ui,
-                        &format!("Отправить ★ {}", self.paid_react_count),
-                        Vec2::new(165.0, 34.0),
+                        &format!("Отправить {} Stars", self.paid_react_count),
+                        Vec2::new(172.0, 34.0),
                     )
                     .clicked()
                     {
@@ -1595,7 +1595,7 @@ impl App {
         let mut send_now: Option<i32> = None;
         let mut delete_id: Option<i32> = None;
         let mut refresh = false;
-        egui::Window::new("⏰ Отложенные сообщения и напоминания")
+        egui::Window::new("Отложенные сообщения и напоминания")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -2256,7 +2256,7 @@ impl App {
                                     );
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if ui.small_button("Копия").clicked() {
-                                            ctx.copy_text(item.text.clone());
+                                            crate::copy_text_to_clipboard(ctx, &item.text);
                                         }
                                         if self.dialogs.iter().any(|d| d.id == item.peer)
                                             && ui.small_button("В чат").clicked()
@@ -2571,7 +2571,7 @@ impl App {
                     ui.monospace(&url);
                     ui.add_space(8.0);
                     if orange_button(ui, "Скопировать", Vec2::new(140.0, 32.0)).clicked() {
-                        ctx.copy_text(url);
+                        crate::copy_text_to_clipboard(ctx, &url);
                         self.folder_invite_url = None;
                     }
                 });

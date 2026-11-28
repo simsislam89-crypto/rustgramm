@@ -137,8 +137,11 @@ where
                 }
                 return Err(InvocationError::Rpc(err));
             }
-            Err(InvocationError::Io(_)) if transient < 2 => {
+            Err(InvocationError::Io(_) | InvocationError::Deserialize(_)) if transient < 2 => {
                 transient += 1;
+                if let Some(h) = pool_handle {
+                    h.disconnect_from_dc(prev_dc);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(350)).await;
             }
             Err(InvocationError::Rpc(err)) if err.code >= 500 && transient < 2 => {

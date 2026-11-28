@@ -60,6 +60,24 @@ enum LoginButtonRight {
     Keyboard,
 }
 
+/// Копирует текст в системный буфер обмена на Windows/Desktop (`arboard` + `egui`) и Android (`ClipboardManager`).
+pub(crate) fn copy_text_to_clipboard(ctx: &egui::Context, text: &str) -> bool {
+    ctx.copy_text(text.to_owned());
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Ok(mut cb) = arboard::Clipboard::new()
+            && cb.set_text(text.to_owned()).is_ok()
+        {
+            return true;
+        }
+        false
+    }
+    #[cfg(target_os = "android")]
+    {
+        android_jni::copy_text(text)
+    }
+}
+
 struct App {
     cmd: UnboundedSender<Cmd>,
     ev: Receiver<Ev>,
@@ -3055,7 +3073,7 @@ impl App {
                     }
                 }
                 Ev::InviteLink(id, link) => {
-                    ctx.copy_text(link.clone());
+                    copy_text_to_clipboard(ctx, &link);
                     if let Some(info) = self.peer_infos.get_mut(&id) {
                         info.invite_link = link.clone();
                     }
@@ -3887,7 +3905,7 @@ impl App {
                     }
                 }
                 Ev::FolderInviteUrl(url) => {
-                    ctx.copy_text(url.clone());
+                    copy_text_to_clipboard(ctx, &url);
                     self.folder_invite_url = Some(url.clone());
                     self.status = format!("Ссылка на папку скопирована: {url}");
                 }
@@ -4163,11 +4181,11 @@ impl App {
             LoginButtonRight::None => {}
             LoginButtonRight::Chevron(open) => icons::chevron(p, icon_center, open, SUBTEXT),
             LoginButtonRight::Keyboard => {
-                p.text(
+                icons::tg_sized(
+                    p,
+                    "chat/input_bot_keyboard",
                     icon_center,
-                    egui::Align2::CENTER_CENTER,
-                    "⌨",
-                    FontId::proportional(15.0),
+                    Vec2::splat(18.0),
                     SUBTEXT,
                 );
             }
@@ -4185,7 +4203,7 @@ impl App {
         ];
         let kw = ((width - 12.0) / 3.0).floor().max(52.0);
         let gap = ((width - kw * 3.0) * 0.5).max(4.0);
-        let row_h = 42.0;
+        let row_h = if width < 320.0 { 38.0 } else { 42.0 };
         let total_h = 4.0 * row_h + 3.0 * gap;
         ui.allocate_ui_with_layout(
             Vec2::new(width, total_h),
@@ -4357,9 +4375,10 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 let compact = ui.available_width() < 520.0;
-                let outer_pad = if compact { 14.0 } else { 24.0 };
-                let margin_x = if compact { 16 } else { 20 };
-                let top_gap = (ui.available_height() * if compact { 0.025 } else { 0.06 }).clamp(6.0, 52.0);
+                let outer_pad = if compact { 12.0 } else { 24.0 };
+                let margin_x = if compact { 14 } else { 20 };
+                let margin_y = if compact { 14 } else { 20 };
+                let top_gap = (ui.available_height() * if compact { 0.015 } else { 0.06 }).clamp(4.0, 52.0);
                 ui.add_space(top_gap);
                 let col_w = (ui.available_width() - outer_pad * 2.0 - f32::from(margin_x) * 2.0).clamp(260.0, 336.0);
                 let glass_mobile = theme::mobile_glass_active();
@@ -4376,7 +4395,7 @@ impl App {
                         Color32::from_white_alpha(if glass_mobile { 40 } else { 20 }),
                     ))
                     .corner_radius(egui::CornerRadius::same(22))
-                    .inner_margin(egui::Margin::symmetric(margin_x, 20))
+                    .inner_margin(egui::Margin::symmetric(margin_x, margin_y))
                     .show(ui, |ui| {
                         ui.set_width(col_w);
                         ui.vertical_centered(|ui| match self.stage.clone() {
@@ -4423,7 +4442,8 @@ impl App {
                                     )
                                     .clicked()
                                 {
-                                    ui.ctx().copy_text(self.error.clone());
+                                    copy_text_to_clipboard(ui.ctx(), &self.error);
+                                    self.status = "Текст ошибки скопирован".to_owned();
                                 }
                             });
                         });
@@ -4508,7 +4528,7 @@ impl App {
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
-                    ui.ctx().copy_text(url.to_owned());
+                    copy_text_to_clipboard(ui.ctx(), url);
                     self.status = "Ссылка QR-входа скопирована".to_owned();
                 }
                 ui.label(RichText::new("·").size(12.5).color(SUBTEXT));
@@ -4597,16 +4617,17 @@ impl App {
             }
             Stage::NeedPhone => {
                 let enter_k = theme::tween(ui.ctx(), "lg-logo-phone", 1.0, 0.38);
+                let tight = ui.available_width() < 360.0;
                 login_anim::paint_plane_mascot(ui, self.login_busy, enter_k);
-                ui.add_space(6.0);
-                ui.label(RichText::new("Telegram").size(28.0).strong().color(WHITE));
-                ui.add_space(6.0);
+                ui.add_space(if tight { 4.0 } else { 6.0 });
+                ui.label(RichText::new("Telegram").size(if tight { 24.0 } else { 28.0 }).strong().color(WHITE));
+                ui.add_space(if tight { 4.0 } else { 6.0 });
                 ui.label(
                     RichText::new("Проверьте код страны и введите свой номер\nтелефона.")
-                        .size(13.5)
+                        .size(if tight { 12.5 } else { 13.5 })
                         .color(Color32::from_rgb(162, 162, 172)),
                 );
-                ui.add_space(18.0);
+                ui.add_space(if tight { 12.0 } else { 18.0 });
 
                 let country = countries::COUNTRIES
                     .get(self.login_country_idx)
@@ -4723,12 +4744,17 @@ impl App {
                                     .font(FontId::proportional(15.5))
                                     .hint_text(format!("{} {}", country.dial, country.hint)),
                             );
-                            let kb_btn = ui
-                                .add(
-                                    egui::Button::new(RichText::new("⌨").size(14.0).color(SUBTEXT))
-                                        .frame(false),
-                                )
+                            let (kb_r, kb_resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                            icons::tg_sized(
+                                ui.painter(),
+                                "chat/input_bot_keyboard",
+                                kb_r.center(),
+                                Vec2::splat(17.0),
+                                if kb_resp.hovered() { WHITE } else { SUBTEXT },
+                            );
+                            let kb_btn = kb_resp
                                 .on_hover_text("Ввести номер с клавиатуры")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked();
                             (pr, kb_btn)
                         },
@@ -4815,8 +4841,8 @@ impl App {
                     !self.login_busy,
                     egui::Button::new(RichText::new(btn_lbl).size(14.0).strong().color(Color32::WHITE))
                         .fill(btn_fill)
-                        .corner_radius(egui::CornerRadius::same(11))
-                        .min_size(Vec2::new(form_w, 46.0)),
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .min_size(Vec2::new(form_w, 44.0)),
                 );
                 if (go_btn.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || enter_pressed) && !self.login_busy {
                     match countries::normalize_phone(&self.login_dial, &self.login_phone_full) {
@@ -5474,6 +5500,13 @@ impl App {
                     };
                     let p = ui.painter();
                     p.rect_filled(rect, 0.0, fill);
+                    if selected {
+                        let accent_bar = egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), rect.top() + 8.0),
+                            egui::pos2(rect.left() + 3.0, rect.bottom() - 8.0),
+                        );
+                        p.rect_filled(accent_bar, egui::CornerRadius::same(2), c_orange());
+                    }
                     if self.avatar_req.insert(d.id) {
                         let _ = self.cmd.send(Cmd::Avatar(i));
                     }
@@ -6691,25 +6724,46 @@ impl App {
                 }
                 let btn_exp = egui::Rect::from_center_size(egui::pos2(hdr.right() - 52.0, hdr.center().y), Vec2::splat(28.0));
                 let expr = ui.interact(btn_exp, ui.make_persistent_id("miniapp-expand"), Sense::click());
-                ui.painter().text(
-                    btn_exp.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if self.miniapp_expanded { "⤡" } else { "⤢" },
-                    FontId::proportional(14.0),
-                    if expr.hovered() { ORANGE } else { SUBTEXT },
-                );
+                {
+                    let ec = btn_exp.center();
+                    let col = if expr.hovered() { ORANGE } else { SUBTEXT };
+                    let st = egui::Stroke::new(1.5, col);
+                    if self.miniapp_expanded {
+                        ui.painter().line_segment([ec + Vec2::new(-5.0, -5.0), ec + Vec2::new(-1.5, -1.5)], st);
+                        ui.painter().line_segment([ec + Vec2::new(5.0, 5.0), ec + Vec2::new(1.5, 1.5)], st);
+                        ui.painter().rect_stroke(egui::Rect::from_center_size(ec, Vec2::splat(7.0)), 1.5, st, egui::StrokeKind::Inside);
+                    } else {
+                        ui.painter().line_segment([ec + Vec2::new(-5.0, 5.0), ec + Vec2::new(5.0, -5.0)], st);
+                        ui.painter().line_segment([ec + Vec2::new(1.0, -5.0), ec + Vec2::new(5.0, -5.0)], st);
+                        ui.painter().line_segment([ec + Vec2::new(5.0, -5.0), ec + Vec2::new(5.0, -1.0)], st);
+                        ui.painter().line_segment([ec + Vec2::new(-5.0, 5.0), ec + Vec2::new(-1.0, 5.0)], st);
+                        ui.painter().line_segment([ec + Vec2::new(-5.0, 5.0), ec + Vec2::new(-5.0, 1.0)], st);
+                    }
+                }
                 if expr.on_hover_text(if self.miniapp_expanded { "Обычный размер" } else { "Развернуть" }).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.miniapp_expanded = !self.miniapp_expanded;
                 }
                 let btn_ext = egui::Rect::from_center_size(egui::pos2(hdr.right() - 82.0, hdr.center().y), Vec2::splat(28.0));
                 let er = ui.interact(btn_ext, ui.make_persistent_id("miniapp-ext"), Sense::click());
-                ui.painter().text(btn_ext.center(), egui::Align2::CENTER_CENTER, "↗", FontId::proportional(14.0), if er.hovered() { ORANGE } else { SUBTEXT });
+                icons::tg_sized(
+                    ui.painter(),
+                    "info/info_media_forward",
+                    btn_ext.center(),
+                    Vec2::splat(16.0),
+                    if er.hovered() { ORANGE } else { SUBTEXT },
+                );
                 if er.on_hover_text("Открыть в браузере").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     open_ext = true;
                 }
                 let btn_rel = egui::Rect::from_center_size(egui::pos2(hdr.right() - 112.0, hdr.center().y), Vec2::splat(28.0));
                 let rr = ui.interact(btn_rel, ui.make_persistent_id("miniapp-reload"), Sense::click());
-                ui.painter().text(btn_rel.center(), egui::Align2::CENTER_CENTER, "↻", FontId::proportional(14.0), if rr.hovered() { WHITE } else { SUBTEXT });
+                icons::tg_sized(
+                    ui.painter(),
+                    "mediaview/rotate",
+                    btn_rel.center(),
+                    Vec2::splat(16.0),
+                    if rr.hovered() { WHITE } else { SUBTEXT },
+                );
                 if rr.on_hover_text("Обновить").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     reload = true;
                 }
@@ -7723,7 +7777,7 @@ mod tests {
             txt_full.clear();
             out.shapes.iter().for_each(|cs| collect_all_text(&cs.shape, &mut txt_full));
         }
-        assert!(txt_full.contains("≡ Меню"), "left bot menu pill missing: {txt_full}");
+        assert!(txt_full.contains("Меню"), "left bot menu pill missing: {txt_full}");
         assert!(txt_full.contains("Команды бота") && txt_full.contains("/menu"), "bot cmd popup missing: {txt_full}");
         assert!(txt_full.contains('@') && txt_full.contains('❤'), "stacked FABs missing: {txt_full}");
     }
@@ -7918,5 +7972,122 @@ mod tests {
                 "No-Lie Audit failed: inert toggle `{dead}` still present in settings UI"
             );
         }
+    }
+
+    #[test]
+    fn lang_choices_contain_zero_cjk_tofu() {
+        let src = include_str!("tg_settings.rs");
+        for bad in ["中文", "日本語", "한국어"] {
+            assert!(!src.contains(bad), "unexpected CJK glyph string {bad} in tg_settings.rs");
+        }
+    }
+
+    #[test]
+    fn copy_text_to_clipboard_and_act_copy_update_status() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let _ = copy_text_to_clipboard(&ctx, "Проверка буфера");
+        let mut app = demo_app("1");
+        app.apply(&ctx, chat::Act::Copy("Тест сообщения".to_owned()));
+        assert_eq!(app.status, "Скопировано в буфер обмена");
+    }
+
+    #[test]
+    fn login_anim_mascots_render_sculpted_geometry_without_circles_on_compact_phone() {
+        fn scan_shapes(shape: &egui::Shape, big_circles: &mut usize, paths: &mut usize) {
+            match shape {
+                egui::Shape::Circle(c) if c.radius >= 38.0 => *big_circles += 1,
+                egui::Shape::Path(p) if p.points.len() >= 6 => *paths += 1,
+                egui::Shape::Vec(v) => v.iter().for_each(|s| scan_shapes(s, big_circles, paths)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(340.0, 844.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                login_anim::paint_plane_mascot(ui, false, 1.0);
+                login_anim::paint_code_monkey(ui, 3, false);
+                login_anim::paint_password_monkey(ui, true, 5);
+            });
+        });
+        out.textures_delta.clear();
+        let (mut big_circles, mut paths) = (0, 0);
+        out.shapes.iter().for_each(|cs| scan_shapes(&cs.shape, &mut big_circles, &mut paths));
+        assert_eq!(big_circles, 0, "expected zero circular backdrop behind login mascots");
+        assert!(paths >= 3, "expected sculpted bezel/polygon paths on login mascots, got {paths}");
+    }
+
+    #[test]
+    fn reaction_pills_render_color_emoji_atlas_quads_and_paid_star_mesh() {
+        fn inspect_shapes(shape: &egui::Shape, emoji_meshes: &mut usize, star_meshes: &mut usize, txt: &mut String, atlas_id: egui::TextureId) {
+            match shape {
+                egui::Shape::Mesh(m) if m.texture_id == atlas_id => *emoji_meshes += 1,
+                egui::Shape::Rect(r) if r.fill_texture_id() == atlas_id => *emoji_meshes += 1,
+                egui::Shape::Mesh(m) if m.indices.len() == 30 => *star_meshes += 1,
+                egui::Shape::Text(t) => {
+                    txt.push_str(t.galley.text());
+                    txt.push('\n');
+                }
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        inspect_shapes(s, emoji_meshes, star_meshes, txt, atlas_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let loaded_emoji = emoji::Emoji::load(&ctx).expect("bundled Twemoji atlas must decode");
+        let atlas_id = loaded_emoji.tex_id();
+        let mut app = demo_app("1");
+        app.emoji = Some(loaded_emoji);
+        app.selected = Some(0);
+        let mut msg = MessageRow::plain(77, "Проверка реакций".into(), false, app.now);
+        msg.reactions = 5;
+        msg.paid_reactions = 9;
+        msg.reaction_items = vec![
+            rg_core::engine::ReactionPill {
+                emoji: "👍".into(),
+                custom_doc_id: None,
+                count: 5,
+                chosen: true,
+                paid: false,
+            },
+            rg_core::engine::ReactionPill {
+                emoji: "⭐".into(),
+                custom_doc_id: None,
+                count: 9,
+                chosen: false,
+                paid: true,
+            },
+        ];
+        app.messages = vec![msg];
+
+        let mut out_shapes = Vec::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(820.0, 680.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.messages_ui(ui));
+            });
+            out.textures_delta.clear();
+            out_shapes = out.shapes;
+        }
+        let (mut emoji_meshes, mut star_meshes, mut txt) = (0, 0, String::new());
+        for cs in &out_shapes {
+            inspect_shapes(&cs.shape, &mut emoji_meshes, &mut star_meshes, &mut txt, atlas_id);
+        }
+        assert!(emoji_meshes >= 1, "reaction pill must render color emoji from Emoji atlas");
+        assert!(star_meshes >= 1, "paid star reaction pill must render gold star mesh");
+        assert!(txt.contains('5') && txt.contains('9'), "reaction counters missing: {txt}");
+        assert!(!txt.contains("👍 5"), "monochrome raw emoji fallback must not be used when Emoji atlas loaded");
     }
 }
